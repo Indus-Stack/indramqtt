@@ -25,7 +25,7 @@ flowchart LR
 | cassandra | scylla, scylladb, cql | time-series | SB-27 | pending SB-27 | yes | yes | yes | yes | yes | cassandra |
 | clickhouse | ch | time-series | MV-02b | ready | yes | yes | yes | yes | yes | clickhouse |
 | cockroachdb | cockroach | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
-| confluent | confluent_kafka, confluent_cloud, confluent_producer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | confluent |
+| confluent | confluent_kafka, confluent_cloud, confluent_producer | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | confluent |
 | console | logger | local | KC-00/D9 | ready | yes | yes | yes | yes | yes | - |
 | couchbase | couch, cb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | couchbase |
 | databricks | delta_lake | object-store | MV-02d | refused D3 | no | no | no | no | no | - |
@@ -40,10 +40,10 @@ flowchart LR
 | http | rest | http | MV-03c | ready | yes | yes | yes | yes | yes | - |
 | influxdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | iotdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
-| kafka | kafka_producer, kafka_consumer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | kafka |
+| kafka | kafka_producer, kafka_consumer | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | kafka |
 | kinesis | aws_kinesis | cloud-messaging | MV-03b | ready | yes | yes | yes | yes | yes | kinesis |
 | mongodb | mongo, documentdb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | mongodb |
-| mqtt_bridge | mqtt, mqtt-bridge, bridge | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
+| mqtt_bridge | mqtt, mqtt-bridge, bridge | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | - |
 | mssql | sqlserver | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | mysql | mariadb | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | oci_streaming | oci | cloud-messaging | SB-11 | pending SB-11 | yes | yes | yes | yes | yes | - |
@@ -51,11 +51,11 @@ flowchart LR
 | opentsdb | opents | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | oracle |  | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | pgsql | postgres, postgresql | relational | MV-01 | ready | yes | yes | yes | yes | yes | - |
-| pulsar |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
-| rabbitmq | rabbit, amqp | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | rabbitmq |
-| redis |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
+| pulsar |  | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | - |
+| rabbitmq | rabbit, amqp | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | rabbitmq |
+| redis |  | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | - |
 | redshift |  | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
-| rocketmq |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
+| rocketmq |  | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | - |
 | s3 | minio | object-store | MV-02d | ready | yes | yes | yes | yes | yes | s3 |
 | snowflake | snowflake_streaming, snowflake_aggregated | object-store | MV-02d | ready | yes | yes | yes | yes | yes | - |
 | sparkplug_b | sparkplug, spb | device | MV-03c | ready | yes | yes | yes | yes | yes | - |

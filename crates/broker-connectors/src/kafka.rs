@@ -25,6 +25,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock as AsyncRwLock;
 
+/// One short TCP handshake per publish bounds the down check to 1 s.
+// A closed listener fails closed even when an old producer still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 fn default_partitions() -> u32 {
     1
 }
@@ -42,6 +46,12 @@ pub struct KafkaSinkConfig {
     pub bootstrap_servers: String,
     pub topic_template: String,
     pub partition_key_field: Option<String>,
+    /// Key template (`${topic}`, `${payload}`, `${payload.<field>}`,
+    /// `${client_id}` from the payload object). It wins over
+    /// `partition_key_field` when set. Reason: the reference
+    /// `message.key` action field.
+    #[serde(default)]
+    pub key_template: Option<String>,
     #[serde(default = "default_partitions")]
     pub partitions: u32,
     pub client_id: String,
@@ -50,6 +60,36 @@ pub struct KafkaSinkConfig {
     pub batch_max_records: usize,
     #[serde(default = "default_batch_max_bytes")]
     pub batch_max_bytes: usize,
+    /// Partition strategy of the action: false hashes the key
+    /// (`key_dispatch`), true spreads keyless and keyed rows at
+    /// random. Reason: the reference default is `random`.
+    #[serde(default)]
+    pub random_partition: bool,
+    /// Single headers template (rendered per event, then parsed as a
+    /// JSON object or array of key/value pairs). Reason: the reference
+    /// `kafka_headers` action field, which must render to an object or
+    /// an array of key/value pairs.
+    #[serde(default)]
+    pub headers_template: Option<String>,
+    /// Extra record headers: each pair is a header name plus a value
+    /// template (`${topic}`, `${payload}`). Reason: the reference
+    /// `kafka_ext_headers` action field.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Value encoding of the headers: `none` sends raw bytes, `json`
+    /// sends each value JSON-encoded. Reason: the reference
+    /// `kafka_header_value_encode_mode` action field.
+    #[serde(default)]
+    pub header_encode_mode: KafkaHeaderEncodeMode,
+}
+
+/// Encoding of extra header values on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaHeaderEncodeMode {
+    #[default]
+    None,
+    Json,
 }
 
 impl KafkaSinkConfig {
@@ -81,6 +121,13 @@ impl KafkaSinkConfig {
             return Err(ConnectorError::Dispatch(
                 "kafka batch limits must be >= 1".to_string(),
             ));
+        }
+        if let Some(template) = &self.key_template {
+            render_key_template(template, "dummy/topic", b"{}").map(|_| ())?;
+        }
+        if let Some(template) = &self.headers_template {
+            let rendered = render_header_template(template, "dummy/topic", b"{}");
+            parse_rendered_headers(&rendered).map(|_| ())?;
         }
         Ok(())
     }
@@ -164,6 +211,114 @@ pub fn partition_for_key(key: Option<&[u8]>, partitions: u32) -> i32 {
         Some(key) => ((murmur2(key) & 0x7fffffff) % partitions) as i32,
         None => 0,
     }
+}
+
+/// Render one header value template: `${topic}` takes the event
+/// topic, `${payload}` takes the raw event bytes as text.
+pub fn render_header_template(template: &str, topic: &str, payload: &[u8]) -> String {
+    template
+        .replace("${topic}", topic)
+        .replace("${payload}", &String::from_utf8_lossy(payload))
+}
+
+/// Encode one rendered header value: `none` sends raw bytes, `json`
+/// sends the value JSON-encoded (a string gains quotes).
+pub fn encode_header_value(rendered: &str, mode: KafkaHeaderEncodeMode) -> Bytes {
+    match mode {
+        KafkaHeaderEncodeMode::None => Bytes::from(rendered.to_string()),
+        KafkaHeaderEncodeMode::Json => {
+            Bytes::from(serde_json::Value::String(rendered.to_string()).to_string())
+        }
+    }
+}
+
+/// Parse one rendered `kafka_headers` template: a JSON object of
+/// string templates, or an array of `{key, value}` pairs. Anything
+/// else is a dispatch error. Non-string scalars render with their
+/// JSON text.
+pub fn parse_rendered_headers(rendered: &str) -> Result<Vec<(String, String)>> {
+    let value: serde_json::Value = serde_json::from_str(rendered).map_err(|error| {
+        ConnectorError::Dispatch(format!(
+            "kafka_headers template rendered invalid JSON: {error}"
+        ))
+    })?;
+    if let Some(map) = value.as_object() {
+        let mut out = Vec::with_capacity(map.len());
+        for (key, entry) in map {
+            let text = match entry {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Null => continue,
+                scalar => scalar.to_string(),
+            };
+            out.push((key.clone(), text));
+        }
+        return Ok(out);
+    }
+    if let Some(items) = value.as_array() {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let key = item.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                ConnectorError::Dispatch(
+                    "kafka_headers array entries need string `key` and `value`".to_string(),
+                )
+            })?;
+            let text = match item.get("value") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Null) | None => continue,
+                Some(scalar) => scalar.to_string(),
+            };
+            out.push((key.to_string(), text));
+        }
+        return Ok(out);
+    }
+    Err(ConnectorError::Dispatch(
+        "kafka_headers template must render a JSON object or an array of key/value pairs"
+            .to_string(),
+    ))
+}
+
+/// Render one key template: `${topic}` takes the event topic,
+/// `${payload}` takes the raw event bytes, `${payload.<field>}`
+/// takes one payload JSON field, `${client_id}` (and `${.clientid}`)
+/// takes the payload `client_id` field. An empty result reads as no
+/// key; an unknown or unclosed `${...}` variable is a dispatch error.
+pub fn render_key_template(template: &str, topic: &str, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unclosed template variable in key template {template:?}"
+            )));
+        };
+        let name = &after[..end];
+        let value = if name == "topic" {
+            topic.to_string()
+        } else if name == "payload" {
+            String::from_utf8_lossy(payload).into_owned()
+        } else if name == "client_id" || name == ".clientid" {
+            extract_json_field(payload, "client_id")
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        } else if let Some(field) = name.strip_prefix("payload.") {
+            extract_json_field(payload, field)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        } else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unknown template variable {name:?} in key template {template:?}"
+            )));
+        };
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out.into_bytes()))
 }
 
 fn now_millis() -> i64 {
@@ -469,6 +624,32 @@ impl KafkaTransport for RdkafkaKafkaTransport {
         if records.is_empty() {
             return Ok(());
         }
+        // Probe the listener before reusing the cached producer. A
+        // refused port clears the cache and fails closed. It skips the
+        // 30 s send timeout and the 200-attempt retry, so the action
+        // counts one failed forward fast. The error is terminal, so
+        // `KafkaSink::flush` does not retry it.
+        let probe_target = self
+            .config
+            .bootstrap_servers
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !probe_target.is_empty() {
+            let reachable =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_target))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .is_some();
+            if !reachable {
+                *self.producer.write().await = None;
+                return Err(ConnectorError::Dispatch(format!(
+                    "kafka broker unreachable: {probe_target}"
+                )));
+            }
+        }
         let producer = self.producer().await?;
         // 30 s per record: matches `message.timeout.ms` above so a
         // delivery future never outlives the driver's own deadline.
@@ -551,36 +732,69 @@ impl KafkaSink {
         self.buffer.lock().records.len()
     }
 
-    fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> KafkaRecord {
+    fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<KafkaRecord> {
         let rendered = render_topic_template(&self.config.topic_template, topic.as_str());
-        let key = self
-            .config
-            .partition_key_field
-            .as_deref()
-            .and_then(|field| extract_json_field(payload, field))
-            .map(Bytes::from);
-        let partition = partition_for_key(key.as_deref(), self.config.partitions);
-        KafkaRecord {
+        let key = match &self.config.key_template {
+            Some(template) => {
+                render_key_template(template, topic.as_str(), payload)?.map(Bytes::from)
+            }
+            None => self
+                .config
+                .partition_key_field
+                .as_deref()
+                .and_then(|field| extract_json_field(payload, field))
+                .map(Bytes::from),
+        };
+        // One means unconfigured. Pass -1 so the driver assigns
+        // the partition from real broker Metadata. Explicit counts
+        // stay for offline unit tests with fixed topics.
+        let partition = if self.config.partitions <= 1 {
+            -1
+        } else if self.config.random_partition {
+            (rand::random::<u32>() % self.config.partitions.max(1)) as i32
+        } else {
+            partition_for_key(key.as_deref(), self.config.partitions)
+        };
+        let mut headers = vec![
+            (
+                "mqtt.topic".to_string(),
+                Bytes::from(topic.as_str().to_string()),
+            ),
+            (
+                "mqtt.qos".to_string(),
+                Bytes::from(u8::from(qos).to_string()),
+            ),
+            (
+                "mqtt.timestamp".to_string(),
+                Bytes::from(now_millis().to_string()),
+            ),
+        ];
+        for (name, template) in &self.config.extra_headers {
+            headers.push((
+                name.clone(),
+                encode_header_value(
+                    &render_header_template(template, topic.as_str(), payload),
+                    self.config.header_encode_mode,
+                ),
+            ));
+        }
+        if let Some(template) = &self.config.headers_template {
+            let rendered = render_header_template(template, topic.as_str(), payload);
+            for (name, value) in parse_rendered_headers(&rendered)? {
+                headers.push((
+                    name,
+                    encode_header_value(&value, self.config.header_encode_mode),
+                ));
+            }
+        }
+        Ok(KafkaRecord {
             topic: rendered,
             partition,
             key,
             value: payload.clone(),
-            headers: vec![
-                (
-                    "mqtt.topic".to_string(),
-                    Bytes::from(topic.as_str().to_string()),
-                ),
-                (
-                    "mqtt.qos".to_string(),
-                    Bytes::from(u8::from(qos).to_string()),
-                ),
-                (
-                    "mqtt.timestamp".to_string(),
-                    Bytes::from(now_millis().to_string()),
-                ),
-            ],
+            headers,
             timestamp_ms: now_millis(),
-        }
+        })
     }
 
     /// Flush buffered records (no-op when empty). Retryable driver
@@ -670,7 +884,7 @@ fn extract_json_field(payload: &[u8], field: &str) -> Option<Vec<u8>> {
 #[async_trait]
 impl Sink for KafkaSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> super::Result<()> {
-        let record = self.build_record(topic, payload, qos);
+        let record = self.build_record(topic, payload, qos)?;
         let should_flush = {
             let mut buffer = self.buffer.lock();
             buffer.bytes += record.value.len() + record.key.as_ref().map(|k| k.len()).unwrap_or(0);
@@ -698,11 +912,16 @@ mod tests {
             bootstrap_servers: "127.0.0.1:9092".to_string(),
             topic_template: "kafka-telemetry-${topic}".to_string(),
             partition_key_field: Some("device_id".to_string()),
+            key_template: None,
             partitions: 12,
             client_id: "indra-test".to_string(),
             acks: "all".to_string(),
             batch_max_records: 500,
             batch_max_bytes: 256 * 1024,
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: KafkaHeaderEncodeMode::None,
         }
     }
 
@@ -817,6 +1036,24 @@ mod tests {
         );
         assert_eq!(extract_json_field(br#"{ "v": 1 }"#, "device_id"), None);
         assert_eq!(extract_json_field(b"not json", "device_id"), None);
+    }
+
+    #[test]
+    fn test_key_template_renders_topic_payload_and_client_id() {
+        let payload = Bytes::from_static(br#"{ "client_id": "edge-7", "k": "v7" }"#);
+        let rendered =
+            render_key_template("dev-${payload.k}", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"dev-v7".to_vec()));
+        let rendered = render_key_template("${.clientid}", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"edge-7".to_vec()));
+        let rendered = render_key_template("static", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"static".to_vec()));
+        // A missing field renders empty, which reads as no key.
+        let rendered =
+            render_key_template("dev-${payload.nope}", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"dev-".to_vec()));
+        // An unknown variable fails closed.
+        assert!(render_key_template("dev-${nope}", "sensors/t", &payload).is_err());
     }
 
     #[test]
@@ -1031,11 +1268,16 @@ mod tests {
             bootstrap_servers: bootstrap.clone(),
             topic_template: topic.clone(),
             partition_key_field: Some("device_id".to_string()),
+            key_template: None,
             partitions: PARTITIONS,
             client_id: "indra-qual-b324-admin".to_string(),
             acks: "all".to_string(),
             batch_max_records: 500,
             batch_max_bytes: 256 * 1024,
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: KafkaHeaderEncodeMode::None,
         };
         let admin: rdkafka::admin::AdminClient<rdkafka::client::DefaultClientContext> =
             rdkafka_client_config(&admin_config)
@@ -1071,11 +1313,16 @@ mod tests {
             bootstrap_servers: bootstrap.clone(),
             topic_template: topic.clone(),
             partition_key_field: Some("device_id".to_string()),
+            key_template: None,
             partitions: PARTITIONS,
             client_id: "indra-qual-b324".to_string(),
             acks: "all".to_string(),
             batch_max_records: 500,
             batch_max_bytes: 256 * 1024,
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: KafkaHeaderEncodeMode::None,
         };
         config.validate().expect("qual config validates");
         let transport = Arc::new(RdkafkaKafkaTransport::new(&config).expect("qual transport"));

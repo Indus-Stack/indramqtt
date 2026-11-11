@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -37,6 +38,12 @@ pub enum RedisCommandKind {
         stream_template: String,
         #[serde(default)]
         maxlen: Option<usize>,
+    },
+    /// Free-form command template from the action: each entry is one
+    /// RESP argument rendered per event (`${topic}`, `${payload}`).
+    /// A value with spaces stays one argument on the wire.
+    Raw {
+        argv_templates: Vec<String>,
     },
 }
 
@@ -61,6 +68,21 @@ impl RedisSinkConfig {
             RedisCommandKind::XAdd {
                 stream_template, ..
             } => stream_template,
+            RedisCommandKind::Raw { argv_templates } => {
+                if argv_templates.is_empty() {
+                    return Err(ConnectorError::Dispatch(
+                        "redis command template must hold at least the command name".to_string(),
+                    ));
+                }
+                for entry in argv_templates {
+                    if entry.trim().is_empty() {
+                        return Err(ConnectorError::Dispatch(
+                            "redis command template holds a blank argument".to_string(),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
         };
         if template.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -119,7 +141,13 @@ impl RedisCommand {
 }
 
 /// Build the wire command for one MQTT event under `config`.
-pub fn build_command(config: &RedisSinkConfig, topic: &Topic, payload: &Bytes) -> RedisCommand {
+/// A bad raw template is a dispatch error, so typos fail closed
+/// at send time instead of reaching the wire literally.
+pub fn build_command(
+    config: &RedisSinkConfig,
+    topic: &Topic,
+    payload: &Bytes,
+) -> Result<RedisCommand> {
     match &config.command {
         RedisCommandKind::Set {
             key_template,
@@ -131,18 +159,18 @@ pub fn build_command(config: &RedisSinkConfig, topic: &Topic, payload: &Bytes) -
             if let Some(ttl) = ttl_seconds {
                 command = command.arg(b"EX").arg(ttl.to_string().as_bytes());
             }
-            command
+            Ok(command)
         }
         RedisCommandKind::HSet {
             key_template,
             field_template,
-        } => RedisCommand::new("HSET")
+        } => Ok(RedisCommand::new("HSET")
             .arg(render_template(key_template, topic.as_str()).as_bytes())
             .arg(render_template(field_template, topic.as_str()).as_bytes())
-            .arg(payload),
-        RedisCommandKind::Publish { channel_template } => RedisCommand::new("PUBLISH")
+            .arg(payload)),
+        RedisCommandKind::Publish { channel_template } => Ok(RedisCommand::new("PUBLISH")
             .arg(render_template(channel_template, topic.as_str()).as_bytes())
-            .arg(payload),
+            .arg(payload)),
         RedisCommandKind::XAdd {
             stream_template,
             maxlen,
@@ -155,8 +183,81 @@ pub fn build_command(config: &RedisSinkConfig, topic: &Topic, payload: &Bytes) -
                     .arg(b"~")
                     .arg(maxlen.to_string().as_bytes());
             }
-            command.arg(b"*").arg(b"payload").arg(payload)
+            Ok(command.arg(b"*").arg(b"payload").arg(payload))
         }
+        RedisCommandKind::Raw { argv_templates } => {
+            let mut argv = Vec::with_capacity(argv_templates.len());
+            for entry in argv_templates {
+                argv.push(render_raw_arg(entry, topic.as_str(), payload)?);
+            }
+            Ok(RedisCommand { argv })
+        }
+    }
+}
+
+/// Render one free-form command argument: `${topic}` takes the event
+/// topic, `${payload}` takes the raw event bytes, `${clientid}`,
+/// `${client_id}` and `${.clientid}` take the payload client id field,
+/// and `${payload.<field>}` takes one payload JSON field. Each template
+/// stays one RESP bulk string, so spaces never split an argument.
+/// An unknown or unclosed `${...}` variable is a dispatch error.
+fn render_raw_arg(template: &str, topic: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        out.extend_from_slice(&rest.as_bytes()[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unclosed template variable in raw command template {template:?}"
+            )));
+        };
+        let name = &after[..end];
+        if name.is_empty() {
+            return Err(ConnectorError::Dispatch(format!(
+                "empty template variable in raw command template {template:?}"
+            )));
+        }
+        if name == "topic" {
+            out.extend_from_slice(topic.as_bytes());
+        } else if name == "payload" {
+            out.extend_from_slice(payload);
+        } else if name == "clientid" || name == "client_id" || name == ".clientid" {
+            if let Some(bytes) = extract_client_id(payload) {
+                out.extend_from_slice(&bytes);
+            }
+        } else if let Some(field) = name.strip_prefix("payload.") {
+            if let Some(bytes) = extract_payload_field(payload, field) {
+                out.extend_from_slice(&bytes);
+            }
+        } else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unknown template variable {name:?} in raw command template {template:?}"
+            )));
+        }
+        rest = &after[end + 1..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+    Ok(out)
+}
+
+/// Take the payload client id field (`clientid` or `client_id`).
+fn extract_client_id(payload: &[u8]) -> Option<Vec<u8>> {
+    extract_payload_field(payload, "clientid")
+        .or_else(|| extract_payload_field(payload, "client_id"))
+}
+
+/// Take one payload JSON field as bytes. Numbers and booleans use
+/// their JSON text. Objects and arrays use their JSON encoding.
+fn extract_payload_field(payload: &[u8], field: &str) -> Option<Vec<u8>> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    match value.get(field) {
+        Some(serde_json::Value::String(text)) => Some(text.as_bytes().to_vec()),
+        Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
+            Some(scalar.to_string().into_bytes())
+        }
+        Some(other) => serde_json::to_vec(other).ok(),
+        None => None,
     }
 }
 
@@ -267,6 +368,36 @@ const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// bounds each exchange.
 const DRIVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One short TCP handshake per send bounds the down check to 1 s.
+// A closed listener fails closed even when an old connection still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+// Cap for shared Redis endpoints. Reason: operator endpoint count stays small.
+const MAX_SHARED_REDIS_ENDPOINTS: usize = 256;
+
+// Shared driver connection for one endpoint.
+type SharedRedisConnection = Arc<AsyncMutex<Option<redis::aio::MultiplexedConnection>>>;
+// Pool of shared driver connections by endpoint.
+type SharedRedisPool = StdMutex<HashMap<String, SharedRedisConnection>>;
+
+// One pooled connection per endpoint. Action rebuilds share it.
+static SHARED_REDIS_CONNS: OnceLock<SharedRedisPool> = OnceLock::new();
+
+// Share one pooled connection per endpoint.
+// Rebuilds reuse it, so an update sends no new handshake.
+fn shared_redis_conn(key: &str) -> SharedRedisConnection {
+    let pool = SHARED_REDIS_CONNS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = pool.lock().expect("redis pool holds the lock");
+    if let Some(shared) = guard.get(key) {
+        return Arc::clone(shared);
+    }
+    let fresh = Arc::new(AsyncMutex::new(None));
+    if guard.len() < MAX_SHARED_REDIS_ENDPOINTS {
+        guard.insert(key.to_string(), Arc::clone(&fresh));
+    }
+    fresh
+}
+
 /// Build a driver command from one [`RedisCommand`]: the first argv
 /// entry is the command name, the rest ride as binary arguments so
 /// payloads travel out-of-band exactly as on the legacy path.
@@ -315,8 +446,9 @@ fn map_driver_error(error: redis::RedisError) -> ConnectorError {
     }
 }
 
-/// Parse `redis://[:password@]host[:port][/db]` into
-/// `(host, port, password, database)`.
+/// Parse `redis://[[username:]password@]host[:port][/db]` into
+/// `(host, port, password, database)`. A username rides the URL to the
+/// driver; the local check keeps host, port and database only.
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16, Option<String>, u8)> {
     let rest = endpoint.strip_prefix("redis://").ok_or_else(|| {
         ConnectorError::Dispatch(format!(
@@ -371,25 +503,45 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16, Option<String>, u8)> {
 /// bounded queue, so no benchmark numbers are needed.
 pub struct DriverRedisTransport {
     client: redis::Client,
-    conn: AsyncMutex<Option<redis::aio::MultiplexedConnection>>,
+    conn: Arc<AsyncMutex<Option<redis::aio::MultiplexedConnection>>>,
+    probe_target: String,
 }
 
 impl DriverRedisTransport {
     pub fn new(endpoint: &str) -> Result<Self> {
         // Validate the URL shape now so misconfiguration fails at
         // connector creation, never at first publish.
-        parse_endpoint(endpoint)?;
+        let parsed = parse_endpoint(endpoint)?;
         let client = redis::Client::open(endpoint.to_string())
             .map_err(|e| ConnectorError::Dispatch(format!("redis invalid endpoint: {e}")))?;
         Ok(Self {
             client,
-            conn: AsyncMutex::new(None),
+            conn: shared_redis_conn(endpoint),
+            probe_target: format!("{}:{}", parsed.0, parsed.1),
         })
     }
 
     async fn connection(&self) -> Result<redis::aio::MultiplexedConnection> {
         let mut guard = self.conn.lock().await;
         if let Some(conn) = guard.clone() {
+            // Probe the listener before reusing the pooled connection.
+            // A refused port clears the cache and fails closed, so the
+            // action counts one failed forward.
+            let reachable = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect(&self.probe_target),
+            )
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .is_some();
+            if !reachable {
+                *guard = None;
+                return Err(ConnectorError::Connection(format!(
+                    "redis server unreachable: {}",
+                    self.probe_target
+                )));
+            }
             return Ok(conn);
         }
         let conn = tokio::time::timeout(
@@ -503,7 +655,7 @@ impl RedisSink {
 #[async_trait]
 impl Sink for RedisSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> super::Result<()> {
-        let command = build_command(&self.config, topic, payload);
+        let command = build_command(&self.config, topic, payload)?;
         self.transport.execute(command).await?;
         self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -577,7 +729,8 @@ mod tests {
             &set_config(),
             &Topic::new("a/b").unwrap(),
             &Bytes::from_static(b"online"),
-        );
+        )
+        .expect("valid template renders");
         assert_eq!(
             command.encode_resp(),
             b"*5\r\n$3\r\nSET\r\n$16\r\ndevice:a/b:state\r\n$6\r\nonline\r\n$2\r\nEX\r\n$3\r\n300\r\n".to_vec()
@@ -595,7 +748,8 @@ mod tests {
             &config,
             &Topic::new("s").unwrap(),
             &Bytes::from_static(b"1"),
-        );
+        )
+        .expect("valid template renders");
         assert_eq!(
             command.encode_resp(),
             b"*4\r\n$4\r\nHSET\r\n$6\r\ndevice\r\n$6\r\ntemp:s\r\n$1\r\n1\r\n".to_vec()
@@ -612,7 +766,8 @@ mod tests {
             &config,
             &Topic::new("t").unwrap(),
             &Bytes::from_static(b"m"),
-        );
+        )
+        .expect("valid template renders");
         assert_eq!(
             command.encode_resp(),
             b"*3\r\n$7\r\nPUBLISH\r\n$6\r\nalerts\r\n$1\r\nm\r\n".to_vec()
@@ -630,7 +785,8 @@ mod tests {
             &config,
             &Topic::new("t").unwrap(),
             &Bytes::from_static(b"v"),
-        );
+        )
+        .expect("valid template renders");
         assert_eq!(
             command.encode_resp(),
             b"*8\r\n$4\r\nXADD\r\n$6\r\nevents\r\n$6\r\nMAXLEN\r\n$1\r\n~\r\n$4\r\n1000\r\n$1\r\n*\r\n$7\r\npayload\r\n$1\r\nv\r\n".to_vec()
@@ -648,11 +804,73 @@ mod tests {
             &config,
             &Topic::new("t").unwrap(),
             &Bytes::from_static(b"v"),
-        );
+        )
+        .expect("valid template renders");
         assert_eq!(
             command.encode_resp(),
             b"*5\r\n$4\r\nXADD\r\n$6\r\nevents\r\n$1\r\n*\r\n$7\r\npayload\r\n$1\r\nv\r\n".to_vec()
         );
+
+        // Raw template: one argument per entry, spaces stay inside.
+        let config = RedisSinkConfig {
+            endpoint: "redis://h".to_string(),
+            command: RedisCommandKind::Raw {
+                argv_templates: vec![
+                    "HSET".to_string(),
+                    "sensors:${topic}".to_string(),
+                    "payload".to_string(),
+                    "${payload}".to_string(),
+                ],
+            },
+        };
+        let command = build_command(
+            &config,
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(b"v with spaces"),
+        )
+        .expect("valid template renders");
+        assert_eq!(
+            command.encode_resp(),
+            b"*4\r\n$4\r\nHSET\r\n$9\r\nsensors:t\r\n$7\r\npayload\r\n$13\r\nv with spaces\r\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn test_raw_arg_expands_every_advertised_placeholder() {
+        // The served default template uses clientid, payload key and
+        // value. Each renders, and spaces stay one argument.
+        let payload = br#"{"clientid":"edge-7","key":"k1","value":"v x"}"#;
+        assert_eq!(
+            render_raw_arg("${clientid}", "t", payload).expect("known name renders"),
+            b"edge-7".to_vec()
+        );
+        assert_eq!(
+            render_raw_arg("${payload.key}", "t", payload).expect("known field renders"),
+            b"k1".to_vec()
+        );
+        assert_eq!(
+            render_raw_arg("${payload.value}", "t", payload).expect("known field renders"),
+            b"v x".to_vec()
+        );
+        assert_eq!(
+            render_raw_arg("sensors:${topic}", "a/b", payload).expect("known name renders"),
+            b"sensors:a/b".to_vec()
+        );
+        assert_eq!(
+            render_raw_arg("${payload}", "t", payload).expect("known name renders"),
+            payload.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_raw_arg_refuses_unknown_and_unclosed_variables() {
+        // An unknown or unclosed variable fails closed at send time.
+        let payload = br#"{"clientid":"edge-7"}"#;
+        assert!(render_raw_arg("${bogus}", "t", payload).is_err());
+        assert!(render_raw_arg("prefix-${bogus}-suffix", "t", payload).is_err());
+        assert!(render_raw_arg("${topic", "t", payload).is_err());
+        assert!(render_raw_arg("${}", "t", payload).is_err());
     }
 
     #[test]

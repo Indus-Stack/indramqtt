@@ -110,6 +110,20 @@ fn default_partitions() -> u32 {
     12
 }
 
+/// Default broker acknowledgement: all in-sync replicas.
+fn default_acks() -> String {
+    "all".to_string()
+}
+
+/// Encoding of extra header values on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfluentHeaderEncodeMode {
+    #[default]
+    None,
+    Json,
+}
+
 /// Confluent Cloud Kafka sink configuration. Every depth is
 /// user-configurable with no clamped ceiling (`None` = unbounded).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +154,30 @@ pub struct ConfluentKafkaConfig {
     /// Partition count for murmur2 routing (default 12).
     #[serde(default = "default_partitions")]
     pub partitions: u32,
+    /// Broker acknowledgement: `all` (default), `-1`, `1` or `0`.
+    /// Reason: the reference `required_acks` action field.
+    #[serde(default = "default_acks")]
+    pub acks: String,
+    /// Partition strategy of the action: false hashes the key
+    /// (`key_dispatch`), true spreads rows at random. Reason: the
+    /// reference default is `random`.
+    #[serde(default)]
+    pub random_partition: bool,
+    /// Single headers template (rendered per event, then parsed as a
+    /// JSON object or array of key/value pairs). Reason: the reference
+    /// `kafka_headers` action field.
+    #[serde(default)]
+    pub headers_template: Option<String>,
+    /// Extra record headers: each pair is a header name plus a value
+    /// template (`${topic}`, `${payload}`). Reason: the reference
+    /// `kafka_ext_headers` action field.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Value encoding of the extra headers: `none` sends raw bytes,
+    /// `json` sends each value JSON-encoded. Reason: the reference
+    /// `kafka_header_value_encode_mode` action field.
+    #[serde(default)]
+    pub header_encode_mode: ConfluentHeaderEncodeMode,
     /// Flush trigger record count (default 500).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
@@ -182,11 +220,14 @@ impl ConfluentKafkaConfig {
         // send time, shallower ones fail there as dispatch errors.
         resolve_topic(&self.topic_template, "dummy/seg2/seg3/seg4")?;
         if let Some(template) = &self.partition_key_template {
+            // Validate with a dummy client id. Reason: the reference
+            // default `${.clientid}` reads the payload `client_id`
+            // field, so an empty object rejects a valid default.
             resolve_key(
                 template,
                 "dummy/seg2/seg3/seg4",
                 "dummy-client",
-                &serde_json::json!({}),
+                &serde_json::json!({"client_id": "dummy-client"}),
             )?;
         }
         if let Some(registry) = &self.schema_registry {
@@ -208,6 +249,14 @@ impl ConfluentKafkaConfig {
             return Err(ConnectorError::Dispatch(
                 "confluent partitions must be >= 1".to_string(),
             ));
+        }
+        match self.acks.as_str() {
+            "all" | "-1" | "1" | "0" => {}
+            other => {
+                return Err(ConnectorError::Dispatch(format!(
+                    "confluent acks must be one of all/-1/1/0, got {other:?}"
+                )))
+            }
         }
         if self.batch_size == Some(0) {
             return Err(ConnectorError::Dispatch(
@@ -291,6 +340,12 @@ pub fn resolve_template(
             }
             let value = if let Some(leaf) = name.strip_prefix("payload.") {
                 payload_leaf(payload, leaf)
+            } else if name == ".clientid" {
+                // Reference default key `${.clientid}`: the client id
+                // of the event. The sink reads it from the payload
+                // `client_id` field, which is where the rule output
+                // carries it.
+                payload_leaf(payload, "client_id")
             } else {
                 vars.iter()
                     .find(|(key, _)| key == name)
@@ -691,7 +746,7 @@ pub fn rdkafka_client_config(config: &ConfluentKafkaConfig) -> rdkafka::config::
         .set("sasl.username", config.api_key.clone())
         .set("sasl.password", config.api_secret.clone())
         .set("client.id", format!("indra-confluent-{}", config.api_key))
-        .set("request.required.acks", "all")
+        .set("request.required.acks", config.acks.clone())
         .set(
             "message.timeout.ms",
             config.timeout().as_millis().to_string(),
@@ -745,6 +800,10 @@ pub fn classify_driver_error(error: &rdkafka::error::KafkaError) -> ConnectorErr
 /// holds at most one flush in flight: no new unbounded buffer on the
 /// publish path, no lock held across I/O (the producer handle is
 /// cloned under a short read lock, then used lock-free).
+/// One short TCP handshake per publish bounds the down check to 1 s.
+// A closed listener fails closed even when an old producer still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub struct RdkafkaConfluentTransport {
     config: ConfluentKafkaConfig,
     producer: AsyncRwLock<Option<rdkafka::producer::FutureProducer>>,
@@ -803,6 +862,30 @@ impl ConfluentTransport for RdkafkaConfluentTransport {
     async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
+        }
+        // Probe the listener before reusing the cached producer. A
+        // refused port clears the cache and fails closed. It skips the
+        // driver send timeout, so the action counts one failed forward
+        // fast. The error is terminal, so the sink does not retry it.
+        let probe_target = self
+            .config
+            .bootstrap_servers
+            .first()
+            .map(|entry| entry.trim())
+            .unwrap_or("");
+        if !probe_target.is_empty() {
+            let reachable =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_target))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .is_some();
+            if !reachable {
+                *self.producer.write().await = None;
+                return Err(ConnectorError::Dispatch(format!(
+                    "confluent broker unreachable: {probe_target}"
+                )));
+            }
         }
         let producer = self.producer().await?;
         let timeout = self.config.timeout();
@@ -1014,27 +1097,60 @@ impl ConfluentKafkaSink {
         if let Some(registry) = &self.config.schema_registry {
             value = Bytes::from(frame_schema_registry(registry.schema_id, payload));
         }
-        let partition =
-            broker_connectors::kafka::partition_for_key(key.as_deref(), self.config.partitions);
+        // One means unconfigured. Pass -1 so the driver assigns
+        // the partition from real broker Metadata. Explicit counts
+        // stay for offline unit tests with fixed topics.
+        let partition = if self.config.partitions <= 1 {
+            -1
+        } else if self.config.random_partition {
+            (rand::random::<u32>() % self.config.partitions.max(1)) as i32
+        } else {
+            broker_connectors::kafka::partition_for_key(key.as_deref(), self.config.partitions)
+        };
+        let mut headers = vec![
+            (
+                "mqtt.topic".to_string(),
+                Bytes::from(topic.as_str().to_string()),
+            ),
+            (
+                "mqtt.qos".to_string(),
+                Bytes::from(u8::from(qos).to_string()),
+            ),
+            (
+                "mqtt.timestamp".to_string(),
+                Bytes::from(now_millis().to_string()),
+            ),
+        ];
+        for (name, template) in &self.config.extra_headers {
+            let rendered =
+                broker_connectors::kafka::render_header_template(template, topic.as_str(), payload);
+            let value = match self.config.header_encode_mode {
+                ConfluentHeaderEncodeMode::None => Bytes::from(rendered),
+                ConfluentHeaderEncodeMode::Json => {
+                    Bytes::from(serde_json::Value::String(rendered).to_string())
+                }
+            };
+            headers.push((name.clone(), value));
+        }
+        if let Some(template) = &self.config.headers_template {
+            let rendered =
+                broker_connectors::kafka::render_header_template(template, topic.as_str(), payload);
+            for (name, value) in broker_connectors::kafka::parse_rendered_headers(&rendered)? {
+                let value = match self.config.header_encode_mode {
+                    ConfluentHeaderEncodeMode::None => Bytes::from(value),
+                    ConfluentHeaderEncodeMode::Json => {
+                        Bytes::from(serde_json::Value::String(value).to_string())
+                    }
+                };
+                headers.push((name, value));
+            }
+        }
         Ok(ConfluentRecord {
             topic: rendered_topic,
             partition,
             key,
             value,
-            headers: vec![
-                (
-                    "mqtt.topic".to_string(),
-                    Bytes::from(topic.as_str().to_string()),
-                ),
-                (
-                    "mqtt.qos".to_string(),
-                    Bytes::from(u8::from(qos).to_string()),
-                ),
-                (
-                    "mqtt.timestamp".to_string(),
-                    Bytes::from(now_millis().to_string()),
-                ),
-            ],
+            headers,
         })
     }
 
@@ -1164,6 +1280,11 @@ mod tests {
             batch_size: Some(500),
             buffer_capacity: None,
             timeout_ms: None,
+            acks: "all".to_string(),
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: ConfluentHeaderEncodeMode::None,
         }
     }
 
@@ -1654,6 +1775,11 @@ mod tests {
             batch_size: Some(100),
             buffer_capacity: None,
             timeout_ms: Some(30_000),
+            acks: "all".to_string(),
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: ConfluentHeaderEncodeMode::None,
         };
         admin_config.validate().expect("qual config validates");
 

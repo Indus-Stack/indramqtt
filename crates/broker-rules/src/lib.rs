@@ -5065,17 +5065,22 @@ fn std_sources_match(sources: &[StdSource], topic: &Topic) -> bool {
 /// number (0/1/2). Fields the broker cannot supply (`clientid`, `username`,
 /// `flags`, `retain`, `id`, `timestamp`, `node`, `peerhost`,
 /// `publish_received_at`, `pub_props`, `headers`) are omitted, never a
-/// constant standing in for a measurement. Returns the record plus the keys
-/// this call injected (for the wildcard strip).
+/// constant standing in for a measurement. Returns the record, the keys
+/// this call injected (for the wildcard strip), and whether the payload
+/// parsed as a JSON object.
 fn build_std_record(
     topic: &Topic,
     payload: &Bytes,
     qos: QoS,
-) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
-    let mut record: serde_json::Map<String, serde_json::Value> =
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<String>,
+    bool,
+) {
+    let (mut record, payload_is_object): (serde_json::Map<String, serde_json::Value>, bool) =
         match serde_json::from_slice(payload) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
+            Ok(serde_json::Value::Object(map)) => (map, true),
+            _ => (serde_json::Map::new(), false),
         };
     let mut injected = Vec::new();
     // `payload` on first use: decoded JSON, else the raw bytes as a string.
@@ -5098,7 +5103,7 @@ fn build_std_record(
         record.insert("qos".to_string(), serde_json::Value::from(u8::from(qos)));
         injected.push("qos".to_string());
     }
-    (record, injected)
+    (record, injected, payload_is_object)
 }
 
 /// Strip injected message keys from a `SELECT *` expansion so it keeps
@@ -5793,7 +5798,7 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
     };
     if let Some(plan) = rule.std_foreach.as_ref() {
         // TODO(parity): Does FOREACH WHERE evaluate per element with item bound?
-        let (base, _) = build_std_record(topic, payload, qos);
+        let (base, _, _) = build_std_record(topic, payload, qos);
         let rows = expand_foreach_rows(stmt, plan, &base);
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -5821,7 +5826,7 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
         .into_iter()
         .collect();
     }
-    let (record, injected) = build_std_record(topic, payload, qos);
+    let (record, injected, payload_is_object) = build_std_record(topic, payload, qos);
     stdlib::ensure_stdlib_registered();
     let ctx = stdlib::RuleContext {
         topic: Some(topic.as_str().to_string()),
@@ -5845,7 +5850,49 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
             // SELECT * keeps the payload fields only. A plain
             // payload yields no field after the strip, so the
             // row is empty. The window path yields the same.
+            // When the projection equals the input object, forward
+            // the raw bytes so input spacing stays on the wire.
+            // Reuse the single parse from `build_std_record`.
+            // No second parse runs on this path.
             let object: serde_json::Map<String, serde_json::Value> = projected;
+            let mut same =
+                payload_is_object && object.len() == record.len().saturating_sub(injected.len());
+            if same {
+                for (key, value) in object.iter() {
+                    if injected.iter().any(|name| name == key) {
+                        same = false;
+                        break;
+                    }
+                    if record.get(key) != Some(value) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if same {
+                for (key, value) in record.iter() {
+                    if injected.iter().any(|name| name == key) {
+                        continue;
+                    }
+                    if object.get(key) != Some(value) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            // Order decides: a reordered projection serializes in
+            // select order. Raw bytes stay only for the same order.
+            if same {
+                let record_keys = record
+                    .keys()
+                    .filter(|key| !injected.iter().any(|name| name == *key));
+                if !record_keys.eq(object.keys()) {
+                    same = false;
+                }
+            }
+            if same {
+                return vec![payload.clone()];
+            }
             match serde_json::to_vec(&serde_json::Value::Object(object)) {
                 Ok(bytes) => vec![Bytes::from(bytes)],
                 Err(e) => {
@@ -5907,6 +5954,8 @@ fn apply_sql(
     match Evaluator::eval_select(stmt, &record) {
         Some(projected) => {
             // Keep the evaluator's projection order in the JSON object.
+            // The projection is serialized. Input spacing is not
+            // preserved on this path.
             let object: serde_json::Map<String, serde_json::Value> =
                 projected.into_iter().collect();
             match serde_json::to_vec(&serde_json::Value::Object(object)) {
@@ -7866,7 +7915,9 @@ mod tests {
     #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn test_into_connector_desugars_to_forward_action() {
-        use broker_connectors::{KafkaSink, KafkaSinkConfig, MemoryKafkaTransport};
+        use broker_connectors::{
+            kafka::KafkaHeaderEncodeMode, KafkaSink, KafkaSinkConfig, MemoryKafkaTransport,
+        };
 
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
         let transport = Arc::new(MemoryKafkaTransport::new());
@@ -7876,11 +7927,16 @@ mod tests {
                     bootstrap_servers: "unused:9092".to_string(),
                     topic_template: "out-${topic}".to_string(),
                     partition_key_field: Some("device_id".to_string()),
+                    key_template: None,
                     partitions: 4,
                     client_id: "test".to_string(),
                     acks: "1".to_string(),
                     batch_max_records: 100,
                     batch_max_bytes: 1024 * 1024,
+                    random_partition: false,
+                    headers_template: None,
+                    extra_headers: Vec::new(),
+                    header_encode_mode: KafkaHeaderEncodeMode::None,
                 },
                 transport.clone(),
             )
@@ -7973,9 +8029,10 @@ mod tests {
     async fn test_rule_fans_out_to_five_analytical_sinks() {
         use axum::{extract::State, routing::post, Router};
         use broker_connectors::{
-            ClickHouseSink, ClickHouseSinkConfig, InfluxDbSink, InfluxDbSinkConfig, KafkaSink,
-            KafkaSinkConfig, MemoryKafkaTransport, MemoryMySqlTransport, MemoryRedisTransport,
-            MySqlSink, MySqlSinkConfig, RedisCommandKind, RedisSink, RedisSinkConfig,
+            kafka::KafkaHeaderEncodeMode, ClickHouseSink, ClickHouseSinkConfig, InfluxDbSink,
+            InfluxDbSinkConfig, KafkaSink, KafkaSinkConfig, MemoryKafkaTransport,
+            MemoryMySqlTransport, MemoryRedisTransport, MySqlSink, MySqlSinkConfig,
+            RedisCommandKind, RedisSink, RedisSinkConfig,
         };
         use tokio::net::TcpListener;
 
@@ -8008,11 +8065,16 @@ mod tests {
                     bootstrap_servers: "unused:9092".to_string(),
                     topic_template: "out-${topic}".to_string(),
                     partition_key_field: None,
+                    key_template: None,
                     partitions: 4,
                     client_id: "test".to_string(),
                     acks: "1".to_string(),
                     batch_max_records: 100,
                     batch_max_bytes: 1024 * 1024,
+                    random_partition: false,
+                    headers_template: None,
+                    extra_headers: Vec::new(),
+                    header_encode_mode: KafkaHeaderEncodeMode::None,
                 },
                 kafka_transport.clone(),
             )
@@ -8256,6 +8318,7 @@ mod tests {
                     keep_alive_secs: 60,
                     topic_prefix: Some("upstream/".to_string()),
                     topic_template: None,
+                    payload_template: None,
                     qos_override: None,
                     retain_override: None,
                     max_inflight: Some(10_000),
@@ -8535,6 +8598,7 @@ mod tests {
                     topic: "${topic}".to_string(),
                     auth: broker_connectors_enterprise::PulsarAuth::None,
                     partition_key_template: Some("${client_id}".to_string()),
+                    strategy: "key_dispatch".to_string(),
                     properties: HashMap::new(),
                     batch_size: Some(1),
                     batch_bytes: None,
@@ -10211,6 +10275,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     partition_key_template: Some("${client_id}".to_string()),
                     schema_registry: None,
                     partitions: 12,
+                    acks: "all".to_string(),
+                    random_partition: false,
+                    headers_template: None,
+                    extra_headers: Vec::new(),
+                    header_encode_mode:
+                        broker_connectors_enterprise::confluent::ConfluentHeaderEncodeMode::None,
                     batch_size: Some(1),
                     buffer_capacity: None,
                     timeout_ms: None,
@@ -10232,6 +10302,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     topic: "rocket-telemetry".to_string(),
                     tag_template: Some("${topic_segment_2}".to_string()),
                     keys_template: Some("${client_id}-${message_id}".to_string()),
+                    strategy: "key_dispatch".to_string(),
                     message_group_template: None,
                     access_key: None,
                     secret_key: None,

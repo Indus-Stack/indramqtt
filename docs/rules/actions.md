@@ -131,7 +131,7 @@ Check rule counters at `GET /api/v5/rules/{id}/metrics` with `matched`, `passed`
 
 ## Action resource options and counters
 
-An action of kind `http`, `webhook`, `pgsql`, `mysql`, `mssql`, `oracle`, `alloydb`, `cockroachdb`, `redshift`, `clickhouse`, `tdengine`, `greptimedb`, `iotdb`, `opentsdb`, `doris`, `datalayers`, `influxdb`, `timestream`, `cassandra`, `mongodb`, `couchbase` or `elasticsearch` owns a send runtime. The runtime reads these `resource_opts` fields. An absent field takes its default. A refused field answers 400 and names the field.
+An action of kind `http`, `webhook`, `pgsql`, `mysql`, `mssql`, `oracle`, `alloydb`, `cockroachdb`, `redshift`, `clickhouse`, `tdengine`, `greptimedb`, `iotdb`, `opentsdb`, `doris`, `datalayers`, `influxdb`, `timestream`, `cassandra`, `mongodb`, `couchbase`, `elasticsearch`, `kafka`, `confluent`, `rabbitmq`, `pulsar`, `rocketmq`, `mqtt_bridge` or `redis` owns a send runtime. The runtime reads these `resource_opts` fields. An absent field takes its default. A refused field answers 400 and names the field.
 
 ### `batch_size`
 

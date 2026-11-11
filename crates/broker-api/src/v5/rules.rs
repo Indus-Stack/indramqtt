@@ -1319,14 +1319,14 @@ pub(crate) fn connector_persist_error(error: broker_config::ConfigError) -> Resp
 
 /// Probe the connector target the way boot replay does: entries
 /// without a `server`/`url`/… target never probe and count as reachable,
-/// except document kinds which fail closed without a target.
+/// except kinds that need a target, which fail closed without one.
 /// Otherwise a 1.5 s TCP connect decides.
 pub(crate) async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
     match extract_target_host_port(body) {
         Some(target) => check_tcp_reachable(&target).await.is_ok(),
         None => {
             let kind = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            !document_kind_needs_target(kind)
+            !probe_kind_needs_target(kind)
         }
     }
 }
@@ -1455,6 +1455,41 @@ fn missing_connector_field(
         })
     }
 
+    /// Top-level or reference `parameters` object, for kinds whose
+    /// connectors accept both shapes.
+    fn present_nested(body: &serde_json::Value, keys: &[&str]) -> bool {
+        if present(body, keys) {
+            return true;
+        }
+        body.get("parameters").is_some_and(|params| {
+            keys.iter().any(|k| {
+                params
+                    .get(*k)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+            })
+        })
+    }
+
+    /// Reference `authentication` object (top-level or nested in
+    /// `parameters`), for kinds whose credentials may arrive there.
+    fn nested_auth_field(body: &serde_json::Value, key: &str) -> bool {
+        for parent in [
+            body.get("authentication"),
+            body.get("parameters")
+                .and_then(|params| params.get("authentication")),
+        ] {
+            if parent.is_some_and(|auth| {
+                auth.get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
     match conn_type {
         "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
             // Credential first so a bare body names the credential, not an identity.
@@ -1517,12 +1552,15 @@ fn missing_connector_field(
             }
             None
         }
-        "confluent" => {
-            if !present(body, &["api_key", "username"]) {
+        "confluent" | "confluent_producer" => {
+            if !present(body, &["api_key", "username"]) && !nested_auth_field(body, "username") {
                 return Some("api_key");
             }
-            if !present(body, &["api_secret", "password"]) {
+            if !present(body, &["api_secret", "password"]) && !nested_auth_field(body, "password") {
                 return Some("api_secret");
+            }
+            if !present_nested(body, &["bootstrap_hosts", "bootstrap_servers", "servers"]) {
+                return Some("bootstrap_hosts");
             }
             None
         }
@@ -1721,6 +1759,100 @@ fn missing_connector_field(
         // gate (documented defaults only); the remaining families keep
         // their existing behaviour until their service documentation is
         // checked for real defaults.
+        "kafka" | "kafka_producer" | "kafka_consumer" => {
+            if !present_nested(body, &["bootstrap_hosts", "bootstrap_servers", "servers"]) {
+                return Some("bootstrap_hosts");
+            }
+            // Only `none` is wired to the plaintext driver. Any other
+            // authentication value is refused here, naming the field,
+            // instead of storing credentials the broker never uses.
+            let auth = body.get("authentication").or_else(|| {
+                body.get("parameters")
+                    .and_then(|params| params.get("authentication"))
+            });
+            let auth_none = match auth {
+                None => true,
+                Some(value) if value.is_null() => true,
+                Some(serde_json::Value::String(text)) => {
+                    text.trim().is_empty() || text.trim() == "none"
+                }
+                Some(serde_json::Value::Object(map)) => map.is_empty(),
+                Some(_) => false,
+            };
+            if !auth_none {
+                return Some("authentication");
+            }
+            None
+        }
+        "rabbitmq" => {
+            if !present_nested(body, &["servers", "server"]) {
+                return Some("servers");
+            }
+            // Check password before username. Source: reference lists
+            // password before username in required fields.
+            if !present_nested(body, &["password", "pass"]) {
+                return Some("password");
+            }
+            if !present_nested(body, &["username", "user"]) {
+                return Some("username");
+            }
+            None
+        }
+        "redis" => {
+            if !present_nested(body, &["servers", "server", "host"]) {
+                return Some("servers");
+            }
+            None
+        }
+        "mqtt_bridge" | "mqtt" => {
+            if !present_nested(body, &["server", "broker_address", "broker", "host"]) {
+                return Some("server");
+            }
+            None
+        }
+        "pulsar" => {
+            if !present_nested(body, &["servers", "service_url", "server", "endpoint"]) {
+                return Some("servers");
+            }
+            // Only `none` is wired to the driver. Token and basic
+            // forms are refused here, naming the field, instead of
+            // storing credentials the broker never uses.
+            let auth = body.get("authentication").or_else(|| {
+                body.get("parameters")
+                    .and_then(|params| params.get("authentication"))
+            });
+            let auth_none = match auth {
+                None => true,
+                Some(value) if value.is_null() => true,
+                Some(serde_json::Value::String(text)) => {
+                    text.trim().is_empty() || text.trim() == "none"
+                }
+                Some(serde_json::Value::Object(map)) => map.is_empty(),
+                Some(_) => false,
+            };
+            if !auth_none {
+                return Some("authentication");
+            }
+            None
+        }
+        "rocketmq" => {
+            if !present_nested(body, &["servers", "endpoints", "endpoint", "server"]) {
+                return Some("servers");
+            }
+            // The pair sets together or not at all. A half pair
+            // fails closed here, so create names the missing half
+            // instead of storing a half credential.
+            let has_access = present_nested(body, &["access_key"]);
+            let has_secret = present_nested(body, &["secret_key"]);
+            if has_access != has_secret {
+                return Some(if has_access {
+                    "secret_key"
+                } else {
+                    "access_key"
+                });
+            }
+            None
+        }
         _ => missing_mv02b_connector_field(conn_type, body),
     }
 }
@@ -2504,6 +2636,8 @@ fn canonical_connector_kind(conn_type: &str) -> &str {
         "opcua" => "opc_ua",
         "sparkplug" | "spb" => "sparkplug_b",
         "aws_kinesis" => "kinesis",
+        "kafka_producer" | "kafka_consumer" => "kafka",
+        "confluent_producer" | "confluent_kafka" | "confluent_cloud" => "confluent",
         "gcp_pubsub_producer" => "gcp_pubsub_producer",
         "gcp_pubsub_consumer" => "gcp_pubsub_consumer",
         "gcp" | "pubsub" => "gcp_pubsub",
@@ -2518,12 +2652,17 @@ fn canonical_connector_kind(conn_type: &str) -> &str {
     }
 }
 
-/// Type stored and returned in a connector document. The reference names
-/// its HTTP connector `http`, and `rest` is the legacy alias of the same
-/// kind. The runtime still executes both in the `webhook` arm.
+/// Type stored and returned in a connector document.
+/// The reference names its HTTP connector `http`.
+/// `rest` is the legacy alias of the same kind.
+/// The runtime executes both in the `webhook` arm.
+/// The document keeps `kafka` and `confluent`.
+/// Their aliases map to the same stored type.
 fn stored_connector_kind(conn_type: &str) -> &str {
     match conn_type {
         "http" | "rest" => "http",
+        "kafka" | "kafka_producer" | "kafka_consumer" => "kafka",
+        "confluent" | "confluent_producer" | "confluent_kafka" | "confluent_cloud" => "confluent",
         other => canonical_connector_kind(other),
     }
 }
@@ -2696,6 +2835,39 @@ fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
             serde_json::Value::String("azure_event_hub_producer".to_string()),
         );
     }
+    if canonical == "kafka" {
+        // The reference names this kind `kafka_producer`.
+        // Store the reference name so the response validates.
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("kafka_producer".to_string()),
+        );
+    }
+    if canonical == "confluent" {
+        // The reference requires `authentication` and `ssl`.
+        // Derive `authentication` from the operator pair.
+        // Use empty `ssl` when the operator gives none.
+        // Empty `ssl` selects the reference default.
+        if obj.get("authentication").is_none() {
+            let username = read(obj, "api_key").or_else(|| read(obj, "username"));
+            let password = read(obj, "api_secret").or_else(|| read(obj, "password"));
+            if let (Some(username), Some(password)) = (username, password) {
+                obj.insert(
+                    "authentication".to_string(),
+                    serde_json::json!({"username": username, "password": password}),
+                );
+            }
+        }
+        if obj.get("ssl").is_none() {
+            obj.insert("ssl".to_string(), serde_json::json!({}));
+        }
+        // The reference names this kind `confluent_producer`.
+        // Store the reference name so the response validates.
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("confluent_producer".to_string()),
+        );
+    }
     if canonical != "mongodb" {
         return;
     }
@@ -2857,38 +3029,10 @@ pub(crate) async fn register_live_sink(
                 .register(format!("webhook:{name}"), sink);
         }
         "redis" => {
-            let servers = body
-                .get("servers")
-                .or_else(|| body.get("server"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:6379");
-            let pass = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let endpoint = if pass.is_empty() {
-                format!("redis://{}", servers)
-            } else {
-                format!("redis://:{}@{}", pass, servers)
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors::redis::DriverRedisTransport::new(&endpoint)
-            ) {
-                let config = broker_connectors::redis::RedisSinkConfig {
-                    endpoint,
-                    command: broker_connectors::redis::RedisCommandKind::HSet {
-                        key_template: "sensors:${topic}".to_string(),
-                        field_template: "payload".to_string(),
-                    },
-                };
-                if let Some(sink) = record_sink_error!(broker_connectors::redis::RedisSink::new(
-                    config,
-                    Arc::new(transport)
-                )) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("redis:{}", name), sink);
-                }
-            }
+            // The connector carries the connection only. The command
+            // belongs to the action, so a connector alone registers no
+            // sink and invents no target.
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         "alloydb" => {
             let server = body
@@ -2985,37 +3129,10 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(feature = "kafka")]
         "kafka" => {
-            let servers = body
-                .get("bootstrap_hosts")
-                .or_else(|| body.get("servers"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:9092");
-            let config = broker_connectors::kafka::KafkaSinkConfig {
-                bootstrap_servers: servers.to_string(),
-                topic_template: "events-${topic}".to_string(),
-                partition_key_field: None,
-                partitions: 1,
-                client_id: format!("indramqtt-{}", name),
-                acks: "1".to_string(),
-                batch_max_records: 1,
-                batch_max_bytes: 65536,
-            };
-            // Production write path on the maintained `rdkafka` driver;
-            // the hand-written TCP framing stays for offline unit tests.
-            if let Some(transport) = record_sink_error!(
-                broker_connectors::kafka::RdkafkaKafkaTransport::new(&config)
-            ) {
-                if let Some(sink) = record_sink_error!(broker_connectors::kafka::KafkaSink::new(
-                    config,
-                    Arc::new(transport)
-                )) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("kafka:{}", name), sink);
-                }
-            }
+            // The connector carries the connection only. The topic,
+            // key, headers and strategy belong to the action, so a
+            // connector alone registers no sink and invents no target.
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         #[cfg(not(feature = "kafka"))]
         "kafka" => {
@@ -3149,43 +3266,10 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(feature = "rabbitmq")]
         "rabbitmq" => {
-            let endpoint = body
-                .get("server")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("endpoint").and_then(|v| v.as_str()))
-                .unwrap_or("127.0.0.1:5672");
-            let username = body
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("guest");
-            let password = body
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("guest");
-            let full_endpoint = if endpoint.starts_with("amqp://") {
-                endpoint.to_string()
-            } else {
-                format!("amqp://{}:{}@{}/", username, password, endpoint)
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors::rabbitmq::LapinRabbitTransport::new(&full_endpoint)
-            ) {
-                let config = broker_connectors::rabbitmq::RabbitMqSinkConfig {
-                    endpoint: full_endpoint,
-                    exchange: "amq.topic".to_string(),
-                    routing_key_template: "sensor.${topic}".to_string(),
-                    delivery_mode: 1,
-                };
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors::rabbitmq::RabbitMqSink::new(config, Arc::new(transport))
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("rabbitmq:{}", name), sink);
-                }
-            }
+            // The connector carries the connection only. The exchange,
+            // routing key, headers and body belong to the action, so a
+            // connector alone registers no sink and invents no target.
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         #[cfg(not(feature = "rabbitmq"))]
         "rabbitmq" => {
@@ -3276,56 +3360,10 @@ pub(crate) async fn register_live_sink(
             return Err(refuse_disabled_kind(conn_type, "clickhouse"));
         }
         "mqtt_bridge" | "bridge" => {
-            let server = body
-                .get("server")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("broker_address").and_then(|v| v.as_str()))
-                .unwrap_or("127.0.0.1:1883");
-            let client_id = body
-                .get("client_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("indra-bridge");
-            let username = body
-                .get("username")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let password = body
-                .get("password")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let config = broker_connectors::MqttBridgeSinkConfig {
-                broker_address: server.to_string(),
-                client_id: client_id.to_string(),
-                clean_start: true,
-                username,
-                password,
-                keep_alive_secs: 60,
-                topic_prefix: None,
-                topic_template: None,
-                qos_override: None,
-                retain_override: None,
-                max_inflight: Some(1000),
-                max_batch_size: Some(1),
-                linger_ms: Some(10),
-                protocol: broker_connectors::MqttBridgeProtocol::V311,
-            };
-            if let Some(transport) =
-                record_sink_error!(broker_connectors::RumqttcMqttBridgeTransport::new(&config))
-            {
-                if let Some(sink) = record_sink_error!(broker_connectors::MqttBridgeSink::new(
-                    config,
-                    Arc::new(transport)
-                )) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("bridge:{}", name), sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("mqtt_bridge:{}", name), sink);
-                }
-            }
+            // The connector carries the remote broker only. The topic,
+            // QoS, retain flag and body belong to the action, so a
+            // connector alone registers no sink and invents no target.
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         "influxdb" => {
             // Fail closed (S1-01): the create and update paths gate
@@ -4561,213 +4599,36 @@ pub(crate) async fn register_live_sink(
             return Err(refuse_disabled_kind(conn_type, "elasticsearch"));
         }
         "pulsar" => {
-            let server = body
-                .get("service_url")
-                .or_else(|| body.get("server"))
-                .or_else(|| body.get("servers"))
-                .or_else(|| body.get("endpoint"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("pulsar://127.0.0.1:6650");
-            let service_url = if server.starts_with("pulsar://")
-                || server.starts_with("http://")
-                || server.starts_with("https://")
-            {
-                server.to_string()
-            } else {
-                format!("pulsar://{}", server)
-            };
-            let topic = body
-                .get("topic")
-                .or_else(|| body.get("topic_template"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("persistent://public/default/telemetry")
-                .to_string();
-            let tenant = body
-                .get("tenant")
-                .and_then(|v| v.as_str())
-                .unwrap_or("public")
-                .to_string();
-            let namespace = body
-                .get("namespace")
-                .and_then(|v| v.as_str())
-                .unwrap_or("default")
-                .to_string();
-            let token = body.get("token").and_then(|v| v.as_str());
-            let auth = if let Some(t) = token {
-                broker_connectors_enterprise::pulsar::PulsarAuth::Token {
-                    token: t.to_string(),
-                }
-            } else {
-                broker_connectors_enterprise::pulsar::PulsarAuth::None
-            };
-            let timeout_ms = body
-                .get("timeout_ms")
-                .or_else(|| body.get("timeout"))
-                .or_else(|| body.get("request_timeout_ms"))
-                .and_then(|v| v.as_u64());
-
-            let config = broker_connectors_enterprise::pulsar::PulsarSinkConfig {
-                service_url,
-                tenant,
-                namespace,
-                topic,
-                auth,
-                partition_key_template: Some("${client_id}".to_string()),
-                properties: std::collections::HashMap::new(),
-                batch_size: Some(1),
-                batch_bytes: Some(2_097_152),
-                linger_ms: Some(10),
-                max_retries: Some(3),
-                initial_backoff_ms: Some(100),
-                max_backoff_ms: Some(2_000),
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::pulsar::DriverPulsarTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::pulsar::PulsarSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("pulsar:{}", name), sink);
-                }
-            }
+            // The connector carries the service URL only. The topic,
+            // key and strategy belong to the action, so a connector
+            // alone registers no sink and invents no target.
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         "rocketmq" => {
-            let server = body
-                .get("endpoint")
-                .or_else(|| body.get("endpoints"))
-                .or_else(|| body.get("server"))
-                .or_else(|| body.get("servers"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:9876");
-            let endpoint = server
-                .trim_start_matches("http://")
-                .trim_start_matches("tcp://")
-                .to_string();
-            let topic = body
-                .get("topic")
-                .and_then(|v| v.as_str())
-                .unwrap_or("rocket-telemetry")
-                .to_string();
-            let access_key = body
-                .get("access_key")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let secret_key = body
-                .get("secret_key")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let timeout_ms = body
-                .get("timeout_ms")
-                .or_else(|| body.get("timeout"))
-                .or_else(|| body.get("request_timeout_ms"))
-                .and_then(|v| v.as_u64());
-
-            let config = broker_connectors_enterprise::rocketmq::RocketMqSinkConfig {
-                endpoints: vec![endpoint],
-                topic,
-                tag_template: None,
-                keys_template: Some("${client_id}".to_string()),
-                message_group_template: None,
-                access_key,
-                secret_key,
-                batch_size: Some(1),
-                buffer_capacity: None,
-                linger_ms: Some(10),
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::rocketmq::TcpRocketMqTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::rocketmq::RocketMqSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("rocketmq:{}", name), sink);
-                }
-            }
+            // The connector carries the proxy endpoints only. The
+            // topic, tag and keys belong to the action, so a connector
+            // alone registers no sink and invents no target.
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         #[cfg(feature = "confluent")]
         "confluent" => {
-            let server = body
-                .get("bootstrap_servers")
-                .or_else(|| body.get("bootstrap_hosts"))
-                .or_else(|| body.get("server"))
-                .or_else(|| body.get("servers"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:9092");
-            let bootstrap = server
-                .trim_start_matches("http://")
-                .trim_start_matches("tcp://")
-                .to_string();
-            let topic = body
-                .get("topic_template")
-                .or_else(|| body.get("topic"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("telemetry-events")
-                .to_string();
-            // Fail closed (S1-01): API key and secret are operator-supplied;
-            // the previous built-in placeholders are removed.
-            let Some(api_key) = body
-                .get("api_key")
-                .or_else(|| body.get("username"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-            else {
-                return Ok(());
-            };
-            let Some(api_secret) = body
-                .get("api_secret")
-                .or_else(|| body.get("password"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-            else {
-                return Ok(());
-            };
-            let timeout_ms = body
-                .get("timeout_ms")
-                .or_else(|| body.get("timeout"))
-                .or_else(|| body.get("request_timeout_ms"))
-                .and_then(|v| v.as_u64());
-
-            let config = broker_connectors_enterprise::confluent::ConfluentKafkaConfig {
-                bootstrap_servers: vec![bootstrap],
-                api_key: api_key.to_string(),
-                api_secret: api_secret.to_string(),
-                auth_mechanism: broker_connectors_enterprise::confluent::SaslMechanism::Plain,
-                security_protocol:
-                    broker_connectors_enterprise::confluent::ConfluentSecurityProtocol::SaslSsl,
-                topic_template: topic,
-                partition_key_template: Some("${client_id}".to_string()),
-                schema_registry: None,
-                partitions: 1,
-                batch_size: Some(1),
-                buffer_capacity: None,
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::confluent::RdkafkaConfluentTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::confluent::ConfluentKafkaSink::new(
-                        config, transport,
-                    )
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("confluent:{}", name), sink);
+            // The connector carries the endpoints and credentials
+            // only. The topic, key, headers and strategy belong to the
+            // action, so a connector alone registers no sink and
+            // invents no target.
+            for key in [
+                "pool_size",
+                "pipelining",
+                "enable_pipelining",
+                "max_inactive",
+            ] {
+                let present = body
+                    .get(key)
+                    .or_else(|| body.get("parameters").and_then(|params| params.get(key)));
+                if present.is_some_and(|v| !v.is_null()) {
+                    return Err(format!(
+                        "connector {name:?} field `{key}` is not supported; remove it"
+                    ));
                 }
             }
         }
@@ -6758,6 +6619,14 @@ pub async fn create_connector(
                 | "gcp_pubsub"
                 | "azure_eventhubs"
                 | "gcp_iot"
+                | "kafka"
+                | "confluent"
+                | "rabbitmq"
+                | "redis"
+                | "mqtt_bridge"
+                | "mqtt"
+                | "pulsar"
+                | "rocketmq"
         ) {
             return ApiError::AlreadyExists(message).into_response();
         }
@@ -6775,12 +6644,45 @@ pub async fn create_connector(
     // not stored and ignored.
     if matches!(
         crate::v5::action_sinks::canonical_action_kind(&conn_type),
-        "mongodb" | "couchbase" | "elasticsearch"
+        "mongodb"
+            | "couchbase"
+            | "elasticsearch"
+            | "kafka"
+            | "rabbitmq"
+            | "redis"
+            | "mqtt_bridge"
+            | "mqtt"
+            | "pulsar"
+            | "rocketmq"
     ) {
         if let Err(message) =
             crate::v5::action_sinks::validate_connector_io_bounds(&body, &name, "connector create")
         {
             return ApiError::BadRequest(message).into_response();
+        }
+    }
+    // Confluent applies `ssl.enable` to the driver protocol, so the
+    // shared refusal above does not fit; only the pool knobs are
+    // refused here.
+    if matches!(
+        crate::v5::action_sinks::canonical_action_kind(&conn_type),
+        "confluent" | "confluent_producer"
+    ) {
+        for key in [
+            "pool_size",
+            "pipelining",
+            "enable_pipelining",
+            "max_inactive",
+        ] {
+            let present = body
+                .get(key)
+                .or_else(|| body.get("parameters").and_then(|params| params.get(key)));
+            if present.is_some_and(|v| !v.is_null()) {
+                return ApiError::BadRequest(format!(
+                    "connector {name:?} field `{key}` is not supported; remove it (connector create)"
+                ))
+                .into_response();
+            }
         }
     }
 
@@ -7058,12 +6960,42 @@ pub async fn update_connector(
     // explicit pool, pipelining or `ssl` value is refused at update.
     if matches!(
         crate::v5::action_sinks::canonical_action_kind(&conn_type),
-        "mongodb" | "couchbase" | "elasticsearch"
+        "mongodb"
+            | "couchbase"
+            | "elasticsearch"
+            | "kafka"
+            | "rabbitmq"
+            | "redis"
+            | "mqtt_bridge"
+            | "mqtt"
+            | "pulsar"
+            | "rocketmq"
     ) {
         if let Err(message) =
             crate::v5::action_sinks::validate_connector_io_bounds(&body, &bare, "connector update")
         {
             return ApiError::BadRequest(message).into_response();
+        }
+    }
+    if matches!(
+        crate::v5::action_sinks::canonical_action_kind(&conn_type),
+        "confluent" | "confluent_producer"
+    ) {
+        for key in [
+            "pool_size",
+            "pipelining",
+            "enable_pipelining",
+            "max_inactive",
+        ] {
+            let present = body
+                .get(key)
+                .or_else(|| body.get("parameters").and_then(|params| params.get(key)));
+            if present.is_some_and(|v| !v.is_null()) {
+                return ApiError::BadRequest(format!(
+                    "connector {bare:?} field `{key}` is not supported; remove it (connector update)"
+                ))
+                .into_response();
+            }
         }
     }
     // MV-01 (R2-04): build the whole new generation before anything
@@ -7090,6 +7022,14 @@ pub async fn update_connector(
         )
             .into_response();
     }
+    // MV-01 (R2-04): every dependent action must accept the new
+    // connector settings before anything swaps in. Each action's owned
+    // sink is built here staged (built, never registered): a failure
+    // answers 400 naming the action and the field, keeps every old
+    // sink (the old generation keeps delivering) and leaves the stored
+    // row untouched. On success the staged sinks swap in under the
+    // action dispatch keys below, after the stored update and its
+    // persist.
     let mut staged_ids: Vec<String> = Vec::new();
     for record in state.actions.snapshot() {
         if !crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, &bare) {
@@ -7888,7 +7828,11 @@ pub(crate) async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
 /// True when the kind stores documents through a server target. Such a
 /// kind is never probed without one: a missing target is a failed
 /// probe, never a silent reachable.
-fn document_kind_needs_target(kind: &str) -> bool {
+/// True when a probe without a network target must fail instead of
+/// answering success. Every kind whose delivery dials a configured
+/// target is listed: a probe with no target names the missing field
+/// instead of reporting a success it never measured.
+fn probe_kind_needs_target(kind: &str) -> bool {
     matches!(
         crate::v5::action_sinks::canonical_action_kind(kind),
         "mongodb"
@@ -7902,6 +7846,13 @@ fn document_kind_needs_target(kind: &str) -> bool {
             | "aws_iot"
             | "azure_iot"
             | "oci_streaming"
+            | "kafka"
+            | "confluent"
+            | "rabbitmq"
+            | "pulsar"
+            | "rocketmq"
+            | "mqtt_bridge"
+            | "redis"
     )
 }
 
@@ -8312,7 +8263,7 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
     // the kind itself validated. No store write, no runtime registration,
     // no background task survives the return.
     let target = extract_target_host_port(&body).or_else(|| {
-        if document_kind_needs_target(&kind) {
+        if probe_kind_needs_target(&kind) {
             probe_string(
                 &body,
                 &[
@@ -8373,7 +8324,7 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
             Ok(Err(err)) => probe_failed(err),
             Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
-    } else if document_kind_needs_target(&kind) {
+    } else if probe_kind_needs_target(&kind) {
         probe_failed(format!(
             "connector type {kind} needs a probe target: missing required field: server"
         ))
@@ -8503,7 +8454,7 @@ pub async fn probe_action(
     // itself validated. No store write, no runtime registration, no
     // background task survives the return.
     let target = extract_target_host_port(&body).or_else(|| {
-        if document_kind_needs_target(&kind) {
+        if probe_kind_needs_target(&kind) {
             probe_string(
                 &body,
                 &[
@@ -8563,7 +8514,7 @@ pub async fn probe_action(
             Ok(Err(err)) => probe_failed(err),
             Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
-    } else if document_kind_needs_target(&kind) {
+    } else if probe_kind_needs_target(&kind) {
         probe_failed(format!(
             "connector type {kind} needs a probe target: missing required field: server"
         ))

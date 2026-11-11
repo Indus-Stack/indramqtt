@@ -23,6 +23,11 @@ use std::time::Duration;
 
 use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
+/// One short TCP handshake per send bounds the down check. Reason: a
+/// closed listener fails closed even when an old connection still
+/// lives, and 1 s bounds the probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// MQTT protocol version for wire framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -98,7 +103,8 @@ fn default_true() -> bool {
 }
 
 fn default_keep_alive() -> u16 {
-    60
+    // Reference connector_mqtt defaults keepalive to 160 s.
+    160
 }
 
 fn default_max_inflight() -> Option<usize> {
@@ -128,7 +134,7 @@ pub struct MqttBridgeSinkConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    /// Keep-alive seconds (default 60).
+    /// Keep-alive seconds (default 160, the reference default).
     #[serde(default = "default_keep_alive")]
     pub keep_alive_secs: u16,
     /// Prefix prepended to remapped topics (e.g. `edge/station1/`).
@@ -137,6 +143,10 @@ pub struct MqttBridgeSinkConfig {
     /// Remap template with `${topic}` (default identity).
     #[serde(default)]
     pub topic_template: Option<String>,
+    /// Body template (`${topic}`, `${payload}`); `None` forwards the
+    /// raw event bytes. Reason: the reference `payload` action field.
+    #[serde(default)]
+    pub payload_template: Option<String>,
     /// Force outbound QoS (`None` preserves ingress).
     #[serde(default)]
     pub qos_override: Option<u8>,
@@ -156,6 +166,20 @@ pub struct MqttBridgeSinkConfig {
     /// Wire protocol version (default 3.1.1).
     #[serde(default)]
     pub protocol: MqttBridgeProtocol,
+}
+
+/// Render one bridge body template: `${topic}` takes the event
+/// topic, `${payload}` takes the raw event bytes as text.
+pub fn render_bridge_body(template: &str, topic: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let borrowed = [
+        ("topic", topic.to_string()),
+        ("payload", String::from_utf8_lossy(payload).into_owned()),
+    ];
+    let refs: Vec<(&str, String)> = borrowed
+        .iter()
+        .map(|(key, value)| (*key, value.clone()))
+        .collect();
+    render_template(template, &refs).map(String::into_bytes)
 }
 
 impl MqttBridgeSinkConfig {
@@ -581,6 +605,24 @@ impl RumqttcMqttBridgeTransport {
 impl MqttBridgeTransport for RumqttcMqttBridgeTransport {
     async fn connect(&self) -> Result<()> {
         if self.state.lock().await.is_some() {
+            // The cached client queues behind a dead eventloop, so a
+            // downed broker reads as success. Probe the port first;
+            // a refused port clears the cache and fails closed, so
+            // the action counts one failed forward. One short TCP
+            // handshake per send bounds the check to 1s.
+            let probe = format!("{}:{}", self.endpoint.host, self.endpoint.port);
+            let reachable =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&probe))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .is_some();
+            if !reachable {
+                *self.state.lock().await = None;
+                return Err(ConnectorError::Connection(format!(
+                    "mqtt bridge broker unreachable: {probe}"
+                )));
+            }
             return Ok(());
         }
         if self.endpoint.tls {
@@ -856,6 +898,10 @@ impl MqttBridgeSink {
         let mapped = self.config.remap_topic(topic.as_str(), qos, millis)?;
         let out_qos = self.config.qos_override.unwrap_or_else(|| u8::from(qos));
         let retain = self.config.retain_override.unwrap_or(false);
+        let body = match &self.config.payload_template {
+            Some(template) => render_bridge_body(template, topic.as_str(), payload)?,
+            None => payload.to_vec(),
+        };
         let packet_id = if out_qos > 0 {
             self.next_packet_id()
         } else {
@@ -863,7 +909,7 @@ impl MqttBridgeSink {
         };
         Ok(self.buffer.lock().push(BridgeRow {
             topic: mapped,
-            payload: payload.to_vec(),
+            payload: body,
             qos: out_qos,
             retain,
             packet_id,
@@ -925,6 +971,7 @@ mod tests {
             keep_alive_secs: 60,
             topic_prefix: None,
             topic_template: None,
+            payload_template: None,
             qos_override: None,
             retain_override: None,
             max_inflight: Some(10_000),
@@ -1305,6 +1352,7 @@ mod tests {
             keep_alive_secs: 30,
             topic_prefix: None,
             topic_template: Some(run_topic.clone()),
+            payload_template: None,
             qos_override: Some(1),
             retain_override: Some(false),
             max_inflight: Some(10_000),

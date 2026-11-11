@@ -113,6 +113,10 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [Datalayers](./datalayers.md) | Table rows. |
 | [HTTP webhook](./http.md) | Any HTTP receiver. |
 | [MQTT bridge](./mqtt-bridge.md) | A remote broker. |
+| [RabbitMQ](./rabbitmq.md) | Queues and exchanges. |
+| [Pulsar](./pulsar.md) | Topics. |
+| [RocketMQ](./rocketmq.md) | Topics. |
+| [Confluent](./confluent.md) | Cloud Kafka. |
 | [S3](./s3.md) | Object files. |
 | [SQL Server](./mssql.md) | Relational rows. |
 | [Oracle](./oracle.md) | Relational rows. |
@@ -176,8 +180,8 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"alloydb", "aws_timestream", "azure_blob_storage", "azure_event_hub_producer", "bigquery", "clickhouse", "cockroachdb", "couchbase", "datalayers", "disk_log", "doris", "dynamo", "elasticsearch", "gcp_pubsub_producer", "greptimedb", "http", "influxdb", "iotdb", "kinesis", "mongodb", "mysql", "opc_ua", "opents", "oracle", "pgsql", "redshift", "s3", "snowflake", "snowflake_streaming", "sparkplug_b", "sqlserver", "tablestore", "tdengine"}, names
-for pending in ("aws_iot", "azure_iot", "oci_streaming", "mqtt", "kafka_producer", "redis", "cassandra"):
+assert names == {"alloydb", "aws_timestream", "azure_blob_storage", "azure_event_hub_producer", "bigquery", "clickhouse", "cockroachdb", "couchbase", "datalayers", "disk_log", "doris", "dynamo", "elasticsearch", "gcp_pubsub_producer", "greptimedb", "http", "influxdb", "iotdb", "kinesis", "mongodb", "mqtt", "kafka_producer", "redis", "rabbitmq", "pulsar", "rocketmq", "confluent_producer", "mysql", "opc_ua", "opents", "oracle", "pgsql", "redshift", "s3", "snowflake", "snowflake_streaming", "sparkplug_b", "sqlserver", "tablestore", "tdengine"}, names
+for pending in ("aws_iot", "azure_iot", "oci_streaming", "cassandra"):
     assert pending not in names, pending
 print("ok")
 PY

@@ -129,6 +129,7 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             json!({
                 "redis_type": enum_prop(&["single", "sentinel", "cluster"], "single"),
                 "servers": str_prop("127.0.0.1:6379"),
+                "username": str_prop(""),
                 "password": pwd_prop(),
                 "database": int_prop(0),
                 "pool_size": int_prop(8),
@@ -277,7 +278,7 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "username": str_prop(""),
                 "password": pwd_prop(),
                 "keepalive": int_prop(60),
-                "proto_ver": enum_prop(&["v3.1.1", "v5.0"], "v5.0"),
+                "proto_ver": enum_prop(&["v3", "v4", "v5"], "v4"),
                 "clean_start": bool_prop(true),
                 "ssl": ssl_prop()
             }),
@@ -344,7 +345,7 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "password": pwd_prop(),
                 "ssl": ssl_prop()
             }),
-            &["name", "server"],
+            &["name", "server", "username", "password"],
         ),
     );
 
@@ -355,6 +356,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "pulsar",
             json!({
                 "servers": str_prop("pulsar://127.0.0.1:6650"),
+                "tenant": str_prop("public"),
+                "namespace": str_prop("default"),
                 "ssl": ssl_prop()
             }),
             &["name", "servers"],
@@ -587,9 +590,11 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "confluent",
             json!({
                 "bootstrap_hosts": str_prop(""),
+                "api_key": str_prop(""),
+                "api_secret": pwd_prop(),
                 "ssl": ssl_prop()
             }),
-            &["name", "bootstrap_hosts"],
+            &["name", "bootstrap_hosts", "api_key", "api_secret"],
         ),
     );
 
@@ -951,13 +956,13 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "redis",
             json!({
                 "connector": str_prop(""),
-                "command": json!({
+                "command_template": json!({
                     "type": "array",
                     "items": { "type": "string" },
                     "default": ["HSET", "${clientid}", "${payload.key}", "${payload.value}"]
                 })
             }),
-            &["name", "connector"],
+            &["name", "connector", "command_template"],
         ),
     );
 
@@ -968,10 +973,23 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "kafka",
             json!({
                 "connector": str_prop(""),
-                "kafka_topic": str_prop("iot_telemetry"),
-                "payload": str_prop("${payload}")
+                "topic": str_prop(""),
+                "message": json!({
+                    "type": "object",
+                    "properties": {
+                        "key": str_prop("${.clientid}"),
+                        "value": str_prop("${.}"),
+                        "timestamp": str_prop("${.timestamp}")
+                    }
+                }),
+                "partition_strategy": enum_prop(&["random", "key_dispatch"], "random"),
+                "required_acks": enum_prop(&["all_isr", "leader_only", "none"], "all_isr"),
+                "kafka_headers": str_prop(""),
+                "kafka_ext_headers": json!({"type": "array"}),
+                "kafka_header_value_encode_mode": enum_prop(&["none", "json"], "none"),
+                "query_mode": enum_prop(&["async", "sync"], "async")
             }),
-            &["name", "connector", "kafka_topic"],
+            &["name", "connector", "topic"],
         ),
     );
 
@@ -1271,7 +1289,90 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "connector": str_prop(""),
                 "topic": str_prop("forward/${topic}"),
                 "payload": str_prop("${payload}"),
-                "qos": int_prop(1)
+                "qos": int_prop(1),
+                "retain": bool_prop(false)
+            }),
+            &["name", "connector", "topic"],
+        ),
+    );
+
+    // RabbitMQ action
+    schemas.insert(
+        "bridge_rabbitmq.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "rabbitmq",
+            json!({
+                "connector": str_prop(""),
+                "routing_key": str_prop(""),
+                "exchange": str_prop(""),
+                "delivery_mode": enum_prop(&["non_persistent", "persistent"], "non_persistent"),
+                "headers_template": json!({"type": "array"}),
+                "properties_template": json!({"type": "array"}),
+                "payload_template": str_prop("")
+            }),
+            &["name", "connector", "routing_key"],
+        ),
+    );
+
+    // Pulsar action
+    schemas.insert(
+        "pulsar.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "pulsar",
+            json!({
+                "connector": str_prop(""),
+                "pulsar_topic": str_prop(""),
+                "message": json!({
+                    "type": "object",
+                    "properties": {
+                        "key": str_prop("${.clientid}"),
+                        "value": str_prop("${.}")
+                    }
+                }),
+                "strategy": enum_prop(&["random", "roundrobin", "key_dispatch"], "random")
+            }),
+            &["name", "connector", "pulsar_topic"],
+        ),
+    );
+
+    // RocketMQ action
+    schemas.insert(
+        "rocketmq.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "rocketmq",
+            json!({
+                "connector": str_prop(""),
+                "topic": str_prop("TopicTest"),
+                "tag": str_prop(""),
+                "key": str_prop(""),
+                "template": str_prop(""),
+                "strategy": enum_prop(&["roundrobin", "key_dispatch"], "roundrobin")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Confluent action
+    schemas.insert(
+        "confluent.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "confluent",
+            json!({
+                "connector": str_prop(""),
+                "topic": str_prop(""),
+                "message": json!({
+                    "type": "object",
+                    "properties": {
+                        "key": str_prop("${.clientid}"),
+                        "value": str_prop("${.}")
+                    }
+                }),
+                "partition_strategy": enum_prop(&["random", "key_dispatch"], "random"),
+                "required_acks": enum_prop(&["all_isr", "leader_only", "none"], "all_isr"),
+                "kafka_headers": str_prop(""),
+                "kafka_ext_headers": json!({"type": "array"}),
+                "kafka_header_value_encode_mode": enum_prop(&["none", "json"], "none"),
+                "query_mode": enum_prop(&["async", "sync"], "async")
             }),
             &["name", "connector", "topic"],
         ),

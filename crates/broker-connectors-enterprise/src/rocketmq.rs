@@ -39,6 +39,10 @@ use broker_connectors::{
 /// Envelope wire version.
 pub const ENVELOPE_VERSION: u8 = 0x01;
 
+/// One short TCP handshake per send bounds the down check to 1 s.
+// A closed listener fails closed even when an old connection still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// RocketMQ 5.0 sink configuration. Every depth is user-configurable
 /// with no clamped ceiling (`None` = unbounded).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,8 +56,14 @@ pub struct RocketMqSinkConfig {
     pub tag_template: Option<String>,
     /// Business message keys template, e.g.
     /// `${client_id}-${message_id}` (`${message_id}` = per-event seq).
+    /// Absent for `roundrobin` dispatch.
     #[serde(default)]
     pub keys_template: Option<String>,
+    /// Dispatch strategy: `roundrobin` (default, the reference
+    /// default) or `key_dispatch`. `key_dispatch` hashes the keys.
+    /// The other sends with no keys so the proxy spreads rows.
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
     /// FIFO message group template for ordered delivery.
     #[serde(default)]
     pub message_group_template: Option<String>,
@@ -85,6 +95,10 @@ fn default_linger_ms() -> Option<u64> {
     Some(100)
 }
 
+fn default_strategy() -> String {
+    "roundrobin".to_string()
+}
+
 impl RocketMqSinkConfig {
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
@@ -105,6 +119,12 @@ impl RocketMqSinkConfig {
             return Err(ConnectorError::Dispatch(format!(
                 "rocketmq topic must not contain whitespace: {:?}",
                 self.topic
+            )));
+        }
+        if !["roundrobin", "key_dispatch"].contains(&self.strategy.as_str()) {
+            return Err(ConnectorError::Dispatch(format!(
+                "rocketmq strategy must be one of roundrobin, key_dispatch: {:?}",
+                self.strategy
             )));
         }
         match (&self.access_key, &self.secret_key) {
@@ -542,6 +562,26 @@ impl TcpRocketMqTransport {
 
     async fn roundtrip(&self, frame: Vec<u8>) -> Result<Vec<u8>> {
         let mut guard = self.conn.lock().await;
+        // Probe the listener before reusing the pooled connection.
+        // A refused port clears the cache and fails closed, so the
+        // action counts one failed forward.
+        if guard.is_some() {
+            let reachable = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect(&self.endpoint),
+            )
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .is_some();
+            if !reachable {
+                *guard = None;
+                return Err(ConnectorError::Connection(format!(
+                    "rocketmq proxy unreachable: {}",
+                    self.endpoint
+                )));
+            }
+        }
         for attempt in 0..2 {
             if guard.is_none() {
                 let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
@@ -882,6 +922,7 @@ mod tests {
             topic: "rocket-telemetry".to_string(),
             tag_template: Some("${topic_segment_2}".to_string()),
             keys_template: Some("${client_id}-${message_id}".to_string()),
+            strategy: "key_dispatch".to_string(),
             message_group_template: Some("group-${client_id}".to_string()),
             access_key: Some("rocket-key".to_string()),
             secret_key: Some("rocket-secret".to_string()),

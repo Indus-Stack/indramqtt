@@ -17736,16 +17736,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create data dir");
         let pending = r#"
 [[connectors.connectors]]
-id = "pending-snowflake"
-connector_type = "kafka"
+id = "pending-timescaledb"
+connector_type = "timescaledb"
 enable = true
 config = '{}'
 
 [[actions.actions]]
-id = "pending-snowflake"
-action_type = "kafka"
+id = "pending-timescaledb"
+action_type = "timescaledb"
 enable = true
-config = '{"connector":"pending-snowflake"}'
+config = '{"connector":"pending-timescaledb"}'
 "#;
         std::fs::write(dir.join("state.toml"), pending).expect("write pending state");
 
@@ -17776,11 +17776,11 @@ config = '{"connector":"pending-snowflake"}'
             .filter_map(|row| row["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"connector_unavailable:pending-snowflake"),
+            names.contains(&"connector_unavailable:pending-timescaledb"),
             "{names:?}"
         );
         assert!(
-            names.contains(&"action_unavailable:pending-snowflake"),
+            names.contains(&"action_unavailable:pending-timescaledb"),
             "{names:?}"
         );
 

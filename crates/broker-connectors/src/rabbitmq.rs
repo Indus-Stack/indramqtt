@@ -23,6 +23,16 @@ pub struct RabbitMqSinkConfig {
     pub exchange: String,
     pub routing_key_template: String,
     pub delivery_mode: u8,
+    /// Extra message headers: each pair is a header name plus a value
+    /// template (`${topic}`, `${payload}`). Reason: the reference
+    /// `headers_template` action field.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Body template (`${topic}`, `${payload}`); `None` forwards the
+    /// raw event bytes. Reason: the reference `payload_template`
+    /// action field (empty means the whole message).
+    #[serde(default)]
+    pub payload_template: Option<String>,
 }
 
 /// Longest accepted exchange name in bytes. Reason: AMQP shortstr holds at most 255 bytes.
@@ -61,6 +71,22 @@ impl RabbitMqSinkConfig {
 /// `sensor.${topic}` with `a/b` becomes `sensor.a.b`.
 pub fn render_routing_key(template: &str, topic: &str) -> String {
     template.replace("${topic}", topic).replace('/', ".")
+}
+
+/// Render one body or header value template: `${topic}` takes the
+/// event topic, `${payload}` takes the raw event bytes as text.
+pub fn render_body_template_string(template: &str, topic: &str, payload: &[u8]) -> String {
+    template
+        .replace("${topic}", topic)
+        .replace("${payload}", &String::from_utf8_lossy(payload))
+}
+
+/// Render one body template, failing closed on non-UTF-8 bytes.
+pub fn render_body_template(template: &str, topic: &str, payload: &[u8]) -> Option<String> {
+    if std::str::from_utf8(payload).is_err() && template.contains("${payload}") {
+        return None;
+    }
+    Some(render_body_template_string(template, topic, payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -393,8 +419,35 @@ impl LapinRabbitTransport {
             ))
         })?
         .map_err(|e| ConnectorError::Connection(format!("rabbitmq driver connect failed: {e}")))?;
-        let channel = connection.create_channel().await.map_err(|e| {
-            ConnectorError::Connection(format!("rabbitmq driver channel failed: {e}"))
+        // Bound the channel handshake. A downed broker fails closed fast.
+        let channel = tokio::time::timeout(LAPIN_CONNECT_TIMEOUT, connection.create_channel())
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "rabbitmq driver channel timeout: {}",
+                    self.amqp_url
+                ))
+            })?
+            .map_err(|e| {
+                ConnectorError::Connection(format!("rabbitmq driver channel failed: {e}"))
+            })?;
+        // Publisher confirms: every publish below awaits the broker
+        // ack, so a lost or rejected message counts a failed forward
+        // instead of reading success it never earned.
+        // Bound the confirm handshake. A downed broker fails closed fast.
+        tokio::time::timeout(
+            LAPIN_CONNECT_TIMEOUT,
+            channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "rabbitmq driver confirm mode timeout: {}",
+                self.amqp_url
+            ))
+        })?
+        .map_err(|e| {
+            ConnectorError::Connection(format!("rabbitmq driver confirm mode failed: {e}"))
         })?;
         let cloned = channel.clone();
         *guard = Some(LapinChannelState {
@@ -418,12 +471,19 @@ impl LapinRabbitTransport {
             .map_err(|e| {
                 ConnectorError::Connection(format!("rabbitmq driver publish failed: {e}"))
             })?;
-        tokio::time::timeout(LAPIN_CONFIRM_TIMEOUT, confirm)
+        let confirm = tokio::time::timeout(LAPIN_CONFIRM_TIMEOUT, confirm)
             .await
             .map_err(|_| ConnectorError::Connection("rabbitmq driver confirm timeout".to_string()))?
             .map_err(|e| {
                 ConnectorError::Connection(format!("rabbitmq driver publish not confirmed: {e}"))
             })?;
+        // A broker nack refuses the publish: report it so the sink
+        // counts a failed forward instead of a success it never earned.
+        if confirm.is_nack() {
+            return Err(ConnectorError::Connection(
+                "rabbitmq driver publish not confirmed: nack".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -477,26 +537,47 @@ impl RabbitMqSink {
 #[async_trait]
 impl Sink for RabbitMqSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> super::Result<()> {
+        let body = match &self.config.payload_template {
+            Some(template) => Bytes::from(
+                render_body_template(template, topic.as_str(), payload).ok_or_else(|| {
+                    ConnectorError::Dispatch(
+                        "rabbitmq payload template needs UTF-8 bytes".to_string(),
+                    )
+                })?,
+            ),
+            None => payload.clone(),
+        };
+        let mut headers = vec![
+            (
+                "mqtt.topic".to_string(),
+                FieldValue::Str(topic.as_str().to_string()),
+            ),
+            (
+                "mqtt.qos".to_string(),
+                FieldValue::I32(u8::from(qos) as i32),
+            ),
+            (
+                "mqtt.timestamp".to_string(),
+                FieldValue::Timestamp(now_secs()),
+            ),
+        ];
+        for (name, template) in &self.config.extra_headers {
+            headers.push((
+                name.clone(),
+                FieldValue::Str(render_body_template_string(
+                    template,
+                    topic.as_str(),
+                    payload,
+                )),
+            ));
+        }
         let publish = AmqpPublish {
             exchange: self.config.exchange.clone(),
             routing_key: render_routing_key(&self.config.routing_key_template, topic.as_str()),
             delivery_mode: self.config.delivery_mode,
             timestamp_secs: now_secs(),
-            headers: vec![
-                (
-                    "mqtt.topic".to_string(),
-                    FieldValue::Str(topic.as_str().to_string()),
-                ),
-                (
-                    "mqtt.qos".to_string(),
-                    FieldValue::I32(u8::from(qos) as i32),
-                ),
-                (
-                    "mqtt.timestamp".to_string(),
-                    FieldValue::Timestamp(now_secs()),
-                ),
-            ],
-            body: payload.clone(),
+            headers,
+            body,
         };
         if publish.routing_key.len() > 255 {
             return Err(ConnectorError::Dispatch(format!(
@@ -524,6 +605,8 @@ mod tests {
             exchange: "telemetry".to_string(),
             routing_key_template: "sensor.${topic}".to_string(),
             delivery_mode: 2,
+            extra_headers: Vec::new(),
+            payload_template: None,
         }
     }
 
@@ -805,6 +888,8 @@ mod tests {
             exchange: exchange.clone(),
             routing_key_template: "${topic}".to_string(),
             delivery_mode: 2,
+            extra_headers: Vec::new(),
+            payload_template: None,
         };
         config.validate().expect("qual config validates");
         let transport = Arc::new(LapinRabbitTransport::new(&amqp_url).expect("qual transport"));

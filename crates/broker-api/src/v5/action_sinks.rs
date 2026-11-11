@@ -196,6 +196,43 @@ const MV03B_OCI_BACKOFF_FIRST_MS: u64 = 100;
 /// so a dead endpoint fails fast to the runtime backoff.
 const MV03B_OCI_BACKOFF_MAX_MS: u64 = 2_000;
 
+/// Message-broker partition count for hashing. Reason: the loopback
+/// fake reports twelve partitions in Metadata, and the driver hashes
+/// with this count when broker Metadata is unavailable.
+#[cfg(any(feature = "kafka", feature = "confluent"))]
+const MV03A_DEFAULT_PARTITIONS: u32 = 12;
+/// Message-broker batch ceiling. Reason: one Kafka batch caps at
+/// 1 MiB in the reference producer buffer.
+#[cfg(any(feature = "kafka", feature = "confluent", feature = "rabbitmq"))]
+const MV03A_BATCH_MAX_BYTES: usize = 1_048_576;
+/// Message-broker rows per send. Reason: one row per send keeps the
+/// runtime in charge of batching (RO-01).
+const MV03A_BATCH_SIZE_ONE: usize = 1;
+/// Message-broker batch bytes for Pulsar. Reason: the Pulsar driver
+/// defaults one batch to 2 MiB.
+const MV03A_PULSAR_BATCH_BYTES: usize = 2_097_152;
+/// Message-broker linger. Reason: a 10 ms linger lets one row per
+/// send wait for the runtime batch timer (RO-01).
+const MV03A_LINGER_MS: u64 = 10;
+/// Message-broker send retries. Reason: three tries ride out a short
+/// flap without a long stall.
+const MV03A_MAX_RETRIES: usize = 3;
+/// Message-broker retry start. Reason: 100 ms spaces quick retries
+/// without blocking the queue.
+const MV03A_BACKOFF_FIRST_MS: u64 = 100;
+/// Message-broker retry cap. Reason: 2 s caps one send so a dead
+/// endpoint fails fast to the runtime backoff.
+const MV03A_BACKOFF_MAX_MS: u64 = 2_000;
+/// Message-broker inflight bound. Reason: 1000 rows cap the sink
+/// queue while the runtime drains it (RO-01).
+const MV03A_MAX_INFLIGHT: usize = 1_000;
+/// Message-broker proxy buffer rows. Reason: 1024 rows cap the memory
+/// the proxy client holds while the runtime owns batching (RO-01).
+const MV03A_PROXY_BUFFER_ROWS: usize = 1_024;
+/// MQTT bridge keep-alive. Reason: the reference connector_mqtt
+/// defaults keepalive to 160 s.
+const MV03A_MQTT_KEEPALIVE_SECS: u16 = 160;
+
 /// Dispatch strategy of the reference action resource options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActionDispatchStrategy {
@@ -570,6 +607,9 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "aws_iot_core" => "aws_iot",
         "azure_iot_hub" | "azure_iothub" | "iothub" => "azure_iot",
         "gcp_iot_core" | "cloud_iot" => "gcp_iot",
+        "mqtt" => "mqtt_bridge",
+        "kafka_producer" | "kafka_consumer" => "kafka",
+        "confluent_producer" | "confluent_kafka" | "confluent_cloud" => "confluent",
         _ => kind,
     }
 }
@@ -623,6 +663,12 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "aws_iot"
             | "azure_iot"
             | "oci_streaming"
+            | "kafka"
+            | "confluent"
+            | "pulsar"
+            | "rocketmq"
+            | "mqtt_bridge"
+            | "redis"
     )
 }
 
@@ -1514,6 +1560,12 @@ pub(crate) fn build_action_sink_with_dir(
         "aws_iot" => build_aws_iot_sink(record, connector_doc).map(Some),
         "azure_iot" => build_azure_iot_sink(record, connector_doc).map(Some),
         "oci_streaming" => build_oci_streaming_sink(record, connector_doc).map(Some),
+        "kafka" => build_kafka_sink(record, connector_doc).map(Some),
+        "confluent" => build_confluent_sink(record, connector_doc).map(Some),
+        "pulsar" => build_pulsar_sink(record, connector_doc).map(Some),
+        "rocketmq" => build_rocketmq_sink(record, connector_doc).map(Some),
+        "mqtt_bridge" => build_mqtt_bridge_sink(record, connector_doc).map(Some),
+        "redis" => build_redis_sink(record, connector_doc).map(Some),
         // Other kinds own no runtime yet: no sink, no registration.
         // Delivery stays refused-by-default (the fire counts one
         // failure) until the kind plots its own data path (KC-00).
@@ -1606,6 +1658,24 @@ fn is_non_empty_string_list(value: &serde_json::Value) -> bool {
     value
         .as_array()
         .is_some_and(|items| !items.is_empty() && items.iter().all(|item| item.is_string()))
+}
+
+/// Read one string field of the reference `message` object of the
+/// action record. `None` when the object or the field is absent.
+fn param_message_field(record: &ActionRecord, key: &str) -> Option<String> {
+    for source in [&record.parameters, &record.params] {
+        if let Some(text) = source
+            .get("message")
+            .and_then(|message| message.get(key))
+            .filter(|value| !value.is_null())
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(text.to_string());
+        }
+    }
+    None
 }
 
 /// Read one string-map parameter into owned pairs. Non-string entries
@@ -1933,10 +2003,10 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
             if let Some(template) = param_string(record, "template") {
                 if template != "${.}" {
                     return Err(bad(
-                    "template",
-                    "only the documented default `${.}` is supported: this driver writes the projected event as one record"
-                        .to_string(),
-                ));
+                        "template",
+                        "only the documented default `${.}` is supported: this driver writes the projected event as one record"
+                            .to_string(),
+                    ));
                 }
             }
             if let Some(mode) = param_string(record, "write_mode") {
@@ -1969,6 +2039,319 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
                     return Err(bad(
                         "topic_prefix",
                         "must start with `spBv1.0/`".to_string(),
+                    ));
+                }
+            }
+        }
+        "kafka" | "confluent" => {
+            if param_string(record, "topic").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: topic (field `parameters.topic`)",
+                    record.id
+                ));
+            }
+            if let Some(strategy) = param_string(record, "partition_strategy") {
+                if !["random", "key_dispatch"].contains(&strategy.as_str()) {
+                    return Err(bad(
+                        "partition_strategy",
+                        format!("must be one of random, key_dispatch: {strategy:?}"),
+                    ));
+                }
+            }
+            if let Some(acks) = param_string(record, "required_acks") {
+                if !["all_isr", "leader_only", "none"].contains(&acks.as_str()) {
+                    return Err(bad(
+                        "required_acks",
+                        format!("must be one of all_isr, leader_only, none: {acks:?}"),
+                    ));
+                }
+            }
+            if let Some(mode) = param_string(record, "kafka_header_value_encode_mode") {
+                if !["none", "json"].contains(&mode.as_str()) {
+                    return Err(bad(
+                        "kafka_header_value_encode_mode",
+                        format!("must be one of none, json: {mode:?}"),
+                    ));
+                }
+            }
+            if param_value(record, "query_mode").is_some_and(|v| !v.is_null()) {
+                return Err(bad(
+                    "query_mode",
+                    "is not supported for this kind: omit it, use `resource_opts.query_mode`"
+                        .to_string(),
+                ));
+            }
+            if let Some(message) = param_value(record, "message") {
+                if !message.is_null() && !message.is_object() {
+                    return Err(bad("message", "must be an object".to_string()));
+                }
+                if let Some(value) = message.get("value").filter(|v| !v.is_null()) {
+                    let text = value.as_str().unwrap_or("");
+                    if !["${.}", "${payload}"].contains(&text) {
+                        return Err(bad(
+                            "message.value",
+                            "only the whole-message value is supported: omit it or use ${.}"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if let Some(stamp) = message.get("timestamp").filter(|v| !v.is_null()) {
+                    let text = stamp.as_str().unwrap_or("");
+                    if text != "${.timestamp}" {
+                        return Err(bad(
+                            "message.timestamp",
+                            "only the event timestamp is supported: omit it or use ${.timestamp}"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if canonical_action_kind(record.action_type.as_str()) == "confluent"
+                    && message.get("timestamp").is_some_and(|v| !v.is_null())
+                {
+                    return Err(bad(
+                        "message.timestamp",
+                        "the confluent message carries no timestamp: omit it".to_string(),
+                    ));
+                }
+            }
+            // Producer buffer and socket tuning belongs to the action
+            // runtime (`resource_opts`, RO-01). The driver reads none
+            // of these fields, so a present value is refused instead
+            // of stored as an ignored setting.
+            for field in [
+                "buffer",
+                "max_batch_age",
+                "max_batch_bytes",
+                "max_inflight",
+                "max_linger_bytes",
+                "max_linger_time",
+                "max_retries",
+                "partition_count_refresh_interval",
+                "partitions_limit",
+                "reconnect_delay",
+                "send_buffer",
+                "sync_query_timeout",
+            ] {
+                if param_value(record, field).is_some_and(|v| !v.is_null()) {
+                    return Err(bad(
+                        field,
+                        "is not supported for this kind: batching and tuning belong to `resource_opts`"
+                            .to_string(),
+                    ));
+                }
+            }
+            if let Some(compression) = param_string(record, "compression") {
+                if compression != "no_compression" {
+                    return Err(bad(
+                        "compression",
+                        "only no_compression is supported: the driver sends uncompressed"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        "rabbitmq" => {
+            if param_string(record, "routing_key").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: routing_key (field `parameters.routing_key`)",
+                    record.id
+                ));
+            }
+            if let Some(mode) = param_string(record, "delivery_mode") {
+                if !["non_persistent", "persistent"].contains(&mode.as_str()) {
+                    return Err(bad(
+                        "delivery_mode",
+                        format!("must be one of non_persistent, persistent: {mode:?}"),
+                    ));
+                }
+            }
+            if let Some(headers) = param_value(record, "headers_template") {
+                let items = headers.as_array().ok_or_else(|| {
+                    bad(
+                        "headers_template",
+                        "must be an array of {key, value} templates".to_string(),
+                    )
+                })?;
+                for item in items {
+                    let ok = item.as_object().is_some_and(|map| {
+                        map.get("key")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.trim().is_empty())
+                    }) && item.get("value").and_then(|v| v.as_str()).is_some();
+                    if !ok {
+                        return Err(bad(
+                            "headers_template",
+                            "each entry needs a non-empty `key` and a string `value` template"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(props) = param_value(record, "properties_template") {
+                let empty = props.as_array().is_some_and(|items| items.is_empty());
+                if !empty {
+                    return Err(bad(
+                        "properties_template",
+                        "only the empty list is supported: the broker sets content type, delivery mode and timestamp"
+                            .to_string(),
+                    ));
+                }
+            }
+            // Confirmation tuning belongs to the driver call, which
+            // always awaits the broker ack. A present value is refused
+            // instead of stored as an ignored setting.
+            for field in [
+                "publish_confirmation_timeout",
+                "wait_for_publish_confirmations",
+            ] {
+                if param_value(record, field).is_some_and(|v| !v.is_null()) {
+                    return Err(bad(
+                        field,
+                        "is not supported for this kind: delivery always awaits the broker ack"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        "redis" => match param_value(record, "command_template") {
+            Some(value) => {
+                let items = value.as_array().ok_or_else(|| {
+                    bad(
+                        "command_template",
+                        "must be a non-empty array of strings".to_string(),
+                    )
+                })?;
+                if items.is_empty()
+                    || items
+                        .iter()
+                        .any(|entry| entry.as_str().is_none_or(|text| text.trim().is_empty()))
+                {
+                    return Err(bad(
+                        "command_template",
+                        "must be a non-empty array of non-blank strings".to_string(),
+                    ));
+                }
+            }
+            None => {
+                return Err(format!(
+                        "action {:?} is missing required field: command_template (field `parameters.command_template`)",
+                        record.id
+                    ));
+            }
+        },
+        "mqtt_bridge" => {
+            if param_string(record, "topic").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: topic (field `parameters.topic`)",
+                    record.id
+                ));
+            }
+            if let Some(qos) = param_value(record, "qos").filter(|v| !v.is_null()) {
+                let ok = qos.as_u64().is_some_and(|n| n <= 2)
+                    || qos
+                        .as_str()
+                        .is_some_and(|text| ["0", "1", "2"].contains(&text.trim()));
+                if !ok {
+                    return Err(bad("qos", "must be one of 0, 1, 2".to_string()));
+                }
+            }
+            if let Some(retain) = param_value(record, "retain").filter(|v| !v.is_null()) {
+                if !retain.is_boolean() {
+                    return Err(bad("retain", "must be a boolean".to_string()));
+                }
+            }
+        }
+        "pulsar" => {
+            if param_string(record, "pulsar_topic").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: pulsar_topic (field `parameters.pulsar_topic`)",
+                    record.id
+                ));
+            }
+            if let Some(strategy) = param_string(record, "strategy") {
+                if !["random", "roundrobin", "key_dispatch"].contains(&strategy.as_str()) {
+                    return Err(bad(
+                        "strategy",
+                        format!("must be one of random, roundrobin, key_dispatch: {strategy:?}"),
+                    ));
+                }
+            }
+            if let Some(message) = param_value(record, "message") {
+                if !message.is_null() && !message.is_object() {
+                    return Err(bad("message", "must be an object".to_string()));
+                }
+                if let Some(value) = message.get("value").filter(|v| !v.is_null()) {
+                    let text = value.as_str().unwrap_or("");
+                    if !["${.}", "${payload}"].contains(&text) {
+                        return Err(bad(
+                            "message.value",
+                            "only the whole-message value is supported: omit it or use ${.}"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            // Producer buffer and socket tuning belongs to the action
+            // runtime (`resource_opts`, RO-01). The driver reads none
+            // of these fields, so a present value is refused instead
+            // of stored as an ignored setting.
+            for field in [
+                "batch_size",
+                "buffer",
+                "max_batch_bytes",
+                "max_inflight",
+                "retention_period",
+                "send_buffer",
+                "sync_timeout",
+            ] {
+                if param_value(record, field).is_some_and(|v| !v.is_null()) {
+                    return Err(bad(
+                        field,
+                        "is not supported for this kind: batching and tuning belong to `resource_opts`"
+                            .to_string(),
+                    ));
+                }
+            }
+            if let Some(compression) = param_string(record, "compression") {
+                if compression != "no_compression" {
+                    return Err(bad(
+                        "compression",
+                        "only no_compression is supported: the driver sends uncompressed"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        "rocketmq" => {
+            if let Some(strategy) = param_string(record, "strategy") {
+                if !["roundrobin", "key_dispatch"].contains(&strategy.as_str()) {
+                    return Err(bad(
+                        "strategy",
+                        format!("must be one of roundrobin, key_dispatch: {strategy:?}"),
+                    ));
+                }
+            }
+            // A custom row template needs rule-output fields the sink
+            // never sees. The empty template stores the whole message,
+            // which is what the driver sends.
+            // TODO(parity): MV-03a: execute a non-empty `template`, or
+            // keep the refusal as documented behavior.
+            if param_string(record, "template").is_some() {
+                return Err(bad(
+                    "template",
+                    "only the empty template is supported: the driver stores the whole message"
+                        .to_string(),
+                ));
+            }
+            // Socket tuning belongs to the action runtime path, not the
+            // driver call. A present value is refused instead of stored
+            // as an ignored setting.
+            for field in ["refresh_interval", "send_buffer", "sync_timeout"] {
+                if param_value(record, field).is_some_and(|v| !v.is_null()) {
+                    return Err(bad(
+                        field,
+                        "is not supported for this kind: tuning belongs to the runtime path"
+                            .to_string(),
                     ));
                 }
             }
@@ -3138,6 +3521,38 @@ fn first_string_nested<'a>(
         doc.get("parameters")
             .and_then(|parameters| first_string(parameters, keys))
     })
+}
+
+/// Read one string from the connector document, top-level or inside
+/// the reference `parameters` object. Message-broker connectors
+/// accept both shapes.
+fn nested_field<'a>(
+    doc: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<std::borrow::Cow<'a, str>> {
+    first_string(doc, keys).or_else(|| {
+        doc.get("parameters")
+            .and_then(|parameters| first_string(parameters, keys))
+    })
+}
+
+/// Read one required connector field through its accepted key
+/// aliases, top-level or inside `parameters`. A missing value fails
+/// with the connector and the field named.
+fn required_nested_field(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+    keys: &[&str],
+    field: &str,
+) -> Result<String, String> {
+    nested_field(connector_doc, keys)
+        .map(|value| value.into_owned())
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: {field} (action {action_id:?})"
+            )
+        })
 }
 
 /// Normalize one HTTP(S) endpoint: a bare `host:port` reads as `http`.
@@ -5157,128 +5572,6 @@ const RABBITMQ_NON_PERSISTENT: u8 = 1;
 #[cfg(feature = "rabbitmq")]
 const RABBITMQ_PERSISTENT: u8 = 2;
 
-/// Build the action's `rabbitmq` config. The connection comes from
-/// the connector. The exchange and routing key come from the action.
-///
-/// Values and defaults:
-/// - `servers`: the connector target. It is required. It has no default.
-/// - `username` and `password`: the connector pair. Each defaults to `guest`.
-/// - `exchange`: the action exchange. Empty selects the default exchange.
-/// - `routing_key`: the action template. It is required. Slashes become dots.
-/// - `delivery_mode`: `persistent` writes durable. Default is non-persistent.
-///
-/// Empty exchange is valid. See #components/schemas/bridge_rabbitmq.action_parameters.
-#[cfg(feature = "rabbitmq")]
-pub(crate) fn rabbitmq_sink_config(
-    record: &ActionRecord,
-    connector_doc: &serde_json::Value,
-) -> Result<broker_connectors::rabbitmq::RabbitMqSinkConfig, String> {
-    let connector = record.connector.trim().to_string();
-    let servers = first_string(connector_doc, &["servers", "server", "endpoint"])
-        .map(|value| value.into_owned())
-        .ok_or_else(|| {
-            format!(
-                "connector {connector:?} is missing required field: servers (action {:?})",
-                record.id
-            )
-        })?;
-    let username = first_string(connector_doc, &["username", "user"])
-        .map(|value| value.into_owned())
-        .unwrap_or_else(|| "guest".to_string());
-    let password = first_string(connector_doc, &["password", "pass"])
-        .map(|value| value.into_owned())
-        .unwrap_or_else(|| "guest".to_string());
-    let endpoint = if servers.trim().starts_with("amqp://") {
-        servers.trim().to_string()
-    } else {
-        format!(
-            "amqp://{username}:{password}@{}/%2f",
-            servers.trim().trim_end_matches('/')
-        )
-    };
-    let routing_key = param_string(record, "routing_key")
-        .or_else(|| param_string(record, "routing_key_template"))
-        .ok_or_else(|| {
-            format!(
-                "action {:?} is missing required field: routing_key (field `parameters.routing_key`)",
-                record.id
-            )
-        })?;
-    let delivery_mode = match param_value(record, "delivery_mode") {
-        None => RABBITMQ_NON_PERSISTENT,
-        Some(serde_json::Value::Number(value)) => match value.as_u64() {
-            Some(1) => RABBITMQ_NON_PERSISTENT,
-            Some(2) => RABBITMQ_PERSISTENT,
-            _ => {
-                return Err(format!(
-                    "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent",
-                    record.id
-                ));
-            }
-        },
-        Some(serde_json::Value::String(text)) => match text.trim() {
-            "non_persistent" | "1" => RABBITMQ_NON_PERSISTENT,
-            "persistent" | "2" => RABBITMQ_PERSISTENT,
-            _ => {
-                return Err(format!(
-                    "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent",
-                    record.id
-                ));
-            }
-        },
-        Some(_) => {
-            return Err(format!(
-                "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent",
-                record.id
-            ));
-        }
-    };
-    Ok(broker_connectors::rabbitmq::RabbitMqSinkConfig {
-        endpoint,
-        exchange: param_string(record, "exchange").unwrap_or_default(),
-        routing_key_template: routing_key,
-        delivery_mode,
-    })
-}
-
-/// Build the action's `rabbitmq` sink from its config. The config
-/// carries the applied defaults. The transport and sink add no values.
-#[cfg(feature = "rabbitmq")]
-pub(crate) fn build_rabbitmq_sink(
-    record: &ActionRecord,
-    connector_doc: &serde_json::Value,
-) -> Result<Arc<dyn broker_connectors::Sink>, String> {
-    use broker_connectors::rabbitmq::{LapinRabbitTransport, RabbitMqSink};
-    let config = rabbitmq_sink_config(record, connector_doc)?;
-    let transport = LapinRabbitTransport::new(&config.endpoint).map_err(|error| {
-        format!(
-            "action {:?} cannot build its rabbitmq transport: {error}",
-            record.id
-        )
-    })?;
-    let sink = RabbitMqSink::new(config, Arc::new(transport)).map_err(|error| {
-        format!(
-            "action {:?} cannot build its rabbitmq sink: {error}",
-            record.id
-        )
-    })?;
-    Ok(Arc::new(sink))
-}
-
-/// The default build compiles the RabbitMQ driver out. The kind is
-/// known but the runtime is absent. The build fails closed and names
-/// the missing feature.
-#[cfg(not(feature = "rabbitmq"))]
-pub(crate) fn build_rabbitmq_sink(
-    record: &ActionRecord,
-    _connector_doc: &serde_json::Value,
-) -> Result<Arc<dyn broker_connectors::Sink>, String> {
-    Err(format!(
-        "action {:?} needs cargo feature `rabbitmq` (disabled in this build)",
-        record.id
-    ))
-}
-
 /// Build the action's `elasticsearch` sink: the server and authentication
 /// come from the connector; the action owns the operation, index, id and
 /// document.
@@ -5967,6 +6260,1083 @@ pub(crate) fn build_snowflake_sink(
     let sink = SnowflakeSink::new(config, Arc::new(transport)).map_err(|error| {
         format!(
             "action {:?} cannot build its snowflake sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `kafka` sink: the connection comes from the
+/// connector; the topic, key, headers and strategy come from the
+/// action.
+///
+/// Values and defaults:
+/// - `bootstrap_hosts`: the connector's `bootstrap_hosts` (aliases
+///   `bootstrap_servers`, `servers`); required, no invented default.
+/// - `authentication`: absent or `none` only. SASL is refused with the
+///   field named: the driver dials plaintext with no SASL wiring yet.
+/// - `ssl`: refused when present: the driver dials plaintext with no
+///   TLS knob.
+/// - `topic`: the action parameter, required. `${topic}` renders the
+///   ingress topic.
+/// - `message.key`: the record key template; absent means a null key.
+/// - `partition_strategy`: `random` (default, spreads rows at random)
+///   or `key_dispatch` (murmur2 hash of the key, sticky).
+/// - `required_acks`: `all_isr` (default), `leader_only` or `none`.
+/// - `kafka_headers`, `kafka_ext_headers`,
+///   `kafka_header_value_encode_mode`: the reference header fields.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with no linger, so the runtime
+///   owns the batch size and the batch timer.
+#[cfg(feature = "kafka")]
+pub(crate) fn kafka_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors::kafka::KafkaSinkConfig, String> {
+    use broker_connectors::kafka::{KafkaHeaderEncodeMode, KafkaSinkConfig};
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let bootstrap = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["bootstrap_hosts", "bootstrap_servers", "servers"],
+        "bootstrap_hosts",
+    )?;
+    let auth = connector_doc.get("authentication").or_else(|| {
+        connector_doc
+            .get("parameters")
+            .and_then(|params| params.get("authentication"))
+    });
+    let auth_none = match auth {
+        None => true,
+        Some(value) if value.is_null() => true,
+        Some(serde_json::Value::String(text)) => text.trim().is_empty() || text.trim() == "none",
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+        Some(_) => false,
+    };
+    if !auth_none {
+        return Err(format!(
+            "connector {connector:?} field `authentication` only supports `none` for kind `kafka`: the driver dials plaintext with no SASL wiring (action {:?})",
+            record.id
+        ));
+    }
+    let topic = param_string(record, "topic").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: topic (field `parameters.topic`)",
+            record.id
+        )
+    })?;
+    let strategy =
+        param_string(record, "partition_strategy").unwrap_or_else(|| "random".to_string());
+    let random_partition = match strategy.as_str() {
+        "random" => true,
+        "key_dispatch" => false,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.partition_strategy` must be one of random, key_dispatch: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let acks = match param_string(record, "required_acks")
+        .unwrap_or_else(|| "all_isr".to_string())
+        .as_str()
+    {
+        "all_isr" => "all",
+        "leader_only" => "1",
+        "none" => "0",
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.required_acks` must be one of all_isr, leader_only, none: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let encode_mode = match param_string(record, "kafka_header_value_encode_mode")
+        .unwrap_or_else(|| "none".to_string())
+        .as_str()
+    {
+        "none" => KafkaHeaderEncodeMode::None,
+        "json" => KafkaHeaderEncodeMode::Json,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.kafka_header_value_encode_mode` must be one of none, json: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let mut ext_headers = Vec::new();
+    if let Some(items) = param_value(record, "kafka_ext_headers") {
+        let items = items.as_array().ok_or_else(|| {
+            format!(
+                "action {:?} field `parameters.kafka_ext_headers` must be an array",
+                record.id
+            )
+        })?;
+        for item in items {
+            let key = item
+                .get("kafka_ext_header_key")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "action {:?} field `parameters.kafka_ext_headers` needs a non-empty `kafka_ext_header_key`",
+                        record.id
+                    )
+                })?;
+            let value = item
+                .get("kafka_ext_header_value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "action {:?} field `parameters.kafka_ext_headers` needs a string `kafka_ext_header_value`",
+                        record.id
+                    )
+                })?;
+            ext_headers.push((key.to_string(), value.to_string()));
+        }
+    }
+    let config = KafkaSinkConfig {
+        bootstrap_servers: bootstrap,
+        topic_template: topic,
+        partition_key_field: None,
+        // Reference kafka_message.key defaults to `${.clientid}`.
+        key_template: param_message_field(record, "key")
+            .or_else(|| Some("${.clientid}".to_string())),
+        // Twelve partitions match the loopback fake Metadata. The
+        // driver hashes with this count. Real topics report their own
+        // count through broker Metadata.
+        partitions: MV03A_DEFAULT_PARTITIONS,
+        client_id: format!("indramqtt-{}", record.id),
+        acks: acks.to_string(),
+        batch_max_records: MV03A_BATCH_SIZE_ONE,
+        batch_max_bytes: MV03A_BATCH_MAX_BYTES,
+        random_partition,
+        headers_template: param_string(record, "kafka_headers"),
+        extra_headers: ext_headers,
+        header_encode_mode: encode_mode,
+    };
+    Ok(config)
+}
+
+/// Build the action's `kafka` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+#[cfg(feature = "kafka")]
+pub(crate) fn build_kafka_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::kafka::{KafkaSink, RdkafkaKafkaTransport};
+    let config = kafka_sink_config(record, connector_doc)?;
+    // Production write path on the maintained `rdkafka` driver; the
+    // hand-written TCP framing stays for offline unit tests only.
+    let transport = RdkafkaKafkaTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its kafka transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = KafkaSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its kafka sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "kafka"))]
+pub(crate) fn build_kafka_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `kafka` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `confluent` sink: the Cloud endpoints and API
+/// credentials come from the connector; the topic, key, headers and
+/// strategy come from the action.
+///
+/// Values and defaults:
+/// - `bootstrap_hosts`: the connector's hosts (aliases
+///   `bootstrap_servers`, `servers`); required, no invented default.
+/// - `api_key`/`api_secret` (aliases `username`/`password`): the
+///   connector pair; required, both parts.
+/// - `ssl.enable`: the connector flag, default true. It maps to the
+///   driver `SASL_SSL`/`SASL_PLAINTEXT` protocol. Reason: the hosted
+///   endpoints need TLS; local qualification has no certificate.
+/// - `authentication`: the reference object form is stored opaquely;
+///   the driver always uses SASL with the API pair above.
+/// - `topic`: the action parameter, required.
+/// - `message.key`: the partition key template; absent means a null
+///   key. The reference default `${.clientid}` reads the payload
+///   `client_id` field.
+/// - `partition_strategy`: `random` (default) or `key_dispatch`.
+/// - `required_acks`: `all_isr` (default), `leader_only` or `none`.
+/// - `kafka_headers`, `kafka_ext_headers`,
+///   `kafka_header_value_encode_mode`: the reference header fields.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send in a bounded buffer, so the
+///   runtime owns the batch size and the batch timer.
+#[cfg(feature = "confluent")]
+pub(crate) fn confluent_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors_enterprise::confluent::ConfluentKafkaConfig, String> {
+    use broker_connectors_enterprise::confluent::{
+        ConfluentHeaderEncodeMode, ConfluentKafkaConfig, ConfluentSecurityProtocol,
+    };
+    let connector = record.connector.trim().to_string();
+    for key in [
+        "pool_size",
+        "pipelining",
+        "enable_pipelining",
+        "max_inactive",
+    ] {
+        let present = connector_doc.get(key).or_else(|| {
+            connector_doc
+                .get("parameters")
+                .and_then(|params| params.get(key))
+        });
+        if present.is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "connector {connector:?} field `{key}` is not supported; remove it (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let bootstrap = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["bootstrap_hosts", "bootstrap_servers", "servers"],
+        "bootstrap_hosts",
+    )?;
+    // Credentials: top-level or `parameters` first (the console
+    // shape), then the reference `authentication` object.
+    let nested_auth = connector_doc
+        .get("authentication")
+        .or_else(|| {
+            connector_doc
+                .get("parameters")
+                .and_then(|params| params.get("authentication"))
+        })
+        .and_then(|auth| auth.as_object());
+    let api_key = nested_field(connector_doc, &["api_key", "username"])
+        .map(|value| value.into_owned())
+        .or_else(|| {
+            nested_auth
+                .and_then(|auth| auth.get("username"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: api_key (action {:?})",
+                record.id
+            )
+        })?;
+    let api_secret = nested_field(connector_doc, &["api_secret", "password"])
+        .map(|value| value.into_owned())
+        .or_else(|| {
+            nested_auth
+                .and_then(|auth| auth.get("password"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: api_secret (action {:?})",
+                record.id
+            )
+        })?;
+    let tls_on = connector_doc
+        .get("ssl")
+        .or_else(|| {
+            connector_doc
+                .get("parameters")
+                .and_then(|params| params.get("ssl"))
+        })
+        .and_then(|ssl| ssl.get("enable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let topic = param_string(record, "topic").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: topic (field `parameters.topic`)",
+            record.id
+        )
+    })?;
+    let strategy =
+        param_string(record, "partition_strategy").unwrap_or_else(|| "random".to_string());
+    let random_partition = match strategy.as_str() {
+        "random" => true,
+        "key_dispatch" => false,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.partition_strategy` must be one of random, key_dispatch: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let acks = match param_string(record, "required_acks")
+        .unwrap_or_else(|| "all_isr".to_string())
+        .as_str()
+    {
+        "all_isr" => "all",
+        "leader_only" => "1",
+        "none" => "0",
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.required_acks` must be one of all_isr, leader_only, none: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let encode_mode = match param_string(record, "kafka_header_value_encode_mode")
+        .unwrap_or_else(|| "none".to_string())
+        .as_str()
+    {
+        "none" => ConfluentHeaderEncodeMode::None,
+        "json" => ConfluentHeaderEncodeMode::Json,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.kafka_header_value_encode_mode` must be one of none, json: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let mut ext_headers = Vec::new();
+    if let Some(items) = param_value(record, "kafka_ext_headers") {
+        let items = items.as_array().ok_or_else(|| {
+            format!(
+                "action {:?} field `parameters.kafka_ext_headers` must be an array",
+                record.id
+            )
+        })?;
+        for item in items {
+            let key = item
+                .get("kafka_ext_header_key")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "action {:?} field `parameters.kafka_ext_headers` needs a non-empty `kafka_ext_header_key`",
+                        record.id
+                    )
+                })?;
+            let value = item
+                .get("kafka_ext_header_value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "action {:?} field `parameters.kafka_ext_headers` needs a string `kafka_ext_header_value`",
+                        record.id
+                    )
+                })?;
+            ext_headers.push((key.to_string(), value.to_string()));
+        }
+    }
+    Ok(ConfluentKafkaConfig {
+        bootstrap_servers: bootstrap
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect(),
+        api_key,
+        api_secret,
+        auth_mechanism: broker_connectors_enterprise::confluent::SaslMechanism::Plain,
+        security_protocol: if tls_on {
+            ConfluentSecurityProtocol::SaslSsl
+        } else {
+            ConfluentSecurityProtocol::SaslPlaintext
+        },
+        topic_template: topic,
+        // Reference kafka_message.key defaults to `${.clientid}`.
+        partition_key_template: param_message_field(record, "key")
+            .or_else(|| Some("${.clientid}".to_string())),
+        schema_registry: None,
+        // Twelve partitions match the loopback fake Metadata. The
+        // driver hashes with this count. Real topics report their own
+        // count through broker Metadata.
+        partitions: MV03A_DEFAULT_PARTITIONS,
+        acks: acks.to_string(),
+        random_partition,
+        headers_template: param_string(record, "kafka_headers"),
+        extra_headers: ext_headers,
+        header_encode_mode: encode_mode,
+        batch_size: Some(MV03A_BATCH_SIZE_ONE),
+        // Bounded inner buffer: 1024 rows cap the memory the driver
+        // holds while the runtime owns batching (RO-01).
+        buffer_capacity: Some(MV03A_PROXY_BUFFER_ROWS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    })
+}
+
+/// Build the action's `confluent` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+#[cfg(feature = "confluent")]
+pub(crate) fn build_confluent_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::confluent::{ConfluentKafkaSink, RdkafkaConfluentTransport};
+    let config = confluent_sink_config(record, connector_doc)?;
+    if config.bootstrap_servers.is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: bootstrap_hosts (connector {:?})",
+            record.id, record.connector
+        ));
+    }
+    let transport = RdkafkaConfluentTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its confluent transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = ConfluentKafkaSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its confluent sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "confluent"))]
+pub(crate) fn build_confluent_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `confluent` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `rabbitmq` sink: the connection comes from the
+/// connector; the exchange, routing key, headers and body come from
+/// the action.
+///
+/// Values and defaults:
+/// - `servers` (alias `server`): the connector target; required,
+///   no invented default. A missing target fails closed.
+/// - `username`/`password`: the connector pair; required, no
+///   invented default.
+/// - `virtual_host`: the connector value; default `/`, the reference
+///   default.
+/// - `exchange`: the action value; default `""` (the default
+///   exchange), the reference action default. An empty exchange with
+///   a queue in `routing_key` publishes direct.
+/// - `routing_key`: the action template, required. MQTT slashes
+///   become AMQP dots.
+/// - `delivery_mode`: `non_persistent` (default) or `persistent`.
+/// - `headers_template`: array of `{key, value}` templates; the
+///   values render `${topic}` and `${payload}`.
+/// - `payload_template`: the body template; absent forwards the raw
+///   event bytes.
+/// - Batching belongs to the action runtime: each send is one
+///   broker-acknowledged publish.
+#[cfg(feature = "rabbitmq")]
+pub(crate) fn rabbitmq_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors::rabbitmq::RabbitMqSinkConfig, String> {
+    use broker_connectors::rabbitmq::RabbitMqSinkConfig;
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    // The driver derives the port from `servers` and has no heartbeat
+    // or timeout knob. A present value is refused instead of stored
+    // as an ignored setting.
+    for field in ["port", "heartbeat", "timeout"] {
+        let present = connector_doc.get(field).or_else(|| {
+            connector_doc
+                .get("parameters")
+                .and_then(|params| params.get(field))
+        });
+        if present.is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "connector {connector:?} field `{field}` is not supported for this kind: remove it (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let servers = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["servers", "server"],
+        "servers",
+    )?;
+    let username = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["username", "user"],
+        "username",
+    )?;
+    let password = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["password", "pass"],
+        "password",
+    )?;
+    let virtual_host = nested_field(connector_doc, &["virtual_host", "vhost"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "/".to_string());
+    let host = servers.trim().trim_start_matches("amqp://");
+    let endpoint = format!(
+        "amqp://{username}:{password}@{host}{vhost}",
+        vhost = virtual_host_for_url(&virtual_host)
+    );
+    let routing_key = param_string(record, "routing_key").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: routing_key (field `parameters.routing_key`)",
+            record.id
+        )
+    })?;
+    let delivery_mode = match param_string(record, "delivery_mode")
+        .unwrap_or_else(|| "non_persistent".to_string())
+        .as_str()
+    {
+        "non_persistent" => RABBITMQ_NON_PERSISTENT,
+        "persistent" => RABBITMQ_PERSISTENT,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let mut extra_headers = Vec::new();
+    if let Some(items) = param_value(record, "headers_template") {
+        let items = items.as_array().ok_or_else(|| {
+            format!(
+                "action {:?} field `parameters.headers_template` must be an array",
+                record.id
+            )
+        })?;
+        for item in items {
+            let key = item
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "action {:?} field `parameters.headers_template` needs a non-empty `key`",
+                        record.id
+                    )
+                })?;
+            let value = item.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                format!(
+                    "action {:?} field `parameters.headers_template` needs a string `value`",
+                    record.id
+                )
+            })?;
+            extra_headers.push((key.to_string(), value.to_string()));
+        }
+    }
+    Ok(RabbitMqSinkConfig {
+        endpoint,
+        exchange: param_string(record, "exchange").unwrap_or_default(),
+        routing_key_template: routing_key,
+        delivery_mode,
+        extra_headers,
+        payload_template: param_string(record, "payload_template"),
+    })
+}
+
+/// Render one virtual host for an AMQP URL: `/` becomes the default
+/// `%2f` segment, any other value is used as the path.
+#[cfg(feature = "rabbitmq")]
+fn virtual_host_for_url(virtual_host: &str) -> String {
+    let trimmed = virtual_host.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        "/%2f".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// Build the action's `rabbitmq` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+#[cfg(feature = "rabbitmq")]
+pub(crate) fn build_rabbitmq_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::rabbitmq::{LapinRabbitTransport, RabbitMqSink};
+    let config = rabbitmq_sink_config(record, connector_doc)?;
+    // Production write path on the maintained `lapin` driver; the
+    // hand-written TCP framing stays for offline unit tests only.
+    let transport = LapinRabbitTransport::new(&config.endpoint).map_err(|error| {
+        format!(
+            "action {:?} cannot build its rabbitmq transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = RabbitMqSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its rabbitmq sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "rabbitmq"))]
+pub(crate) fn build_rabbitmq_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `rabbitmq` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `redis` sink: the endpoint comes from the
+/// connector; the command comes from the action.
+///
+/// Values and defaults:
+/// - `servers` (alias `server`): the connector host and port;
+///   required, no invented default. The port defaults to 6379, the
+///   reference default.
+/// - `password`: the connector secret; default empty.
+/// - `username`: the connector ACL name; default empty.
+/// - `database`: the connector index; default 0, the reference
+///   default.
+/// - `command_template`: the action array, required. Each entry is one
+///   RESP argument rendered per event (`${topic}`, `${payload}`); a
+///   value with spaces stays one argument and never becomes a second
+///   command.
+pub(crate) fn redis_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors::redis::RedisSinkConfig, String> {
+    use broker_connectors::redis::{RedisCommandKind, RedisSinkConfig};
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let servers = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["servers", "server", "host"],
+        "servers",
+    )?;
+    let password = nested_field(connector_doc, &["password", "pass"])
+        .map(|value| value.into_owned())
+        .unwrap_or_default();
+    let username = nested_field(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .unwrap_or_default();
+    let database = connector_doc
+        .get("database")
+        .or_else(|| {
+            connector_doc
+                .get("parameters")
+                .and_then(|params| params.get("database"))
+        })
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut authority = String::new();
+    if !username.is_empty() {
+        authority.push_str(&username);
+        authority.push(':');
+    } else if !password.is_empty() {
+        authority.push(':');
+    }
+    if !password.is_empty() {
+        authority.push_str(&password);
+        authority.push('@');
+    } else if !username.is_empty() {
+        authority.push('@');
+    }
+    let (host, port) = match servers.trim().rsplit_once(':') {
+        Some((host, port)) => (host.trim(), port.trim()),
+        None => (servers.trim(), "6379"),
+    };
+    if host.is_empty() {
+        return Err(format!(
+            "connector {connector:?} is missing required field: servers (action {:?})",
+            record.id
+        ));
+    }
+    let port: u16 = port.parse().map_err(|_| {
+        format!(
+            "connector {connector:?} field `servers` holds a bad port (action {:?})",
+            record.id
+        )
+    })?;
+    let endpoint = format!("redis://{authority}{host}:{port}/{database}");
+    let argv = param_value(record, "command_template")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            format!(
+                "action {:?} is missing required field: command_template (field `parameters.command_template`)",
+                record.id
+            )
+        })?
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).ok_or_else(|| {
+                format!(
+                    "action {:?} field `parameters.command_template` must be a non-empty array of non-blank strings",
+                    record.id
+                )
+            })
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+    if argv.is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: command_template (field `parameters.command_template`)",
+            record.id
+        ));
+    }
+    Ok(RedisSinkConfig {
+        endpoint,
+        command: RedisCommandKind::Raw {
+            argv_templates: argv,
+        },
+    })
+}
+
+/// Build the action's `redis` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+pub(crate) fn build_redis_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::redis::{DriverRedisTransport, RedisSink};
+    let config = redis_sink_config(record, connector_doc)?;
+    // Production write path on the maintained `redis` driver; the
+    // hand-written TCP framing stays for offline unit tests only.
+    let transport = DriverRedisTransport::new(&config.endpoint).map_err(|error| {
+        format!(
+            "action {:?} cannot build its redis transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = RedisSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its redis sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `mqtt_bridge` sink: the remote broker comes
+/// from the connector; the topic, QoS, retain flag and body come from
+/// the action.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (alias `broker_address`);
+///   required, no invented default.
+/// - `clientid_prefix`, `username`, `password`: the connector egress
+///   identity. The client id defaults to the connector id.
+///   Keep-alive defaults to 160 s (the reference default).
+/// - `proto_ver`: the connector version, default `v4`; only `v3`,
+///   `v4` and `v5` are accepted. `v3` and `v4` use 3.1.1 framing.
+/// - `topic`: the action remote topic, required. Templates are
+///   rendered per event; the remapped topic never matches the local
+///   forwarding rule again, so a bridged message is not bridged back.
+/// - `payload`: the action body template; absent forwards the raw
+///   event bytes.
+/// - `qos`: 0, 1 (default) or 2. `retain`: default false.
+/// - The action runtime owns batching: one row per send with a short
+///   linger and a bounded inflight window.
+pub(crate) fn mqtt_bridge_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors::MqttBridgeSinkConfig, String> {
+    use broker_connectors::{MqttBridgeProtocol, MqttBridgeSinkConfig};
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let server = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["server", "broker_address", "broker", "host"],
+        "server",
+    )?;
+    if let Some(version) = nested_field(connector_doc, &["proto_ver", "protocol_version"]) {
+        let version = version.into_owned();
+        if !["v3", "v4", "v5"].contains(&version.as_str()) {
+            return Err(format!(
+                "connector {connector:?} field `proto_ver` must be one of v3, v4, v5: {version:?} (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let qos = match param_value(record, "qos").filter(|v| !v.is_null()) {
+        None => 1,
+        Some(value) => {
+            if let Some(n) = value.as_u64() {
+                if n <= 2 {
+                    n as u8
+                } else {
+                    return Err(format!(
+                        "action {:?} field `parameters.qos` must be one of 0, 1, 2",
+                        record.id
+                    ));
+                }
+            } else if let Some(text) = value.as_str() {
+                match text.trim() {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    _ => {
+                        return Err(format!(
+                            "action {:?} field `parameters.qos` must be one of 0, 1, 2",
+                            record.id
+                        ));
+                    }
+                }
+            } else {
+                return Err(format!(
+                    "action {:?} field `parameters.qos` must be one of 0, 1, 2",
+                    record.id
+                ));
+            }
+        }
+    };
+    let retain = param_value(record, "retain")
+        .filter(|v| !v.is_null())
+        .map(|v| v.as_bool())
+        .unwrap_or(Some(false))
+        .ok_or_else(|| {
+            format!(
+                "action {:?} field `parameters.retain` must be a boolean",
+                record.id
+            )
+        })?;
+    let topic = param_string(record, "topic").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: topic (field `parameters.topic`)",
+            record.id
+        )
+    })?;
+    let protocol = match nested_field(connector_doc, &["proto_ver", "protocol_version"])
+        .map(|v| v.into_owned())
+        .as_deref()
+    {
+        Some("v5") => MqttBridgeProtocol::V50,
+        // The driver speaks 3.1.1 framing for both 3.1 (`v3`) and 3.1.1
+        // (`v4`). Both map to V311.
+        Some("v3") | Some("v4") => MqttBridgeProtocol::V311,
+        // Validated above to be one of v3, v4, v5. Absent defaults to
+        // v4 (the reference default), which is 3.1.1 framing.
+        None => MqttBridgeProtocol::V311,
+        Some(other) => {
+            return Err(format!(
+                "connector {connector:?} field `proto_ver` must be one of v3, v4, v5: {other:?} (action {:?})",
+                record.id
+            ));
+        }
+    };
+    Ok(MqttBridgeSinkConfig {
+        broker_address: server,
+        client_id: nested_field(connector_doc, &["clientid_prefix", "client_id"])
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|| connector.clone()),
+        clean_start: true,
+        username: nested_field(connector_doc, &["username", "user"]).map(|v| v.into_owned()),
+        password: nested_field(connector_doc, &["password", "pass"]).map(|v| v.into_owned()),
+        // Reference connector_mqtt defaults keepalive to 160 s.
+        keep_alive_secs: MV03A_MQTT_KEEPALIVE_SECS,
+        topic_prefix: None,
+        topic_template: Some(topic),
+        payload_template: param_string(record, "payload"),
+        qos_override: Some(qos),
+        retain_override: Some(retain),
+        // One row per send: the action runtime owns batching (RO-01).
+        max_inflight: Some(MV03A_MAX_INFLIGHT),
+        max_batch_size: Some(MV03A_BATCH_SIZE_ONE),
+        linger_ms: Some(MV03A_LINGER_MS),
+        protocol,
+    })
+}
+
+/// Build the action's `mqtt_bridge` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+pub(crate) fn build_mqtt_bridge_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::{MqttBridgeSink, RumqttcMqttBridgeTransport};
+    let config = mqtt_bridge_sink_config(record, connector_doc)?;
+    // Production write path on the maintained `rumqttc` driver; the
+    // hand-written TCP framing stays for offline unit tests only.
+    let transport = RumqttcMqttBridgeTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its mqtt_bridge transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = MqttBridgeSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its mqtt_bridge sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `pulsar` sink: the service URL and tenant come
+/// from the connector; the topic, key and strategy come from the
+/// action.
+///
+/// Values and defaults:
+/// - `servers` (alias `service_url`): the connector's
+///   `pulsar://host:6650` URL; required, no invented default. An
+///   `http(s)://` address is refused: it names the admin entry, not
+///   the binary entry the driver dials.
+/// - `tenant`/`namespace`: the connector values; defaults `public`
+///   and `default`, the reference-less driver defaults.
+/// - `authentication`: absent or `none` only; token and basic forms
+///   are refused with the field named.
+/// - `pulsar_topic`: the action topic template, required.
+/// - `message.key`: the partition key template; absent means no key.
+/// - `strategy`: `random` (default), `roundrobin` or `key_dispatch`.
+///   The key selects the routing: a set key is hashed, an absent key
+///   spreads across partitions.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn pulsar_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors_enterprise::pulsar::PulsarSinkConfig, String> {
+    use broker_connectors_enterprise::pulsar::{PulsarAuth, PulsarSinkConfig};
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let service_url = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["servers", "service_url", "server", "endpoint"],
+        "servers",
+    )?;
+    if !service_url.starts_with("pulsar://") && !service_url.starts_with("pulsar+ssl://") {
+        return Err(format!(
+            "connector {connector:?} field `servers` must be a pulsar:// service URL (action {:?})",
+            record.id
+        ));
+    }
+    let auth_value = connector_doc.get("authentication").or_else(|| {
+        connector_doc
+            .get("parameters")
+            .and_then(|params| params.get("authentication"))
+    });
+    let auth_none = match auth_value {
+        None => true,
+        Some(value) if value.is_null() => true,
+        Some(serde_json::Value::String(text)) => text.trim().is_empty() || text.trim() == "none",
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+        Some(_) => false,
+    };
+    if !auth_none {
+        return Err(format!(
+            "connector {connector:?} field `authentication` only supports `none` for kind `pulsar`: token and basic forms are not qualified (action {:?})",
+            record.id
+        ));
+    }
+    let topic = param_string(record, "pulsar_topic").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: pulsar_topic (field `parameters.pulsar_topic`)",
+            record.id
+        )
+    })?;
+    let strategy = param_string(record, "strategy").unwrap_or_else(|| "random".to_string());
+    // `key_dispatch` hashes the key. `random` and `roundrobin` send
+    // with no key so the broker spreads rows.
+    let partition_key_template = if strategy == "key_dispatch" {
+        param_message_field(record, "key")
+    } else {
+        None
+    };
+    Ok(PulsarSinkConfig {
+        service_url,
+        tenant: nested_field(connector_doc, &["tenant"])
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|| "public".to_string()),
+        namespace: nested_field(connector_doc, &["namespace"])
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|| "default".to_string()),
+        topic,
+        auth: PulsarAuth::None,
+        partition_key_template,
+        strategy,
+        properties: std::collections::HashMap::new(),
+        batch_size: Some(MV03A_BATCH_SIZE_ONE),
+        batch_bytes: Some(MV03A_PULSAR_BATCH_BYTES),
+        linger_ms: Some(MV03A_LINGER_MS),
+        max_retries: Some(MV03A_MAX_RETRIES),
+        initial_backoff_ms: Some(MV03A_BACKOFF_FIRST_MS),
+        max_backoff_ms: Some(MV03A_BACKOFF_MAX_MS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    })
+}
+
+/// Build the action's `pulsar` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+pub(crate) fn build_pulsar_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::pulsar::{DriverPulsarTransport, PulsarSink};
+    let config = pulsar_sink_config(record, connector_doc)?;
+    // Production write path on the maintained `pulsar` driver; the
+    // hand-written TCP framing stays for offline unit tests only.
+    let transport = DriverPulsarTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its pulsar transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = PulsarSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its pulsar sink: {error}",
             record.id
         )
     })?;
@@ -6740,6 +8110,129 @@ pub(crate) fn build_oci_streaming_sink(
     Ok(Arc::new(sink))
 }
 
+/// Build the action's `rocketmq` sink: the proxy endpoints and ACL
+/// keys come from the connector; the topic, tag and keys come from
+/// the action.
+///
+/// Values and defaults:
+/// - `servers` (alias `endpoints`): the connector's proxy endpoints;
+///   required, no invented default.
+/// - `access_key`/`secret_key`: the connector ACL pair; both or
+///   neither (a half pair is refused, it cannot sign).
+/// - `ssl`: refused when present: the proxy dial is plaintext.
+/// - `topic`: the action topic; default `TopicTest`, the reference
+///   action default.
+/// - `tag`, `keys`: the action templates (`${topic}`,
+///   `${client_id}`, `${message_id}`); absent means no tag or keys.
+/// - `strategy`: `roundrobin` (default, the reference default) or
+///   `key_dispatch`.
+/// - `template`: only the empty template is supported; it stores the
+///   whole message.
+/// - The action runtime owns batching: one row per send with a short
+///   linger and a bounded buffer.
+pub(crate) fn rocketmq_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors_enterprise::rocketmq::RocketMqSinkConfig, String> {
+    use broker_connectors_enterprise::rocketmq::RocketMqSinkConfig;
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let servers = required_nested_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["servers", "endpoints", "endpoint", "server"],
+        "servers",
+    )?;
+    let endpoints: Vec<String> = servers
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .trim_start_matches("http://")
+                .trim_start_matches("tcp://")
+                .to_string()
+        })
+        .filter(|part| !part.is_empty())
+        .collect();
+    if endpoints.is_empty() {
+        return Err(format!(
+            "connector {connector:?} is missing required field: servers (action {:?})",
+            record.id
+        ));
+    }
+    let access_key = nested_field(connector_doc, &["access_key"]).map(|v| v.into_owned());
+    let secret_key = nested_field(connector_doc, &["secret_key"]).map(|v| v.into_owned());
+    match (&access_key, &secret_key) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => {
+            return Err(format!(
+                "connector {connector:?} fields `access_key` and `secret_key` must be set together (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let access_key = access_key.filter(|key| !key.trim().is_empty());
+    let secret_key = secret_key.filter(|key| !key.trim().is_empty());
+    if access_key.is_some() != secret_key.is_some() {
+        return Err(format!(
+            "connector {connector:?} fields `access_key` and `secret_key` must be set together (action {:?})",
+            record.id
+        ));
+    }
+    let strategy = param_string(record, "strategy").unwrap_or_else(|| "roundrobin".to_string());
+    // `key_dispatch` hashes the keys. `roundrobin` sends with no keys
+    // so the proxy spreads rows.
+    let keys_template = if strategy == "key_dispatch" {
+        param_string(record, "key")
+    } else {
+        None
+    };
+    Ok(RocketMqSinkConfig {
+        endpoints,
+        topic: param_string(record, "topic").unwrap_or_else(|| "TopicTest".to_string()),
+        tag_template: param_string(record, "tag"),
+        keys_template,
+        strategy,
+        message_group_template: None,
+        access_key,
+        secret_key,
+        batch_size: Some(MV03A_BATCH_SIZE_ONE),
+        // Bounded inner buffer: 1024 rows cap the memory the proxy
+        // client holds while the runtime owns batching (RO-01).
+        buffer_capacity: Some(MV03A_PROXY_BUFFER_ROWS),
+        linger_ms: Some(MV03A_LINGER_MS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    })
+}
+
+/// Build the action's `rocketmq` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+pub(crate) fn build_rocketmq_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::rocketmq::{RocketMqSink, TcpRocketMqTransport};
+    let config = rocketmq_sink_config(record, connector_doc)?;
+    let transport = TcpRocketMqTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its rocketmq transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = RocketMqSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its rocketmq sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
 #[cfg(not(feature = "kinesis"))]
 pub(crate) fn build_kinesis_sink(
     record: &ActionRecord,
@@ -7260,8 +8753,10 @@ mod tests {
         ] {
             assert!(action_owned_kind(kind), "{kind} owns a runtime");
         }
-        assert!(!action_owned_kind("mqtt_bridge"));
-        assert!(!action_owned_kind("kafka"));
+        // MV-03a owns these runtimes now; they are covered by
+        // `action_owned_kind_covers_the_mv03a_kinds`. Timescaledb stays
+        // pending, so it still owns no runtime.
+        assert!(!action_owned_kind("timescaledb"));
     }
 
     fn mv02b_record(
@@ -9643,6 +11138,346 @@ mod tests {
             .err()
             .expect("a missing routing key refuses");
         assert!(error.contains("routing_key"), "{error}");
+    }
+
+    #[test]
+    fn canonical_action_kind_maps_every_mv03a_alias() {
+        assert_eq!(canonical_action_kind("mqtt"), "mqtt_bridge");
+        assert_eq!(canonical_action_kind("kafka_producer"), "kafka");
+        assert_eq!(canonical_action_kind("kafka_consumer"), "kafka");
+        assert_eq!(canonical_action_kind("confluent_producer"), "confluent");
+        assert_eq!(canonical_action_kind("confluent_kafka"), "confluent");
+        assert_eq!(canonical_action_kind("confluent_cloud"), "confluent");
+        assert_eq!(canonical_action_kind("rabbit"), "rabbitmq");
+        assert_eq!(canonical_action_kind("amqp"), "rabbitmq");
+        for kind in [
+            "kafka",
+            "confluent",
+            "rabbitmq",
+            "pulsar",
+            "rocketmq",
+            "mqtt_bridge",
+            "redis",
+        ] {
+            assert_eq!(canonical_action_kind(kind), kind);
+        }
+    }
+
+    #[test]
+    fn action_owned_kind_covers_the_mv03a_kinds() {
+        for kind in [
+            "kafka",
+            "kafka_producer",
+            "kafka_consumer",
+            "confluent",
+            "confluent_producer",
+            "confluent_kafka",
+            "confluent_cloud",
+            "rabbitmq",
+            "rabbit",
+            "amqp",
+            "pulsar",
+            "rocketmq",
+            "mqtt_bridge",
+            "mqtt",
+            "redis",
+        ] {
+            assert!(action_owned_kind(kind), "{kind} owns a runtime");
+        }
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "kafka",
+            "kafka:up",
+            serde_json::json!({"topic": "events"}),
+        );
+        let error = build_kafka_sink(&rec, &serde_json::json!({}))
+            .err()
+            .expect("a missing bootstrap host refuses");
+        assert!(error.contains("bootstrap_hosts"), "{error}");
+        let sasl = mv02b_record(
+            "act",
+            "kafka",
+            "kafka:up",
+            serde_json::json!({"topic": "events"}),
+        );
+        let error = build_kafka_sink(
+            &sasl,
+            &serde_json::json!({
+                "bootstrap_hosts": "h:9092",
+                "authentication": {"mechanism": "plain", "username": "u", "password": "p"},
+            }),
+        )
+        .err()
+        .expect("a SASL connector refuses");
+        assert!(error.contains("authentication"), "{error}");
+        let cfg = kafka_sink_config(
+            &mv02b_record(
+                "act",
+                "kafka",
+                "kafka:up",
+                serde_json::json!({
+                    "topic": "events",
+                    "message": {"key": "${payload.k}"},
+                    "partition_strategy": "key_dispatch",
+                    "required_acks": "leader_only",
+                }),
+            ),
+            &serde_json::json!({"bootstrap_hosts": "h:9092"}),
+        )
+        .expect("a full kafka config builds");
+        assert_eq!(cfg.bootstrap_servers, "h:9092");
+        assert_eq!(cfg.topic_template, "events");
+        assert_eq!(cfg.key_template.as_deref(), Some("${payload.k}"));
+        assert!(!cfg.random_partition);
+        assert_eq!(cfg.acks, "1");
+        let sink = build_kafka_sink(
+            &mv02b_record(
+                "act",
+                "kafka",
+                "kafka:up",
+                serde_json::json!({"topic": "events"}),
+            ),
+            &serde_json::json!({"bootstrap_hosts": "h:9092"}),
+        )
+        .expect("a full kafka pair builds");
+        assert_eq!(sink.kind(), "kafka");
+        // Defaults: random strategy spreads, acks wait for all replicas.
+        let cfg = kafka_sink_config(
+            &mv02b_record(
+                "act",
+                "kafka",
+                "kafka:up",
+                serde_json::json!({"topic": "events"}),
+            ),
+            &serde_json::json!({"bootstrap_hosts": "h:9092"}),
+        )
+        .expect("defaults build");
+        assert!(cfg.random_partition);
+        assert_eq!(cfg.acks, "all");
+        assert_eq!(cfg.key_template.as_deref(), Some("${.clientid}"));
+    }
+
+    #[cfg(feature = "confluent")]
+    #[test]
+    fn confluent_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "confluent",
+            "confluent:up",
+            serde_json::json!({"topic": "events"}),
+        );
+        let error = build_confluent_sink(&rec, &serde_json::json!({"bootstrap_hosts": "h:9092"}))
+            .err()
+            .expect("a missing API key refuses");
+        assert!(error.contains("api_key"), "{error}");
+        let error = build_confluent_sink(
+            &rec,
+            &serde_json::json!({"bootstrap_hosts": "h:9092", "api_key": "k"}),
+        )
+        .err()
+        .expect("a missing API secret refuses");
+        assert!(error.contains("api_secret"), "{error}");
+        // The reference `authentication` object supplies the same pair.
+        let cfg = confluent_sink_config(
+            &rec,
+            &serde_json::json!({
+                "bootstrap_hosts": "h:9092",
+                "authentication": {"username": "k", "password": "s"},
+                "ssl": {"enable": false},
+            }),
+        )
+        .expect("a nested credentials pair builds");
+        assert_eq!(cfg.api_key, "k");
+        assert_eq!(cfg.api_secret, "s");
+        assert_eq!(
+            cfg.security_protocol,
+            broker_connectors_enterprise::confluent::ConfluentSecurityProtocol::SaslPlaintext
+        );
+        assert_eq!(cfg.bootstrap_servers, vec!["h:9092".to_string()]);
+        assert_eq!(
+            cfg.partition_key_template.as_deref(),
+            Some("${.clientid}"),
+            "absent key defaults to the reference client id"
+        );
+        let sink = build_confluent_sink(
+            &rec,
+            &serde_json::json!({"bootstrap_hosts": "h:9092", "api_key": "k", "api_secret": "s"}),
+        )
+        .expect("a full confluent pair builds");
+        assert_eq!(sink.kind(), "confluent");
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    #[test]
+    fn rabbitmq_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "rabbitmq",
+            "rabbitmq:up",
+            serde_json::json!({"routing_key": "sensor.${topic}"}),
+        );
+        let error = build_rabbitmq_sink(&rec, &serde_json::json!({"servers": "h:5672"}))
+            .err()
+            .expect("a missing username refuses");
+        assert!(error.contains("username"), "{error}");
+        let error =
+            build_rabbitmq_sink(&rec, &serde_json::json!({"username": "u", "password": "p"}))
+                .err()
+                .expect("a missing target refuses");
+        assert!(error.contains("servers"), "{error}");
+        let cfg = rabbitmq_sink_config(
+            &rec,
+            &serde_json::json!({"servers": "h:5672", "username": "u", "password": "p"}),
+        )
+        .expect("a full rabbitmq config builds");
+        assert_eq!(cfg.endpoint, "amqp://u:p@h:5672/%2f");
+        assert_eq!(cfg.exchange, "");
+        assert_eq!(cfg.routing_key_template, "sensor.${topic}");
+        assert_eq!(cfg.delivery_mode, 1);
+        let sink = build_rabbitmq_sink(
+            &mv02b_record(
+                "act",
+                "rabbitmq",
+                "rabbitmq:up",
+                serde_json::json!({"routing_key": "k", "exchange": "e", "delivery_mode": "persistent"}),
+            ),
+            &serde_json::json!({"servers": "h:5672", "username": "u", "password": "p"}),
+        )
+        .expect("a full rabbitmq pair builds");
+        assert_eq!(sink.kind(), "rabbitmq");
+    }
+
+    #[test]
+    fn redis_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "redis",
+            "redis:up",
+            serde_json::json!({"command_template": ["HSET", "s:${topic}", "f", "${payload}"]}),
+        );
+        let error = build_redis_sink(&rec, &serde_json::json!({}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("servers"), "{error}");
+        let cfg = redis_sink_config(
+            &rec,
+            &serde_json::json!({"servers": "h:6380", "password": "pw", "database": 2}),
+        )
+        .expect("a full redis config builds");
+        assert_eq!(cfg.endpoint, "redis://:pw@h:6380/2");
+        match &cfg.command {
+            broker_connectors::redis::RedisCommandKind::Raw { argv_templates } => {
+                assert_eq!(argv_templates.len(), 4);
+                assert_eq!(argv_templates[0], "HSET");
+            }
+            other => panic!("the action builds a raw command, got {other:?}"),
+        }
+        let sink = build_redis_sink(&rec, &serde_json::json!({"servers": "h:6379"}))
+            .expect("a full redis pair builds");
+        assert_eq!(sink.kind(), "redis");
+    }
+
+    #[test]
+    fn mqtt_bridge_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "mqtt_bridge",
+            "mqtt_bridge:up",
+            serde_json::json!({"topic": "remote/${topic}", "qos": 1, "retain": true}),
+        );
+        let error = build_mqtt_bridge_sink(&rec, &serde_json::json!({}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        let cfg = mqtt_bridge_sink_config(
+            &rec,
+            &serde_json::json!({"server": "h:1883", "proto_ver": "v5"}),
+        )
+        .expect("a full bridge config builds");
+        assert_eq!(cfg.broker_address, "h:1883");
+        assert_eq!(cfg.topic_template.as_deref(), Some("remote/${topic}"));
+        assert_eq!(cfg.qos_override, Some(1));
+        assert_eq!(cfg.retain_override, Some(true));
+        assert_eq!(cfg.protocol, broker_connectors::MqttBridgeProtocol::V50);
+        assert_eq!(cfg.max_batch_size, Some(1));
+        let sink = build_mqtt_bridge_sink(&rec, &serde_json::json!({"server": "h:1883"}))
+            .expect("a full bridge pair builds");
+        assert_eq!(sink.kind(), "mqtt_bridge");
+    }
+
+    #[test]
+    fn pulsar_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "pulsar",
+            "pulsar:up",
+            serde_json::json!({"pulsar_topic": "events", "message": {"key": "${client_id}"}}),
+        );
+        let error = build_pulsar_sink(&rec, &serde_json::json!({}))
+            .err()
+            .expect("a missing service URL refuses");
+        assert!(error.contains("servers"), "{error}");
+        let error = build_pulsar_sink(&rec, &serde_json::json!({"servers": "http://h:8080"}))
+            .err()
+            .expect("an admin URL refuses");
+        assert!(error.contains("pulsar://"), "{error}");
+        let error = build_pulsar_sink(
+            &rec,
+            &serde_json::json!({"servers": "pulsar://h:6650", "authentication": "token"}),
+        )
+        .err()
+        .expect("a token auth refuses");
+        assert!(error.contains("authentication"), "{error}");
+        let cfg = pulsar_sink_config(
+            &rec,
+            &serde_json::json!({"servers": "pulsar://h:6650", "tenant": "t", "namespace": "n"}),
+        )
+        .expect("a full pulsar config builds");
+        assert_eq!(cfg.service_url, "pulsar://h:6650");
+        assert_eq!(cfg.tenant, "t");
+        assert_eq!(cfg.topic, "events");
+        assert_eq!(cfg.batch_size, Some(1));
+        assert_eq!(cfg.max_retries, Some(3));
+        let sink = build_pulsar_sink(&rec, &serde_json::json!({"servers": "pulsar://h:6650"}))
+            .expect("a full pulsar pair builds");
+        assert_eq!(sink.kind(), "pulsar");
+    }
+
+    #[test]
+    fn rocketmq_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "rocketmq",
+            "rocketmq:up",
+            serde_json::json!({"tag": "t", "key": "${client_id}"}),
+        );
+        let error = build_rocketmq_sink(&rec, &serde_json::json!({}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("servers"), "{error}");
+        let error = build_rocketmq_sink(
+            &rec,
+            &serde_json::json!({"servers": "h:9876", "access_key": "k"}),
+        )
+        .err()
+        .expect("a half ACL pair refuses");
+        assert!(error.contains("secret_key"), "{error}");
+        let cfg = rocketmq_sink_config(
+            &rec,
+            &serde_json::json!({"servers": "h:9876", "access_key": "k", "secret_key": "s"}),
+        )
+        .expect("a full rocketmq config builds");
+        assert_eq!(cfg.endpoints, vec!["h:9876".to_string()]);
+        assert_eq!(cfg.topic, "TopicTest");
+        assert_eq!(cfg.tag_template.as_deref(), Some("t"));
+        let sink = build_rocketmq_sink(&rec, &serde_json::json!({"servers": "h:9876"}))
+            .expect("a full rocketmq pair builds");
+        assert_eq!(sink.kind(), "rocketmq");
     }
 
     #[tokio::test]

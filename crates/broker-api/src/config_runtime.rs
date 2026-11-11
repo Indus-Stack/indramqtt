@@ -2143,14 +2143,14 @@ mod tests {
             .connectors
             .push(broker_config::ConnectorEntry {
                 id: "sb27-mysql".to_string(),
-                connector_type: "kafka".to_string(),
+                connector_type: "timescaledb".to_string(),
                 enable: true,
                 config: "{}".to_string(),
             });
         let (status, body) = harness
             .post_auth(
                 "/api/v1/config/reload",
-                json!({"snapshot": snapshot, "actor": "tester", "summary": "add pending mysql"}),
+                json!({"snapshot": snapshot, "actor": "tester", "summary": "add pending timescaledb"}),
                 &token,
             )
             .await;

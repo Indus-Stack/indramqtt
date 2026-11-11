@@ -8580,8 +8580,8 @@ async fn mv01_failed_boot_action_wiring_reports_error_and_alarm() {
 async fn mv01_down_webhook_server_stores_the_action_and_delivers_when_up() {
     let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
     let address = reserve.local_addr().expect("reserved address");
-    drop(reserve);
     let kernel = spawn_kernel("").await;
+    drop(reserve);
     let (status, body) = mv00_api(
         &kernel,
         reqwest::Method::POST,

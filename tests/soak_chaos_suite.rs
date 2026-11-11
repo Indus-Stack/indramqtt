@@ -35,7 +35,9 @@ use broker_connectors::{
 // the default build, so the three tests that fan out through it run only
 // on feature builds.
 #[cfg(feature = "kafka")]
-use broker_connectors::{KafkaSink, KafkaSinkConfig, MemoryKafkaTransport};
+use broker_connectors::{
+    kafka::KafkaHeaderEncodeMode, KafkaSink, KafkaSinkConfig, MemoryKafkaTransport,
+};
 // Kafka legs use the gateways (X1-10). Gate them with the tests.
 #[cfg(feature = "kafka")]
 use broker_gateway::{coap, lwm2m, ocpp, GatewayManager, GatewayProtocol};
@@ -882,11 +884,16 @@ async fn test_e2e_sequential_all_free_targets_with_rule_engine_and_zero_disk_res
                     bootstrap_servers: "127.0.0.1:9092".to_string(),
                     topic_template: "kafka-events-${topic}".to_string(),
                     partition_key_field: Some("device".to_string()),
+                    key_template: None,
                     partitions: 8,
                     client_id: "e2e-tester".to_string(),
                     acks: "all".to_string(),
                     batch_max_records: 50,
                     batch_max_bytes: 64 * 1024,
+                    random_partition: false,
+                    headers_template: None,
+                    extra_headers: Vec::new(),
+                    header_encode_mode: KafkaHeaderEncodeMode::None,
                 },
                 kafka_transport.clone(),
             )
@@ -1541,11 +1548,16 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
                 bootstrap_servers: "127.0.0.1:9092".to_string(),
                 topic_template: "tenant-alpha-events".to_string(),
                 partition_key_field: Some("device".to_string()),
+                key_template: None,
                 partitions: 4,
                 client_id: "alpha-client".to_string(),
                 acks: "all".to_string(),
                 batch_max_records: 50,
                 batch_max_bytes: 64 * 1024,
+                random_partition: false,
+                headers_template: None,
+                extra_headers: Vec::new(),
+                header_encode_mode: KafkaHeaderEncodeMode::None,
             },
             alpha_transport.clone(),
         )
@@ -1563,11 +1575,16 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
                 bootstrap_servers: "127.0.0.1:9092".to_string(),
                 topic_template: "tenant-beta-events".to_string(),
                 partition_key_field: Some("device".to_string()),
+                key_template: None,
                 partitions: 4,
                 client_id: "beta-client".to_string(),
                 acks: "all".to_string(),
                 batch_max_records: 50,
                 batch_max_bytes: 64 * 1024,
+                random_partition: false,
+                headers_template: None,
+                extra_headers: Vec::new(),
+                header_encode_mode: KafkaHeaderEncodeMode::None,
             },
             beta_transport.clone(),
         )
@@ -1729,11 +1746,16 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
                 bootstrap_servers: "127.0.0.1:9092".to_string(),
                 topic_template: "coap-kafka-events".to_string(),
                 partition_key_field: Some("sensor".to_string()),
+                key_template: None,
                 partitions: 4,
                 client_id: "coap-ingest-tester".to_string(),
                 acks: "all".to_string(),
                 batch_max_records: 10,
                 batch_max_bytes: 32 * 1024,
+                random_partition: false,
+                headers_template: None,
+                extra_headers: Vec::new(),
+                header_encode_mode: KafkaHeaderEncodeMode::None,
             },
             kafka_transport.clone(),
         )

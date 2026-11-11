@@ -236,7 +236,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["confluent_kafka", "confluent_cloud", "confluent_producer"],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -470,7 +470,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["kafka_producer", "kafka_consumer"],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -515,7 +515,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["mqtt", "mqtt-bridge", "bridge"],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -635,7 +635,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -650,7 +650,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["rabbit", "amqp"],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -665,7 +665,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -695,7 +695,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "message-broker",
         owner: "MV-03a",
-        state: KindState::Pending("MV-03a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -881,7 +881,7 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
 pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &[
-    "MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d", "MV-03b", "MV-03c",
+    "MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d", "MV-03a", "MV-03b", "MV-03c",
 ];
 
 /// Enable the test-only `test` kind for this process. Test builds call
@@ -1214,7 +1214,17 @@ mod tests {
         assert!(is_kind_ready("sparkplug_b"));
         assert!(is_kind_ready("sparkplug"));
         assert!(is_kind_ready("spb"));
-        assert!(!is_kind_ready("kafka"));
+        assert!(is_kind_ready("kafka"));
+        assert!(is_kind_ready("kafka_producer"));
+        assert!(is_kind_ready("confluent"));
+        assert!(is_kind_ready("rabbitmq"));
+        assert!(is_kind_ready("pulsar"));
+        assert!(is_kind_ready("rocketmq"));
+        assert!(is_kind_ready("mqtt_bridge"));
+        assert!(is_kind_ready("mqtt"));
+        assert!(is_kind_ready("redis"));
+        assert_eq!(kind_row("kafka").map(|row| row.owner), Some("MV-03a"));
+        assert_eq!(kind_row("mqtt_bridge").map(|row| row.owner), Some("MV-03a"));
         assert!(is_kind_ready("mysql"));
         assert!(is_kind_ready("mssql"));
         assert!(is_kind_ready("oracle"));

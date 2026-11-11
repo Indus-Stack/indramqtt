@@ -3122,16 +3122,13 @@ mod tests {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let message = "connector type kafka is not available in this broker";
+        let message = "connector type timescaledb is not available in this broker";
 
         // Create of a pending kind stores nothing.
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"id": "pending-conn", "type": "kafka",
-                       "account": "xy12345.us-east-1", "user": "indra_loader",
-                       "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY",
-                       "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"}),
+                json!({"id": "pending-conn", "type": "timescaledb"}),
                 &token,
             )
             .await;
@@ -3171,7 +3168,7 @@ mod tests {
         let (status, body) = server
             .put_auth(
                 "/api/v5/connectors/pending-keep-conn",
-                json!({"type": "kafka"}),
+                json!({"type": "timescaledb"}),
                 &token,
             )
             .await;
@@ -3188,7 +3185,7 @@ mod tests {
         let (status, body) = server
             .put_auth(
                 "/api/v5/actions/pending-keep-action",
-                json!({"type": "kafka"}),
+                json!({"type": "timescaledb"}),
                 &token,
             )
             .await;
@@ -3204,7 +3201,7 @@ mod tests {
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/pending-keep-source",
-                json!({"type": "kafka"}),
+                json!({"type": "timescaledb"}),
                 &token,
             )
             .await;
@@ -3223,7 +3220,7 @@ mod tests {
             ("/api/v5/sources", "pending-source"),
         ] {
             let (status, body) = server
-                .post_auth(path, json!({"id": id, "type": "kafka"}), &token)
+                .post_auth(path, json!({"id": id, "type": "timescaledb"}), &token)
                 .await;
             assert_eq!(status, 400, "{path} create");
             assert_eq!(body["code"], json!("ALREADY_EXISTS"), "{path}");
@@ -3237,7 +3234,7 @@ mod tests {
             "/api/v5/sources_probe",
         ] {
             let (status, body) = server
-                .post_auth(path, json!({"type": "kafka"}), &token)
+                .post_auth(path, json!({"type": "timescaledb"}), &token)
                 .await;
             assert_eq!(status, 400, "{path}");
             assert_eq!(body["code"], json!("TEST_FAILED"), "{path}");
@@ -3247,17 +3244,29 @@ mod tests {
         let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
         for row in connectors.as_array().expect("connector list") {
-            assert_ne!(row["type"], json!("kafka"), "pending connector not stored");
+            assert_ne!(
+                row["type"],
+                json!("timescaledb"),
+                "pending connector not stored"
+            );
         }
         let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
         for row in actions.as_array().expect("action list") {
-            assert_ne!(row["type"], json!("kafka"), "pending action not stored");
+            assert_ne!(
+                row["type"],
+                json!("timescaledb"),
+                "pending action not stored"
+            );
         }
         let (status, sources) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
         for row in sources.as_array().expect("source list") {
-            assert_ne!(row["type"], json!("kafka"), "pending source not stored");
+            assert_ne!(
+                row["type"],
+                json!("timescaledb"),
+                "pending source not stored"
+            );
         }
 
         let _ = server
@@ -3397,12 +3406,20 @@ mod tests {
                 "source_types lists non-ready kind {kind}"
             );
         }
-        // Every documented source kind is pending at the close of KC-00,
-        // so the listing is empty. A later family ticket adds its name.
-        assert!(
-            source_kinds.is_empty(),
-            "source_types lists no pending kind: {source_kinds:?}"
-        );
+        // MV-03a sets the message-broker source kinds ready, so the
+        // listing holds the ready names and no pending kind.
+        for ready in ["mqtt", "kafka_consumer", "rabbitmq"] {
+            assert!(
+                source_kinds.contains(&ready),
+                "source_types lists the ready kind {ready}: {source_kinds:?}"
+            );
+        }
+        for pending in ["timescaledb", "oci_streaming"] {
+            assert!(
+                !source_kinds.contains(&pending),
+                "source_types lists no pending kind {pending}: {source_kinds:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3669,8 +3686,8 @@ connector_id = "legacy-good"
         std::fs::create_dir_all(&dir).expect("create data dir");
         let pending = r#"
 [[connectors.connectors]]
-id = "pending-snowflake"
-connector_type = "kafka"
+id = "pending-timescaledb"
+connector_type = "timescaledb"
 enable = true
 config = '{}'
 
@@ -3681,10 +3698,10 @@ enable = true
 config = '{}'
 
 [[actions.actions]]
-id = "pending-snowflake"
-action_type = "kafka"
+id = "pending-timescaledb"
+action_type = "timescaledb"
 enable = true
-config = '{"connector":"pending-snowflake"}'
+config = '{"connector":"pending-timescaledb"}'
 
 [[actions.actions]]
 id = "pending-good"
@@ -3697,7 +3714,7 @@ id = "pending-rule"
 name = "pending rule"
 tenant = "default"
 topic_filter = "pending/#"
-sql_query = 'SELECT * FROM "pending/+" INTO connector("pending-snowflake")'
+sql_query = 'SELECT * FROM "pending/+" INTO connector("pending-timescaledb")'
 enabled = true
 
 [[rules.rules.actions]]
@@ -3710,7 +3727,7 @@ connector_id = "pending-good"
             Arc::new(ConfigRegistry::load_for_boot(&dir).expect("pending state loads for boot"));
         let (server, _state) = TestServer::start_with_registry(registry).await;
         let token = server.login_as_admin().await;
-        let reason = "connector type kafka is not available in this broker";
+        let reason = "connector type timescaledb is not available in this broker";
 
         let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
@@ -3718,7 +3735,7 @@ connector_id = "pending-good"
             .as_array()
             .expect("connector list")
             .iter()
-            .find(|row| row["id"] == json!("pending-snowflake"))
+            .find(|row| row["id"] == json!("pending-timescaledb"))
             .expect("pending connector kept and listed");
         assert_eq!(pending_connector["status"], json!("disconnected"));
         assert_eq!(pending_connector["status_reason"], json!(reason));
@@ -3737,7 +3754,7 @@ connector_id = "pending-good"
             .as_array()
             .expect("action list")
             .iter()
-            .find(|row| row["id"] == json!("pending-snowflake"))
+            .find(|row| row["id"] == json!("pending-timescaledb"))
             .expect("pending action kept and listed");
         assert_eq!(pending_action["status"], json!("disconnected"));
         assert_eq!(pending_action["status_reason"], json!(reason));
@@ -3755,11 +3772,11 @@ connector_id = "pending-good"
             .filter_map(|row| row["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"connector_unavailable:pending-snowflake"),
+            names.contains(&"connector_unavailable:pending-timescaledb"),
             "{names:?}"
         );
         assert!(
-            names.contains(&"action_unavailable:pending-snowflake"),
+            names.contains(&"action_unavailable:pending-timescaledb"),
             "{names:?}"
         );
 
@@ -3774,7 +3791,7 @@ connector_id = "pending-good"
         assert_eq!(status, 202, "no subscriber: accepted for the rule path");
 
         let (status, metrics) = server
-            .get_auth("/api/v5/actions/pending-snowflake/metrics", &token)
+            .get_auth("/api/v5/actions/pending-timescaledb/metrics", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(metrics["metrics"]["total"], json!(1));
@@ -5122,6 +5139,3284 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 202, "publish drives the rule path");
+    }
+
+    /// Poll one action's metrics until `failed` reaches `want`.
+    /// Exact equality: a duplicate failure count fails instead of passing.
+    async fn mv03a_wait_failed(server: &TestServer, token: &str, action: &str, want: u64) {
+        for _ in 0..400 {
+            let (status, metrics) = server
+                .get_auth(&format!("/api/v5/actions/{action}/metrics"), token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) == want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("action {action} never reached failed {want}");
+    }
+
+    /// Minimal RESP array parser for the Redis loopback fake: splits
+    /// one `*<n>` array of bulk strings into its arguments. Returns
+    /// `None` when the bytes do not hold a full array yet.
+    fn mv03a_parse_resp(frame: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
+        if !frame.starts_with(b"*") {
+            return None;
+        }
+        let mut pos = frame.iter().position(|b| *b == b'\r')?;
+        if frame.get(pos + 1) != Some(&b'\n') {
+            return None;
+        }
+        let count: usize = std::str::from_utf8(frame.get(1..pos)?).ok()?.parse().ok()?;
+        pos += 2;
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            if frame.get(pos) != Some(&b'$') {
+                return None;
+            }
+            let end = pos + frame.get(pos..)?.iter().position(|b| *b == b'\r')?;
+            if frame.get(end + 1) != Some(&b'\n') {
+                return None;
+            }
+            let len: usize = std::str::from_utf8(frame.get(pos + 1..end)?)
+                .ok()?
+                .parse()
+                .ok()?;
+            pos = end + 2;
+            if pos + len + 2 > frame.len() {
+                return None;
+            }
+            args.push(frame[pos..pos + len].to_vec());
+            pos += len;
+            if frame.get(pos..pos + 2) != Some(b"\r\n".as_slice()) {
+                return None;
+            }
+            pos += 2;
+        }
+        Some((args, pos))
+    }
+
+    /// One captured Redis command of the MV-03a Redis fake: the raw
+    /// argument list in order.
+    struct Mv03aRedisFake {
+        port: u16,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Vec<Vec<u8>>>>>,
+        _task: tokio::task::JoinHandle<()>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl Drop for Mv03aRedisFake {
+        fn drop(&mut self) {
+            // Stop the listener and every accepted connection. A
+            // dropped fake must refuse the next publish, as a stopped
+            // server does. Finished handles are not kept.
+            self._task.abort();
+            let mut connections = self.connections.lock().expect("fake tracks connections");
+            for connection in connections.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    impl Mv03aRedisFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let port = listener.local_addr().expect("fake addr").port();
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_received = std::sync::Arc::clone(&received);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let received = std::sync::Arc::clone(&task_received);
+                    let connection = tokio::spawn(async move {
+                        let mut stream = stream;
+                        let mut buf = [0u8; 4096];
+                        let mut pending = Vec::new();
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) => return,
+                                Ok(n) => n,
+                                Err(_) => return,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            while !pending.is_empty() {
+                                let Some((args, used)) = mv03a_parse_resp(&pending) else {
+                                    // A split TCP segment: wait for more.
+                                    break;
+                                };
+                                pending.drain(..used);
+                                let name = args
+                                    .first()
+                                    .map(|arg| arg.to_ascii_uppercase())
+                                    .unwrap_or_default();
+                                let reply: &[u8] = match name.as_slice() {
+                                    b"AUTH" | b"SELECT" | b"CLIENT" | b"HELLO" => b"+OK\r\n",
+                                    b"HSET" | b"SADD" | b"PUBLISH" | b"RPUSH" | b"LPUSH"
+                                    | b"SETNX" => b":1\r\n",
+                                    b"XADD" => b"$7\r\n1750000\r\n",
+                                    _ => b"+OK\r\n",
+                                };
+                                received.lock().expect("fake records").push(args);
+                                if stream.write_all(reply).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                    let mut tracked = task_connections.lock().expect("fake tracks connections");
+                    tracked.retain(|connection| !connection.is_finished());
+                    tracked.push(connection);
+                }
+            });
+            Self {
+                port,
+                received,
+                _task: task,
+                connections,
+            }
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Vec<Vec<u8>>> {
+            for _ in 0..300 {
+                let got = self.received.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "redis fake got {} commands, wanted {count}",
+                self.received.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    /// One captured RocketMQ envelope of the MV-03a RocketMQ fake.
+    struct Mv03aRocketFake {
+        port: u16,
+        received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        _task: tokio::task::JoinHandle<()>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl Drop for Mv03aRocketFake {
+        fn drop(&mut self) {
+            // Stop the listener and every accepted connection. A
+            // dropped fake must refuse the next publish, as a stopped
+            // server does. Finished handles are not kept.
+            self._task.abort();
+            let mut connections = self.connections.lock().expect("fake tracks connections");
+            for connection in connections.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    impl Mv03aRocketFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let port = listener.local_addr().expect("fake addr").port();
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_received = std::sync::Arc::clone(&received);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let received = std::sync::Arc::clone(&task_received);
+                    let connection = tokio::spawn(async move {
+                        let mut stream = stream;
+                        loop {
+                            let mut prefix = [0u8; 5];
+                            if stream.read_exact(&mut prefix).await.is_err() {
+                                return;
+                            }
+                            assert_eq!(prefix[0], 0x01, "envelope version");
+                            let len =
+                                u32::from_be_bytes([prefix[1], prefix[2], prefix[3], prefix[4]])
+                                    as usize;
+                            let mut body = vec![0u8; len];
+                            if stream.read_exact(&mut body).await.is_err() {
+                                return;
+                            }
+                            let envelope: serde_json::Value =
+                                serde_json::from_slice(&body).expect("envelope is JSON");
+                            received.lock().expect("fake records").push(envelope);
+                            let ack = br#"{"code":0}"#;
+                            let mut framed = (ack.len() as u32).to_be_bytes().to_vec();
+                            framed.extend_from_slice(ack);
+                            if stream.write_all(&framed).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    let mut tracked = task_connections.lock().expect("fake tracks connections");
+                    tracked.retain(|connection| !connection.is_finished());
+                    tracked.push(connection);
+                }
+            });
+            Self {
+                port,
+                received,
+                _task: task,
+                connections,
+            }
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<serde_json::Value> {
+            for _ in 0..300 {
+                let got = self.received.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "rocketmq fake got {} envelopes, wanted {count}",
+                self.received.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    /// Kafka protocol helpers for the MV-03a broker fakes: one
+    /// length-prefixed frame read or write, and big-endian string and
+    /// int readers over a request body.
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    async fn mv03a_kafka_read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut len_buf = [0u8; 4];
+        // A closed client socket ends the fake connection, as a real
+        // broker ends it: stop the task instead of panicking. The
+        // probe dials and closes without sending, so EOF is common.
+        stream.read_exact(&mut len_buf).await.ok()?;
+        let len = i32::from_be_bytes(len_buf);
+        if len < 0 || len as usize > 8 * 1024 * 1024 {
+            return None;
+        }
+        let len = len as usize;
+        let mut frame = vec![0u8; len];
+        stream.read_exact(&mut frame).await.ok()?;
+        Some(frame)
+    }
+
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    async fn mv03a_kafka_write_frame(stream: &mut tokio::net::TcpStream, body: &[u8]) -> bool {
+        use tokio::io::AsyncWriteExt;
+        let mut framed = (body.len() as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(body);
+        stream.write_all(&framed).await.is_ok()
+    }
+
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    fn mv03a_kafka_str(frame: &[u8], pos: &mut usize) -> Option<String> {
+        if *pos + 2 > frame.len() {
+            return None;
+        }
+        let len = i16::from_be_bytes([frame[*pos], frame[*pos + 1]]);
+        if len < 0 {
+            return None;
+        }
+        *pos += 2;
+        let len = len as usize;
+        if *pos + len > frame.len() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&frame[*pos..*pos + len]).to_string();
+        *pos += len;
+        Some(text)
+    }
+
+    /// One captured Kafka produce request of the MV-03a Kafka fake:
+    /// the raw request frame plus the api version the driver used.
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    #[derive(Clone)]
+    struct Mv03aKafkaProduced {
+        api_version: i16,
+        frame: Vec<u8>,
+    }
+
+    /// Minimal Kafka broker for the MV-03a delivery tests: answers
+    /// ApiVersions (v0-v3, newer versions close so the driver
+    /// downgrades), Metadata (v0/v1, one broker, twelve partitions)
+    /// and Produce (v0-v3 success) with canned data. Every other
+    /// api version closes the connection. The test asserts the topic,
+    /// key, value and header bytes on the wire.
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    struct Mv03aKafkaFake {
+        port: u16,
+        produced: std::sync::Arc<std::sync::Mutex<Vec<Mv03aKafkaProduced>>>,
+        auth_bytes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        error_acks: std::sync::Arc<std::sync::Mutex<bool>>,
+        _task: tokio::task::JoinHandle<()>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    impl Drop for Mv03aKafkaFake {
+        fn drop(&mut self) {
+            // Stop the listener and every accepted connection. A
+            // dropped fake must refuse the next publish, as a stopped
+            // server does. Finished handles are not kept.
+            self._task.abort();
+            let mut connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for connection in connections.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    impl Mv03aKafkaFake {
+        async fn start(sasl: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            let port = listener.local_addr().expect("fake addr").port();
+            Self::serve(listener, port, sasl).await
+        }
+
+        async fn start_on(port: u16, sasl: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener, port, sasl).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener, port: u16, sasl: bool) -> Self {
+            let produced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let auth_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let error_acks = std::sync::Arc::new(std::sync::Mutex::new(false));
+            let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_produced = std::sync::Arc::clone(&produced);
+            let task_auth = std::sync::Arc::clone(&auth_bytes);
+            let task_error = std::sync::Arc::clone(&error_acks);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let produced = std::sync::Arc::clone(&task_produced);
+                    let auth_bytes = std::sync::Arc::clone(&task_auth);
+                    let error_acks = std::sync::Arc::clone(&task_error);
+                    let connection = tokio::spawn(async move {
+                        let mut stream = stream;
+                        loop {
+                            let Some(frame) = mv03a_kafka_read_frame(&mut stream).await else {
+                                break;
+                            };
+                            if frame.len() < 8 {
+                                break;
+                            }
+                            let api_key = i16::from_be_bytes([frame[0], frame[1]]);
+                            let api_version = i16::from_be_bytes([frame[2], frame[3]]);
+                            let correlation = [frame[4], frame[5], frame[6], frame[7]];
+                            let mut response = correlation.to_vec();
+                            match api_key {
+                                // ApiVersions: v0-v3 list what this fake
+                                // speaks. Newer versions close so the
+                                // driver downgrades.
+                                18 => {
+                                    if api_version > 3 {
+                                        break;
+                                    }
+                                    // Produce 0-3, Metadata 0-0, Fetch 0-4
+                                    // (for RecordBatch headers), ApiVersions
+                                    // 0-3, SaslHandshake 0-1,
+                                    // SaslAuthenticate 0-0.
+                                    let apis: &[(i16, i16, i16)] = if sasl {
+                                        &[
+                                            (0, 0, 3),
+                                            (1, 0, 4),
+                                            (3, 0, 0),
+                                            (18, 0, 3),
+                                            (17, 0, 1),
+                                            (36, 0, 0),
+                                        ]
+                                    } else {
+                                        &[(0, 0, 3), (1, 0, 4), (3, 0, 0), (18, 0, 3)]
+                                    };
+                                    response.extend_from_slice(&0i16.to_be_bytes());
+                                    if api_version >= 3 {
+                                        // Compact array: length plus one as
+                                        // varint, then each entry with tags.
+                                        let mut len = (apis.len() + 1) as u32;
+                                        loop {
+                                            let mut byte = (len & 0x7F) as u8;
+                                            len >>= 7;
+                                            if len != 0 {
+                                                byte |= 0x80;
+                                            }
+                                            response.push(byte);
+                                            if len == 0 {
+                                                break;
+                                            }
+                                        }
+                                        for (key, min, max) in apis {
+                                            response.extend_from_slice(&key.to_be_bytes());
+                                            response.extend_from_slice(&min.to_be_bytes());
+                                            response.extend_from_slice(&max.to_be_bytes());
+                                            response.push(0);
+                                        }
+                                        response.extend_from_slice(&0i32.to_be_bytes());
+                                        response.push(0);
+                                    } else {
+                                        response
+                                            .extend_from_slice(&(apis.len() as i32).to_be_bytes());
+                                        for (key, min, max) in apis {
+                                            response.extend_from_slice(&key.to_be_bytes());
+                                            response.extend_from_slice(&min.to_be_bytes());
+                                            response.extend_from_slice(&max.to_be_bytes());
+                                        }
+                                        if api_version >= 1 {
+                                            response.extend_from_slice(&0i32.to_be_bytes());
+                                        }
+                                    }
+                                    if !mv03a_kafka_write_frame(&mut stream, &response).await {
+                                        break;
+                                    }
+                                }
+                                // SaslHandshake: PLAIN only. A newer version
+                                // closes so the driver downgrades.
+                                17 => {
+                                    if api_version > 1 {
+                                        break;
+                                    }
+                                    let mut pos = 8;
+                                    let Some(_) = mv03a_kafka_str(&frame, &mut pos) else {
+                                        break;
+                                    };
+                                    let Some(mechanism) = mv03a_kafka_str(&frame, &mut pos) else {
+                                        break;
+                                    };
+                                    if mechanism != "PLAIN" {
+                                        break;
+                                    }
+                                    response.extend_from_slice(&0i16.to_be_bytes());
+                                    response.extend_from_slice(&1i32.to_be_bytes());
+                                    response.extend_from_slice(&5i16.to_be_bytes());
+                                    response.extend_from_slice(b"PLAIN");
+                                    if !mv03a_kafka_write_frame(&mut stream, &response).await {
+                                        break;
+                                    }
+                                }
+                                // SaslAuthenticate: capture the bytes,
+                                // answer success.
+                                36 => {
+                                    if frame.len() < 8 {
+                                        break;
+                                    }
+                                    auth_bytes
+                                        .lock()
+                                        .expect("fake records")
+                                        .push(frame[8..].to_vec());
+                                    response.extend_from_slice(&0i16.to_be_bytes());
+                                    response.extend_from_slice(&(-1i16).to_be_bytes());
+                                    response.extend_from_slice(&0i32.to_be_bytes());
+                                    if !mv03a_kafka_write_frame(&mut stream, &response).await {
+                                        break;
+                                    }
+                                }
+                                // Metadata: v0/v1, one broker, one topic
+                                // with twelve partitions. A newer version
+                                // closes so the driver downgrades.
+                                3 => {
+                                    if api_version > 1 {
+                                        break;
+                                    }
+                                    if frame.len() < 12 {
+                                        break;
+                                    }
+                                    let mut pos = 8;
+                                    // Skip the client id string, then read
+                                    // the topics array.
+                                    let Some(_) = mv03a_kafka_str(&frame, &mut pos) else {
+                                        break;
+                                    };
+                                    let mut topics = Vec::new();
+                                    if pos + 4 > frame.len() {
+                                        break;
+                                    }
+                                    let count = i32::from_be_bytes([
+                                        frame[pos],
+                                        frame[pos + 1],
+                                        frame[pos + 2],
+                                        frame[pos + 3],
+                                    ]);
+                                    pos += 4;
+                                    if count < -1 || count as usize > 1024 {
+                                        break;
+                                    }
+                                    if count == -1 {
+                                        // Null array means all topics. Answer
+                                        // with no topics; the driver then
+                                        // asks for the produce topic.
+                                    } else if count > 0 {
+                                        let mut ok = true;
+                                        for _ in 0..count as usize {
+                                            let Some(topic) = mv03a_kafka_str(&frame, &mut pos)
+                                            else {
+                                                ok = false;
+                                                break;
+                                            };
+                                            topics.push(topic);
+                                        }
+                                        if !ok {
+                                            break;
+                                        }
+                                    }
+                                    // brokers: one entry, this fake.
+                                    response.extend_from_slice(&1i32.to_be_bytes());
+                                    response.extend_from_slice(&0i32.to_be_bytes());
+                                    let host = b"127.0.0.1";
+                                    response.extend_from_slice(&(host.len() as i16).to_be_bytes());
+                                    response.extend_from_slice(host);
+                                    response.extend_from_slice(&(port as i32).to_be_bytes());
+                                    if api_version == 1 {
+                                        // rack: absent.
+                                        response.extend_from_slice(&(-1i16).to_be_bytes());
+                                        response.extend_from_slice(&0i32.to_be_bytes());
+                                    }
+                                    response
+                                        .extend_from_slice(&(topics.len() as i32).to_be_bytes());
+                                    for topic in &topics {
+                                        response.extend_from_slice(&0i16.to_be_bytes());
+                                        response
+                                            .extend_from_slice(&(topic.len() as i16).to_be_bytes());
+                                        response.extend_from_slice(topic.as_bytes());
+                                        if api_version == 1 {
+                                            response.push(0);
+                                        }
+                                        response.extend_from_slice(&12i32.to_be_bytes());
+                                        for partition in 0..12i32 {
+                                            response.extend_from_slice(&0i16.to_be_bytes());
+                                            response.extend_from_slice(&partition.to_be_bytes());
+                                            response.extend_from_slice(&0i32.to_be_bytes());
+                                            response.extend_from_slice(&1i32.to_be_bytes());
+                                            response.extend_from_slice(&0i32.to_be_bytes());
+                                            response.extend_from_slice(&1i32.to_be_bytes());
+                                            response.extend_from_slice(&0i32.to_be_bytes());
+                                        }
+                                    }
+                                    if !mv03a_kafka_write_frame(&mut stream, &response).await {
+                                        break;
+                                    }
+                                }
+                                // Produce: v0/v1/v2/v3 success, echoing
+                                // the topic. A newer version closes so
+                                // the driver downgrades. An armed error
+                                // ack answers 29.
+                                0 => {
+                                    if api_version > 3 {
+                                        break;
+                                    }
+                                    if frame.len() < 14 {
+                                        break;
+                                    }
+                                    produced.lock().expect("fake records").push(
+                                        Mv03aKafkaProduced {
+                                            api_version,
+                                            frame: frame.clone(),
+                                        },
+                                    );
+                                    let mut pos = 8;
+                                    // Skip the client id string, then read
+                                    // the transactional id for v2 and v3.
+                                    let Some(_) = mv03a_kafka_str(&frame, &mut pos) else {
+                                        break;
+                                    };
+                                    if api_version >= 2 {
+                                        // transactional_id, nullable.
+                                        if pos + 2 > frame.len() {
+                                            break;
+                                        }
+                                        let len = i16::from_be_bytes([frame[pos], frame[pos + 1]]);
+                                        pos += 2;
+                                        if len >= 0 {
+                                            if len as usize > frame.len() {
+                                                break;
+                                            }
+                                            pos += len as usize;
+                                        }
+                                    }
+                                    if pos + 6 > frame.len() {
+                                        break;
+                                    }
+                                    pos += 2 + 4; // acks, timeout
+                                    if pos + 4 > frame.len() {
+                                        break;
+                                    }
+                                    let topic_count = i32::from_be_bytes([
+                                        frame[pos],
+                                        frame[pos + 1],
+                                        frame[pos + 2],
+                                        frame[pos + 3],
+                                    ]);
+                                    pos += 4;
+                                    if topic_count != 1 {
+                                        break;
+                                    }
+                                    let Some(topic) = mv03a_kafka_str(&frame, &mut pos) else {
+                                        break;
+                                    };
+                                    let error: i16 = if *error_acks.lock().expect("fake reads") {
+                                        29
+                                    } else {
+                                        0
+                                    };
+                                    // Produce success per version: v0 is
+                                    // topic, partition, error and base
+                                    // offset; v1 adds the throttle; v2 and
+                                    // v3 add the two timestamps.
+                                    response.extend_from_slice(&1i32.to_be_bytes());
+                                    response.extend_from_slice(&(topic.len() as i16).to_be_bytes());
+                                    response.extend_from_slice(topic.as_bytes());
+                                    response.extend_from_slice(&1i32.to_be_bytes());
+                                    response.extend_from_slice(&0i32.to_be_bytes());
+                                    response.extend_from_slice(&error.to_be_bytes());
+                                    response.extend_from_slice(&1i64.to_be_bytes());
+                                    if api_version >= 2 {
+                                        response.extend_from_slice(&(-1i64).to_be_bytes());
+                                        response.extend_from_slice(&(-1i64).to_be_bytes());
+                                    }
+                                    if api_version >= 1 {
+                                        response.extend_from_slice(&0i32.to_be_bytes());
+                                    }
+                                    if !mv03a_kafka_write_frame(&mut stream, &response).await {
+                                        break;
+                                    }
+                                }
+                                // An api the fake never speaks ends the
+                                // connection, as a real broker ends it.
+                                // The driver reconnects and downgrades.
+                                _ => {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    let mut tracked = task_connections.lock().expect("fake tracks connections");
+                    tracked.retain(|connection| !connection.is_finished());
+                    tracked.push(connection);
+                }
+            });
+            Self {
+                port,
+                produced,
+                auth_bytes,
+                error_acks,
+                _task: task,
+                connections,
+            }
+        }
+
+        fn arm_error_acks(&self) {
+            *self.error_acks.lock().expect("fake arms") = true;
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Mv03aKafkaProduced> {
+            for _ in 0..400 {
+                let got = self.produced.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "kafka fake got {} produces, wanted {count}",
+                self.produced.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    /// Partition index of one captured Produce request: the first
+    /// topic's first partition, parsed per api version.
+    #[cfg(any(feature = "kafka", feature = "confluent"))]
+    fn mv03a_kafka_partition(captured: &Mv03aKafkaProduced) -> i32 {
+        let frame = &captured.frame;
+        let mut pos = 8;
+        let mut cursor = pos;
+        let _ = mv03a_kafka_str(frame, &mut cursor);
+        pos = cursor;
+        if captured.api_version >= 2 {
+            let len = i16::from_be_bytes([frame[pos], frame[pos + 1]]);
+            pos += 2;
+            if len >= 0 {
+                pos += len as usize;
+            }
+        }
+        pos += 2 + 4;
+        pos += 4; // topic count
+        let mut cursor = pos;
+        let _ = mv03a_kafka_str(frame, &mut cursor);
+        cursor += 4; // partition count
+        i32::from_be_bytes([
+            frame[cursor],
+            frame[cursor + 1],
+            frame[cursor + 2],
+            frame[cursor + 3],
+        ])
+    }
+
+    /// AMQP frame helpers for the MV-03a RabbitMQ fake: method frames
+    /// carry class and method ids; content frames are captured raw.
+    #[cfg(feature = "rabbitmq")]
+    async fn mv03a_amqp_read_frame(stream: &mut tokio::net::TcpStream) -> (u8, u16, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0u8; 7];
+        stream
+            .read_exact(&mut head)
+            .await
+            .expect("fake reads the header");
+        let size = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
+        assert!(size < 8 * 1024 * 1024, "amqp frame too large: {size}");
+        let mut payload = vec![0u8; size];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("fake reads the payload");
+        let mut end = [0u8; 1];
+        stream
+            .read_exact(&mut end)
+            .await
+            .expect("fake reads the end");
+        assert_eq!(end[0], 0xCE, "amqp frame end");
+        let channel = u16::from_be_bytes([head[1], head[2]]);
+        (head[0], channel, payload)
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn mv03a_amqp_write_frame(
+        stream: &mut tokio::net::TcpStream,
+        frame_type: u8,
+        channel: u16,
+        payload: &[u8],
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut frame = vec![frame_type];
+        frame.extend_from_slice(&channel.to_be_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame.push(0xCE);
+        stream
+            .write_all(&frame)
+            .await
+            .expect("fake writes the frame");
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn mv03a_amqp_write_method(
+        stream: &mut tokio::net::TcpStream,
+        channel: u16,
+        class_id: u16,
+        method_id: u16,
+        args: &[u8],
+    ) {
+        let mut payload = class_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(&method_id.to_be_bytes());
+        payload.extend_from_slice(args);
+        mv03a_amqp_write_frame(stream, 1, channel, &payload).await;
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn mv03a_amqp_read_method(
+        stream: &mut tokio::net::TcpStream,
+    ) -> (u16, (u16, u16), Vec<u8>) {
+        let (frame_type, channel, payload) = mv03a_amqp_read_frame(stream).await;
+        assert_eq!(frame_type, 1, "fake reads a method frame");
+        let class_id = u16::from_be_bytes([payload[0], payload[1]]);
+        let method_id = u16::from_be_bytes([payload[2], payload[3]]);
+        (channel, (class_id, method_id), payload[4..].to_vec())
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    fn mv03a_amqp_longstr(text: &[u8]) -> Vec<u8> {
+        let mut out = (text.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(text);
+        out
+    }
+
+    /// One captured RabbitMQ publish triple of the MV-03a fake: the
+    /// method, content-header and body frames in order.
+    #[cfg(feature = "rabbitmq")]
+    #[derive(Clone)]
+    struct Mv03aRabbitPublished {
+        method: Vec<u8>,
+        header: Vec<u8>,
+        body: Vec<u8>,
+    }
+
+    /// Minimal AMQP broker for the MV-03a delivery tests: scripted
+    /// PLAIN handshake, then captures publish triples and answers
+    /// publisher confirms with Basic.Ack. An armed `nack_all` flag
+    /// answers every publish with Basic.Nack instead, which the
+    /// driver reports as a failed forward.
+    #[cfg(feature = "rabbitmq")]
+    struct Mv03aRabbitFake {
+        port: u16,
+        published: std::sync::Arc<std::sync::Mutex<Vec<Mv03aRabbitPublished>>>,
+        nack_all: std::sync::Arc<std::sync::Mutex<bool>>,
+        _task: tokio::task::JoinHandle<()>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    impl Drop for Mv03aRabbitFake {
+        fn drop(&mut self) {
+            // Stop the listener and every accepted connection. A
+            // dropped fake must refuse the next publish, as a stopped
+            // server does. Finished handles are not kept.
+            self._task.abort();
+            let mut connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for connection in connections.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    impl Mv03aRabbitFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            use tokio::io::AsyncReadExt;
+            let port = listener.local_addr().expect("fake addr").port();
+            let published = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let nack_all = std::sync::Arc::new(std::sync::Mutex::new(false));
+            let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_published = std::sync::Arc::clone(&published);
+            let task_nack = std::sync::Arc::clone(&nack_all);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let published = std::sync::Arc::clone(&task_published);
+                    let nack_all = std::sync::Arc::clone(&task_nack);
+                    let connection = tokio::spawn(async move {
+                        let mut stream = stream;
+                        // Protocol header.
+                        let mut header = [0u8; 8];
+                        if stream.read_exact(&mut header).await.is_err() {
+                            return;
+                        }
+                        assert_eq!(&header, b"AMQP\x00\x00\x09\x01", "protocol header");
+                        // Connection.Start: version, properties, PLAIN.
+                        let mut start = vec![0u8, 9];
+                        start.extend_from_slice(&0u32.to_be_bytes());
+                        start.extend_from_slice(&mv03a_amqp_longstr(b"PLAIN"));
+                        start.extend_from_slice(&mv03a_amqp_longstr(b"en_US"));
+                        mv03a_amqp_write_method(&mut stream, 0, 10, 10, &start).await;
+                        // Start-Ok names PLAIN with credentials.
+                        let (_, method, args) = mv03a_amqp_read_method(&mut stream).await;
+                        assert_eq!(method, (10, 11), "connection start-ok");
+                        assert!(
+                            args.windows(5).any(|w| w == b"PLAIN"),
+                            "client offers PLAIN"
+                        );
+                        // Tune bounds the connection. Reason: frame-max 0 means
+                        // no limit and the driver allocates 32 frames, which
+                        // exhausts memory. RabbitMQ uses 131072.
+                        let tune: &[u8] = &[0x07, 0xFF, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00];
+                        mv03a_amqp_write_method(&mut stream, 0, 10, 30, tune).await;
+                        let _ = mv03a_amqp_read_method(&mut stream).await; // Tune-Ok
+                        let (_, method, _) = mv03a_amqp_read_method(&mut stream).await; // Open
+                        assert_eq!(method, (10, 40), "connection open");
+                        mv03a_amqp_write_method(&mut stream, 0, 10, 41, &[0]).await;
+                        // Channel open.
+                        let (channel, method, _) = mv03a_amqp_read_method(&mut stream).await;
+                        assert_eq!(method, (20, 10), "channel open");
+                        mv03a_amqp_write_method(&mut stream, channel, 20, 11, &[0, 0, 0, 0]).await;
+                        // Confirm.Select.
+                        let (_, method, _) = mv03a_amqp_read_method(&mut stream).await;
+                        assert_eq!(method, (85, 10), "confirm select");
+                        mv03a_amqp_write_method(&mut stream, channel, 85, 11, &[]).await;
+                        // Publish triples: capture, then ack or nack. Each
+                        // publish is a method frame, a header frame and a
+                        // body frame. The driver awaits the ack.
+                        let mut tag: u64 = 0;
+                        loop {
+                            let (close_channel, method, method_payload) =
+                                mv03a_amqp_read_method(&mut stream).await;
+                            // An update drops the old client. The old client closes its channel.
+                            // Answer the close and stop. Only a publish counts.
+                            if method == (20, 40) {
+                                mv03a_amqp_write_method(&mut stream, close_channel, 20, 41, &[])
+                                    .await;
+                                break;
+                            }
+                            if method == (10, 60) {
+                                mv03a_amqp_write_method(&mut stream, 0, 10, 61, &[]).await;
+                                break;
+                            }
+                            assert_eq!(method, (60, 40), "basic publish");
+                            let (header_type, _, header_payload) =
+                                mv03a_amqp_read_frame(&mut stream).await;
+                            assert_eq!(header_type, 2, "content header frame");
+                            let (body_type, _, body_payload) =
+                                mv03a_amqp_read_frame(&mut stream).await;
+                            assert_eq!(body_type, 3, "content body frame");
+                            tag += 1;
+                            published
+                                .lock()
+                                .expect("fake records")
+                                .push(Mv03aRabbitPublished {
+                                    method: method_payload.clone(),
+                                    header: header_payload.clone(),
+                                    body: body_payload.clone(),
+                                });
+                            let nack = *nack_all.lock().expect("fake reads");
+                            // Basic.Ack and Basic.Nack carry the flags
+                            // in one octet: multiple and requeue bits.
+                            let mut args = tag.to_be_bytes().to_vec();
+                            args.push(if nack { 1 } else { 0 });
+                            let method_id = if nack { 120u16 } else { 80u16 };
+                            mv03a_amqp_write_method(&mut stream, channel, 60, method_id, &args)
+                                .await;
+                        }
+                    });
+                    let mut tracked = task_connections.lock().expect("fake tracks connections");
+                    tracked.retain(|connection| !connection.is_finished());
+                    tracked.push(connection);
+                }
+            });
+            Self {
+                port,
+                published,
+                nack_all,
+                _task: task,
+                connections,
+            }
+        }
+
+        fn arm_nacks(&self) {
+            *self.nack_all.lock().expect("fake arms") = true;
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Mv03aRabbitPublished> {
+            for _ in 0..300 {
+                let got = self.published.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "rabbit fake got {} publishes, wanted {count}",
+                self.published.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    /// MQTT variable-byte integer reader for the bridge fake.
+    async fn mv03a_mqtt_read_varint(stream: &mut tokio::net::TcpStream) -> Option<usize> {
+        use tokio::io::AsyncReadExt;
+        let mut value = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.ok()?;
+            value |= ((byte[0] & 0x7F) as usize) << shift;
+            if byte[0] & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+            if shift > 21 {
+                return None;
+            }
+        }
+    }
+
+    /// One captured MQTT publish of the MV-03a bridge fake.
+    #[derive(Clone)]
+    struct Mv03aMqttPublished {
+        topic: String,
+        payload: Vec<u8>,
+        qos: u8,
+        retain: bool,
+    }
+
+    /// Minimal MQTT broker for the MV-03a bridge tests: answers
+    /// CONNECT with CONNACK, captures PUBLISH frames and answers QoS
+    /// 1 with PUBACK. The test asserts the remapped topic, the body,
+    /// the QoS and the retain flag on the wire.
+    struct Mv03aMqttFake {
+        port: u16,
+        published: std::sync::Arc<std::sync::Mutex<Vec<Mv03aMqttPublished>>>,
+        _task: tokio::task::JoinHandle<()>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl Drop for Mv03aMqttFake {
+        fn drop(&mut self) {
+            // Stop the listener and every accepted connection. A
+            // dropped fake must refuse the next publish, as a stopped
+            // server does. Finished handles are not kept.
+            self._task.abort();
+            let mut connections = self.connections.lock().expect("fake tracks connections");
+            for connection in connections.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    impl Mv03aMqttFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let port = listener.local_addr().expect("fake addr").port();
+            let published = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_published = std::sync::Arc::clone(&published);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let published = std::sync::Arc::clone(&task_published);
+                    let connection = tokio::spawn(async move {
+                        let mut stream = stream;
+                        // CONNECT: fixed header, length, body.
+                        let mut fixed = [0u8; 1];
+                        if stream.read_exact(&mut fixed).await.is_err() {
+                            return;
+                        }
+                        assert_eq!(fixed[0] >> 4, 1, "CONNECT packet");
+                        let len = mv03a_mqtt_read_varint(&mut stream)
+                            .await
+                            .expect("connect length");
+                        let mut body = vec![0u8; len];
+                        if stream.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        // CONNACK: session 0, code 0.
+                        if stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.is_err() {
+                            return;
+                        }
+                        loop {
+                            let mut head = [0u8; 1];
+                            if stream.read_exact(&mut head).await.is_err() {
+                                return;
+                            }
+                            match head[0] >> 4 {
+                                3 => {
+                                    let qos = (head[0] >> 1) & 0x03;
+                                    let retain = head[0] & 0x01 == 1;
+                                    let len = mv03a_mqtt_read_varint(&mut stream)
+                                        .await
+                                        .expect("publish length");
+                                    let mut body = vec![0u8; len];
+                                    if stream.read_exact(&mut body).await.is_err() {
+                                        return;
+                                    }
+                                    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                                    let topic = String::from_utf8_lossy(&body[2..2 + topic_len])
+                                        .to_string();
+                                    let mut rest = &body[2 + topic_len..];
+                                    let packet_id = if qos > 0 {
+                                        let id = u16::from_be_bytes([rest[0], rest[1]]);
+                                        rest = &rest[2..];
+                                        id
+                                    } else {
+                                        0
+                                    };
+                                    published.lock().expect("fake records").push(
+                                        Mv03aMqttPublished {
+                                            topic,
+                                            payload: rest.to_vec(),
+                                            qos,
+                                            retain,
+                                        },
+                                    );
+                                    if qos == 1
+                                        && stream
+                                            .write_all(&[
+                                                0x40,
+                                                0x02,
+                                                (packet_id >> 8) as u8,
+                                                packet_id as u8,
+                                            ])
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                12 => {
+                                    // PINGREQ: answer PINGRESP.
+                                    let _ = mv03a_mqtt_read_varint(&mut stream).await;
+                                    if stream.write_all(&[0xD0, 0x00]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                14 => {
+                                    // DISCONNECT: stop reading.
+                                    return;
+                                }
+                                other => panic!("fake speaks no mqtt packet {other}"),
+                            }
+                        }
+                    });
+                    let mut tracked = task_connections.lock().expect("fake tracks connections");
+                    tracked.retain(|connection| !connection.is_finished());
+                    tracked.push(connection);
+                }
+            });
+            Self {
+                port,
+                published,
+                _task: task,
+                connections,
+            }
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Mv03aMqttPublished> {
+            for _ in 0..300 {
+                let got = self.published.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "mqtt fake got {} publishes, wanted {count}",
+                self.published.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    /// Protobuf helpers for the MV-03a Pulsar fake: varint fields and
+    /// length-delimited fields with real PulsarApi field numbers.
+    fn mv03a_pb_varint(field: u32, value: u64, out: &mut Vec<u8>) {
+        let mut tag = u64::from(field) << 3;
+        loop {
+            let mut byte = (tag & 0x7F) as u8;
+            tag >>= 7;
+            if tag != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if tag == 0 {
+                break;
+            }
+        }
+        let mut value = value;
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn mv03a_pb_string(field: u32, value: &str, out: &mut Vec<u8>) {
+        let mut tag = (u64::from(field) << 3) | 2;
+        loop {
+            let mut byte = (tag & 0x7F) as u8;
+            tag >>= 7;
+            if tag != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if tag == 0 {
+                break;
+            }
+        }
+        let mut len = value.len() as u64;
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn mv03a_pb_sub(field: u32, body: &[u8], out: &mut Vec<u8>) {
+        mv03a_pb_string(field, "", out);
+        out.truncate(out.len() - 1);
+        let mut len = body.len() as u64;
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(body);
+    }
+
+    /// Scan one protobuf command for a varint field value.
+    fn mv03a_pb_find_varint(command: &[u8], want: u32) -> Option<u64> {
+        let mut pos = 0;
+        while pos < command.len() {
+            let (tag, used) = mv03a_pb_read_varint(&command[pos..])?;
+            pos += used;
+            let field = (tag >> 3) as u32;
+            let wire = (tag & 0x07) as u32;
+            match wire {
+                0 => {
+                    let (value, used) = mv03a_pb_read_varint(&command[pos..])?;
+                    if field == want {
+                        return Some(value);
+                    }
+                    pos += used;
+                }
+                2 => {
+                    let (len, used) = mv03a_pb_read_varint(&command[pos..])?;
+                    pos += used;
+                    pos += len as usize;
+                }
+                1 => pos += 8,
+                5 => pos += 4,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn mv03a_pb_read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        for (index, byte) in buf.iter().enumerate() {
+            value |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                return Some((value, index + 1));
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Scan one protobuf command for a length-delimited field.
+    fn mv03a_pb_find_bytes(command: &[u8], want: u32) -> Option<&[u8]> {
+        let mut pos = 0;
+        while pos < command.len() {
+            let (tag, used) = mv03a_pb_read_varint(&command[pos..])?;
+            pos += used;
+            let field = (tag >> 3) as u32;
+            let wire = (tag & 0x07) as u32;
+            match wire {
+                0 => {
+                    let (_, used) = mv03a_pb_read_varint(&command[pos..])?;
+                    pos += used;
+                }
+                2 => {
+                    let (len, used) = mv03a_pb_read_varint(&command[pos..])?;
+                    pos += used;
+                    if field == want {
+                        return Some(&command[pos..pos + len as usize]);
+                    }
+                    pos += len as usize;
+                }
+                1 => pos += 8,
+                5 => pos += 4,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Wrap one command in a Pulsar frame: total size, command size,
+    /// command bytes.
+    fn mv03a_pulsar_frame(command: &[u8]) -> Vec<u8> {
+        let mut frame = ((command.len() + 4) as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&(command.len() as u32).to_be_bytes());
+        frame.extend_from_slice(command);
+        frame
+    }
+
+    /// Read one Pulsar frame: total size, command size, command bytes,
+    /// plus the optional message payload after the magic.
+    async fn mv03a_pulsar_read_frame(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut total = [0u8; 4];
+        // A closed client socket ends the fake connection, as a real
+        // broker ends it: stop the task instead of panicking.
+        stream.read_exact(&mut total).await.ok()?;
+        let total = u32::from_be_bytes(total) as usize;
+        if total < 4 {
+            return None;
+        }
+        let mut command_size = [0u8; 4];
+        stream.read_exact(&mut command_size).await.ok()?;
+        let command_size = u32::from_be_bytes(command_size) as usize;
+        if command_size > total - 4 {
+            return None;
+        }
+        let mut command = vec![0u8; command_size];
+        stream.read_exact(&mut command).await.ok()?;
+        let mut rest = vec![0u8; total - 4 - command_size];
+        if !rest.is_empty() {
+            stream.read_exact(&mut rest).await.ok()?;
+        }
+        // Split metadata and payload after the 0x0E01 magic.
+        if rest.len() > 10 && rest[0] == 0x0E && rest[1] == 0x01 {
+            let checksum_len = 4;
+            let meta_len = u32::from_be_bytes([
+                rest[2 + checksum_len],
+                rest[3 + checksum_len],
+                rest[4 + checksum_len],
+                rest[5 + checksum_len],
+            ]) as usize;
+            let meta_start = 2 + checksum_len + 4;
+            if meta_start + meta_len > rest.len() {
+                return None;
+            }
+            let metadata = rest[meta_start..meta_start + meta_len].to_vec();
+            let payload = rest[meta_start + meta_len..].to_vec();
+            Some((command, metadata, payload))
+        } else {
+            Some((command, Vec::new(), rest))
+        }
+    }
+
+    /// One captured Pulsar message of the MV-03a Pulsar fake.
+    #[derive(Clone)]
+    struct Mv03aPulsarMessage {
+        topic_path: String,
+        payload: Vec<u8>,
+        partition_key: Option<String>,
+        properties: Vec<(String, String)>,
+    }
+
+    /// Minimal Pulsar broker for the MV-03a delivery tests: answers
+    /// Connect, PartitionedMetadata (zero partitions), Lookup
+    /// (Connect to self), Producer and Send with canned receipts.
+    /// The test asserts the topic path, the payload, the partition
+    /// key and the properties on the wire.
+    struct Mv03aPulsarFake {
+        port: u16,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Mv03aPulsarMessage>>>,
+        error_sends: std::sync::Arc<std::sync::Mutex<bool>>,
+        _task: tokio::task::JoinHandle<()>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl Drop for Mv03aPulsarFake {
+        fn drop(&mut self) {
+            // Stop the listener and every accepted connection. A
+            // dropped fake must refuse the next publish, as a stopped
+            // server does. Finished handles are not kept.
+            self._task.abort();
+            let mut connections = self.connections.lock().expect("fake tracks connections");
+            for connection in connections.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    impl Mv03aPulsarFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            use tokio::io::AsyncWriteExt;
+            let port = listener.local_addr().expect("fake addr").port();
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let error_sends = std::sync::Arc::new(std::sync::Mutex::new(false));
+            let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task_received = std::sync::Arc::clone(&received);
+            let task_errors = std::sync::Arc::clone(&error_sends);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let received = std::sync::Arc::clone(&task_received);
+                    let error_sends = std::sync::Arc::clone(&task_errors);
+                    let connection = tokio::spawn(async move {
+                        let mut stream = stream;
+                        let mut last_topic = String::new();
+                        // BaseCommand helpers, real PulsarApi numbers:
+                        // type field 1; Connect 2; Connected 3; Producer
+                        // 5; Send 6; SendReceipt 7; ProducerSuccess 17;
+                        // Ping 18; Pong 19; PartitionedMetadata 21 and
+                        // its response 22; Lookup 23 and its response 24.
+                        let command = |message_type: u64, body: &[u8]| {
+                            let mut command = Vec::new();
+                            mv03a_pb_varint(1, message_type, &mut command);
+                            command.extend_from_slice(body);
+                            command
+                        };
+                        loop {
+                            let Some((frame, metadata, payload)) =
+                                mv03a_pulsar_read_frame(&mut stream).await
+                            else {
+                                break;
+                            };
+                            let message_type =
+                                mv03a_pb_find_varint(&frame, 1).expect("command carries a type");
+                            match message_type as u32 {
+                                2 => {
+                                    // Connect: Connected with a version.
+                                    let mut body = Vec::new();
+                                    mv03a_pb_string(1, "pulsar-fake-3.0", &mut body);
+                                    mv03a_pb_varint(2, 12, &mut body);
+                                    let frame = command(3, &{
+                                        let mut connected = Vec::new();
+                                        mv03a_pb_sub(3, &body, &mut connected);
+                                        connected
+                                    });
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes connected");
+                                }
+                                21 => {
+                                    // PartitionedMetadata: zero
+                                    // partitions for a plain topic.
+                                    let inner = mv03a_pb_find_bytes(&frame, 21)
+                                        .expect("partitioned metadata body");
+                                    let request_id =
+                                        mv03a_pb_find_varint(inner, 2).expect("request id");
+                                    let mut body = Vec::new();
+                                    mv03a_pb_varint(1, 0, &mut body);
+                                    mv03a_pb_varint(2, request_id, &mut body);
+                                    mv03a_pb_varint(3, 0, &mut body);
+                                    let mut response = Vec::new();
+                                    mv03a_pb_sub(22, &body, &mut response);
+                                    let frame = command(22, &response);
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes partitioned metadata");
+                                }
+                                23 => {
+                                    // Lookup: Connect to this fake.
+                                    let inner =
+                                        mv03a_pb_find_bytes(&frame, 23).expect("lookup body");
+                                    let request_id =
+                                        mv03a_pb_find_varint(inner, 2).expect("request id");
+                                    let mut body = Vec::new();
+                                    mv03a_pb_string(
+                                        1,
+                                        &format!("pulsar://127.0.0.1:{port}"),
+                                        &mut body,
+                                    );
+                                    mv03a_pb_varint(3, 1, &mut body);
+                                    mv03a_pb_varint(4, request_id, &mut body);
+                                    mv03a_pb_varint(5, 1, &mut body);
+                                    let mut response = Vec::new();
+                                    mv03a_pb_sub(24, &body, &mut response);
+                                    let frame = command(24, &response);
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes lookup");
+                                }
+                                5 => {
+                                    // Producer: success with the name.
+                                    let inner =
+                                        mv03a_pb_find_bytes(&frame, 5).expect("producer body");
+                                    let request_id =
+                                        mv03a_pb_find_varint(inner, 3).expect("request id");
+                                    if let Some(topic) = mv03a_pb_find_bytes(inner, 1) {
+                                        last_topic = String::from_utf8_lossy(topic).to_string();
+                                    }
+                                    let mut body = Vec::new();
+                                    mv03a_pb_varint(1, request_id, &mut body);
+                                    mv03a_pb_string(2, "pulsar-fake-producer", &mut body);
+                                    let mut response = Vec::new();
+                                    mv03a_pb_sub(17, &body, &mut response);
+                                    let frame = command(17, &response);
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes producer success");
+                                }
+                                6 => {
+                                    // Send: capture the message, answer
+                                    // the receipt - or an armed
+                                    // authorization error.
+                                    let inner = mv03a_pb_find_bytes(&frame, 6).expect("send body");
+                                    let producer_id =
+                                        mv03a_pb_find_varint(inner, 1).expect("producer id");
+                                    let sequence_id =
+                                        mv03a_pb_find_varint(inner, 2).expect("sequence id");
+                                    if *error_sends.lock().expect("fake reads") {
+                                        let mut body = Vec::new();
+                                        mv03a_pb_varint(1, producer_id, &mut body);
+                                        mv03a_pb_varint(2, sequence_id, &mut body);
+                                        mv03a_pb_varint(3, 4, &mut body);
+                                        let mut response = Vec::new();
+                                        mv03a_pb_sub(8, &body, &mut response);
+                                        let frame = command(8, &response);
+                                        stream
+                                            .write_all(&mv03a_pulsar_frame(&frame))
+                                            .await
+                                            .expect("fake writes send error");
+                                        continue;
+                                    }
+                                    let mut properties = Vec::new();
+                                    let mut cursor = 0;
+                                    while let Some((tag, used)) =
+                                        mv03a_pb_read_varint(&metadata[cursor..])
+                                    {
+                                        cursor += used;
+                                        let field = (tag >> 3) as u32;
+                                        let wire = (tag & 0x07) as u32;
+                                        if wire != 2 {
+                                            if wire == 0 {
+                                                let (_, used) =
+                                                    mv03a_pb_read_varint(&metadata[cursor..])
+                                                        .expect("metadata varint");
+                                                cursor += used;
+                                            } else {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                        let (len, used) = mv03a_pb_read_varint(&metadata[cursor..])
+                                            .expect("metadata length");
+                                        cursor += used;
+                                        let bytes = &metadata[cursor..cursor + len as usize];
+                                        cursor += len as usize;
+                                        if field == 4 {
+                                            // properties: repeated KeyValue.
+                                            let key = mv03a_pb_find_bytes(bytes, 1)
+                                                .map(|b| String::from_utf8_lossy(b).to_string());
+                                            let value = mv03a_pb_find_bytes(bytes, 2)
+                                                .map(|b| String::from_utf8_lossy(b).to_string());
+                                            if let (Some(key), Some(value)) = (key, value) {
+                                                properties.push((key, value));
+                                            }
+                                        }
+                                    }
+                                    let partition_key = mv03a_pb_find_bytes(&metadata, 6)
+                                        .map(|b| String::from_utf8_lossy(b).to_string());
+                                    // The topic path stays in the fake:
+                                    // the driver opens one producer per
+                                    // path before it sends.
+                                    received.lock().expect("fake records").push(
+                                        Mv03aPulsarMessage {
+                                            topic_path: last_topic.clone(),
+                                            payload,
+                                            partition_key,
+                                            properties,
+                                        },
+                                    );
+                                    let mut body = Vec::new();
+                                    mv03a_pb_varint(1, producer_id, &mut body);
+                                    mv03a_pb_varint(2, sequence_id, &mut body);
+                                    let mut response = Vec::new();
+                                    mv03a_pb_sub(7, &body, &mut response);
+                                    let frame = command(7, &response);
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes receipt");
+                                }
+                                18 => {
+                                    // Ping: Pong.
+                                    let frame = command(19, &[]);
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes pong");
+                                }
+                                other @ 15 | other @ 16 => {
+                                    // Close producer or consumer: answer
+                                    // success. The driver sends this on
+                                    // cleanup. A real broker answers it.
+                                    let inner = mv03a_pb_find_bytes(&frame, other).unwrap_or(&[]);
+                                    let request_id = mv03a_pb_find_varint(inner, 2).unwrap_or(0);
+                                    let mut body = Vec::new();
+                                    mv03a_pb_varint(1, request_id, &mut body);
+                                    let mut response = Vec::new();
+                                    mv03a_pb_sub(13, &body, &mut response);
+                                    let frame = command(13, &response);
+                                    stream
+                                        .write_all(&mv03a_pulsar_frame(&frame))
+                                        .await
+                                        .expect("fake writes close success");
+                                }
+                                other => panic!("fake speaks no pulsar command {other}"),
+                            }
+                        }
+                    });
+                    let mut tracked = task_connections.lock().expect("fake tracks connections");
+                    tracked.retain(|connection| !connection.is_finished());
+                    tracked.push(connection);
+                }
+            });
+            Self {
+                port,
+                received,
+                error_sends,
+                _task: task,
+                connections,
+            }
+        }
+
+        fn arm_error_sends(&self) {
+            *self.error_sends.lock().expect("fake arms") = true;
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Mv03aPulsarMessage> {
+            for _ in 0..300 {
+                let got = self.received.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "pulsar fake got {} messages, wanted {count}",
+                self.received.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mv03a_redis_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-redis");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aRedisFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let servers = format!("127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "redis", "name": "mv03a-redis", "servers": servers, "password": "pw"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "redis", "name": "mv03a-redis-bad"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a serverless connector refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("servers"),
+            "{body}"
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "redis", "name": "mv03a-redis-act",
+                       "connector": "mv03a-redis",
+                       "parameters": {"command_template": ["HSET", "sensors:${topic}", "payload", "${payload}"]}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-redis-rule", "name": "mv03a-redis-rule",
+                       "sql": "SELECT * FROM \"mv03a/redis\"", "actions": ["mv03a-redis-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\":1}").await;
+        let got = fake.wait_for(3).await;
+        let auth = got
+            .iter()
+            .find(|args| args.first().is_some_and(|name| name == b"AUTH"))
+            .expect("the driver authenticates");
+        assert_eq!(auth[1], b"pw".to_vec());
+        let hset = got
+            .iter()
+            .find(|args| args.first().is_some_and(|name| name == b"HSET"))
+            .expect("the driver sends HSET");
+        assert_eq!(hset[1], b"sensors:mv03a/redis".to_vec());
+        assert_eq!(hset[2], b"payload".to_vec());
+        assert_eq!(hset[3], br#"{"v":1}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-redis-act", 1).await;
+
+        // A value with spaces stays one argument on the wire.
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\": \"x y\"}").await;
+        let got = fake.wait_for(4).await;
+        let spaces = got
+            .iter()
+            .filter(|args| args.first().is_some_and(|name| name == b"HSET"))
+            .nth(1)
+            .expect("a second HSET");
+        assert_eq!(spaces[3], br#"{"v": "x y"}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-redis-act", 2).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-redis-act",
+                json!({"type": "redis", "name": "mv03a-redis-act",
+                       "connector": "mv03a-redis",
+                       "parameters": {"command_template": ["HSET", "upd:${topic}", "f", "${payload}"]}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\":3}").await;
+        let got = fake.wait_for(5).await;
+        let upd = got
+            .iter()
+            .find(|args| {
+                args.first().is_some_and(|name| name == b"HSET")
+                    && args.get(1).is_some_and(|key| key == b"upd:mv03a/redis")
+            })
+            .expect("updated target on the wire");
+        assert_eq!(upd[1], b"upd:mv03a/redis".to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-redis-act", 3).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-redis-act",
+                json!({"type": "redis", "name": "mv03a-redis-act",
+                       "connector": "mv03a-redis",
+                       "parameters": {"command_template": []}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an empty command refuses: {body}");
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\":4}").await;
+        let got = fake.wait_for(6).await;
+        let kept = got
+            .iter()
+            .filter(|args| {
+                args.first().is_some_and(|name| name == b"HSET")
+                    && args.get(1).is_some_and(|key| key == b"upd:mv03a/redis")
+            })
+            .nth(1)
+            .expect("refused update keeps the old target");
+        assert_eq!(
+            kept[1],
+            b"upd:mv03a/redis".to_vec(),
+            "the refused update keeps the old target"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-redis-act", 4).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\":5}").await;
+        mv03a_wait_failed(&server, &token, "mv03a-redis-act", 1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let fake = Mv03aRedisFake::start_on(down_port).await;
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\":6}").await;
+        let got = fake.wait_for(3).await;
+        let resumed = got
+            .iter()
+            .find(|args| {
+                args.first().is_some_and(|name| name == b"HSET")
+                    && args.iter().any(|arg| arg == br#"{"v":6}"#)
+            })
+            .expect("restart redelivers");
+        assert_eq!(resumed[3], br#"{"v":6}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-redis-act", 5).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-redis",
+                json!({"type": "redis", "name": "mv03a-redis",
+                       "servers": format!("127.0.0.1:{}", fake.port),
+                       "password": "pw"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03a-redis", &token)
+            .await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aRedisFake::start_on(restart_port).await;
+        mv02b_publish(&server, &token, "mv03a/redis", "{\"v\":7}").await;
+        let got = fake.wait_for(1).await;
+        let resumed = got
+            .iter()
+            .find(|args| {
+                args.first().is_some_and(|name| name == b"HSET")
+                    && args.iter().any(|arg| arg == br#"{"v":7}"#)
+            })
+            .expect("delivery resumes after the restart");
+        assert_eq!(resumed[3], br#"{"v":7}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-redis-act", 1).await;
+        drop(_state);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03a_rocketmq_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-rocketmq");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aRocketFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let servers = format!("127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "rocketmq", "name": "mv03a-rmq", "servers": servers,
+                       "access_key": "k", "secret_key": "s"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "rocketmq", "name": "mv03a-rmq-half",
+                       "servers": servers, "access_key": "k"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "a half ACL pair refuses at build, tested here at create: {body}"
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "rocketmq", "name": "mv03a-rmq-act",
+                       "connector": "mv03a-rmq",
+                       "parameters": {"topic": "events", "tag": "t1", "key": "${client_id}-${message_id}", "strategy": "key_dispatch"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-rmq-rule", "name": "mv03a-rmq-rule",
+                       "sql": "SELECT * FROM \"mv03a/rocketmq\"", "actions": ["mv03a-rmq-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/rocketmq",
+            "{\"client_id\":\"edge-5\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0]["topic"], json!("events"));
+        let messages = got[0]["messages"].as_array().expect("envelope messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["system_properties"]["tag"], json!("t1"));
+        assert_eq!(
+            messages[0]["system_properties"]["keys"],
+            json!(["edge-5-0"])
+        );
+        assert!(
+            got[0]["authorization"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("MQ k:"),
+            "the keyed envelope carries a signature"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rmq-act", 1).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-rmq-act",
+                json!({"type": "rocketmq", "name": "mv03a-rmq-act",
+                       "connector": "mv03a-rmq",
+                       "parameters": {"topic": "events", "tag": "t2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/rocketmq",
+            "{\"client_id\":\"edge-5\"}",
+        )
+        .await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(
+            got[1]["messages"][0]["system_properties"]["tag"],
+            json!("t2")
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rmq-act", 2).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-rmq-act",
+                json!({"type": "rocketmq", "name": "mv03a-rmq-act",
+                       "connector": "mv03a-rmq",
+                       "parameters": {"strategy": "bogus"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an unknown strategy refuses: {body}");
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/rocketmq",
+            "{\"client_id\":\"edge-5\"}",
+        )
+        .await;
+        let got = fake.wait_for(3).await;
+        assert_eq!(
+            got[2]["messages"][0]["system_properties"]["tag"],
+            json!("t2"),
+            "the refused update keeps the old target"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rmq-act", 3).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/rocketmq",
+            "{\"client_id\":\"edge-5\"}",
+        )
+        .await;
+        mv03a_wait_failed(&server, &token, "mv03a-rmq-act", 1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let fake = Mv03aRocketFake::start_on(down_port).await;
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/rocketmq",
+            "{\"client_id\":\"edge-5\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        let bodies: Vec<String> = got
+            .iter()
+            .flat_map(|envelope| envelope["messages"].as_array().cloned().unwrap_or_default())
+            .filter_map(|message| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(message["body_b64"].as_str().unwrap_or(""))
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .collect();
+        assert!(
+            bodies.iter().any(|body| body.contains("edge-5")),
+            "the restart redelivers: {bodies:?}"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rmq-act", 4).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-rmq",
+                json!({"type": "rocketmq", "name": "mv03a-rmq",
+                       "servers": format!("127.0.0.1:{}", fake.port),
+                       "access_key": "k", "secret_key": "s"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03a-rmq", &token)
+            .await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aRocketFake::start_on(restart_port).await;
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/rocketmq",
+            "{\"client_id\":\"edge-5\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0]["topic"], json!("events"));
+        mv02b_wait_success(&server, &token, "mv03a-rmq-act", 1).await;
+        drop(_state);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn mv03a_kafka_delivers_keyed_records_and_counts_a_broker_refusal() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-kafka");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aKafkaFake::start(false).await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let bootstrap = format!("127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "kafka", "name": "mv03a-kafka", "bootstrap_hosts": bootstrap}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "kafka", "name": "mv03a-kafka-sasl",
+                       "bootstrap_hosts": bootstrap,
+                       "authentication": {"mechanism": "plain", "username": "u", "password": "p"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "SASL is refused at the setting's home: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("authentication"),
+            "{body}"
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "kafka", "name": "mv03a-kafka-act",
+                       "connector": "mv03a-kafka",
+                       "resource_opts": {"health_check_interval": "1s"},
+                       "parameters": {"topic": "events",
+                                      "message": {"key": "${payload.k}"},
+                                      "partition_strategy": "key_dispatch",
+                                      "required_acks": "leader_only",
+                                      "kafka_ext_headers": [{"kafka_ext_header_key": "src",
+                                                             "kafka_ext_header_value": "${topic}"}],
+                                      "kafka_header_value_encode_mode": "json"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-kafka-rule", "name": "mv03a-kafka-rule",
+                       "sql": "SELECT * FROM \"mv03a/kafka\"", "actions": ["mv03a-kafka-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            got[0].frame.windows(6).any(|w| w == b"events"),
+            "topic on the wire"
+        );
+        assert!(
+            got[0].frame.windows(6).any(|w| w == b"edge-7"),
+            "key on the wire"
+        );
+        assert!(
+            got[0].frame.windows(14).any(|w| w == br#"{"k":"edge-7"}"#),
+            "value on the wire"
+        );
+        assert!(
+            got[0].frame.windows(13).any(|w| w == b"\"mv03a/kafka\""),
+            "json header value on the wire"
+        );
+        assert!(
+            got[0].frame.windows(3).any(|w| w == b"src"),
+            "header key on the wire"
+        );
+        let partition = mv03a_kafka_partition(&got[0]);
+        assert!(
+            (0..12).contains(&partition),
+            "partition in range: {partition}"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-kafka-act", 1).await;
+
+        // The same key sticks to the same partition.
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(
+            mv03a_kafka_partition(&got[1]),
+            partition,
+            "key_dispatch is sticky"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-kafka-act", 2).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-kafka-act",
+                json!({"type": "kafka", "name": "mv03a-kafka-act",
+                       "connector": "mv03a-kafka",
+                       "parameters": {"topic": "events2",
+                                      "message": {"key": "${payload.k}"},
+                                      "partition_strategy": "key_dispatch",
+                                      "required_acks": "leader_only"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            got[2].frame.windows(7).any(|w| w == b"events2"),
+            "updated topic on the wire"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-kafka-act", 3).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-kafka-act",
+                json!({"type": "kafka", "name": "mv03a-kafka-act",
+                       "connector": "mv03a-kafka",
+                       "parameters": {"topic": "events2", "partition_strategy": "bogus"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an unknown strategy refuses: {body}");
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        let got = fake.wait_for(4).await;
+        assert!(
+            got[3].frame.windows(7).any(|w| w == b"events2"),
+            "the refused update keeps the old target"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-kafka-act", 4).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        // The 1 s health probe marks the action disconnected while the
+        // broker is down; it reads back connected after the restart.
+        for _ in 0..400 {
+            let (status, action) = server
+                .get_auth("/api/v5/actions/mv03a-kafka-act", &token)
+                .await;
+            assert_eq!(status, 200);
+            if action["status"] == json!("disconnected") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, action) = server
+            .get_auth("/api/v5/actions/mv03a-kafka-act", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            action["status"],
+            json!("disconnected"),
+            "down reads disconnected"
+        );
+        // The probe fails closed and fast, so a publish while the
+        // broker is down counts one failed forward.
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        mv03a_wait_failed(&server, &token, "mv03a-kafka-act", 1).await;
+        let fake = Mv03aKafkaFake::start_on(down_port, false).await;
+        for _ in 0..400 {
+            let (status, action) = server
+                .get_auth("/api/v5/actions/mv03a-kafka-act", &token)
+                .await;
+            assert_eq!(status, 200);
+            if action["status"] == json!("connected") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, action) = server
+            .get_auth("/api/v5/actions/mv03a-kafka-act", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            action["status"],
+            json!("connected"),
+            "restart reads connected"
+        );
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            got[0].frame.windows(7).any(|w| w == b"events2"),
+            "delivery resumes"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-kafka-act", 5).await;
+
+        // A terminal broker ack counts one failed forward, fast.
+        fake.arm_error_acks();
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        mv03a_wait_failed(&server, &token, "mv03a-kafka-act", 2).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-kafka",
+                json!({"type": "kafka", "name": "mv03a-kafka",
+                       "bootstrap_hosts": format!("127.0.0.1:{}", fake.port)}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A broker restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(_state);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03a-kafka", &token)
+            .await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aKafkaFake::start_on(restart_port, false).await;
+        mv02b_publish(&server, &token, "mv03a/kafka", "{\"k\":\"edge-7\"}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            got[0].frame.windows(7).any(|w| w == b"events2"),
+            "delivery resumes after the broker restart"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-kafka-act", 1).await;
+        drop(_state);
+        drop(server);
+        drop(fake);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "confluent")]
+    #[tokio::test]
+    async fn mv03a_confluent_delivers_through_sasl_to_the_proxy() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-confluent");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aKafkaFake::start(true).await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let bootstrap = format!("127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "confluent", "name": "mv03a-cf",
+                       "bootstrap_hosts": bootstrap, "api_key": "k", "api_secret": "s",
+                       "ssl": {"enable": false}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "confluent", "name": "mv03a-cf-act",
+                       "connector": "mv03a-cf",
+                       "resource_opts": {"health_check_interval": "1s"},
+                       "parameters": {"topic": "events",
+                                      "message": {"key": "${client_id}"},
+                                      "partition_strategy": "random"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-cf-rule", "name": "mv03a-cf-rule",
+                       "sql": "SELECT * FROM \"mv03a/confluent\"", "actions": ["mv03a-cf-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        let auth = fake.auth_bytes.lock().expect("fake reads").clone();
+        assert!(!auth.is_empty(), "the driver authenticates SASL PLAIN");
+        assert!(
+            auth[0].windows(4).any(|w| w == b"\x00k\x00s"),
+            "the PLAIN payload carries the key and the secret"
+        );
+        assert!(
+            got[0].frame.windows(6).any(|w| w == b"events"),
+            "topic on the wire"
+        );
+        assert!(
+            got[0].frame.windows(6).any(|w| w == b"edge-9"),
+            "key on the wire"
+        );
+        let partition = mv03a_kafka_partition(&got[0]);
+        assert!(
+            (0..12).contains(&partition),
+            "partition in range: {partition}"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-cf-act", 1).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-cf-act",
+                json!({"type": "confluent", "name": "mv03a-cf-act",
+                       "connector": "mv03a-cf",
+                       "parameters": {"topic": "events2", "partition_strategy": "random"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            got[1].frame.windows(7).any(|w| w == b"events2"),
+            "updated topic on the wire"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-cf-act", 2).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-cf-act",
+                json!({"type": "confluent", "name": "mv03a-cf-act",
+                       "connector": "mv03a-cf",
+                       "parameters": {"topic": "events2", "partition_strategy": "bogus"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an unknown strategy refuses: {body}");
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            got[2].frame.windows(7).any(|w| w == b"events2"),
+            "the refused update keeps the old target"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-cf-act", 3).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        for _ in 0..400 {
+            let (status, action) = server
+                .get_auth("/api/v5/actions/mv03a-cf-act", &token)
+                .await;
+            assert_eq!(status, 200);
+            if action["status"] == json!("disconnected") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, action) = server
+            .get_auth("/api/v5/actions/mv03a-cf-act", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            action["status"],
+            json!("disconnected"),
+            "down reads disconnected"
+        );
+        // The probe fails closed and fast, so a publish while the
+        // broker is down counts one failed forward.
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        mv03a_wait_failed(&server, &token, "mv03a-cf-act", 1).await;
+        let fake = Mv03aKafkaFake::start_on(down_port, true).await;
+        for _ in 0..400 {
+            let (status, action) = server
+                .get_auth("/api/v5/actions/mv03a-cf-act", &token)
+                .await;
+            assert_eq!(status, 200);
+            if action["status"] == json!("connected") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, action) = server
+            .get_auth("/api/v5/actions/mv03a-cf-act", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            action["status"],
+            json!("connected"),
+            "restart reads connected"
+        );
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            got[0].frame.windows(7).any(|w| w == b"events2"),
+            "delivery resumes"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-cf-act", 4).await;
+
+        fake.arm_error_acks();
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        mv03a_wait_failed(&server, &token, "mv03a-cf-act", 2).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-cf",
+                json!({"type": "confluent", "name": "mv03a-cf",
+                       "bootstrap_hosts": format!("127.0.0.1:{}", fake.port),
+                       "api_key": "k", "api_secret": "s",
+                       "ssl": {"enable": false}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A broker restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(_state);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server.get_auth("/api/v5/connectors/mv03a-cf", &token).await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aKafkaFake::start_on(restart_port, true).await;
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/confluent",
+            "{\"client_id\":\"edge-9\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            got[0].frame.windows(7).any(|w| w == b"events2"),
+            "delivery resumes after the broker restart"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-cf-act", 1).await;
+        drop(_state);
+        drop(server);
+        drop(fake);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    #[tokio::test]
+    async fn mv03a_rabbitmq_delivers_confirmed_publishes_and_counts_a_nack() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-rabbitmq");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aRabbitFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let servers = format!("127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "rabbitmq", "name": "mv03a-rb",
+                       "servers": servers, "username": "u", "password": "p"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "rabbitmq", "name": "mv03a-rb-bad", "servers": servers}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a passwordless connector refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("password"),
+            "{body}"
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "rabbitmq", "name": "mv03a-rb-act",
+                       "connector": "mv03a-rb",
+                       "parameters": {"exchange": "events",
+                                      "routing_key": "sensor.${topic}",
+                                      "delivery_mode": "persistent",
+                                      "headers_template": [{"key": "src", "value": "${topic}"}],
+                                      "payload_template": "${topic}=${payload}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-rb-rule", "name": "mv03a-rb-rule",
+                       "sql": "SELECT * FROM \"mv03a/rabbit\"", "actions": ["mv03a-rb-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":1}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            got[0].method.windows(6).any(|w| w == b"events"),
+            "exchange on the wire"
+        );
+        assert!(
+            got[0]
+                .method
+                .windows(19)
+                .any(|w| w == b"sensor.mv03a.rabbit"),
+            "dotted routing key on the wire"
+        );
+        assert!(
+            got[0].header.windows(3).any(|w| w == b"src"),
+            "header key on the wire"
+        );
+        assert!(
+            got[0].header.windows(12).any(|w| w == b"mv03a/rabbit"),
+            "header value on the wire"
+        );
+        assert!(
+            got[0].header.windows(8).any(|w| w == b"mqtt.qos"),
+            "broker headers ride along"
+        );
+        assert_eq!(
+            got[0].body,
+            b"mv03a/rabbit={\"v\":1}".to_vec(),
+            "rendered body on the wire"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rb-act", 1).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-rb-act",
+                json!({"type": "rabbitmq", "name": "mv03a-rb-act",
+                       "connector": "mv03a-rb",
+                       "parameters": {"exchange": "events2",
+                                      "routing_key": "sensor.${topic}",
+                                      "delivery_mode": "persistent",
+                                      "headers_template": [{"key": "src", "value": "${topic}"}],
+                                      "payload_template": "${topic}=${payload}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":2}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            got[1].method.windows(7).any(|w| w == b"events2"),
+            "updated exchange on the wire"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rb-act", 2).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-rb-act",
+                json!({"type": "rabbitmq", "name": "mv03a-rb-act",
+                       "connector": "mv03a-rb",
+                       "parameters": {"exchange": "events2",
+                                      "routing_key": "sensor.${topic}",
+                                      "delivery_mode": "bogus"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an unknown delivery mode refuses: {body}");
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":3}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            got[2].method.windows(7).any(|w| w == b"events2"),
+            "the refused update keeps the old target"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-rb-act", 3).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":4}").await;
+        mv03a_wait_failed(&server, &token, "mv03a-rb-act", 1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let fake = Mv03aRabbitFake::start_on(down_port).await;
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].body, b"mv03a/rabbit={\"v\":5}".to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-rb-act", 4).await;
+
+        // A broker nack counts one failed forward: the confirm logic
+        // reports it instead of reading success it never earned.
+        fake.arm_nacks();
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":6}").await;
+        mv03a_wait_failed(&server, &token, "mv03a-rb-act", 2).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-rb",
+                json!({"type": "rabbitmq", "name": "mv03a-rb",
+                       "servers": format!("127.0.0.1:{}", fake.port),
+                       "username": "u", "password": "p"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A broker restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(_state);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server.get_auth("/api/v5/connectors/mv03a-rb", &token).await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aRabbitFake::start_on(restart_port).await;
+        mv02b_publish(&server, &token, "mv03a/rabbit", "{\"v\":7}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].body, b"mv03a/rabbit={\"v\":7}".to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-rb-act", 1).await;
+        drop(_state);
+        drop(server);
+        drop(fake);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03a_mqtt_bridge_forwards_without_looping_back() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-mqtt");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aMqttFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let broker = format!("127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "mqtt", "name": "mv03a-mq", "server": broker}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "mqtt", "name": "mv03a-mq-act",
+                       "connector": "mv03a-mq",
+                       "parameters": {"topic": "remote/${topic}",
+                                      "payload": "${topic}=${payload}",
+                                      "qos": 1, "retain": true}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-mq-rule", "name": "mv03a-mq-rule",
+                       "sql": "SELECT * FROM \"mv03a/bridge\"", "actions": ["mv03a-mq-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":1}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].topic, "remote/mv03a/bridge");
+        assert_eq!(got[0].payload, b"mv03a/bridge={\"v\":1}".to_vec());
+        assert_eq!(got[0].qos, 1);
+        assert!(got[0].retain, "retain rides the wire");
+        mv02b_wait_success(&server, &token, "mv03a-mq-act", 1).await;
+
+        // The remap keeps the bridged topic out of the local rule
+        // filter. A bridged topic never matches `mv03a/bridge`, so it
+        // is not bridged back. Legitimate traffic still flows.
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":2}").await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(got[1].payload, b"mv03a/bridge={\"v\":2}".to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-mq-act", 2).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-mq-act",
+                json!({"type": "mqtt", "name": "mv03a-mq-act",
+                       "connector": "mv03a-mq",
+                       "parameters": {"topic": "remote2/${topic}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":3}").await;
+        let got = fake.wait_for(3).await;
+        assert_eq!(got[2].topic, "remote2/mv03a/bridge");
+        assert_eq!(
+            got[2].payload,
+            br#"{"v":3}"#.to_vec(),
+            "absent template forwards raw"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-mq-act", 3).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-mq-act",
+                json!({"type": "mqtt", "name": "mv03a-mq-act",
+                       "connector": "mv03a-mq",
+                       "parameters": {"topic": "remote2/${topic}", "qos": 5}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an unknown qos refuses: {body}");
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":4}").await;
+        let got = fake.wait_for(4).await;
+        assert_eq!(got[3].topic, "remote2/mv03a/bridge");
+        mv02b_wait_success(&server, &token, "mv03a-mq-act", 4).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":5}").await;
+        mv03a_wait_failed(&server, &token, "mv03a-mq-act", 1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let fake = Mv03aMqttFake::start_on(down_port).await;
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":6}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            got.iter()
+                .any(|message| message.payload == br#"{"v":6}"#.to_vec()),
+            "the restart redelivers: {:?}",
+            got.iter()
+                .map(|message| &message.payload)
+                .collect::<Vec<_>>()
+        );
+        mv02b_wait_success(&server, &token, "mv03a-mq-act", 5).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-mq",
+                json!({"type": "mqtt", "name": "mv03a-mq",
+                       "server": format!("127.0.0.1:{}", fake.port)}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A broker restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server.get_auth("/api/v5/connectors/mv03a-mq", &token).await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aMqttFake::start_on(restart_port).await;
+        mv02b_publish(&server, &token, "mv03a/bridge", "{\"v\":7}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].topic, "remote2/mv03a/bridge");
+        mv02b_wait_success(&server, &token, "mv03a-mq-act", 1).await;
+        drop(_state);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bridge keeps the tenant: a rule outside the default tenant
+    /// cannot forward to the bridge action, and the default rule
+    /// still delivers through the broker to the remote.
+    #[tokio::test]
+    async fn mv03a_mqtt_bridge_tenant_gate_keeps_connector_forward_in_default_tenant() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-mqtt-tenant");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aMqttFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let broker = format!("127.0.0.1:{}", fake.port);
+
+        // A second namespace owns the refused tenant below.
+        let (status, _) = server
+            .post_auth("/api/v5/mt/ns/mv03a-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "mqtt", "name": "mv03a-ten-mq", "server": broker}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "mqtt", "name": "mv03a-ten-mq-act",
+                       "connector": "mv03a-ten-mq",
+                       "parameters": {"topic": "remote/${topic}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // A rule outside the default tenant must not forward to the
+        // bridge action: the path carries no tenant label.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-ten-mq-rule", "name": "mv03a-ten-mq-rule",
+                       "sql": "SELECT * FROM \"mv03a/ten\"", "tenant": "mv03a-tenant",
+                       "actions": ["mv03a-ten-mq-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "tenant forward refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("tenant"),
+            "refusal names tenant: {body}"
+        );
+        // Nothing is stored for the refused rule.
+        let (status, _) = server
+            .get_auth("/api/v5/rules/mv03a-ten-mq-rule", &token)
+            .await;
+        assert_eq!(status, 404, "refused rule stores nothing");
+
+        // The default tenant keeps working: the rule creates, the
+        // publish delivers through the broker to the fake.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-ten-mq-rule", "name": "mv03a-ten-mq-rule",
+                       "sql": "SELECT * FROM \"mv03a/ten\"",
+                       "actions": ["mv03a-ten-mq-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv02b_publish(&server, &token, "mv03a/ten", "{\"v\":1}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].topic, "remote/mv03a/ten");
+        assert_eq!(got[0].payload, br#"{"v":1}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-ten-mq-act", 1).await;
+
+        // A move outside the default tenant refuses and keeps the
+        // old rule: the next publish still reaches the remote.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/mv03a-ten-mq-rule",
+                json!({"id": "mv03a-ten-mq-rule", "name": "mv03a-ten-mq-rule",
+                       "sql": "SELECT * FROM \"mv03a/ten\"", "tenant": "mv03a-tenant",
+                       "actions": ["mv03a-ten-mq-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "move outside default refuses: {body}");
+        let (status, fetched) = server
+            .get_auth("/api/v5/rules/mv03a-ten-mq-rule", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("default"));
+        mv02b_publish(&server, &token, "mv03a/ten", "{\"v\":2}").await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(got[1].topic, "remote/mv03a/ten");
+        assert_eq!(got[1].payload, br#"{"v":2}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-ten-mq-act", 2).await;
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03a_pulsar_delivers_keyed_messages_and_counts_a_send_error() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03a-pulsar");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv03aPulsarFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let servers = format!("pulsar://127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "pulsar", "name": "mv03a-pu", "servers": servers}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "pulsar", "name": "mv03a-pu-token",
+                       "servers": servers, "authentication": "token"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "token auth is refused at the setting's home: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("authentication"),
+            "{body}"
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "pulsar", "name": "mv03a-pu-act",
+                       "connector": "mv03a-pu",
+                       "parameters": {"pulsar_topic": "events",
+                                      "message": {"key": "${client_id}"},
+                                      "strategy": "key_dispatch"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03a-pu-rule", "name": "mv03a-pu-rule",
+                       "sql": "SELECT * FROM \"mv03a/pulsar\"", "actions": ["mv03a-pu-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].topic_path, "persistent://public/default/events");
+        assert_eq!(got[0].payload, br#"{"client_id":"edge-3"}"#.to_vec());
+        assert_eq!(got[0].partition_key.as_deref(), Some("edge-3"));
+        assert!(
+            got[0]
+                .properties
+                .iter()
+                .any(|(key, value)| key == "mqtt_topic" && value == "mv03a/pulsar"),
+            "broker properties ride along: {:?}",
+            got[0].properties
+        );
+        mv02b_wait_success(&server, &token, "mv03a-pu-act", 1).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-pu-act",
+                json!({"type": "pulsar", "name": "mv03a-pu-act",
+                       "connector": "mv03a-pu",
+                       "parameters": {"pulsar_topic": "events2",
+                                      "message": {"key": "${client_id}"},
+                                      "strategy": "key_dispatch"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(got[1].topic_path, "persistent://public/default/events2");
+        mv02b_wait_success(&server, &token, "mv03a-pu-act", 2).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv03a-pu-act",
+                json!({"type": "pulsar", "name": "mv03a-pu-act",
+                       "connector": "mv03a-pu",
+                       "parameters": {"pulsar_topic": "events2", "strategy": "bogus"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an unknown strategy refuses: {body}");
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        let got = fake.wait_for(3).await;
+        assert_eq!(
+            got[2].topic_path, "persistent://public/default/events2",
+            "the refused update keeps the old target"
+        );
+        mv02b_wait_success(&server, &token, "mv03a-pu-act", 3).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        mv03a_wait_failed(&server, &token, "mv03a-pu-act", 1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let fake = Mv03aPulsarFake::start_on(down_port).await;
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].payload, br#"{"client_id":"edge-3"}"#.to_vec());
+        mv02b_wait_success(&server, &token, "mv03a-pu-act", 4).await;
+
+        // A broker send error counts one failed forward after the
+        // driver retries exhaust.
+        fake.arm_error_sends();
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        mv03a_wait_failed(&server, &token, "mv03a-pu-act", 2).await;
+
+        // A connector update through the production entry keeps delivery.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/mv03a-pu",
+                json!({"type": "pulsar", "name": "mv03a-pu",
+                       "servers": format!("pulsar://127.0.0.1:{}", fake.port)}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        // A broker restart keeps the stored connector and delivery resumes.
+        let restart_port = fake.port;
+        drop(fake);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The restart keeps the changed password. Use it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+        let token = body["token"].as_str().expect("login token").to_string();
+        let (status, _) = server.get_auth("/api/v5/connectors/mv03a-pu", &token).await;
+        assert_eq!(status, 200, "stored connector survives the restart");
+        let fake = Mv03aPulsarFake::start_on(restart_port).await;
+        mv02b_publish(
+            &server,
+            &token,
+            "mv03a/pulsar",
+            "{\"client_id\":\"edge-3\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].topic_path, "persistent://public/default/events2");
+        mv02b_wait_success(&server, &token, "mv03a-pu-act", 1).await;
+        drop(_state);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(feature = "clickhouse")]
@@ -6760,6 +10055,10 @@ connector_id = "pending-good"
     #[cfg(feature = "rabbitmq")]
     /// Fake poll step in millis. Reason: polls without a busy wait.
     const DR01_WAIT_STEP_MS: u64 = 100;
+    #[cfg(feature = "rabbitmq")]
+    /// First publisher delivery tag. Reason: the driver awaits one
+    /// ack for the single publish of the test.
+    const DR01_FIRST_DELIVERY_TAG: u64 = 1;
 
     #[cfg(feature = "rabbitmq")]
     async fn rabbit_fake_send_method(
@@ -6895,7 +10194,13 @@ connector_id = "pending-good"
         // Publish triple: capture the method, header and
         // body frames. This matches the loopback fake pattern.
         // One triple proves delivery with the exact routing key.
-        let (_, method, args) = rabbit_fake_read_method(stream).await?;
+        // Confirm mode: answer Confirm.Select and Basic.Ack.
+        // Reason: the driver enables confirms and awaits the ack.
+        let (mut channel, mut method, mut args) = rabbit_fake_read_method(stream).await?;
+        if method == (85, 10) {
+            rabbit_fake_send_method(stream, channel, 85, 11, &[]).await;
+            (channel, method, args) = rabbit_fake_read_method(stream).await?;
+        }
         if method != (60, 40) {
             return None;
         }
@@ -6908,6 +10213,9 @@ connector_id = "pending-good"
         if body_type != 3 {
             return None;
         }
+        let mut ack = DR01_FIRST_DELIVERY_TAG.to_be_bytes().to_vec();
+        ack.push(0);
+        rabbit_fake_send_method(stream, channel, 60, 80, &ack).await;
         Some(Dr01RabbitPublished {
             exchange,
             routing_key,
@@ -22230,16 +25538,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn cf05_v5_connector_create_refuses_sink_build_failure() {
-        // CF-05: the v5 create path refuses a pending kind. The v1 path is
-        // unchanged and still runs each sink builder and refuses its bad
-        // config with the builder text.
+        // CF-05: the v5 create path refuses a kind that is not ready. The
+        // v1 path is unchanged and still runs each sink builder and
+        // refuses its bad config with the builder text. MV-03a sets the
+        // message-broker kinds ready and MV-03c sets `http` ready, so a
+        // pending kind and a removed kind prove the refusal here.
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         for (name, kind) in [
-            ("cf05-kafka-pending", "kafka"),
-            ("cf05-mqtt-pending", "mqtt"),
+            ("cf05-timescaledb-pending", "timescaledb"),
+            ("cf05-s3tables-removed", "s3_tables"),
         ] {
             let (status, body) = server
                 .post_auth(
@@ -30680,10 +33990,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             kinds.contains("pgsql"),
             "type list holds the documented ready kind pgsql"
         );
-        for pending in ["mqtt", "kafka_producer", "redis"] {
+        for ready in [
+            "mqtt",
+            "kafka_producer",
+            "redis",
+            "rabbitmq",
+            "pulsar",
+            "rocketmq",
+            "confluent_producer",
+        ] {
             assert!(
-                !kinds.contains(pending),
-                "type list has no pending '{pending}'"
+                kinds.contains(ready),
+                "type list holds the documented ready kind {ready}"
             );
         }
         for ready in [
@@ -30730,9 +34048,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let kinds: std::collections::HashSet<&str> =
             entries.iter().filter_map(|e| e.as_str()).collect();
         assert_eq!(kinds.len(), entries.len(), "names must be unique strings");
-        // Every documented source kind is pending at the close of KC-00,
-        // so this list is empty. It never shows a name outside the
-        // reference enum.
+        // MV-03a sets the message-broker source kinds ready. The list
+        // holds only documented names.
         let documented: std::collections::HashSet<&str> = [
             "mqtt",
             "kafka_consumer",
@@ -30748,7 +34065,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "listed kind {name} is documented"
             );
         }
-        for pending in ["mqtt", "kafka_consumer", "http", "rabbitmq"] {
+        for ready in ["mqtt", "kafka_consumer", "rabbitmq"] {
+            assert!(
+                kinds.contains(ready),
+                "type list holds the documented ready kind {ready}"
+            );
+        }
+        for pending in ["timescaledb", "oci_streaming"] {
             assert!(
                 !kinds.contains(pending),
                 "type list has no pending '{pending}'"
@@ -30901,15 +34224,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn ap05_mqtt_kafka_actions_typed_round_trip() {
-        // AP-05/KC-00: mqtt, kafka and mqtt_bridge actions are pending.
-        // Each create is refused with 400 ALREADY_EXISTS and stores
-        // nothing. A ready console action keeps the typed round trip.
+        // AP-05/KC-00: timescaledb, cassandra and s3_tables are not ready. Each create
+        // is refused with 400 ALREADY_EXISTS and stores nothing. MV-03a
+        // sets mqtt, kafka and mqtt_bridge ready, so they no longer
+        // prove the pending refusal here. A ready console action keeps
+        // the typed round trip.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         for (name, kind) in [
-            ("ap05-mqtt", "mqtt"),
-            ("ap05-kafka", "kafka_producer"),
-            ("ap05-legacy", "mqtt_bridge"),
+            ("ap05-ts", "timescaledb"),
+            ("ap05-cass", "cassandra"),
+            ("ap05-legacy", "s3_tables"),
         ] {
             let (status, body) = server
                 .post_auth(
@@ -30951,8 +34276,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn ap05_connectors_typed_round_trip() {
         // AP-05/KC-00: ready kinds (webhook and pgsql) round trip through
-        // both id forms. Pending mqtt and kafka are refused and store
-        // nothing.
+        // both id forms. Pending timescaledb and removed s3_tables are refused and store
+        // nothing. MV-03a sets mqtt and kafka ready, so they no longer
+        // prove the pending refusal here.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let cases = vec![
@@ -30996,8 +34322,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(status, 204);
         }
         for (name, kind) in [
-            ("ap05-conn-mqtt", "mqtt"),
-            ("ap05-conn-kafka", "kafka_producer"),
+            ("ap05-conn-ts", "timescaledb"),
+            ("ap05-conn-s3t", "s3_tables"),
         ] {
             let (status, refused) = server
                 .post_auth(
@@ -31030,7 +34356,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn ap05_sources_typed_round_trip() {
         // AP-05/KC-00: ready kinds (webhook and pgsql) round trip. Pending
-        // mqtt and kafka_consumer are refused and store nothing.
+        // timescaledb and oci_streaming are refused and store nothing.
+        // MV-03a sets mqtt and kafka_consumer ready, so they no longer
+        // prove the pending refusal here.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let cases = [
@@ -31062,8 +34390,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(status, 204);
         }
         for (name, kind) in [
-            ("ap05-src-mqtt", "mqtt"),
-            ("ap05-src-kafka", "kafka_consumer"),
+            ("ap05-src-ts", "timescaledb"),
+            ("ap05-src-oci", "oci_streaming"),
         ] {
             let (status, refused) = server
                 .post_auth(

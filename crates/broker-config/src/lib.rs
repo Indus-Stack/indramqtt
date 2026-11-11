@@ -5213,20 +5213,20 @@ mod tests {
         let dir = unique_dir("pending-kinds");
         let mut snapshot = FullSnapshot::default();
         snapshot.connectors.connectors.push(ConnectorEntry {
-            id: "pending-snowflake".to_string(),
-            connector_type: "kafka".to_string(),
+            id: "pending-timescaledb".to_string(),
+            connector_type: "timescaledb".to_string(),
             enable: true,
             config: "{}".to_string(),
         });
         snapshot.actions.actions.push(ActionEntry {
-            id: "pending-snowflake".to_string(),
-            action_type: "kafka".to_string(),
+            id: "pending-timescaledb".to_string(),
+            action_type: "timescaledb".to_string(),
             enable: true,
             config: "{}".to_string(),
         });
         snapshot.sources.sources.push(SourceEntry {
-            id: "pending-snowflake".to_string(),
-            source_type: "kafka".to_string(),
+            id: "pending-timescaledb".to_string(),
+            source_type: "timescaledb".to_string(),
             enable: true,
             config: "{}".to_string(),
         });
@@ -5246,7 +5246,7 @@ mod tests {
             message.contains("connector_type"),
             "names the key: {message}"
         );
-        assert!(message.contains("kafka"), "names the kind: {message}");
+        assert!(message.contains("timescaledb"), "names the kind: {message}");
 
         let registry = ConfigRegistry::load_for_boot(&dir).expect("boot accepts pending");
         let loaded = registry.snapshot();

@@ -84,6 +84,14 @@ fn default_max_backoff_ms() -> Option<u64> {
     Some(2_000)
 }
 
+fn default_strategy() -> String {
+    "random".to_string()
+}
+
+/// One short TCP handshake per publish bounds the down check to 1 s.
+// A closed listener fails closed even when an old connection still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 fn is_tenant_segment(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -165,8 +173,14 @@ pub struct PulsarSinkConfig {
     #[serde(default)]
     pub auth: PulsarAuth,
     /// Partition key template (`${client_id}`, `${topic}`, ...).
+    /// Absent for `random` and `roundrobin` routing.
     #[serde(default)]
     pub partition_key_template: Option<String>,
+    /// Routing strategy: `random` (default), `roundrobin` or
+    /// `key_dispatch`. `key_dispatch` hashes the key. The other two
+    /// send with no key so the broker spreads rows.
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
     /// Custom properties with template substitution.
     #[serde(default)]
     pub properties: HashMap<String, String>,
@@ -216,6 +230,12 @@ impl PulsarSinkConfig {
             return Err(ConnectorError::Dispatch(
                 "pulsar topic must not be empty".to_string(),
             ));
+        }
+        if !["random", "roundrobin", "key_dispatch"].contains(&self.strategy.as_str()) {
+            return Err(ConnectorError::Dispatch(format!(
+                "pulsar strategy must be one of random, roundrobin, key_dispatch: {:?}",
+                self.strategy
+            )));
         }
         // Strict template checks with dummy values.
         self.resolve_topic("dummy/topic", QoS::AtMostOnce, 0)?;
@@ -838,14 +858,17 @@ fn map_driver_error(context: &str, error: pulsar::Error) -> ConnectorError {
 pub struct DriverPulsarTransport {
     config: PulsarSinkConfig,
     client: tokio::sync::Mutex<Option<pulsar::Pulsar<pulsar::TokioExecutor>>>,
+    probe_target: String,
 }
 
 impl DriverPulsarTransport {
     pub fn new(config: &PulsarSinkConfig) -> Result<Self> {
         config.validate()?;
+        let endpoint = parse_service_url(&config.service_url)?;
         Ok(Self {
             config: config.clone(),
             client: tokio::sync::Mutex::new(None),
+            probe_target: format!("{}:{}", endpoint.host, endpoint.port),
         })
     }
 
@@ -854,11 +877,26 @@ impl DriverPulsarTransport {
     }
 
     async fn client(&self) -> Result<pulsar::Pulsar<pulsar::TokioExecutor>> {
-        if let Some(client) = self.client.lock().await.clone() {
-            return Ok(client);
-        }
         let mut guard = self.client.lock().await;
         if let Some(client) = guard.clone() {
+            // Probe the listener before reusing the cached client. A
+            // refused port clears the cache and fails closed, so the
+            // action counts one failed forward.
+            let reachable = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect(&self.probe_target),
+            )
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .is_some();
+            if !reachable {
+                *guard = None;
+                return Err(ConnectorError::Connection(format!(
+                    "pulsar server unreachable: {}",
+                    self.probe_target
+                )));
+            }
             return Ok(client);
         }
         // Reason: the driver speaks `pulsar://` only. An `http(s)://`
@@ -881,9 +919,16 @@ impl DriverPulsarTransport {
                 "pulsar driver token auth is not qualified yet; use no auth".to_string(),
             ));
         }
-        let client = builder
-            .build()
+        // Bound the broker handshake with the configured timeout, so a
+        // downed server fails closed instead of hanging the send path.
+        let build_timeout = self.config.timeout();
+        let client = tokio::time::timeout(build_timeout, builder.build())
             .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "pulsar driver connect timed out after {build_timeout:?}"
+                ))
+            })?
             .map_err(|e| map_driver_error("connect", e))?;
         *guard = Some(client.clone());
         Ok(client)
@@ -905,12 +950,17 @@ impl PulsarTransport for DriverPulsarTransport {
         }
         let client = self.client().await?;
         let timeout = self.config.timeout();
-        let mut producer = client
-            .producer()
-            .with_topic(topic_path)
-            .build()
-            .await
-            .map_err(|e| map_driver_error("producer", e))?;
+        // Bound the producer handshake with the send timeout, so a
+        // downed server fails closed instead of hanging the send path.
+        let mut producer =
+            tokio::time::timeout(timeout, client.producer().with_topic(topic_path).build())
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "pulsar driver producer timed out after {timeout:?}"
+                    ))
+                })?
+                .map_err(|e| map_driver_error("producer", e))?;
         for message in &batch {
             let send = async {
                 producer
@@ -1206,6 +1256,7 @@ mod tests {
             topic: "${topic}".to_string(),
             auth: PulsarAuth::None,
             partition_key_template: Some("${client_id}".to_string()),
+            strategy: "key_dispatch".to_string(),
             properties: HashMap::from([("source".to_string(), "indramqtt".to_string())]),
             batch_size: Some(200),
             batch_bytes: Some(2_097_152),
@@ -1619,6 +1670,7 @@ mod tests {
             topic: short.clone(),
             auth: PulsarAuth::None,
             partition_key_template: None,
+            strategy: "random".to_string(),
             properties: HashMap::new(),
             batch_size: Some(1000),
             batch_bytes: Some(2_097_152),
@@ -1717,6 +1769,7 @@ mod tests {
             topic: short.clone(),
             auth: PulsarAuth::None,
             partition_key_template: None,
+            strategy: "random".to_string(),
             properties: HashMap::new(),
             batch_size: Some(1000),
             batch_bytes: Some(2_097_152),
