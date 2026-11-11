@@ -1,0 +1,1 @@
+`listeners.wss.bind` sets the address of the secure WebSocket listener. The default is `0.0.0.0:8084`. Use `127.0.0.1:8084` to keep the port on loopback. Boot fails when the value is not a valid host and port.

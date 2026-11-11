@@ -1,0 +1,1 @@
+`listeners.wss.enabled` enables the secure WebSocket listener. The default `false` keeps the port closed. Set `true` with a certificate and a key. The broker then accepts TLS WebSocket handshakes on `listeners.wss.bind`. Boot fails when the certificate or the key is missing.

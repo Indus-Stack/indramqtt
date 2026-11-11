@@ -1,0 +1,57 @@
+[example]
+area = "config"
+item = "listeners.tls.cacertfile"
+kind = "setting"
+expect = "ca-anchors-ok"
+expected = "A client with a certificate from the configured CA connects, and a client with a certificate from another CA fails."
+source = "`crates/broker-node/src/native.rs` loads the trust anchors from the setting and checks the client chain against them."
+action = "Connect one TLS client with a valid certificate and one with a foreign certificate."
+config = '''
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+'''
+script = '''
+from config_probe import *
+import socket
+import ssl
+import struct
+
+CERT = "/work/tree/crates/broker-node/tests/k1_05"
+
+def connect_bytes(client, username=None, password=None):
+    flags = 0x02 | (0x80 if username else 0) | (0x40 if password else 0)
+    body = word("MQTT") + b"\x04" + bytes([flags]) + struct.pack("!H", 60) + word(client)
+    if username:
+        body += word(username)
+    if password:
+        body += word(password)
+    return frame(0x10, body)
+
+def try_connect(cert, key):
+    try:
+        raw = socket.create_connection(("127.0.0.1", 28883), timeout=10)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if cert:
+            ctx.load_cert_chain(cert, key)
+        sock = ctx.wrap_socket(raw, server_hostname="localhost")
+        sock.settimeout(5)
+        sock.sendall(connect_bytes("tls-ca-1", "docs-tls", "docs-pw-0001"))
+        head, ack = packet(sock)
+        sock.close()
+        return head == 0x20 and ack == b"\x00\x00"
+    except Exception:
+        return False
+
+status, _ = http("POST", "/api/v1/auth/users", {"username": "docs-tls", "password": "docs-pw-0001"})
+assert status in (200, 201), status
+assert try_connect(CERT + "/client-a-cert.pem", CERT + "/client-a-key.pem") is True
+assert try_connect(CERT + "/wrong-client-cert.pem", CERT + "/wrong-client-key.pem") is False
+print("ca-anchors-ok")
+'''

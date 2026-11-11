@@ -1,0 +1,43 @@
+[example]
+area = "config"
+item = "listeners.wss.bind"
+kind = "setting"
+expect = "bind=127.0.0.1:28884"
+expected = "A WebSocket client reaches the configured bind, and the listeners row shows the same bind."
+source = "`crates/broker-node/src/main.rs` seeds the listener row from the setting, and `crates/broker-node/src/native.rs` binds the socket to it."
+action = "Run one secure WebSocket upgrade on the configured bind, then read `GET /api/v5/listeners/wss:default`."
+config = '''
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+'''
+script = '''
+from config_probe import *
+import base64
+import os
+import socket
+import ssl
+
+raw = socket.create_connection(("127.0.0.1", 28884), timeout=10)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+tls = ctx.wrap_socket(raw, server_hostname="localhost")
+tls.settimeout(10)
+wskey = base64.b64encode(os.urandom(16)).decode()
+tls.sendall(("GET /mqtt HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wskey + "\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n").encode())
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = tls.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+assert resp.startswith(b"HTTP/1.1 101"), resp[:60]
+tls.close()
+status, row = http("GET", "/api/v5/listeners/wss:default")
+assert status == 200, (status, row)
+assert row["bind"] == "127.0.0.1:28884", row
+print("bind=127.0.0.1:28884")
+'''

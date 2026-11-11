@@ -378,9 +378,32 @@ Notes:
 
 ### `listeners.tls.enabled`
 
-Whether the secure TLS MQTT listener accepts connections.
+`listeners.tls.enabled` enables the secure MQTT listener. The default `false` keeps the port closed. Set `true` with a certificate and a key. The broker then accepts TLS handshakes on `listeners.tls.bind`. Boot fails when the certificate or the key is missing and PSK is off.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client with a username and a password, then read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+tls-serves
+```
 
 Notes:
 
@@ -389,9 +412,32 @@ Notes:
 
 ### `listeners.tls.bind`
 
-Bind address for the secure TLS MQTT listener.
+`listeners.tls.bind` sets the address of the secure MQTT listener. The default is `0.0.0.0:8883`. Use `127.0.0.1:8883` to keep the port on loopback. Boot fails when the value is not a valid host and port.
 
 Type: `socket address string`. Default: `"0.0.0.0:8883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client to the configured bind, then read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+bind=127.0.0.1:28883
+```
 
 Notes:
 
@@ -400,9 +446,32 @@ Notes:
 
 ### `listeners.tls.cert_file`
 
-Path to the PEM server certificate for the TLS listener.
+`listeners.tls.cert_file` points to the PEM server certificate. The listener needs it when `enabled` is true and PSK is off. The file must hold at least one certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when TLS is enabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run a TLS handshake against the secure listener and read the served certificate.
+```
+
+Captured output:
+
+```output
+server-cn=localhost
+```
 
 Notes:
 
@@ -411,9 +480,32 @@ Notes:
 
 ### `listeners.tls.key_file`
 
-Path to the PEM private key for the TLS listener.
+`listeners.tls.key_file` points to the PEM private key. The listener needs it when `enabled` is true and PSK is off. The key must match the certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when TLS is enabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client with a username and a password, then read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+tls-key-ok
+```
 
 Notes:
 
@@ -422,9 +514,29 @@ Notes:
 
 ### `listeners.tls.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.tls.native` does nothing. The kernel always serves this listener. Leave the default `false`. The broker boots with either value. The listener behavior never changes.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+native = true
+```
+
+Action:
+
+```text
+Connect one plaintext client and read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+native-ignored
+```
 
 Notes:
 
@@ -433,9 +545,31 @@ Notes:
 
 ### `listeners.tls.psk_enabled`
 
-Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.
+`listeners.tls.psk_enabled` switches the TLS listener to pre-shared-key mode. The default `false` keeps certificate handshakes unchanged. With `true`, the broker boots with no certificate.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+psk_enabled = true
+```
+
+Action:
+
+```text
+Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.
+```
+
+Captured output:
+
+```output
+psk-no-cert-boot
+```
 
 Notes:
 
@@ -444,9 +578,32 @@ Notes:
 
 ### `listeners.tls.psk_keys_file`
 
-Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.
+`listeners.tls.psk_keys_file` names the PSK identity file. The default `""` keeps the path empty. Set it only when PSK is on. The broker boots with the empty path.
 
 Type: `path string`. Default: `""`. Range: `file path; empty means no identities`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+psk_enabled = true
+psk_keys_file = ""
+```
+
+Action:
+
+```text
+Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.
+```
+
+Captured output:
+
+```output
+psk-empty-store
+```
 
 Notes:
 
@@ -455,9 +612,34 @@ Notes:
 
 ### `listeners.tls.verify_client_cert`
 
-Whether the TLS listener requests and verifies a client certificate.
+`listeners.tls.verify_client_cert` asks clients for a certificate. The default `false` keeps handshakes unchanged. With `true`, the listener needs `cacertfile`. A missing certificate is refused at the bind. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify_client_cert = true
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+verify-legacy-refused
+```
 
 Notes:
 
@@ -466,9 +648,34 @@ Notes:
 
 ### `listeners.tls.verify`
 
-Client certificate chain check mode of the TLS listener.
+`listeners.tls.verify` sets the chain check mode. `verify_none` checks nothing. `verify_peer` checks the chain against `cacertfile`. Any other value fails boot.
 
 Type: `string`. Default: `"verify_none"`. Range: `verify_none | verify_peer`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+verify-peer-optional-ok
+```
 
 Notes:
 
@@ -477,9 +684,34 @@ Notes:
 
 ### `listeners.tls.cacertfile`
 
-CA file for client certificate checks of the TLS listener.
+`listeners.tls.cacertfile` points to the CA file for client checks. The listener needs it when verification is on. The file must hold at least one CA certificate. Boot fails when it is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when client verification is on`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client with a valid certificate and one with a foreign certificate.
+```
+
+Captured output:
+
+```output
+ca-anchors-ok
+```
 
 Notes:
 
@@ -488,9 +720,35 @@ Notes:
 
 ### `listeners.tls.fail_if_no_peer_cert`
 
-Whether the TLS listener refuses a handshake without a certificate.
+`listeners.tls.fail_if_no_peer_cert` refuses handshakes without a certificate. It needs verification on. Without verification, boot fails. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+fail_if_no_peer_cert = true
+```
+
+Action:
+
+```text
+Connect one TLS client without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+no-cert-refused
+```
 
 Notes:
 
@@ -499,9 +757,35 @@ Notes:
 
 ### `listeners.tls.peer_cert_as_username`
 
-Source for the bind username from the client certificate.
+`listeners.tls.peer_cert_as_username` takes the bind username from the client certificate. `disabled` keeps the CONNECT username. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_username = "cn"
+```
+
+Action:
+
+```text
+Connect one TLS client with a valid certificate and a foreign username, then read the client detail.
+```
+
+Captured output:
+
+```output
+username=k1-05-a
+```
 
 Notes:
 
@@ -510,9 +794,35 @@ Notes:
 
 ### `listeners.tls.peer_cert_as_clientid`
 
-Source for the bind client identifier from the client certificate.
+`listeners.tls.peer_cert_as_clientid` takes the bind client identifier from the client certificate. `disabled` keeps the CONNECT identifier. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_clientid = "cn"
+```
+
+Action:
+
+```text
+Connect one TLS client with a valid certificate and an ignored identifier, then read the client detail.
+```
+
+Captured output:
+
+```output
+clientid=k1-05-a
+```
 
 Notes:
 
@@ -656,9 +966,32 @@ Notes:
 
 ### `listeners.wss.enabled`
 
-Whether the secure WebSocket listener accepts connections.
+`listeners.wss.enabled` enables the secure WebSocket listener. The default `false` keeps the port closed. Set `true` with a certificate and a key. The broker then accepts TLS WebSocket handshakes on `listeners.wss.bind`. Boot fails when the certificate or the key is missing.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade, then read `GET /api/v5/listeners/wss:default`.
+```
+
+Captured output:
+
+```output
+wss-serves
+```
 
 Notes:
 
@@ -667,9 +1000,32 @@ Notes:
 
 ### `listeners.wss.bind`
 
-Bind address for the secure WebSocket listener.
+`listeners.wss.bind` sets the address of the secure WebSocket listener. The default is `0.0.0.0:8084`. Use `127.0.0.1:8084` to keep the port on loopback. Boot fails when the value is not a valid host and port.
 
 Type: `socket address string`. Default: `"0.0.0.0:8084"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade on the configured bind, then read `GET /api/v5/listeners/wss:default`.
+```
+
+Captured output:
+
+```output
+bind=127.0.0.1:28884
+```
 
 Notes:
 
@@ -678,9 +1034,33 @@ Notes:
 
 ### `listeners.wss.path`
 
-HTTP path serving secure WebSocket traffic.
+`listeners.wss.path` sets the HTTP path of the secure WebSocket listener. The default is `/mqtt`. The path must start with `/`. A handshake on another path fails.
 
 Type: `string`. Default: `"/mqtt"`. Range: `must start with '/'`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+path = "/docs-mqtt"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade on the configured path.
+```
+
+Captured output:
+
+```output
+path=/docs-mqtt
+```
 
 Notes:
 
@@ -689,9 +1069,32 @@ Notes:
 
 ### `listeners.wss.cert_file`
 
-Path to the PEM server certificate for the secure WebSocket listener.
+`listeners.wss.cert_file` points to the PEM server certificate. The listener needs it when `enabled` is true. The file must hold at least one certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when secure WebSocket is enabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run a TLS handshake against the secure WebSocket listener and read the served certificate.
+```
+
+Captured output:
+
+```output
+server-cn=localhost
+```
 
 Notes:
 
@@ -700,9 +1103,32 @@ Notes:
 
 ### `listeners.wss.key_file`
 
-Path to the PEM private key for the secure WebSocket listener.
+`listeners.wss.key_file` points to the PEM private key. The listener needs it when `enabled` is true. The key must match the certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when secure WebSocket is enabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade, then send MQTT CONNECT and read CONNACK.
+```
+
+Captured output:
+
+```output
+wss-mqtt-ok
+```
 
 Notes:
 
@@ -711,9 +1137,34 @@ Notes:
 
 ### `listeners.wss.verify_client_cert`
 
-Whether the secure WebSocket listener requests and verifies a client certificate.
+`listeners.wss.verify_client_cert` asks clients for a certificate. The default `false` keeps handshakes unchanged. With `true`, the listener needs `cacertfile`. A missing certificate is refused at the bind. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify_client_cert = true
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Upgrade one secure WebSocket client without a certificate and one with a valid certificate, then send MQTT CONNECT on each.
+```
+
+Captured output:
+
+```output
+verify-legacy-refused
+```
 
 Notes:
 
@@ -722,9 +1173,34 @@ Notes:
 
 ### `listeners.wss.verify`
 
-Client certificate chain check mode of the secure WebSocket listener.
+`listeners.wss.verify` sets the chain check mode. `verify_none` checks nothing. `verify_peer` checks the chain against `cacertfile`. Any other value fails boot.
 
 Type: `string`. Default: `"verify_none"`. Range: `verify_none | verify_peer`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Upgrade one secure WebSocket client without a certificate and one with a valid certificate, then send MQTT CONNECT on each.
+```
+
+Captured output:
+
+```output
+verify-peer-optional-ok
+```
 
 Notes:
 
@@ -733,9 +1209,34 @@ Notes:
 
 ### `listeners.wss.cacertfile`
 
-CA file for client certificate checks of the secure WebSocket listener.
+`listeners.wss.cacertfile` points to the CA file for client checks. The listener needs it when verification is on. The file must hold at least one CA certificate. Boot fails when it is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when client verification is on`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Run one secure upgrade with a valid certificate and one with a foreign certificate.
+```
+
+Captured output:
+
+```output
+ca-anchors-ok
+```
 
 Notes:
 
@@ -744,9 +1245,35 @@ Notes:
 
 ### `listeners.wss.fail_if_no_peer_cert`
 
-Whether the secure WebSocket listener refuses a handshake without a certificate.
+`listeners.wss.fail_if_no_peer_cert` refuses handshakes without a certificate. It needs verification on. Without verification, boot fails. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+fail_if_no_peer_cert = true
+```
+
+Action:
+
+```text
+Run one secure upgrade without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+no-cert-refused
+```
 
 Notes:
 
@@ -755,9 +1282,35 @@ Notes:
 
 ### `listeners.wss.peer_cert_as_username`
 
-Source for the bind username from the client certificate.
+`listeners.wss.peer_cert_as_username` takes the bind username from the client certificate. `disabled` keeps the CONNECT username. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_username = "cn"
+```
+
+Action:
+
+```text
+Connect one secure WebSocket client with a valid certificate and a foreign username, then read the client detail.
+```
+
+Captured output:
+
+```output
+username=k1-05-a
+```
 
 Notes:
 
@@ -766,9 +1319,35 @@ Notes:
 
 ### `listeners.wss.peer_cert_as_clientid`
 
-Source for the bind client identifier from the client certificate.
+`listeners.wss.peer_cert_as_clientid` takes the bind client identifier from the client certificate. `disabled` keeps the CONNECT identifier. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_clientid = "cn"
+```
+
+Action:
+
+```text
+Connect one secure WebSocket client with a valid certificate and an ignored identifier, then read the client detail.
+```
+
+Captured output:
+
+```output
+clientid=k1-05-a
+```
 
 Notes:
 
@@ -777,9 +1356,29 @@ Notes:
 
 ### `listeners.wss.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.wss.native` does nothing. The kernel always serves this listener. Leave the default `false`. The broker boots with either value. The listener behavior never changes.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+native = true
+```
+
+Action:
+
+```text
+Connect one plaintext client and read `GET /api/v5/listeners/wss:default`.
+```
+
+Captured output:
+
+```output
+native-ignored
+```
 
 Notes:
 

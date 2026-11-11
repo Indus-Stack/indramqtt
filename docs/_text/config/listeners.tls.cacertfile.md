@@ -1,0 +1,1 @@
+`listeners.tls.cacertfile` points to the CA file for client checks. The listener needs it when verification is on. The file must hold at least one CA certificate. Boot fails when it is missing or empty.
