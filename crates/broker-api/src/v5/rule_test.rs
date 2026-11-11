@@ -49,16 +49,11 @@
 //! the publish path keeps paying what message ingress already pays (the
 //! rule match in `dispatch_ingress`) with no new lock, allocation or queue
 //! from this route.
-// TODO(parity): which exact field names does the documented `POST /rule_test`
-// request require (`sql` versus `sql_query`, flat `topic`/`payload` versus
-// nested `context`)? The rulebook does not decide the exact shape; the
-// current choice accepts `sql`/`sql_query` plus flat and `context`-nested
-// topic/payload aliases until the checker pins it.
-// TODO(parity): which exact success shape does the documented probe require
-// beyond match/no-match plus projected output (`projected` versus `output`
-// key)? The rulebook does not decide the exact shape; fields the broker
-// can supply are served under both keys (`output` mirrors `projected`)
-// until the checker pins it.
+// The reference request carries `sql` and an optional `context`. A
+// non-empty context must carry `event_type`. This handler also accepts the
+// older flat body as an extension. The success body carries `matched` plus
+// the projected row under both `projected` and `output`, because the
+// pinned reference documents no response schema for a match.
 
 use axum::{
     extract::{Path, Query, State},
@@ -103,10 +98,30 @@ fn no_match() -> Response {
         StatusCode::PRECONDITION_FAILED,
         Json(serde_json::json!({
             "code": "NOT_MATCH",
-            "message": "Rule does not match the sample.",
+            "message": "the sample does not match the rule",
         })),
     )
         .into_response()
+}
+
+/// A present, non-empty `context` must carry a non-empty `event_type`, as
+/// the reference schema requires. The default empty context is allowed.
+fn validate_context(value: &serde_json::Value) -> Result<(), Box<Response>> {
+    let Some(context) = value.get("context") else {
+        return Ok(());
+    };
+    let Some(context) = context.as_object() else {
+        return Err(Box::new(bad_request(
+            "field `context` must be an object".to_string(),
+        )));
+    };
+    if context.is_empty() {
+        return Ok(());
+    }
+    if as_non_empty_str(context.get("event_type")).is_none() {
+        return Err(Box::new(missing_field("context.event_type")));
+    }
+    Ok(())
 }
 
 fn as_non_empty_str(value: Option<&serde_json::Value>) -> Option<String> {
@@ -241,11 +256,14 @@ pub async fn test_rule_offline(body: Bytes) -> Response {
     if !value.is_object() {
         return bad_request("rule test body must be a JSON object".to_string());
     }
+    if let Err(response) = validate_context(&value) {
+        return *response;
+    }
     let Some(sql) = extract_sql(&value) else {
         return missing_field("sql");
     };
     let Some(topic) = extract_topic(&value) else {
-        return missing_field("topic");
+        return no_match();
     };
     let Some(payload) = extract_payload(&value) else {
         return missing_field("payload");
@@ -332,21 +350,13 @@ pub async fn test_rule_offline(body: Bytes) -> Response {
 /// rule match in `dispatch_ingress`) with no new lock, allocation or queue
 /// from this route. The stored-rule lookup clones at most one small rule
 /// under one short read lock on the management plane.
-// TODO(parity): which exact sample shape does the documented per-rule probe
-// require (flat `topic`/`payload` versus nested `context`, sample `sql`
-// overriding or ignored)? The rulebook does not decide the exact shape;
-// the current choice accepts flat and `context`-nested topic/payload
-// aliases and ignores a sample `sql` (bound to the stored rule) until the
-// checker pins it.
-// TODO(parity): which exact success shape does the documented per-rule
-// probe require beyond match/no-match plus projected output (`projected`
-// versus `output` key)? The rulebook does not decide the exact shape;
-// fields the broker can supply are served under both keys (`output`
-// mirrors `projected`) until the checker pins it.
+// The sample accepts flat and `context`-nested topic/payload aliases and
+// ignores a sample `sql`, because the probe is bound to the stored rule.
+// The success body carries the projected row under both `projected` and
+// `output`, because the pinned reference documents no response schema.
 // TODO(parity): for an unknown id with an invalid sample body, is the
-// answer 404 or 400? The rulebook does not decide the precedence; the
-// current choice answers 404 first (existence before validation, mirroring
-// the rule update) and stores nothing either way.
+// answer 404 or 400? The reference reads the stored rule first; this
+// handler answers 404 before body validation and stores nothing.
 pub async fn test_stored_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -358,7 +368,7 @@ pub async fn test_stored_rule(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "code": "RULE_NOT_FOUND",
-                "message": "Rule not found"
+                "message": "rule not found"
             })),
         )
             .into_response();
@@ -376,6 +386,9 @@ pub async fn test_stored_rule(
     };
     if !value.is_object() {
         return bad_request("rule test body must be a JSON object".to_string());
+    }
+    if let Err(response) = validate_context(&value) {
+        return *response;
     }
     // The documented flag defaults to true: stop each action after its
     // template is rendered. This probe never runs an action, so `false`
@@ -396,7 +409,7 @@ pub async fn test_stored_rule(
         }
     }
     let Some(topic) = extract_topic(&value) else {
-        return missing_field("topic");
+        return no_match();
     };
     let Some(payload) = extract_payload(&value) else {
         return missing_field("payload");
@@ -552,7 +565,6 @@ mod tests {
     async fn missing_fields_are_rejected() {
         for bad in [
             serde_json::json!({"topic": "a/b", "payload": {}}),
-            serde_json::json!({"sql": "SELECT * FROM \"a/b\"", "payload": {}}),
             serde_json::json!({"sql": "SELECT * FROM \"a/b\"", "topic": "a/b"}),
             serde_json::json!([]),
         ] {
@@ -560,6 +572,31 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
         }
+        // No topic means no match, as the reference tester reports it.
+        let (status, body) = response_parts(
+            test_rule_offline(body_of(serde_json::json!({
+                "sql": "SELECT * FROM \"a/b\"",
+                "payload": {},
+            })))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], serde_json::json!("NOT_MATCH"));
+    }
+
+    #[tokio::test]
+    async fn non_empty_context_requires_event_type() {
+        let (status, body) = response_parts(
+            test_rule_offline(body_of(serde_json::json!({
+                "sql": "SELECT * FROM \"a/b\"",
+                "context": {"topic": "a/b", "payload": {}},
+            })))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
     }
 
     struct FnSink;
@@ -648,7 +685,11 @@ mod tests {
             (Some(serde_json::json!("no")), StatusCode::BAD_REQUEST),
         ] {
             let mut body = serde_json::json!({
-                "context": {"topic": "sensors/kitchen", "payload": "{\"temperature\":150.0}"},
+                "context": {
+                    "event_type": "message_publish",
+                    "topic": "sensors/kitchen",
+                    "payload": "{\"temperature\":150.0}",
+                },
             });
             if let Some(flag) = flag {
                 body["stop_action_after_template_rendering"] = flag;
@@ -737,17 +778,13 @@ mod tests {
         }
     }
 
-    /// Malformed samples on a known rule are 400 with the documented
-    /// shape and store nothing new.
+    /// Malformed samples on a known rule are refused with the documented
+    /// shape and store nothing new. A missing topic is a normal no-match.
     #[tokio::test]
     async fn stored_probe_malformed_sample_is_rejected() {
         let state = stored_state();
         let before = state.engine.list_rules().len();
-        for bad in [
-            serde_json::json!({"payload": {"temperature": 1.0}}),
-            serde_json::json!({"topic": "sensors/kitchen"}),
-            serde_json::json!([]),
-        ] {
+        for bad in [serde_json::json!([])] {
             let (status, body) = response_parts(
                 test_stored_rule(
                     State(state.clone()),
@@ -761,6 +798,30 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
         }
+        let (status, body) = response_parts(
+            test_stored_rule(
+                State(state.clone()),
+                Path("w316-rule".to_string()),
+                Query(HashMap::new()),
+                body_of(serde_json::json!({"topic": "sensors/kitchen"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        let (status, body) = response_parts(
+            test_stored_rule(
+                State(state.clone()),
+                Path("w316-rule".to_string()),
+                Query(HashMap::new()),
+                body_of(serde_json::json!({"payload": {"temperature": 150.0}})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], serde_json::json!("NOT_MATCH"));
         assert_eq!(state.engine.list_rules().len(), before);
     }
 }

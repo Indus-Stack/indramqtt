@@ -85,6 +85,10 @@ OK
 
 Creating a rule with an id that already exists returns `400 BAD_REQUEST`.
 The existing rule and its stored settings do not change.
+A rule whose `FROM` clause is absent or invalid returns `400 BAD_REQUEST`
+with a message that names the problem. The broker never substitutes a topic.
+`PUT /api/v5/rules/{id}` merges the fields that the body carries. An omitted
+field keeps its stored value.
 Testing an absent rule with `POST /api/v5/rules/{id}/test` returns
 `404 RULE_NOT_FOUND`. The test creates no rule.
 

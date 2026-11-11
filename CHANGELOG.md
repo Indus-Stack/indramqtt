@@ -17,6 +17,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 - **Connector lifecycle (MV-06b)**: `POST /api/v5/connectors/{id}/{operation}` serves `start`, `stop` and `restart`. Each keeps the stored settings and answers 204. `restart` runs a fresh connection test and enables the connector. `status` and `status_reason` come from the sink state. The schema listing names exactly the ready capability kinds. See [`docs/connectors/`](docs/connectors/index.md).
+- **Rules API parity (MV-06a)**:
+  - The `FROM` clause of a rule is read with the rule SQL parser. Several sources, quoted topic filters and event sources route correctly.
+  - An absent or invalid `FROM` answers `400 BAD_REQUEST` and names the problem.
+  - `POST /api/v5/rules` stores and returns `description` and `metadata`.
+  - `PUT /api/v5/rules/{id}` merges the body fields into the stored rule.
+  - `GET /api/v5/rules` accepts the documented filters.
+  - `GET /api/v5/rules/{id}/metrics` adds `failed.no_result` and `node_metrics`. The reset route zeroes every counter.
+  - `POST /api/v5/rule_test` requires `event_type` in a non-empty context. It answers `412 NOT_MATCH` when no topic matches.
+  - See [`docs/rules/`](docs/rules/index.md).
 - **HTTP, device and local kinds (MV-03c)**: add `http`, `opc_ua`, `sparkplug_b` runtimes with aliases. Missing fields answer 400. See [`docs/connectors/`](docs/connectors/index.md).
 - **Message-broker connectors are ready**: the `kafka`, `confluent`, `rabbitmq`, `pulsar`, `rocketmq`, `mqtt_bridge` and `redis` kinds now own action runtimes. The aliases `kafka_producer`, `kafka_consumer`, `confluent_producer`, `confluent_kafka`, `confluent_cloud`, `rabbit`, `amqp`, `mqtt`, `mqtt-bridge` and `bridge` select the same runtimes. The connector carries the connection only; the action carries the target (topic, key, headers, strategy, exchange, routing key, command). A missing required field answers 400 and names the field. A broker ack or a send receipt is checked for every delivery; a refused ack counts one failed forward. Each kind proves delivery, update, refused update, recovery and failure counting through the broker against a loopback fake. The bridge remaps topics so a bridged message is never bridged back. Live delivery against real servers waits for the CTO release run. See [`docs/connectors/`](docs/connectors/index.md).
 - **Document and search connectors are ready**: the `mongodb`, `couchbase` and `elasticsearch` kinds now own action runtimes with required fields, action-selected collections, indexes, ids and document templates. The aliases `mongo`, `documentdb`, `couch`, `cb`, `elastic` and `es` select the same runtimes. A document template that does not render a JSON object counts one failed forward. The connector, action, probe and schema endpoints accept the documented fields.

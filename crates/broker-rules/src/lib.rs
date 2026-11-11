@@ -1048,6 +1048,12 @@ pub enum RuleTier {
 pub struct Rule {
     pub id: String,
     pub name: String,
+    /// Free-form rule description from the management API. Empty when
+    /// the request does not carry one.
+    pub description: String,
+    /// Rule metadata object from the management API. An empty object
+    /// when the request does not carry one.
+    pub metadata: serde_json::Value,
     /// Tenant that owns the rule. One rule serves one tenant. Rules
     /// stored before tenancy carry the default tenant.
     pub tenant: String,
@@ -1067,6 +1073,12 @@ pub struct Rule {
     /// `Stream` sources constrain nothing. Empty for pre-front-end rules.
     #[serde(skip_serializing)]
     pub std_sources: Vec<StdSource>,
+    /// Topic filters compiled from the `Topic` entries of `std_sources`.
+    /// One entry per source, in the same order; non-topic sources hold
+    /// `None`. Compiling here keeps the ingress path free of a per-publish
+    /// `TopicFilter` parse.
+    #[serde(skip_serializing)]
+    pub std_topic_filters: Vec<Option<TopicFilter>>,
     /// True when the standard select list holds a top-level `*`. Consulted
     /// on the deliver path to strip injected message keys from the
     /// expansion so `SELECT *` keeps projecting exactly the payload fields.
@@ -1085,6 +1097,11 @@ pub struct Rule {
     pub passed_cnt: Arc<AtomicU64>,
     #[serde(skip_serializing)]
     pub failed_cnt: Arc<AtomicU64>,
+    /// SQL rows that produced no result. The reference API reports this
+    /// as `failed.no_result`. A rule without a result increments both
+    /// this counter and `failed_cnt`.
+    #[serde(skip_serializing)]
+    pub no_result_cnt: Arc<AtomicU64>,
     #[serde(skip_serializing)]
     pub actions_total_cnt: Arc<AtomicU64>,
     #[serde(skip_serializing)]
@@ -1631,6 +1648,9 @@ struct RuleTaskConfig {
     /// Failed counter of the owning rule. The eval loop bumps it once
     /// per non-empty batch that yields no row.
     failed: Arc<AtomicU64>,
+    /// No-result counter of the owning rule. The eval loop bumps it for
+    /// the same no-row batches, which are SQL no-result outcomes.
+    no_result: Arc<AtomicU64>,
 }
 
 /// Configuration for a rule-task bus feeder: what the feeder needs to turn
@@ -1641,6 +1661,7 @@ struct RuleFeederConfig {
     tenant: String,
     topic_filter: TopicFilter,
     std_sources: Vec<StdSource>,
+    std_topic_filters: Vec<Option<TopicFilter>>,
     has_foreach: bool,
     parsed_query: Option<SelectStmt>,
     std_has_wildcard: bool,
@@ -1651,6 +1672,9 @@ struct RuleFeederConfig {
     /// Failed counter of the owning rule. The feeder bumps it once per
     /// ingress that cannot enter the window buffer.
     failed: Arc<AtomicU64>,
+    /// No-result counter of the owning rule. The feeder bumps it for a
+    /// row that the WHERE clause rejects.
+    no_result: Arc<AtomicU64>,
 }
 
 /// The runtime sink bridge: [`runtime::RuleOutputSink`] over the broker's
@@ -2217,6 +2241,8 @@ impl RuleEngine {
             id,
             tenant,
             name,
+            String::new(),
+            serde_json::json!({}),
             topic_filter,
             sql_query,
             enabled,
@@ -2247,6 +2273,8 @@ impl RuleEngine {
             id,
             "default".to_string(),
             name,
+            String::new(),
+            serde_json::json!({}),
             topic_filter,
             sql_query,
             enabled,
@@ -2257,12 +2285,15 @@ impl RuleEngine {
     /// Build and store a rule under a caller-chosen id in one tenant.
     /// The tenant must pass `is_valid_rule_tenant`; blank maps to the
     /// default tenant. Shares the same bounds as `create_rule_with_id`.
+    /// Stores the `description` and `metadata` of the management request.
     #[allow(clippy::too_many_arguments)]
     pub fn create_rule_with_id_in_tenant(
         &self,
         id: String,
         tenant: String,
         name: String,
+        description: String,
+        metadata: serde_json::Value,
         topic_filter: TopicFilter,
         sql_query: Option<String>,
         enabled: bool,
@@ -2278,6 +2309,8 @@ impl RuleEngine {
             id,
             tenant,
             name,
+            description,
+            metadata,
             topic_filter,
             sql_query,
             enabled,
@@ -2308,6 +2341,8 @@ impl RuleEngine {
         id: String,
         tenant: String,
         name: String,
+        description: String,
+        metadata: serde_json::Value,
         topic_filter: TopicFilter,
         sql_query: Option<String>,
         enabled: bool,
@@ -2405,15 +2440,19 @@ impl RuleEngine {
                 "tenant {tenant:?} is not valid (field `tenant`)"
             )));
         }
+        let std_topic_filters = compile_std_topic_filters(&std_sources);
         let rule = Rule {
             id: id.clone(),
             name,
+            description,
+            metadata,
             tenant,
             topic_filter,
             sql_query,
             parsed_query,
             std_foreach,
             std_sources,
+            std_topic_filters,
             std_has_wildcard,
             std_explicit_keys,
             tier,
@@ -2422,6 +2461,7 @@ impl RuleEngine {
             matched_cnt: Arc::new(AtomicU64::new(0)),
             passed_cnt: Arc::new(AtomicU64::new(0)),
             failed_cnt: Arc::new(AtomicU64::new(0)),
+            no_result_cnt: Arc::new(AtomicU64::new(0)),
             actions_total_cnt: Arc::new(AtomicU64::new(0)),
             actions_success_cnt: Arc::new(AtomicU64::new(0)),
             actions_failed_cnt: Arc::new(AtomicU64::new(0)),
@@ -2561,6 +2601,8 @@ impl RuleEngine {
                 entry.id.clone(),
                 tenant,
                 entry.name.clone(),
+                entry.description.clone(),
+                entry.metadata.clone(),
                 topic_filter,
                 entry.sql_query.clone(),
                 entry.enabled,
@@ -2587,6 +2629,8 @@ impl RuleEngine {
             .map(|rule| broker_config::RuleEntry {
                 id: rule.id.clone(),
                 name: rule.name.clone(),
+                description: rule.description.clone(),
+                metadata: rule.metadata.clone(),
                 tenant: rule.tenant.clone(),
                 topic_filter: rule.topic_filter.as_str().to_string(),
                 sql_query: rule.sql_query.clone(),
@@ -2730,10 +2774,13 @@ impl RuleEngine {
     /// publish path keeps reading its per-ingress snapshot and never takes
     /// this lock beyond the snapshot clone in `dispatch_ingress`.
     // TODO(parity): Do per-rule counters reset on replace or persist across updates?
+    #[allow(clippy::too_many_arguments)]
     pub fn replace_rule(
         &self,
         id: &str,
         name: String,
+        description: String,
+        metadata: serde_json::Value,
         topic_filter: TopicFilter,
         sql_query: Option<String>,
         enabled: bool,
@@ -2745,18 +2792,31 @@ impl RuleEngine {
             .get(id)
             .map(|arc| arc.tenant.clone())
             .unwrap_or_else(|| "default".to_string());
-        self.replace_rule_in_tenant(id, tenant, name, topic_filter, sql_query, enabled, actions)
+        self.replace_rule_in_tenant(
+            id,
+            tenant,
+            name,
+            description,
+            metadata,
+            topic_filter,
+            sql_query,
+            enabled,
+            actions,
+        )
     }
 
     /// Replace a stored rule in full in one tenant. Same bounds as
     /// `replace_rule`. The tenant must pass `is_valid_rule_tenant`.
-    /// Counters carry over from the old rule.
+    /// Counters carry over from the old rule. Stores the `description`
+    /// and `metadata` of the management request.
     #[allow(clippy::too_many_arguments)]
     pub fn replace_rule_in_tenant(
         &self,
         id: &str,
         tenant: String,
         name: String,
+        description: String,
+        metadata: serde_json::Value,
         topic_filter: TopicFilter,
         sql_query: Option<String>,
         enabled: bool,
@@ -2820,15 +2880,19 @@ impl RuleEngine {
                 "tenant {tenant:?} is not valid (field `tenant`)"
             )));
         }
+        let std_topic_filters = compile_std_topic_filters(&std_sources);
         let rule = Rule {
             id: id.to_string(),
             name,
+            description,
+            metadata,
             tenant,
             topic_filter,
             sql_query,
             parsed_query,
             std_foreach,
             std_sources,
+            std_topic_filters,
             std_has_wildcard,
             std_explicit_keys,
             tier,
@@ -2837,6 +2901,7 @@ impl RuleEngine {
             matched_cnt: old.matched_cnt.clone(),
             passed_cnt: old.passed_cnt.clone(),
             failed_cnt: old.failed_cnt.clone(),
+            no_result_cnt: old.no_result_cnt.clone(),
             actions_total_cnt: old.actions_total_cnt.clone(),
             actions_success_cnt: old.actions_success_cnt.clone(),
             actions_failed_cnt: old.actions_failed_cnt.clone(),
@@ -3765,6 +3830,7 @@ impl RuleEngine {
             tenant: rule.tenant.clone(),
             topic_filter: rule.topic_filter.clone(),
             std_sources: rule.std_sources.clone(),
+            std_topic_filters: rule.std_topic_filters.clone(),
             has_foreach: rule.std_foreach.is_some(),
             parsed_query: rule.parsed_query.clone(),
             std_has_wildcard: rule.std_has_wildcard,
@@ -3773,6 +3839,7 @@ impl RuleEngine {
             bus_rx,
             counters: counters.clone(),
             failed: rule.failed_cnt.clone(),
+            no_result: rule.no_result_cnt.clone(),
         };
         let eval_config = RuleTaskConfig {
             rule_id: rule.id.clone(),
@@ -3783,6 +3850,7 @@ impl RuleEngine {
             std_has_wildcard: rule.std_has_wildcard,
             std_explicit_keys: rule.std_explicit_keys.clone(),
             failed: rule.failed_cnt.clone(),
+            no_result: rule.no_result_cnt.clone(),
         };
         let bridge = BrokerRuleSink {
             rule_id: rule.id.clone(),
@@ -3817,6 +3885,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         tenant,
         topic_filter,
         std_sources,
+        std_topic_filters,
         has_foreach,
         parsed_query,
         std_has_wildcard,
@@ -3825,6 +3894,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         mut bus_rx,
         counters,
         failed,
+        no_result,
     } = config;
     let stmt = match parsed_query.as_ref() {
         Some(stmt) => stmt,
@@ -3843,7 +3913,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         if !topic_filter.matches(&feeder.topic) {
             continue;
         }
-        if !std_sources_match(&std_sources, &feeder.topic) {
+        if !std_sources_match(&std_sources, &std_topic_filters, &feeder.topic) {
             continue;
         }
         // Rebuild the exact evaluation record for either dialect mode:
@@ -3857,6 +3927,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
             // skips it. An empty object still proceeds.
             if !feeder.has_object {
                 failed.fetch_add(1, Ordering::Relaxed);
+                no_result.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let mut record = feeder.record;
@@ -3898,6 +3969,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         };
         if !passes {
             failed.fetch_add(1, Ordering::Relaxed);
+            no_result.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         // Carry the ingress QoS into the window buffer so flush delivery
@@ -4018,7 +4090,7 @@ impl RuleEngine {
             rules
                 .values()
                 .filter(|rule| {
-                    rule.enabled && rule.tenant == tenant && rule.topic_filter.matches(topic)
+                    rule.enabled && rule.tenant == tenant && rule_matches_ingress(rule, topic)
                 })
                 .cloned()
                 .collect()
@@ -4083,6 +4155,7 @@ impl RuleEngine {
             let outputs = apply_rule(rule, topic, payload, qos);
             if outputs.is_empty() {
                 rule.failed_cnt.fetch_add(1, Ordering::Relaxed);
+                rule.no_result_cnt.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
@@ -4174,10 +4247,7 @@ impl RuleEngine {
                     rules
                         .values()
                         .filter(|r| {
-                            r.enabled
-                                && r.tenant == tenant
-                                && r.topic_filter.matches(&event.topic)
-                                && std_sources_match(&r.std_sources, &event.topic)
+                            r.enabled && r.tenant == tenant && rule_matches_ingress(r, &event.topic)
                         })
                         .cloned()
                         .collect()
@@ -4197,6 +4267,7 @@ impl RuleEngine {
                     let outputs = apply_rule(rule, &event.topic, &event.payload, QoS::AtMostOnce);
                     if outputs.is_empty() {
                         rule.failed_cnt.fetch_add(1, Ordering::Relaxed);
+                        rule.no_result_cnt.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
@@ -4516,6 +4587,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
         std_has_wildcard,
         std_explicit_keys,
         failed,
+        no_result,
     } = config;
     match window {
         WindowDef::TumblingTime { unit, length } => {
@@ -4529,7 +4601,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                     _ = ticker.tick() => {
                         let end = now_ms();
                         let batch = std::mem::take(&mut buffer);
-                        flush_rule_window(&rule_id, &stmt, batch, window_start, end, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed).await;
+                        flush_rule_window(&rule_id, &stmt, batch, window_start, end, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed, &no_result).await;
                         window_start = end;
                     }
                     rec = feed_rx.recv() => {
@@ -4570,6 +4642,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                         std_has_wildcard,
                         &std_explicit_keys,
                         &failed,
+                        &no_result,
                     )
                     .await;
                     since_flush = 0;
@@ -4610,6 +4683,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                             std_has_wildcard,
                             &std_explicit_keys,
                             &failed,
+                            &no_result,
                         )
                         .await;
                     }
@@ -4648,6 +4722,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                     std_has_wildcard,
                     &std_explicit_keys,
                     &failed,
+                    &no_result,
                 )
                 .await;
             }
@@ -4675,7 +4750,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                         let end = now_ms();
                         let start = session_start.unwrap_or(end);
                         let batch = std::mem::take(&mut buffer);
-                        flush_rule_window(&rule_id, &stmt, batch, start, end, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed).await;
+                        flush_rule_window(&rule_id, &stmt, batch, start, end, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed, &no_result).await;
                         session_start = None;
                         last_arrival = None;
                     }
@@ -4694,7 +4769,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                                 last_arrival = Some(now);
                                 if now.saturating_sub(start) >= max_duration_ms {
                                     let batch = std::mem::take(&mut buffer);
-                                    flush_rule_window(&rule_id, &stmt, batch, start, now, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed).await;
+                                    flush_rule_window(&rule_id, &stmt, batch, start, now, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed, &no_result).await;
                                     session_start = None;
                                     last_arrival = None;
                                 }
@@ -4732,6 +4807,7 @@ async fn flush_rule_window(
     std_has_wildcard: bool,
     std_explicit_keys: &[String],
     failed: &Arc<AtomicU64>,
+    no_result: &Arc<AtomicU64>,
 ) -> usize {
     if batch.is_empty() {
         return 0;
@@ -4827,6 +4903,7 @@ async fn flush_rule_window(
     // an ingress with no output.
     if rows_out == 0 {
         failed.fetch_add(1, Ordering::Relaxed);
+        no_result.fetch_add(1, Ordering::Relaxed);
     }
     rows_out
 }
@@ -4983,6 +5060,37 @@ fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
     }
 }
 
+/// Parse the `FROM` sources of a rule SQL string for the management API.
+///
+/// The standard rule dialect is the first parser. Legacy statements that
+/// the streaming parser accepts keep their existing FROM target. A
+/// statement neither parser accepts, or one with no FROM target, returns
+/// an error that names the problem. The management handler turns this
+/// error into the documented 400 answer; it never invents a topic.
+pub fn rule_sql_sources(sql: &str) -> Result<Vec<StdSource>, String> {
+    let (stripped, _) = split_into_connector(sql).map_err(|e| e.to_string())?;
+    let rewritten = rewrite_colliding_functions(&stripped);
+    match std_sql::parse_std_rule(&rewritten) {
+        Ok(rule) => Ok(rule.sources),
+        Err(std_err) => {
+            let normalized = normalize_from_target(&rewritten);
+            match rekuiper_sql::Parser::new(&normalized).parse_select() {
+                Ok(_) => match from_target_text(&stripped) {
+                    Some(target) if !target.trim().is_empty() => {
+                        if target.starts_with("$events/") {
+                            Ok(vec![StdSource::Event(target)])
+                        } else {
+                            Ok(vec![StdSource::Topic(target)])
+                        }
+                    }
+                    _ => Err(format!("invalid sql_query: {std_err}")),
+                },
+                Err(_) => Err(format!("invalid sql_query: {std_err}")),
+            }
+        }
+    }
+}
+
 // Cache output names only for metadata cleanup. The evaluator owns field
 // order and values, including expressions and repeated names.
 fn projection_metadata(stmt: &SelectStmt) -> (bool, Vec<String>) {
@@ -5005,30 +5113,59 @@ fn projection_metadata(stmt: &SelectStmt) -> (bool, Vec<String>) {
     (has_wildcard, explicit_keys)
 }
 
+/// Compile the `Topic` entries of `std_sources` once, at rule creation.
+///
+/// The result has one entry per source in source order. A non-topic
+/// source, or a filter the parser rejects, holds `None`. The ingress path
+/// then matches these filters without a per-publish parse.
+fn compile_std_topic_filters(sources: &[StdSource]) -> Vec<Option<TopicFilter>> {
+    sources
+        .iter()
+        .map(|source| match source {
+            StdSource::Topic(filter) => TopicFilter::new(filter).ok(),
+            StdSource::Event(_) | StdSource::Stream(_) => None,
+        })
+        .collect()
+}
+
+/// True when an ingress topic may execute this rule.
+///
+/// The rule must match both its stored `topic_filter` and its sources.
+/// A rule with several sources stores `#` as the filter and matches each
+/// source through [`std_sources_match`], so every source routes and the
+/// counters see only real matches. A single event source matches only its
+/// own event topic, so MQTT ingress does not run it. The source check
+/// uses the filters compiled at creation, so it adds no parse.
+fn rule_matches_ingress(rule: &Rule, topic: &Topic) -> bool {
+    rule.topic_filter.matches(topic)
+        && std_sources_match(&rule.std_sources, &rule.std_topic_filters, topic)
+}
+
 /// True when the ingress topic may execute this standard rule's statement.
 ///
-/// `Topic` sources must match (via [`TopicFilter::matches`]); `Event`
-/// sources (`"$events/..."`, built in RQ-04) match their own event topic so
-/// an event rule runs its actions once on the drain path; they are enqueued
-/// only by the kernel `fire_*` entry points and never arrive on MQTT
-/// ingress, so a rule over only events still never fires on MQTT ingress
-/// (fail closed); `Stream` sources (bare names, the streaming extension)
-/// constrain nothing. An empty source list is a pre-front-end rule and
-/// constrains nothing.
-fn std_sources_match(sources: &[StdSource], topic: &Topic) -> bool {
+/// `Topic` sources must match their precompiled filter; `Event` sources
+/// (`"$events/..."`, built in RQ-04) match their own event topic so an
+/// event rule runs its actions once on the drain path. Only the kernel
+/// `fire_*` entry points enqueue them, so a rule over only events never
+/// fires on MQTT ingress (fail closed). `Stream` sources (bare names, the
+/// streaming extension) constrain nothing. An empty source list is a
+/// pre-front-end rule and constrains nothing.
+fn std_sources_match(
+    sources: &[StdSource],
+    filters: &[Option<TopicFilter>],
+    topic: &Topic,
+) -> bool {
     if sources.is_empty() {
         return true;
     }
     let mut has_topic = false;
     let mut has_stream = false;
-    for source in sources {
+    for (source, filter) in sources.iter().zip(filters) {
         match source {
-            StdSource::Topic(filter) => {
+            StdSource::Topic(_) => {
                 has_topic = true;
-                if let Ok(parsed) = TopicFilter::new(filter) {
-                    if parsed.matches(topic) {
-                        return true;
-                    }
+                if filter.as_ref().is_some_and(|parsed| parsed.matches(topic)) {
+                    return true;
                 }
             }
             StdSource::Stream(_) => {
@@ -5208,7 +5345,7 @@ fn expand_foreach_rows(
 /// `stmt.from`, so the target is semantically inert here. A field
 /// literally named `from` is not supported (creation fails loudly rather
 /// than misparsing silently only if the rewrite breaks the statement).
-fn normalize_from_target(sql: &str) -> String {
+fn from_target_bounds(sql: &str) -> Option<(usize, usize)> {
     let chars: Vec<(usize, char)> = sql.char_indices().collect();
     let n = chars.len();
     let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
@@ -5231,7 +5368,7 @@ fn normalize_from_target(sql: &str) -> String {
             cj += 1;
         }
         if cj >= n {
-            return sql.to_string();
+            return None;
         }
         let jb = chars[cj].0;
         let kb = {
@@ -5242,7 +5379,7 @@ fn normalize_from_target(sql: &str) -> String {
                     ck += 1;
                 }
                 if ck >= n {
-                    return sql.to_string();
+                    return None;
                 }
                 chars[ck].0 + q.len_utf8()
             } else {
@@ -5261,9 +5398,37 @@ fn normalize_from_target(sql: &str) -> String {
                 }
             }
         };
-        return format!("{}stream{}", &sql[..jb], &sql[kb..]);
+        return Some((jb, kb));
     }
-    sql.to_string()
+    None
+}
+
+fn normalize_from_target(sql: &str) -> String {
+    match from_target_bounds(sql) {
+        Some((jb, kb)) => format!("{}stream{}", &sql[..jb], &sql[kb..]),
+        None => sql.to_string(),
+    }
+}
+
+/// The FROM target text as written, without its quote characters.
+fn from_target_text(sql: &str) -> Option<String> {
+    let (jb, kb) = from_target_bounds(sql)?;
+    let raw = sql[jb..kb].trim();
+    let text = if raw.len() >= 2 {
+        let first = raw.chars().next();
+        let last = raw.chars().next_back();
+        match (first, last) {
+            (Some(a), Some(b))
+                if (a == '"' && b == '"') || (a == '\'' && b == '\'') || (a == '`' && b == '`') =>
+            {
+                &raw[1..raw.len() - 1]
+            }
+            _ => raw,
+        }
+    } else {
+        raw
+    };
+    Some(text.to_string())
 }
 
 /// Rewrite colliding standard-dialect function names to internal `std_*`
@@ -5439,7 +5604,8 @@ pub fn try_evaluate(
         _ => (None, None, Vec::new(), false, Vec::new()),
     };
     stdlib::ensure_stdlib_registered();
-    if !std_sources_match(&sources, &probe) {
+    let source_filters = compile_std_topic_filters(&sources);
+    if !std_sources_match(&sources, &source_filters, &probe) {
         return Ok((false, None));
     }
     let is_std = !sources.is_empty() || foreach.is_some();
@@ -5788,10 +5954,10 @@ fn split_into_connector(sql: &str) -> Result<(String, Option<String>), RuleEngin
 /// yields at most one. Pre-front-end rules (empty sources, no `FOREACH`,
 /// wildcard or explicit) run the historical raw-record path so existing
 /// rekuiper-dialect rules keep their behaviour and hot-path numbers.
+///
+/// The caller already matched the rule against the topic through
+/// [`rule_matches_ingress`], so this does not repeat the source check.
 fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Bytes> {
-    if !std_sources_match(&rule.std_sources, topic) {
-        return Vec::new();
-    }
     let stmt = match rule.parsed_query.as_ref() {
         Some(stmt) => stmt,
         None => return vec![payload.clone()],
@@ -11082,10 +11248,22 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         ))
     }
 
-    fn persisted_rule_snapshot(rule: &Rule) -> (String, String, String, Option<String>, bool) {
+    fn persisted_rule_snapshot(
+        rule: &Rule,
+    ) -> (
+        String,
+        String,
+        String,
+        serde_json::Value,
+        String,
+        Option<String>,
+        bool,
+    ) {
         (
             rule.id.clone(),
             rule.name.clone(),
+            rule.description.clone(),
+            rule.metadata.clone(),
             rule.topic_filter.as_str().to_string(),
             rule.sql_query.clone(),
             rule.enabled,
@@ -11104,8 +11282,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let engine = RuleEngine::from_registry(&registry).expect("empty snapshot boots");
         // All three action variants; the republish rule stays disabled.
         engine
-            .create_rule(
+            .create_rule_with_id_in_tenant(
                 "republish-rule".to_string(),
+                "default".to_string(),
+                "republish-rule".to_string(),
+                "hot readings".to_string(),
+                serde_json::json!({"owner": "rules"}),
                 TopicFilter::new("sensors/+").unwrap(),
                 Some(r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#.to_string()),
                 false,
@@ -11149,7 +11331,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(
                 persisted_rule_snapshot(before_rule),
                 persisted_rule_snapshot(after_rule),
-                "id/name/filter/sql/enable must round-trip"
+                "id/name/description/metadata/filter/sql/enable must round-trip"
             );
             assert_eq!(
                 persisted_actions_value(before_rule),
@@ -11244,6 +11426,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             rules: vec![broker_config::RuleEntry {
                 id: "rule-1".to_string(),
                 name: "bad".to_string(),
+                description: String::new(),
+                metadata: serde_json::json!({}),
                 tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: None,
@@ -11266,6 +11450,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             rules: vec![broker_config::RuleEntry {
                 id: "rule-1".to_string(),
                 name: "bad".to_string(),
+                description: String::new(),
+                metadata: serde_json::json!({}),
                 tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: Some("SELECT FROM WHERE".to_string()),

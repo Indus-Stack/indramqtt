@@ -127,7 +127,7 @@ Then create the rule and watch the effect:
 4. Publish a non-matching message. Nothing arrives.
 5. Delete the rule with `DELETE /api/v1/rules/{id}`. It answers 204.
 
-Check rule counters at `GET /api/v5/rules/{id}/metrics` with `matched`, `passed`, and `failed`. `failed` counts `WHERE`-false rows and non-JSON payloads.
+Check rule counters at `GET /api/v5/rules/{id}/metrics` with `matched`, `passed`, `failed` and `failed.no_result`. `failed` counts `WHERE`-false rows and non-JSON payloads. `failed.no_result` counts the subset that produced no SQL result. The same body carries `node_metrics` for the local node. `PUT /api/v5/rules/{id}/metrics/reset` zeroes every counter.
 
 ## Action resource options and counters
 

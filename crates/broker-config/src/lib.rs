@@ -901,6 +901,12 @@ fn default_rule_tenant() -> String {
     "default".to_string()
 }
 
+/// Serde default for a missing rule metadata object: historical entries
+/// predate the field, and the management schema defaults to an object.
+fn default_rule_metadata() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 /// Longest accepted rule tenant id (128 chars). Reason: mirrors the
 /// session tenant bound, so the id joins routing keys with bounded
 /// key memory.
@@ -946,6 +952,12 @@ pub struct RuleEntry {
     /// Rule name; free-form (pre-persistence files load as empty).
     #[serde(default)]
     pub name: String,
+    /// Rule description; free-form. Older files load as empty.
+    #[serde(default)]
+    pub description: String,
+    /// Rule metadata object. Older files load as an empty object.
+    #[serde(default = "default_rule_metadata")]
+    pub metadata: serde_json::Value,
     /// Tenant that owns the rule. Empty loads as the default tenant so
     /// files written before tenancy keep their behaviour.
     #[serde(default = "default_rule_tenant")]
@@ -4659,6 +4671,8 @@ mod tests {
                 rules: vec![RuleEntry {
                     id: "rule-1".to_string(),
                     name: "rule-1".to_string(),
+                    description: String::new(),
+                    metadata: serde_json::json!({}),
                     tenant: "default".to_string(),
                     topic_filter: "sensors/#".to_string(),
                     sql_query: Some("SELECT * FROM 'sensors/#'".to_string()),
@@ -4793,6 +4807,8 @@ mod tests {
         let rule = RuleEntry {
             id: "rule-1".to_string(),
             name: "rule-1".to_string(),
+            description: String::new(),
+            metadata: serde_json::json!({}),
             tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: Some("SELECT * FROM 'a/#'".to_string()),
@@ -4821,6 +4837,8 @@ mod tests {
         let rule = RuleEntry {
             id: "rule-fn".to_string(),
             name: "rule-fn".to_string(),
+            description: String::new(),
+            metadata: serde_json::json!({}),
             tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: Some("SELECT * FROM 'a/#'".to_string()),
@@ -5333,6 +5351,8 @@ mod tests {
             rules: vec![RuleEntry {
                 id: "rule-1".to_string(),
                 name: "rule-1".to_string(),
+                description: String::new(),
+                metadata: serde_json::json!({}),
                 tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: Some("SELECT * FROM 'sensors/#'".to_string()),
@@ -5385,6 +5405,8 @@ mod tests {
             rules: vec![RuleEntry {
                 id: String::new(),
                 name: String::new(),
+                description: String::new(),
+                metadata: serde_json::json!({}),
                 tenant: "default".to_string(),
                 topic_filter: "a/#".to_string(),
                 sql_query: Some("SELECT 1".to_string()),

@@ -1,0 +1,340 @@
+[
+ {
+  "operation": "POST /rules",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "id": "sb14-conf-no-from",
+   "sql": "SELECT 1",
+   "actions": []
+  },
+  "expect_status": 400,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-no-from"
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-no-from"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "POST /rules",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "id": "sb14-conf-bad-sql",
+   "sql": "SELECT WHERE WHERE",
+   "actions": []
+  },
+  "expect_status": 400,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-bad-sql"
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-bad-sql"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "POST /rules",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "id": "sb14-conf-multi",
+   "sql": "SELECT * FROM \"sb14/conf/a\", \"sb14/conf/b\"",
+   "actions": []
+  },
+  "expect_status": 201,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-multi"
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-multi"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "POST /rules",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "id": "sb14-conf-event",
+   "sql": "SELECT * FROM \"$events/client_connected\"",
+   "actions": []
+  },
+  "expect_status": 201,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-event"
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-event"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "GET /rules",
+  "path_params": {},
+  "query": {
+   "like_id": "sb14-conf"
+  },
+  "body": null,
+  "expect_status": 200,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-like"
+    }
+   },
+   {
+    "api": {
+     "method": "POST",
+     "path": "/rules",
+     "body": {
+      "id": "sb14-conf-like",
+      "sql": "SELECT * FROM \"sb14/conf/like\"",
+      "actions": []
+     }
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-like"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "GET /rules",
+  "path_params": {},
+  "query": {
+   "from": "sb14/conf/from"
+  },
+  "body": null,
+  "expect_status": 200,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-from"
+    }
+   },
+   {
+    "api": {
+     "method": "POST",
+     "path": "/rules",
+     "body": {
+      "id": "sb14-conf-from",
+      "sql": "SELECT * FROM \"sb14/conf/from\"",
+      "actions": []
+     }
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-from"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "GET /rules",
+  "path_params": {},
+  "query": {
+   "enable": "false"
+  },
+  "body": null,
+  "expect_status": 200,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-disabled"
+    }
+   },
+   {
+    "api": {
+     "method": "POST",
+     "path": "/rules",
+     "body": {
+      "id": "sb14-conf-disabled",
+      "sql": "SELECT * FROM \"sb14/conf/disabled\"",
+      "actions": []
+     }
+    }
+   },
+   {
+    "api": {
+     "method": "PUT",
+     "path": "/rules/sb14-conf-disabled",
+     "body": {
+      "enable": false
+     }
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-disabled"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "GET /rules",
+  "path_params": {},
+  "query": {
+   "page": "0"
+  },
+  "body": null,
+  "expect_status": 400,
+  "setup": [],
+  "cleanup": []
+ },
+ {
+  "operation": "GET /rules",
+  "path_params": {},
+  "query": {
+   "limit": "10001"
+  },
+  "body": null,
+  "expect_status": 400,
+  "setup": [],
+  "cleanup": []
+ },
+ {
+  "operation": "PUT /rules/{id}",
+  "path_params": {
+   "id": "sb14-conf-put"
+  },
+  "query": {},
+  "body": {
+   "name": "sb14-renamed"
+  },
+  "expect_status": 200,
+  "setup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-put"
+    }
+   },
+   {
+    "api": {
+     "method": "POST",
+     "path": "/rules",
+     "body": {
+      "id": "sb14-conf-put",
+      "sql": "SELECT * FROM \"sb14/conf/put\"",
+      "actions": []
+     }
+    }
+   }
+  ],
+  "cleanup": [
+   {
+    "api": {
+     "method": "DELETE",
+     "path": "/rules/sb14-conf-put"
+    }
+   }
+  ]
+ },
+ {
+  "operation": "POST /rule_test",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "sql": "SELECT * FROM \"sb14/conf/test\""
+  },
+  "expect_status": 412,
+  "setup": [],
+  "cleanup": []
+ },
+ {
+  "operation": "POST /rule_test",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "context": {
+    "event_type": "message_publish",
+    "topic": "sb14/conf/test"
+   }
+  },
+  "expect_status": 400,
+  "setup": [],
+  "cleanup": []
+ },
+ {
+  "operation": "POST /rule_test",
+  "path_params": {},
+  "query": {},
+  "body": {
+   "sql": "SELECT * FROM \"sb14/conf/test\"",
+   "context": {
+    "event_type": "message_publish",
+    "topic": "sb14/conf/test",
+    "payload": "{\"a\":1}"
+   }
+  },
+  "expect_status": 200,
+  "setup": [],
+  "cleanup": []
+ },
+ {
+  "operation": "GET /rule_events",
+  "path_params": {},
+  "query": {},
+  "body": null,
+  "expect_status": 200,
+  "expect_json": {
+   "/0/event": "$events/client_connected"
+  },
+  "setup": [],
+  "cleanup": []
+ }
+]

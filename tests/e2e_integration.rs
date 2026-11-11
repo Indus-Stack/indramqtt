@@ -4228,6 +4228,468 @@ async fn sb27_inline_and_window_plain_payload_agree_through_mqtt() {
     kernel.finish().await;
 }
 
+/// SB-14: the rules API reads FROM with the SQL parser, merges PUT
+/// fields, filters the list, and serves the rule events through HTTP.
+#[tokio::test]
+async fn sb14_rules_crud_topic_parsing_and_filters_through_api() {
+    let kernel = spawn_kernel("").await;
+    let create = |id: &str, sql: &str| serde_json::json!({"id": id, "sql": sql, "actions": []});
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "sb14-topic-a",
+            "sql": r#"SELECT * FROM "sb14/topic/+""#,
+            "description": "kitchen sensors",
+            "metadata": {"owner": "sb14"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "quoted topic create: {body}");
+    assert_eq!(body["from"], serde_json::json!(["sb14/topic/+"]));
+    assert_eq!(body["name"], serde_json::json!(""));
+    assert_eq!(body["description"], serde_json::json!("kitchen sensors"));
+    assert_eq!(body["metadata"], serde_json::json!({"owner": "sb14"}));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        create(
+            "sb14-topic-event",
+            r#"SELECT * FROM "$events/client_connected""#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "event source create: {body}");
+    assert_eq!(
+        body["from"],
+        serde_json::json!(["$events/client_connected"])
+    );
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "sb14-topic-multi",
+            "sql": r#"SELECT * FROM "sb14/multi/a", "sb14/multi/b""#,
+            "actions": [{"function": "republish", "args": {"topic": "sb14/out/multi"}}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "multi-source create: {body}");
+    assert_eq!(
+        body["from"],
+        serde_json::json!(["sb14/multi/a", "sb14/multi/b"])
+    );
+    let mut subscriber = mv00_connect(&kernel, "sb14-topic-multi-sub").await;
+    send_mqtt(&mut subscriber, &sy02_subscribe(1, &[("sb14/out/#", 0)])).await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    let mut publisher = mv00_connect(&kernel, "sb14-topic-multi-pub").await;
+    for topic in ["sb14/multi/a", "sb14/multi/b"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(topic, 0, 0, false, br#"{"v":1}"#),
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30, "multi-source output is PUBLISH");
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, "sb14/out/multi");
+    }
+
+    for (id, sql) in [
+        ("sb14-no-from", "SELECT 1"),
+        ("sb14-bad-sql", "SELECT WHERE WHERE"),
+        ("sb14-bad-topic", r#"SELECT * FROM "sb14/[bad""#),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            create(id, sql),
+        )
+        .await;
+        assert_eq!(status, 400, "invalid FROM {id}: {body}");
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?like_id=sb14-topic",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "like_id filter: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["sb14-topic-a", "sb14-topic-event", "sb14-topic-multi"]
+    );
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?like_description=kitchen",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "like_description filter: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["sb14-topic-a"]);
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?from=sb14%2Fmulti%2Fa",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "from filter: {body}");
+    assert!(body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .any(|row| row["id"] == "sb14-topic-multi"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::json!({"name": "renamed"}),
+    )
+    .await;
+    assert_eq!(status, 200, "partial name update: {body}");
+    assert_eq!(body["name"], serde_json::json!("renamed"));
+    assert_eq!(
+        body["sql"],
+        serde_json::json!(r#"SELECT * FROM "sb14/topic/+""#)
+    );
+    assert_eq!(body["from"], serde_json::json!(["sb14/topic/+"]));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::json!({"enable": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "partial enable update: {body}");
+    assert_eq!(body["enable"], serde_json::json!(false));
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?enable=false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "enable filter: {body}");
+    assert!(body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .any(|row| row["id"] == "sb14-topic-a"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::json!({"sql": "SELECT WHERE WHERE"}),
+    )
+    .await;
+    assert_eq!(status, 400, "refused update: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["sql"],
+        serde_json::json!(r#"SELECT * FROM "sb14/topic/+""#)
+    );
+
+    for query in ["page=0", "limit=0", "limit=10001"] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules?{query}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 400, "invalid page/limit {query}: {body}");
+    }
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rule_events",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "rule events: {body}");
+    assert!(body
+        .as_array()
+        .expect("rule event list")
+        .iter()
+        .any(|row| row["event"] == "$events/client_connected"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rule_test",
+        serde_json::json!({
+            "sql": r#"SELECT * FROM "sb14/test""#,
+            "context": {"event_type": "message_publish", "topic": "sb14/test", "payload": "{\"a\":1}"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule test match: {body}");
+    assert_eq!(body["matched"], serde_json::json!(true));
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rule_test",
+        serde_json::json!({"sql": r#"SELECT * FROM "sb14/test""#}),
+    )
+    .await;
+    assert_eq!(status, 412, "rule test without topic: {body}");
+    assert_eq!(body["code"], serde_json::json!("NOT_MATCH"));
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rule_test",
+        serde_json::json!({"context": {"event_type": "message_publish", "topic": "t"}}),
+    )
+    .await;
+    assert_eq!(status, 400, "rule test without sql");
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/sb14-topic-multi",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules/sb14-topic-multi",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-absent",
+        serde_json::json!({"sql": r#"SELECT * FROM "sb14/absent""#}),
+    )
+    .await;
+    assert_eq!(status, 404, "absent update");
+
+    kernel.finish().await;
+}
+
+/// SB-14: rule counters come from the live engine. A filtered publish
+/// counts a failure and a no-result. Reset zeroes every counter. A
+/// disabled rule counts nothing. A multi-action rule counts each action.
+#[tokio::test]
+async fn sb14_rule_counters_and_reset_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "sb14-count";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": id,
+            "sql": r#"SELECT * FROM "sb14/count/in" WHERE v = 1"#,
+            "actions": [{"function": "republish", "args": {"topic": "sb14/count/out"}}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "counter rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "sb14-count-pub").await;
+    for payload in [r#"{"v":1}"#, r#"{"v":1}"#, r#"{"v":0}"#, "not-json"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("sb14/count/in", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+
+    let mut latest = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "counter read: {body}");
+        latest = body.clone();
+        if body["metrics"]["matched"] == serde_json::json!(4)
+            && body["metrics"]["failed"] == serde_json::json!(2)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        latest["metrics"]["matched"],
+        serde_json::json!(4),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["passed"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["failed"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["failed.no_result"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["actions.total"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert!(latest["node_metrics"][0]["node"]
+        .as_str()
+        .is_some_and(|node| node.contains('@')));
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        &format!("/api/v5/rules/{id}/metrics/reset"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "counter reset");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    for counter in [
+        "matched",
+        "passed",
+        "failed",
+        "failed.no_result",
+        "actions.total",
+        "actions.success",
+        "actions.failed",
+    ] {
+        assert_eq!(body["metrics"][counter], serde_json::json!(0), "{counter}");
+    }
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        &format!("/api/v5/rules/{id}"),
+        serde_json::json!({"enable": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "disable rule");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sb14/count/in", 0, 0, false, br#"{"v":1}"#),
+    )
+    .await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["metrics"]["matched"], serde_json::json!(0));
+
+    let multi_id = "sb14-count-multi";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": multi_id,
+            "sql": r#"SELECT * FROM "sb14/count/multi""#,
+            "actions": [
+                {"function": "republish", "args": {"topic": "sb14/count/one"}},
+                {"function": "republish", "args": {"topic": "sb14/count/two"}},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "multi-action rule create: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sb14/count/multi", 0, 0, false, br#"{"v":1}"#),
+    )
+    .await;
+    let mut multi = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{multi_id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "multi counter read: {body}");
+        multi = body.clone();
+        if body["metrics"]["actions.total"] == serde_json::json!(2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(multi["metrics"]["matched"], serde_json::json!(1), "{multi}");
+    assert_eq!(multi["metrics"]["passed"], serde_json::json!(1), "{multi}");
+    assert_eq!(
+        multi["metrics"]["actions.total"],
+        serde_json::json!(2),
+        "{multi}"
+    );
+    assert_eq!(
+        multi["metrics"]["actions.success"],
+        serde_json::json!(2),
+        "{multi}"
+    );
+    kernel.finish().await;
+}
+
 /// Group rows keep first-seen order and each group's payload metadata keys.
 #[tokio::test]
 async fn mv00_group_windows_keep_order_and_payload_shadows() {

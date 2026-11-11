@@ -10720,6 +10720,8 @@ connector_id = "pending-good"
         candidate.rules.rules.push(broker_config::RuleEntry {
             id: "mv02b-reload-bad".to_string(),
             name: "mv02b-reload-bad".to_string(),
+            description: String::new(),
+            metadata: serde_json::json!({}),
             tenant: "mv02b-tenant".to_string(),
             topic_filter: "mv02b/reload".to_string(),
             sql_query: Some(
@@ -19236,7 +19238,7 @@ connector_id = "pending-good"
             .await;
         assert_eq!(status, 201);
         assert_eq!(created["actions"], json!([]));
-        assert!(created.get("description").is_none());
+        assert_eq!(created["description"], json!(""));
         assert!(created.get("created_at").is_none());
 
         let (status, body) = server.get_auth("/api/v5/rules", &token).await;
@@ -19249,7 +19251,7 @@ connector_id = "pending-good"
         let data = body["data"].as_array().expect("data is a list");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["actions"], json!([]));
-        assert!(data[0].get("description").is_none());
+        assert_eq!(data[0]["description"], json!(""));
         assert!(data[0].get("created_at").is_none());
     }
 
@@ -25752,11 +25754,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "actions.success",
                 "actions.total",
                 "failed",
+                "failed.no_result",
                 "matched",
                 "passed"
             ]
         );
-        assert!(body.get("node_metrics").is_none());
+        assert_eq!(body["node_metrics"].as_array().expect("node rows").len(), 1);
         assert!(metrics.get("rate").is_none());
         assert!(metrics.get("rate_max").is_none());
         assert!(metrics.get("rate_last5m").is_none());
@@ -30204,7 +30207,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 412);
         assert_eq!(body["code"], json!("NOT_MATCH"));
 
-        // Malformed samples are rejected with the documented shape.
+        // A sample with no topic is a normal no-match.
         let (status, body) = server
             .post_auth(
                 "/api/v5/rules/w3-16-rule/test",
@@ -30212,8 +30215,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(status, 412);
+        assert_eq!(body["code"], json!("NOT_MATCH"));
 
         // Unknown rule id is 404 with the documented error code.
         let (status, body) = server

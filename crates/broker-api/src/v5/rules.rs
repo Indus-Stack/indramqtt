@@ -1,7 +1,7 @@
 //! Streaming SQL rules, data connectors, action sinks, and schema registry for the v5 REST API.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
-use crate::pagination::{meta_page, paginate, PageParams};
+use crate::pagination::{meta_page, paginate};
 use crate::ApiState;
 
 use crate::node_scope::local_node_name;
@@ -33,7 +33,7 @@ use crate::node_scope::local_node_name;
 // - `id` is capped at [`MAX_RULE_ID_LEN`] chars (256: bounds map-key
 //   memory per entry; longer ids are rejected with `BAD_REQUEST`);
 // - list paging reuses the shared extractor (default limit 100, max
-//   1000); the default store is empty.
+//   10_000); the default store is empty.
 //
 // Persistence: every mutation exports the validated store into the
 // config core (`RulesConf`, versioned file) and saves atomically;
@@ -74,6 +74,16 @@ pub const MAX_RULES: usize = broker_config::MAX_RULES;
 /// entry so one create cannot balloon the store.
 const MAX_RULE_ID_LEN: usize = broker_config::MAX_RULE_ID_LEN;
 
+/// First accepted list page. Reason: the reference pages count from 1,
+/// so 0 and a negative value are refused.
+const MIN_RULE_PAGE: u32 = 1;
+/// Default list page size. Reason: the reference default page holds 100
+/// rows; the rule catalogue is capped well below this.
+const DEFAULT_RULE_LIMIT: u32 = 100;
+/// Largest accepted list page size. Reason: the reference maximum
+/// prevents one request from cloning an unbounded slice.
+const MAX_RULE_LIMIT: u32 = 10_000;
+
 /// Length of a generated rule id in hex chars. Reason: the documented
 /// example shows an 8-char id, so a create without one assigns 8 chars.
 const GENERATED_RULE_ID_LEN: usize = 8;
@@ -96,10 +106,153 @@ fn generate_rule_id() -> String {
 // Streaming Rules
 // ---------------------------------------------------------------------------
 
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_query_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        out.push(high * 16 + low);
+                        index += 3;
+                    }
+                    _ => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[derive(Default)]
+struct RuleListQuery {
+    ns: Option<String>,
+    only_global: Option<String>,
+    enable: Option<String>,
+    from: Option<String>,
+    like_id: Option<String>,
+    like_from: Option<String>,
+    like_description: Option<String>,
+    match_from: Option<String>,
+    action: Vec<String>,
+    source: Vec<String>,
+    page: Option<String>,
+    limit: Option<String>,
+}
+
+fn parse_rule_list_query(raw: Option<String>) -> RuleListQuery {
+    let mut query = RuleListQuery::default();
+    for pair in raw.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_component(key);
+        let value = decode_query_component(value);
+        match key.as_str() {
+            "ns" => query.ns = Some(value),
+            "only_global" => query.only_global = Some(value),
+            "enable" => query.enable = Some(value),
+            "from" => query.from = Some(value),
+            "like_id" => query.like_id = Some(value),
+            "like_from" => query.like_from = Some(value),
+            "like_description" => query.like_description = Some(value),
+            "match_from" => query.match_from = Some(value),
+            "action" => query.action.push(value),
+            "source" => query.source.push(value),
+            "page" => query.page = Some(value),
+            "limit" => query.limit = Some(value),
+            _ => {}
+        }
+    }
+    query
+}
+
+fn source_text(source: &broker_rules::StdSource) -> String {
+    match source {
+        broker_rules::StdSource::Topic(value)
+        | broker_rules::StdSource::Event(value)
+        | broker_rules::StdSource::Stream(value) => value.clone(),
+    }
+}
+
+/// The SQL `FROM` sources of a stored rule, as the reference `from` array.
+/// A pre-front-end rule keeps the stored topic filter.
+fn rule_from(rule: &broker_rules::Rule) -> Vec<String> {
+    if rule.std_sources.is_empty() {
+        vec![rule.topic_filter.as_str().to_string()]
+    } else {
+        rule.std_sources.iter().map(source_text).collect()
+    }
+}
+
+/// Derive the stored topic filter from the SQL `FROM` clause through the
+/// rule engine parser. A single source uses its filter. Several sources
+/// use `#` and the engine matches each source, so every source routes.
+/// An invalid or absent FROM is a 400 that names the problem.
+fn topic_filter_from_sql(sql: &str) -> Result<broker_protocol::TopicFilter, Box<Response>> {
+    let bad = |message: String| Box::new(ApiError::BadRequest(message).into_response());
+    let sources = broker_rules::rule_sql_sources(sql).map_err(bad)?;
+    if sources.is_empty() {
+        return Err(bad(
+            "rule SQL FROM must name a quoted topic filter or an event source (field `sql`)"
+                .to_string(),
+        ));
+    }
+    if sources
+        .iter()
+        .any(|source| matches!(source, broker_rules::StdSource::Stream(_)))
+    {
+        return Err(bad(
+            "rule SQL FROM must name a quoted topic filter or an event source (field `sql`)"
+                .to_string(),
+        ));
+    }
+    let texts: Vec<String> = sources.iter().map(source_text).collect();
+    if texts
+        .iter()
+        .any(|text| text.contains('[') || text.contains(']'))
+    {
+        return Err(bad(
+            "invalid topic filter: bracket characters are not allowed".to_string(),
+        ));
+    }
+    let topic = if texts.len() == 1 {
+        texts[0].clone()
+    } else {
+        "#".to_string()
+    };
+    broker_protocol::TopicFilter::new(&topic)
+        .map_err(|error| bad(format!("invalid topic filter: {error}")))
+}
+
 /// Projection of the stored [`broker_rules::Rule`] for `/api/v5/rules`.
 /// Only real engine state: stored actions verbatim (empty stays empty),
-/// no invented `description`/`created_at`, no connector-id coercion.
-/// `tenant` names the owning tenant (`default` for pre-tenancy rules).
+/// stored description and metadata, no invented `created_at`, no
+/// connector-id coercion. `tenant` names the owning tenant (`default`
+/// for pre-tenancy rules).
 fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     let topic = rule.topic_filter.as_str().to_string();
     let sql = rule
@@ -116,9 +269,11 @@ fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     serde_json::json!({
         "id": rule.id,
         "name": rule.name,
+        "description": rule.description,
+        "metadata": rule.metadata,
         "tenant": rule.tenant,
         "sql": sql,
-        "from": [topic],
+        "from": rule_from(rule),
         "enable": rule.enabled,
         "actions": actions,
     })
@@ -183,16 +338,154 @@ fn refuse_forward_outside_default_tenant(
     }
 }
 
-pub async fn list_rules(State(state): State<ApiState>, params: PageParams) -> Response {
-    let data: Vec<_> = state.engine.list_rules().iter().map(rule_to_v5).collect();
+fn query_bool(name: &str, value: Option<&String>) -> Result<Option<bool>, Box<Response>> {
+    match value {
+        None => Ok(None),
+        Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(Some(false)),
+        Some(_) => Err(Box::new(
+            ApiError::BadRequest(format!("query parameter `{name}` must be a boolean"))
+                .into_response(),
+        )),
+    }
+}
 
-    let count = data.len();
-    let page_rows = paginate(&data, params.page, params.limit);
+fn rule_has_action(rule: &broker_rules::Rule, wanted: &str) -> bool {
+    rule.actions.iter().any(|action| match action {
+        broker_rules::RuleAction::ForwardConnector { connector_id } => {
+            connector_id == wanted || broker_config::v5_action_sink_id(connector_id) == Some(wanted)
+        }
+        _ => false,
+    })
+}
+
+fn rule_matches_topic_query(
+    sources: &[String],
+    query: &str,
+    query_topic: &Result<broker_protocol::Topic, broker_protocol::ProtocolError>,
+) -> bool {
+    sources.iter().any(
+        |source| match (query_topic, broker_protocol::TopicFilter::new(source)) {
+            (Ok(topic), Ok(filter)) => filter.matches(topic),
+            _ => source == query,
+        },
+    )
+}
+
+pub async fn list_rules(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Response {
+    let params = parse_rule_list_query(raw);
+    let page = match params.page.as_deref() {
+        None => MIN_RULE_PAGE,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(value) if value >= MIN_RULE_PAGE => value,
+            _ => {
+                return ApiError::BadRequest("page must be a positive integer".to_string())
+                    .into_response();
+            }
+        },
+    };
+    let limit = match params.limit.as_deref() {
+        None => DEFAULT_RULE_LIMIT,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(value) if (MIN_RULE_PAGE..=MAX_RULE_LIMIT).contains(&value) => value,
+            _ => {
+                return ApiError::BadRequest(format!(
+                    "limit must be an integer from {MIN_RULE_PAGE} to {MAX_RULE_LIMIT}"
+                ))
+                .into_response();
+            }
+        },
+    };
+    let only_global = match query_bool("only_global", params.only_global.as_ref()) {
+        Ok(value) => value.unwrap_or(false),
+        Err(response) => return *response,
+    };
+    let enable = match query_bool("enable", params.enable.as_ref()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let match_from_topic = params
+        .match_from
+        .as_deref()
+        .map(broker_protocol::Topic::new);
+    let rules: Vec<_> = state
+        .engine
+        .list_rules()
+        .into_iter()
+        .filter(|rule| {
+            if let Some(namespace) = params.ns.as_deref() {
+                if rule.tenant != namespace {
+                    return false;
+                }
+            }
+            if only_global && rule.tenant != "default" {
+                return false;
+            }
+            if let Some(wanted) = enable {
+                if rule.enabled != wanted {
+                    return false;
+                }
+            }
+            let sources = rule_from(rule);
+            if let Some(wanted) = params.from.as_deref() {
+                if !sources.iter().any(|source| source == wanted) {
+                    return false;
+                }
+            }
+            if let Some(wanted) = params.like_id.as_deref() {
+                if !rule.id.contains(wanted) {
+                    return false;
+                }
+            }
+            if let Some(wanted) = params.like_from.as_deref() {
+                if !sources.iter().any(|source| source.contains(wanted)) {
+                    return false;
+                }
+            }
+            if let Some(wanted) = params.like_description.as_deref() {
+                if !rule.description.contains(wanted) {
+                    return false;
+                }
+            }
+            if let Some(wanted) = params.match_from.as_deref() {
+                // Use the precomputed topic when present. An invalid topic
+                // falls back to string equality in the matcher.
+                if let Some(query_topic) = match_from_topic.as_ref() {
+                    if !rule_matches_topic_query(&sources, wanted, query_topic) {
+                        return false;
+                    }
+                }
+            }
+            if !params.action.is_empty()
+                && !params
+                    .action
+                    .iter()
+                    .any(|wanted| rule_has_action(rule, wanted))
+            {
+                return false;
+            }
+            if !params.source.is_empty()
+                && !params
+                    .source
+                    .iter()
+                    .any(|wanted| sources.iter().any(|source| source == wanted))
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let count = rules.len();
+    let page_rows: Vec<_> = paginate(&rules, page, limit)
+        .iter()
+        .map(rule_to_v5)
+        .collect();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": page_rows,
-            "meta": meta_page(params.page, params.limit, count),
+            "meta": meta_page(page, limit, count),
         })),
     )
         .into_response()
@@ -292,19 +585,28 @@ fn parse_rule_actions(
     Ok(actions)
 }
 
-/// `POST /api/v5/rules`: compile the rule before storing (malformed
-/// bodies rejected with the documented error shape); a duplicate id is
-/// rejected cleanly, never overwritten. The documented request needs
-/// only `sql`: an explicit `id` is stored verbatim so duplicates are
-/// detectable, `name` falls back as the id for older callers, and
-/// neither present means the broker assigns an 8-char hex id and
-/// returns it so `GET /rules/{id}` finds the rule. A `tenant` field
-/// selects the owning tenant (absent
-/// means the default tenant); an unknown tenant is rejected with 400.
+/// `POST /api/v5/rules`: compile the rule before storing. A malformed
+/// body is rejected with the documented error shape. A duplicate id is
+/// rejected cleanly and never overwritten.
+///
+/// The documented request needs only `sql`. An explicit `id` is stored
+/// verbatim so duplicates are detectable. An absent `id` falls back to
+/// `name`, then to an 8-char hex id that the response carries so
+/// `GET /rules/{id}` finds the rule. An absent `name` is the documented
+/// empty string.
+///
+/// The `FROM` clause is read with the rule SQL parser. An invalid or
+/// absent `FROM` is a 400 that names the problem. A `tenant` field
+/// selects the owning tenant; absent means the default tenant. An
+/// unknown tenant is rejected with 400.
+///
 /// The `actions` list follows [`parse_rule_actions`]. A
-/// `ForwardConnector` target naming no known action is
-/// rejected (the W3-02 action linkage). Management-plane only; publish
-/// and deliver never touch this map (dispatch reads a snapshot).
+/// `ForwardConnector` target naming no known action is rejected (the
+/// W3-02 action linkage). The handler stores `description` and
+/// `metadata` and returns them on every read.
+///
+/// Management-plane only; publish and deliver never touch this map
+/// (dispatch reads a snapshot).
 pub async fn create_rule(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -314,8 +616,8 @@ pub async fn create_rule(
             .into_response();
     };
     // A present `id` must be a non-empty string. An empty id fails
-    // with 400. An absent id falls back to `name`, then to a
-    // generated id.
+    // with 400. An absent id falls back to `name`, then to a generated
+    // id.
     if let Some(id_value) = obj.get("id") {
         let Some(text) = id_value.as_str() else {
             return ApiError::BadRequest("field `id` must be a string".to_string()).into_response();
@@ -342,17 +644,35 @@ pub async fn create_rule(
         ))
         .into_response();
     }
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| rule_id.clone());
-    // TODO(parity): does a create without `name` default the name to
-    // the id or to ""? The spec gives `name` a "" default, but this
-    // route has always echoed the id. The current choice keeps the id
-    // until the checker pins it.
+    // The reference schema gives `name` an empty default.
+    let name = match obj.get("name") {
+        None => String::new(),
+        Some(value) => match value.as_str() {
+            Some(name) => name.trim().to_string(),
+            None => {
+                return ApiError::BadRequest("field `name` must be a string".to_string())
+                    .into_response();
+            }
+        },
+    };
+    let description = match obj.get("description") {
+        None => String::new(),
+        Some(value) => match value.as_str() {
+            Some(text) => text.to_string(),
+            None => {
+                return ApiError::BadRequest("field `description` must be a string".to_string())
+                    .into_response();
+            }
+        },
+    };
+    let metadata = match obj.get("metadata") {
+        None => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => {
+            return ApiError::BadRequest("field `metadata` must be an object".to_string())
+                .into_response();
+        }
+    };
     let Some(sql) = obj
         .get("sql")
         .and_then(|v| v.as_str())
@@ -362,7 +682,16 @@ pub async fn create_rule(
     else {
         return ApiError::BadRequest("missing required field: sql".to_string()).into_response();
     };
-    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enable = match obj.get("enable") {
+        None => true,
+        Some(value) => match value.as_bool() {
+            Some(enable) => enable,
+            None => {
+                return ApiError::BadRequest("field `enable` must be a boolean".to_string())
+                    .into_response();
+            }
+        },
+    };
     // Tenant scope first: an unknown tenant fails with 400 before
     // any other store check, and stores nothing.
     let tenant = match resolve_rule_tenant(&state, obj) {
@@ -379,32 +708,9 @@ pub async fn create_rule(
             }
         },
     };
-    let topic_str = if sql.contains("FROM \"") {
-        sql.split("FROM \"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .unwrap_or("t/#")
-    } else {
-        "t/#"
-    };
-
-    let topic_filter = match broker_protocol::TopicFilter::new(topic_str) {
-        Ok(filter) => {
-            // The v5 rules projection treats bracket characters as invalid
-            // filter characters (the spec's `t/[` example): the shared
-            // `TopicFilter` accepts them, but a rule FROM-target containing
-            // `[` or `]` is rejected here with 400 instead of going live.
-            if topic_str.contains('[') || topic_str.contains(']') {
-                return ApiError::BadRequest(
-                    "invalid topic filter: bracket characters are not allowed".to_string(),
-                )
-                .into_response();
-            }
-            filter
-        }
-        Err(e) => {
-            return ApiError::BadRequest(format!("invalid topic filter: {e}")).into_response();
-        }
+    let topic_filter = match topic_filter_from_sql(&sql) {
+        Ok(filter) => filter,
+        Err(response) => return *response,
     };
 
     let actions = match parse_rule_actions(&state, &raw_actions) {
@@ -437,6 +743,8 @@ pub async fn create_rule(
         rule_id,
         tenant,
         name,
+        description,
+        metadata,
         topic_filter,
         Some(sql),
         enable,
@@ -499,17 +807,14 @@ pub async fn get_rule(
 /// and creates nothing. On success the stored entry is swapped for the
 /// recompiled snapshot and the new fields read back with 200.
 ///
-/// A body carrying none of `sql`/`from`/`actions`/`name` is treated as a
-/// legacy enable flip (the pre-W3-14 shape): only `enable` is applied, so
-/// existing enable-only callers keep working while full bodies replace.
+/// The reference PUT merges the body into the stored rule. Only the fields
+/// that the body carries change; an omitted `sql`, `name`, `enable`,
+/// `actions` or `tenant` keeps the stored value. The `FROM` clause of a
+/// supplied `sql` is read with the rule SQL parser. The `from` array is
+/// not a create field; routing comes from `sql` only.
 ///
-/// The path id is authoritative: a body `id`/`name` that names a different
-/// rule is rejected instead of renaming or forking the entry. An omitted
-/// `enable` keeps the stored value; an omitted `name` keeps the stored
-/// name; an omitted `actions` clears to empty (whole-replace semantics).
-/// The `from` array, when present, is accepted but the topic is derived
-/// from the SQL `FROM` clause (the same derivation create uses), so a
-/// conflicting `from` does not fork routing.
+/// The path id is authoritative: a body `id` that names a different rule
+/// is rejected instead of renaming or forking the entry.
 ///
 /// The pair is not paged; unknown query parameters are ignored (the
 /// ignored query sink below). Management-plane only: one short write lock
@@ -527,27 +832,9 @@ pub async fn get_rule(
 /// plus one `Arc` each of the disabled-action set and the per-action metric
 /// map per ingress, then clones the matching rule `Arc`s under one short
 /// read lock; this update takes the map lock only on the management plane.
-// TODO(parity): may an update rename the rule (body id differing from the
-// path id), or change only the enable half? The rulebook does not decide
-// the exact PUT field set; the current choice keeps the path id
-// authoritative and replaces the whole entry in place until the checker
-// pins it.
-// TODO(parity): does an omitted `enable` keep the stored value or default
-// to `true`? The rulebook does not decide; the current choice keeps the
-// stored value (a replace must not surprise-disable a rule) until the
-// checker pins it.
-// TODO(parity): does an omitted `actions` clear to empty or keep the
-// stored list? The rulebook does not decide; the current choice clears to
-// empty (whole-replace semantics, mirroring create's default) until the
-// checker pins it.
-// TODO(parity): is the topic taken from the SQL `FROM` clause, from the
-// `from` array, or must both agree? The rulebook does not decide; the
-// current choice derives from SQL (the same derivation create uses) and
-// accepts `from` without forking routing until the checker pins it.
-// TODO(parity): for an unknown id with an invalid body, is the answer 404
-// or 400? The rulebook does not decide the precedence; the current choice
-// answers 404 first (existence before validation, mirroring the action
-// update) and creates nothing either way.
+// TODO(parity): on an unknown id with an invalid body, may the answer be
+// 400 instead of 404? The reference reads the stored rule first; this
+// handler answers 404 before body validation and creates nothing.
 pub async fn update_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -581,147 +868,129 @@ pub async fn update_rule(
             .into_response();
         }
     }
-    let has_full_keys = obj.contains_key("sql")
-        || obj.contains_key("from")
-        || obj.contains_key("actions")
-        || obj.contains_key("name")
-        || obj.contains_key("tenant");
-    if !has_full_keys {
-        // Legacy enable-only shape (pre-W3-14): apply only the flag.
-        if let Some(enable) = obj.get("enable").and_then(|v| v.as_bool()) {
-            // A persist failure must surface as a 500, never as a success:
-            // the in-memory flag applied but the disk save failed.
-            match state.engine.set_rule_enabled(&id, enable) {
-                Ok(_) => {}
-                Err(error) => return rule_persist_error(error),
-            }
-        }
-        match state.engine.get_rule(&id) {
-            Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "code": "NOT_FOUND",
-                    "message": "Rule not found"
-                })),
-            )
-                .into_response(),
-        }
-    } else {
-        let name = obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| existing.name.clone());
-        let Some(sql) = obj
-            .get("sql")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-        else {
-            return ApiError::BadRequest("missing required field: sql".to_string()).into_response();
-        };
-        let enable = obj
-            .get("enable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(existing.enabled);
-        let raw_actions: Vec<serde_json::Value> = match obj.get("actions") {
-            None => Vec::new(),
-            Some(value) => match value.as_array() {
-                Some(items) => items.clone(),
-                None => {
-                    return ApiError::BadRequest("field `actions` must be an array".to_string())
-                        .into_response();
-                }
-            },
-        };
-        let topic_str = if sql.contains("FROM \"") {
-            sql.split("FROM \"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .unwrap_or("t/#")
-        } else {
-            "t/#"
-        };
-        let topic_filter = match broker_protocol::TopicFilter::new(topic_str) {
-            Ok(filter) => {
-                if topic_str.contains('[') || topic_str.contains(']') {
-                    return ApiError::BadRequest(
-                        "invalid topic filter: bracket characters are not allowed".to_string(),
-                    )
+    // The reference PUT merges the body into the stored rule. Only the
+    // fields present change; absent fields keep the stored value.
+    let name = match obj.get("name") {
+        None => existing.name.clone(),
+        Some(value) => match value.as_str() {
+            Some(name) => name.trim().to_string(),
+            None => {
+                return ApiError::BadRequest("field `name` must be a string".to_string())
                     .into_response();
-                }
-                filter
             }
-            Err(e) => {
-                return ApiError::BadRequest(format!("invalid topic filter: {e}")).into_response();
+        },
+    };
+    let description = match obj.get("description") {
+        None => existing.description.clone(),
+        Some(value) => match value.as_str() {
+            Some(text) => text.to_string(),
+            None => {
+                return ApiError::BadRequest("field `description` must be a string".to_string())
+                    .into_response();
             }
-        };
-        let actions = match parse_rule_actions(&state, &raw_actions) {
-            Ok(actions) => actions,
+        },
+    };
+    let metadata = match obj.get("metadata") {
+        None => existing.metadata.clone(),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => {
+            return ApiError::BadRequest("field `metadata` must be an object".to_string())
+                .into_response();
+        }
+    };
+    let sql = match obj.get("sql") {
+        None => existing.sql_query.clone(),
+        Some(value) => match value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(sql) => Some(sql.to_string()),
+            None => {
+                return ApiError::BadRequest("field `sql` must be a non-empty string".to_string())
+                    .into_response();
+            }
+        },
+    };
+    let topic_filter = match sql.as_deref() {
+        Some(sql) => match topic_filter_from_sql(sql) {
+            Ok(filter) => filter,
             Err(response) => return *response,
-        };
-        // Tenant scope: a body tenant moves the rule. Absent keeps
-        // the stored tenant. A present but non-string tenant fails
-        // with 400. An unknown tenant fails with 400 and keeps the
-        // old rule.
-        let tenant = match obj.get("tenant") {
-            None => existing.tenant.clone(),
-            Some(value) => {
-                let Some(raw) = value.as_str() else {
-                    return ApiError::BadRequest("field `tenant` must be a string".to_string())
-                        .into_response();
-                };
-                let tenant = broker_config::canonical_rule_tenant(raw);
-                if !broker_config::is_valid_rule_tenant(&tenant) {
-                    return ApiError::BadRequest(format!(
-                        "tenant {tenant:?} is not valid (field `tenant`)"
-                    ))
+        },
+        None => existing.topic_filter.clone(),
+    };
+    let enable = match obj.get("enable") {
+        None => existing.enabled,
+        Some(value) => match value.as_bool() {
+            Some(enable) => enable,
+            None => {
+                return ApiError::BadRequest("field `enable` must be a boolean".to_string())
                     .into_response();
-                }
-                if !state.namespaces.contains(&tenant) {
-                    return ApiError::BadRequest(format!(
-                        "unknown tenant {tenant:?} (field `tenant`)"
-                    ))
-                    .into_response();
-                }
-                tenant
             }
-        };
-        // A move outside the default tenant keeps the stored forwards
-        // when the body names no actions: check the effective set.
-        let effective: &[broker_rules::RuleAction] = if obj.contains_key("actions") {
-            &actions
-        } else {
-            &existing.actions
-        };
-        if let Some(response) = refuse_forward_outside_default_tenant(&tenant, effective) {
-            return response;
+        },
+    };
+    let actions = match obj.get("actions") {
+        None => existing.actions.clone(),
+        Some(value) => match value.as_array() {
+            Some(items) => match parse_rule_actions(&state, items) {
+                Ok(actions) => actions,
+                Err(response) => return *response,
+            },
+            None => {
+                return ApiError::BadRequest("field `actions` must be an array".to_string())
+                    .into_response();
+            }
+        },
+    };
+    // Tenant scope: a body tenant moves the rule. Absent keeps the
+    // stored tenant. A present but non-string tenant fails with 400.
+    // An unknown tenant fails with 400 and keeps the old rule.
+    let tenant = match obj.get("tenant") {
+        None => existing.tenant.clone(),
+        Some(value) => {
+            let Some(raw) = value.as_str() else {
+                return ApiError::BadRequest("field `tenant` must be a string".to_string())
+                    .into_response();
+            };
+            let tenant = broker_config::canonical_rule_tenant(raw);
+            if !broker_config::is_valid_rule_tenant(&tenant) {
+                return ApiError::BadRequest(format!(
+                    "tenant {tenant:?} is not valid (field `tenant`)"
+                ))
+                .into_response();
+            }
+            if !state.namespaces.contains(&tenant) {
+                return ApiError::BadRequest(format!("unknown tenant {tenant:?} (field `tenant`)"))
+                    .into_response();
+            }
+            tenant
         }
-        match state.engine.replace_rule_in_tenant(
-            &id,
-            tenant,
-            name,
-            topic_filter,
-            Some(sql),
-            enable,
-            actions,
-        ) {
-            Ok(Some(r)) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "code": "NOT_FOUND",
-                    "message": "Rule not found"
-                })),
-            )
-                .into_response(),
-            Err(error @ broker_rules::RuleEngineError::Persist(_)) => rule_persist_error(error),
-            Err(e) => ApiError::BadRequest(format!("Rule update failed: {e}")).into_response(),
-        }
+    };
+    if let Some(response) = refuse_forward_outside_default_tenant(&tenant, &actions) {
+        return response;
+    }
+    match state.engine.replace_rule_in_tenant(
+        &id,
+        tenant,
+        name,
+        description,
+        metadata,
+        topic_filter,
+        sql,
+        enable,
+        actions,
+    ) {
+        Ok(Some(r)) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Rule not found"
+            })),
+        )
+            .into_response(),
+        Err(error @ broker_rules::RuleEngineError::Persist(_)) => rule_persist_error(error),
+        Err(e) => ApiError::BadRequest(format!("Rule update failed: {e}")).into_response(),
     }
 }
 
@@ -742,14 +1011,16 @@ pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) 
 /// `GET /api/v5/rules/:id/metrics`: live per-rule counters (C06-23).
 ///
 /// Reads the fixed counter set from live engine state (`matched`,
-/// `passed`, `failed` plus the per-rule action attribution
-/// `actions.total`/`actions.success`/`actions.failed`). Every field is a
-/// lock-free atomic bumped only on the evaluation path
+/// `passed`, `failed`, `failed.no_result` plus the per-rule action
+/// attribution `actions.total`/`actions.success`/`actions.failed`). Every
+/// field is a lock-free atomic bumped only on the evaluation path
 /// (`RuleEngine::dispatch_ingress` in `broker-rules`), never a constant:
 /// `matched` counts topic-filter hits, `passed` counts rows that produced
-/// output, `failed` counts hits that produced none (WHERE-false and
-/// non-JSON payloads alike). A fresh rule reads zeroes; a restart rebuilds
-/// the map at zero (memory-only by design, never persisted).
+/// output, `failed` counts hits that produced none, and
+/// `failed.no_result` counts the SQL no-result subset. A fresh rule reads
+/// zeroes; a restart rebuilds the map at zero (memory-only by design,
+/// never persisted). The response carries the same metrics for the local
+/// node in `node_metrics`, as the reference does.
 ///
 /// An unknown id returns 404 with the documented `{code, message}` shape,
 /// not an empty body. The pair is not paged; unknown query parameters are
@@ -757,25 +1028,34 @@ pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) 
 /// snapshot clone plus relaxed atomic loads; increments stay lock-free
 /// atomics and publish/deliver never touch this map directly.
 ///
-/// Bound (stated here and enforced by construction): a fixed six-counter
-/// set per rule (three `AtomicU64` for match/pass/fail plus three for
-/// action attribution, default zero); no per-fire allocation (one snapshot
-/// clone per request on the read path, relaxed loads only) and no
+/// Bound (stated here and enforced by construction): a fixed seven-counter
+/// set per rule (four `AtomicU64` for match/pass/fail/no-result plus three
+/// for action attribution, default zero); no per-fire allocation (one
+/// snapshot clone per request on the read path, relaxed loads only) and no
 /// unbounded history.
 ///
 /// Fire-path cost (stated for the delivery-path note): no new work on
 /// publish or deliver. The evaluation path pays one relaxed `fetch_add`
 /// per counter per ingress (lock-free atomics only, no lock, no queue, no
 /// per-fire allocation); text rendering stays here in the handler.
-// TODO(parity): which counter names plus envelope shapes does the documented
-// spec require beyond `matched`/`passed`/`failed` (rates, node rows, ...)?
-// The rulebook does not decide the exact shape; the current choice reports
-// the honest live subset the fire path can attribute and omits the rest
-// rather than inventing constants, until the checker pins it.
-// TODO(parity): are the per-rule action-attribution keys part of the
-// documented shape, or only the three match counters? The rulebook does
-// not decide; the current choice reports both (dotted `actions.*` keys)
-// until the checker pins it.
+// TODO(parity): the reference body also lists `failed.exception`,
+// `failed.unknown`, three `matched.rate` fields and three action failure
+// counters that this engine does not classify or measure. They stay out
+// rather than appear as invented zeroes.
+fn rule_metrics_value(r: &broker_rules::Rule) -> serde_json::Value {
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    serde_json::json!({
+        "matched": load(&r.matched_cnt),
+        "passed": load(&r.passed_cnt),
+        "failed": load(&r.failed_cnt),
+        "failed.no_result": load(&r.no_result_cnt),
+        "actions.total": load(&r.actions_total_cnt),
+        "actions.success": load(&r.actions_success_cnt),
+        "actions.failed": load(&r.actions_failed_cnt),
+    })
+}
+
 pub async fn get_rule_metrics(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -792,31 +1072,17 @@ pub async fn get_rule_metrics(
         )
             .into_response();
     };
-    let matched = r.matched_cnt.load(std::sync::atomic::Ordering::Relaxed);
-    let passed = r.passed_cnt.load(std::sync::atomic::Ordering::Relaxed);
-    let failed = r.failed_cnt.load(std::sync::atomic::Ordering::Relaxed);
-    let actions_total = r
-        .actions_total_cnt
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let actions_success = r
-        .actions_success_cnt
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let actions_failed = r
-        .actions_failed_cnt
-        .load(std::sync::atomic::Ordering::Relaxed);
-
+    let metrics = rule_metrics_value(r);
+    let node_metrics = serde_json::json!([{
+        "node": local_node_name(),
+        "metrics": metrics.clone(),
+    }]);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "id": id,
-            "metrics": {
-                "matched": matched,
-                "passed": passed,
-                "failed": failed,
-                "actions.total": actions_total,
-                "actions.success": actions_success,
-                "actions.failed": actions_failed
-            }
+            "metrics": metrics,
+            "node_metrics": node_metrics,
         })),
     )
         .into_response()
@@ -855,6 +1121,8 @@ pub async fn reset_rule_metrics(
     r.matched_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
     r.passed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
     r.failed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
+    r.no_result_cnt
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     r.actions_total_cnt
         .store(0, std::sync::atomic::Ordering::Relaxed);
     r.actions_success_cnt
