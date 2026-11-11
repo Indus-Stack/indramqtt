@@ -1106,3 +1106,30 @@ AssertionError: (32, '0004')`.
 - Expected: With the API off, the health endpoint refuses and MQTT accepts. Source: `crates/broker-node/src/main.rs` opens no socket when the flag is false.
 - Broker gave: The docs runner waits for `/healthz` on the API port. A run with the flag off never reaches the action. The broker opens no API socket per `main.rs:12192`.
 - Date: 2026-11-10.
+
+## DX2-063 item `quotas.default_max_connections`
+
+- Input: the configuration in `docs/_examples/config/quotas.default_max_connections.toml` and this action: Connect one client per username with a default cap of one.
+- Expected: With a default cap of one, the second connection of a second username is refused. Source: `crates/broker-config/src/schema.rs` documents the default cap, but no CONNECT path reads it: per-user quotas stay unlimited unless the user row sets them.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 23, in <module>
+AssertionError: (32, '0000')`.
+- Date: 2026-11-11.
+
+## DX2-063 item `quotas.default_max_publish_rate`
+
+- Input: the configuration in `docs/_examples/config/quotas.default_max_publish_rate.toml` and this action: Publish a burst of ten and count the deliveries with a default rate of one.
+- Expected: With a default rate of one message per second, a burst of ten loses most messages. Source: `crates/broker-config/src/schema.rs` documents the default rate, but no publish path reads it: per-user quotas stay unlimited unless the user row sets them.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 34, in <module>
+AssertionError: 10`.
+- Date: 2026-11-11.
+
+## DX2-063 item `quotas.burst_multiplier`
+
+- Input: the configuration in `docs/_examples/config/quotas.burst_multiplier.toml` and this action: Publish a burst of sixty and count the deliveries with a multiplier of 1.0.
+- Expected: With a rate of ten and a burst multiplier of 1.0, a burst of sixty delivers only about ten. Source: `crates/broker-config/src/schema.rs` documents the burst multiplier, but no publish path reads it: the per-user burst defaults to the rate itself.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 34, in <module>
+AssertionError: 60`.
+- Date: 2026-11-11.

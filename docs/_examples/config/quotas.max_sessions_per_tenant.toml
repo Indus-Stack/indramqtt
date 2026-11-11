@@ -1,0 +1,42 @@
+[example]
+area = "config"
+item = "quotas.max_sessions_per_tenant"
+kind = "setting"
+expect = "limited"
+expected = "With a cap of one, the second client id of one user is refused with code 3 while the first session stays live."
+source = "`crates/broker-node/src/main.rs` copies the file value into the limit store at boot, and the CONNECT path refuses a new session past the cap of the bind tenant."
+action = "Connect two client ids with the same username and a cap of one."
+config = '''
+[quotas]
+max_connections_per_tenant = 0
+max_sessions_per_tenant = 1
+max_retained_per_tenant = 0
+
+[[tenants.rules]]
+expression = "t-${username}"
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def raw_connect(client, username, password):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    flags = 0x02 | 0x80 | 0x40
+    payload = word(client) + word(username) + word(password)
+    body = word("MQTT") + b"\x04" + bytes([flags]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    return sock, head, ack
+
+status, _ = http("POST", "/api/v1/auth/users?tenant=t-quota-sess", {"username": "quota-sess", "password": "Quota-docs-pw-2"})
+assert status in (200, 201), status
+first, head, ack = raw_connect("qs-a", "quota-sess", "Quota-docs-pw-2")
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+second, head2, ack2 = raw_connect("qs-b", "quota-sess", "Quota-docs-pw-2")
+second.close()
+disconnect(first)
+assert head2 == 0x20 and ack2 == b"\x00\x03", (head2, ack2.hex())
+print("limited")
+'''

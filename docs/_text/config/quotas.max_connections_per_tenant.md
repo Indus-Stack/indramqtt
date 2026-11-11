@@ -1,0 +1,1 @@
+`quotas.max_connections_per_tenant` caps live connections in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. The default tenant holds no bound. The default is 0, which means unlimited.

@@ -1,0 +1,1 @@
+`quotas.default_max_connections` sets the default cap for concurrent connections of one username. The broker parses the value but applies no bound from it. The default is 10000. 0 means unlimited, as an explicit opt-in.

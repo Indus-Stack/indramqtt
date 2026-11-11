@@ -1,0 +1,50 @@
+[example]
+area = "config"
+item = "quotas.burst_multiplier"
+kind = "setting"
+expect = "throttled"
+expected = "With a rate of ten and a burst multiplier of 1.0, a burst of sixty delivers only about ten."
+source = "`crates/broker-config/src/schema.rs` documents the burst multiplier, but no publish path reads it: the per-user burst defaults to the rate itself."
+action = "Publish a burst of sixty and count the deliveries with a multiplier of 1.0."
+config = '''
+[quotas]
+default_max_publish_rate = 10
+burst_multiplier = 1.0
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def raw_connect(client, username, password):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    flags = 0x02 | 0x80 | 0x40
+    payload = word(client) + word(username) + word(password)
+    body = word("MQTT") + bytes([4]) + bytes([flags]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    return sock, head, ack
+
+status, _ = http("POST", "/api/v1/auth/users", {"username": "quota-bm", "password": "Quota-docs-pw-6"})
+assert status in (200, 201), status
+status, _ = http("POST", "/api/v1/auth/acls", {"client_pattern": "qb-both", "action": "all", "topic_pattern": "qb/#", "allow": True})
+assert status in (200, 201), status
+sock, head, ack = raw_connect("qb-both", "quota-bm", "Quota-docs-pw-6")
+assert head == 0x20 and ack == bytes([0, 0]), (head, ack.hex())
+subscribe(sock, "qb/flood")
+for i in range(60):
+    publish(sock, "qb/flood", ("n-%d" % i).encode())
+sock.settimeout(3.0)
+got = 0
+try:
+    while True:
+        head, body = packet(sock)
+        if head & 0xF0 == 0x30:
+            got += 1
+except Exception:
+    pass
+disconnect(sock)
+assert got < 60, got
+print("throttled")
+'''

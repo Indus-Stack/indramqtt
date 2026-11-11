@@ -1481,20 +1481,39 @@ Cap connections, sessions and publish rates.
 
 ### `quotas.default_max_connections`
 
-Default max connections per authenticated username (0 = unlimited).
-
-Type: `u32`. Default: `10000`. Range: `0..=1000000 (0 = unlimited opt-in)`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `quotas.max_connections_per_tenant`
 
-Default max live connections per tenant (0 = unlimited).
+`quotas.max_connections_per_tenant` caps live connections in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. The default tenant holds no bound. The default is 0, which means unlimited.
 
 Type: `u32`. Default: `0`. Range: `0..=1000000 (0 = unlimited opt-in)`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[quotas]
+max_connections_per_tenant = 1
+max_sessions_per_tenant = 0
+max_retained_per_tenant = 0
+
+[[tenants.rules]]
+expression = "t-${username}"
+```
+
+Action:
+
+```text
+Connect two clients with the same username and a cap of one.
+```
+
+Captured output:
+
+```output
+limited
+```
 
 Notes:
 
@@ -1503,9 +1522,34 @@ Notes:
 
 ### `quotas.max_sessions_per_tenant`
 
-Default max sessions per tenant (0 = unlimited).
+`quotas.max_sessions_per_tenant` caps sessions in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. The default tenant holds no bound. The default is 0, which means unlimited.
 
 Type: `u32`. Default: `0`. Range: `0..=100000 (0 = unlimited opt-in)`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[quotas]
+max_connections_per_tenant = 0
+max_sessions_per_tenant = 1
+max_retained_per_tenant = 0
+
+[[tenants.rules]]
+expression = "t-${username}"
+```
+
+Action:
+
+```text
+Connect two client ids with the same username and a cap of one.
+```
+
+Captured output:
+
+```output
+limited
+```
 
 Notes:
 
@@ -1514,9 +1558,34 @@ Notes:
 
 ### `quotas.max_retained_per_tenant`
 
-Default max retained topics per tenant (0 = unlimited).
+`quotas.max_retained_per_tenant` caps retained topics in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. Past the cap, new topics drop while delivery continues. The default is 0, which means unlimited.
 
 Type: `u32`. Default: `0`. Range: `0..=100000 (0 = unlimited opt-in)`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[quotas]
+max_connections_per_tenant = 0
+max_sessions_per_tenant = 0
+max_retained_per_tenant = 1
+
+[[tenants.rules]]
+expression = "t-${username}"
+```
+
+Action:
+
+```text
+Publish two retained topics with one username and read the retained count.
+```
+
+Captured output:
+
+```output
+retained=1
+```
 
 Notes:
 
@@ -1525,25 +1594,13 @@ Notes:
 
 ### `quotas.default_max_publish_rate`
 
-Default token-bucket publish rate limit in messages per second (0 = unlimited).
-
-Type: `u32`. Default: `50000`. Range: `0..=10000000 msg/s (0 = unlimited opt-in)`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `quotas.burst_multiplier`
 
-Token bucket burst multiplier (allows bursts up to burst times rate).
-
-Type: `f64`. Default: `2.0`. Range: `1.0..=10.0`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.

@@ -1,0 +1,38 @@
+[example]
+area = "config"
+item = "quotas.default_max_connections"
+kind = "setting"
+expect = "limited"
+expected = "With a default cap of one, the second connection of a second username is refused."
+source = "`crates/broker-config/src/schema.rs` documents the default cap, but no CONNECT path reads it: per-user quotas stay unlimited unless the user row sets them."
+action = "Connect one client per username with a default cap of one."
+config = '''
+[quotas]
+default_max_connections = 1
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def raw_connect(client, username, password):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    flags = 0x02 | 0x80 | 0x40
+    payload = word(client) + word(username) + word(password)
+    body = word("MQTT") + b"\x04" + bytes([flags]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    return sock, head, ack
+
+for user in ("quota-dc-a", "quota-dc-b"):
+    status, _ = http("POST", "/api/v1/auth/users", {"username": user, "password": "Quota-docs-pw-4"})
+    assert status in (200, 201), (user, status)
+first, head, ack = raw_connect("qd-a", "quota-dc-a", "Quota-docs-pw-4")
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+second, head2, ack2 = raw_connect("qd-b", "quota-dc-b", "Quota-docs-pw-4")
+second.close()
+disconnect(first)
+assert head2 == 0x20 and ack2 == b"\x00\x03", (head2, ack2.hex())
+print("limited")
+'''
