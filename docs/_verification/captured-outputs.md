@@ -109,9 +109,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `operations/sizing.md` | 71 | `ok` |
 | `operations/troubleshooting.md` | 111 | `ok` |
 | `operations/upgrade.md` | 68 | `ok` |
-| `reference/api/authentication-acl.md` | 437 | `OK` |
-| `reference/api/authentication-acl.md` | 500 | `OK` |
-| `reference/api/authentication-acl.md` | 516 | `OK` |
+| `reference/api/authentication-acl.md` | 549 | `OK` |
+| `reference/api/authentication-acl.md` | 612 | `OK` |
+| `reference/api/authentication-acl.md` | 628 | `OK` |
 | `reference/api/clients-sessions.md` | 162 | `OK` |
 | `reference/api/clients-sessions.md` | 214 | `OK` |
 | `reference/api/clients-sessions.md` | 230 | `OK` |

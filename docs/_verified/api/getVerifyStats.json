@@ -1,0 +1,8 @@
+{
+  "item": "getVerifyStats",
+  "kind": "api",
+  "output": "counted",
+  "request": "GET /api/v1/auth/verify_stats after the flow creates a user and connects it",
+  "returncode": 0,
+  "verified": true
+}

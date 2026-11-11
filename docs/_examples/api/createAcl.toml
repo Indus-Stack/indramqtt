@@ -1,0 +1,36 @@
+[example]
+area = "api"
+item = "createAcl"
+kind = "api"
+request = "POST /api/v1/auth/acls with client_pattern doc-acl-create, action publish, topic_pattern sensors/#, allow true"
+expect = "created"
+expected = "The broker stores the rule, lists it with the same fields, and returns it to the fresh list."
+
+script = '''
+from config_probe import http
+
+body = {
+    "client_pattern": "doc-acl-create",
+    "action": "publish",
+    "topic_pattern": "sensors/#",
+    "allow": True,
+}
+status, stored = http("POST", "/api/v1/auth/acls", body)
+assert status == 201, (status, stored)
+assert stored.get("client_pattern") == "doc-acl-create", stored
+assert stored.get("topic_pattern") == "sensors/#", stored
+assert stored.get("allow") is True, stored
+status, rules = http("GET", "/api/v1/auth/acls")
+assert status == 200, (status, rules)
+match = [
+    rule for rule in rules
+    if rule.get("client_pattern") == "doc-acl-create"
+]
+assert match, rules
+assert match[0].get("action") == "publish", match
+for index in range(len(rules) - 1, -1, -1):
+    if rules[index].get("client_pattern") == "doc-acl-create":
+        code, _ = http("DELETE", f"/api/v1/auth/acls/{index}")
+        assert code == 204, code
+print("created")
+'''

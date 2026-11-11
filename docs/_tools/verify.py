@@ -121,6 +121,11 @@ def load_example(path):
             if key not in ex:
                 raise SystemExit(f"{path}: setting example misses {key}")
         ex.setdefault("expect", "ok")
+    elif ex["kind"] == "api":
+        for key in ("request", "script"):
+            if key not in ex:
+                raise SystemExit(f"{path}: api example misses {key}")
+        ex.setdefault("expect", "ok")
     else:
         for key in ("binary", "args"):
             if key not in ex:
@@ -359,12 +364,15 @@ class RuleBroker:
         self.tmp = tempfile.mkdtemp(prefix="dxrules-")
         self.proc = None
         self.api = None
+        self.mqtt = None
+        self.cfg = None
 
     def start(self):
         """Boot the broker on free ports. Fail closed when it never answers."""
         mqtt, tls, ws, wss, api = (free_port() for _ in range(5))
         cluster, gossip, quic = (free_port() for _ in range(3))
         cfg = Path(self.tmp) / "cfg"
+        self.cfg = cfg
         (cfg / "conf.d").mkdir(parents=True)
         (cfg / "indra.toml").write_text(
             "[node]\n"
@@ -412,6 +420,7 @@ class RuleBroker:
             env=env,
         )
         self.api = api
+        self.mqtt = mqtt
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
@@ -797,6 +806,80 @@ def verify_action_create(ex, broker):
     }
 
 
+# API operations owned by DX2-064 (authentication and ACL).
+DX2_064_ITEMS = {
+    "createAcl",
+    "createUser",
+    "deleteAcl",
+    "deleteUser",
+    "getVerifyStats",
+    "listAcls",
+    "listUsers",
+}
+
+
+def verify_api(ex, broker):
+    """Run one API example in its flow. Return (ok, record dict)."""
+    if broker is None:
+        return False, {"item": ex["item"], "error": "api broker is missing"}
+    env = dict(os.environ)
+    env.update(
+        {
+            "API_PORT": str(broker.api),
+            "MQTT_PORT": str(broker.mqtt),
+            "API_KEY": broker.key,
+            "WORK_DIR": broker.tmp,
+            "CONFIG_DIR": str(broker.cfg),
+            "DATA_DIR": str(Path(broker.tmp) / "data"),
+        }
+    )
+    tools = str(ROOT / "docs" / "_tools")
+    old_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = tools + (os.pathsep + old_path if old_path else "")
+    timeout = int(ex.get("timeout", 60))
+    try:
+        done = subprocess.run(  # noqa: S603
+            [sys.executable, "-"],
+            input=ex["script"],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            cwd=broker.tmp,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, {
+            "item": ex["item"],
+            "kind": "api",
+            "request": ex["request"],
+            "error": f"the call timed out after {timeout} seconds",
+        }
+    got = done.stdout.strip()
+    if done.returncode != 0:
+        error = (done.stderr.strip() or got or "action exited non-zero")[-1000:]
+        return False, {
+            "item": ex["item"],
+            "kind": "api",
+            "request": ex["request"],
+            "error": error,
+        }
+    want = ex.get("expect", "ok")
+    if got != want:
+        return False, {
+            "item": ex["item"],
+            "kind": "api",
+            "request": ex["request"],
+            "error": f"output is {got!r}, wanted {want!r}",
+        }
+    return True, {
+        "item": ex["item"],
+        "kind": "api",
+        "request": ex["request"],
+        "output": got,
+        "returncode": 0,
+    }
+
+
 # Rule event stems owned by DX2-018 (event sources as FROM names).
 DX2_018_ITEMS = {
     "event-events-client_check_authz_complete",
@@ -847,6 +930,8 @@ def failure_marker(item):
         return "DX2-017"
     if item in DX2_018_ITEMS:
         return "DX2-018"
+    if item in DX2_064_ITEMS:
+        return "DX2-064"
     if item.startswith(("node.", "session.", "delayed.", "gateway.", "persistence.")):
         return "DX2-056"
     if item.startswith(("observability.", "logging.")):
@@ -894,6 +979,15 @@ def append_failure(item, ex, record):
             f"\n## {task} item `{item}`\n\n"
             f"- Input: {inputs}.\n"
             f"- Expected: the cased create results in the example.\n"
+            f"- Broker gave: `{record.get('error', record)}`.\n"
+            f"- Date: {day}.\n"
+        )
+    elif ex.get("kind") == "api":
+        block = (
+            f"\n## {task} item `{item}`\n\n"
+            f"- Input: the call described by `{ex.get('request', '')}` in "
+            f"`docs/_examples/api/{item}.toml`.\n"
+            f"- Expected: {ex.get('expected', 'the call succeeds and returns the documented result')}\n"
             f"- Broker gave: `{record.get('error', record)}`.\n"
             f"- Date: {day}.\n"
         )
@@ -1327,7 +1421,26 @@ def run_area(area, write, only_item=""):
                 continue
             items += 1
             ex = load_example(path)
-            if ex["kind"] == "rule-test":
+            if area == "api":
+                binary = find_binary("indramqtt")
+                if binary is None:
+                    ok, record = False, {
+                        "item": ex["item"],
+                        "error": "kernel binary is missing",
+                    }
+                else:
+                    item_broker = RuleBroker(binary)
+                    try:
+                        item_broker.start()
+                        ok, record = verify_api(ex, item_broker)
+                    except SystemExit as exc:
+                        ok, record = False, {
+                            "item": ex["item"],
+                            "error": f"api broker: {exc}",
+                        }
+                    finally:
+                        item_broker.stop()
+            elif ex["kind"] == "rule-test":
                 ok, record = verify_rule_test(ex, broker)
             elif ex["kind"] == "action-create":
                 ok, record = verify_action_create(ex, broker)

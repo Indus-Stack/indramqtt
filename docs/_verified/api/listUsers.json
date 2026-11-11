@@ -1,0 +1,8 @@
+{
+  "item": "listUsers",
+  "kind": "api",
+  "output": "listed",
+  "request": "GET /api/v1/auth/users after the flow creates two users",
+  "returncode": 0,
+  "verified": true
+}

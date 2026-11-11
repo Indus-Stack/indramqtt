@@ -1,0 +1,8 @@
+{
+  "item": "listAcls",
+  "kind": "api",
+  "output": "listed",
+  "request": "GET /api/v1/auth/acls after the flow creates two ordered rules",
+  "returncode": 0,
+  "verified": true
+}

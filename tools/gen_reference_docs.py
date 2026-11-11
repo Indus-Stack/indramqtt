@@ -455,10 +455,83 @@ VERIFIED_CHECK_OPS = {
     ("get", "/api/v1/rules"),
 }
 
+# Per-operation text, examples and failure records.
+API_TEXT = ROOT / "docs" / "_text" / "api"
+API_VERIFIED = ROOT / "docs" / "_verified" / "api"
+API_FAILURES = ROOT / "docs" / "_verification" / "failures.md"
+
+
+def api_text(item: str) -> str | None:
+    """Read the written explanation of one API operation."""
+    path = API_TEXT / (item + ".md")
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip()
+
+
+def api_verified(item: str) -> dict | None:
+    """Read the verified output of one API operation."""
+    path = API_VERIFIED / (item + ".json")
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def api_failed(item: str) -> bool:
+    """Return true when a failure record names this API operation."""
+    try:
+        text = API_FAILURES.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return f"item `{item}`" in text
+
+
+OPERATION_NOTES = {
+    "createUser": [
+        "Send `username` and `password`. An empty value fails with 400.",
+        "Success answers 201 with the stored row. The password is write-only.",
+        "A create for an existing username replaces the stored credential.",
+        "A password longer than 8192 bytes is refused.",
+        "The write persists and clears cached authorization decisions.",
+    ],
+    "listUsers": [
+        "Names are sorted. A password never appears in the answer.",
+        "An absent tenant reads the default tenant.",
+    ],
+    "deleteUser": [
+        "Success answers 204 with no body.",
+        "An unknown username fails with 404.",
+    ],
+    "createAcl": [
+        "Send `client_pattern`, `action`, `topic_pattern` and `allow`.",
+        "An empty client pattern fails with 400. The action must be `publish`, `subscribe` or `all`.",
+        "The topic pattern must be a valid MQTT filter.",
+        "A tenant holds at most 10000 rules.",
+        "The write persists and clears cached authorization decisions.",
+    ],
+    "listAcls": [
+        "The rules keep evaluation order. The first match wins.",
+        "An absent tenant reads the default tenant.",
+    ],
+    "deleteAcl": [
+        "`id` is the zero-based index in the tenant rule list.",
+        "Success answers 204 with no body.",
+        "An index past the end fails with 404.",
+        "The write persists and clears cached authorization decisions.",
+    ],
+    "getVerifyStats": [
+        "The counters live in memory and restart at zero.",
+        "`verifications` counts blocking password hashes. `dedup_joins` counts CONNECTs that shared one leader check.",
+    ],
+}
+
 
 def operation_notes(method: str, op: dict) -> list:
     """Build the Notes list of one operation."""
     # Each note states a limit or an error from the handler code.
+    item = op.get("operationId", "")
+    if item in OPERATION_NOTES:
+        return OPERATION_NOTES[item]
     notes = []
     body = (
         (op.get("requestBody", {}) if isinstance(op.get("requestBody"), dict) else {}).get(
@@ -490,24 +563,36 @@ def operation_notes(method: str, op: dict) -> list:
     return notes
 
 
-def operation_verified(method: str, path: str) -> str:
+def operation_verified(method: str, path: str, op: dict) -> str:
     """State where the live call of one operation runs."""
+    item = op.get("operationId", "")
+    if item and api_verified(item):
+        return (
+            "Verified: the runner ran this call through the management API. "
+            f"See `../../_verified/api/{item}.json`."
+        )
     key = (method.lower(), path)
     if key in VERIFIED_FLOW_OPS:
         return "Verified: the example flow below runs this call."
     if key in VERIFIED_CHECK_OPS:
         return "Verified: the check below runs this call."
+    if item and api_failed(item):
+        return "Not verified: see the failure record."
     return "Not verified: see `../_verification/failures.md`."
 
 
 def render_operation(method: str, path: str, op: dict, tag: str = "") -> str:
     """Render one operation with its example."""
+    item = op.get("operationId", "")
     parts = [f"### `{method.upper()} {path}`\n"]
     summary = op.get("summary", "")
     if summary:
         parts.append(f"{summary}\n")
-    if op.get("operationId"):
-        parts.append(f"Operation id: `{op['operationId']}`.\n")
+    if item:
+        parts.append(f"Operation id: `{item}`.\n")
+    text = api_text(item) if item else None
+    if text:
+        parts.append(f"{text}\n")
     parts.append("Parameters:\n")
     parts.append(render_parameters(op))
     parts.append("Request body:\n")
@@ -517,7 +602,22 @@ def render_operation(method: str, path: str, op: dict, tag: str = "") -> str:
     parts.append("Notes:\n")
     for note in operation_notes(method, op):
         parts.append(f"- {note}\n")
-    parts.append(f"{operation_verified(method, path)}\n")
+    parts.append(f"{operation_verified(method, path, op)}\n")
+    record = api_verified(item) if item else None
+    if record and record.get("verified"):
+        parts.append("Verified example:\n")
+        parts.append(f"Request: `{record.get('request', '')}`.\n")
+        parts.append("Captured output:\n")
+        parts.append("```output")
+        parts.append(str(record.get("output", "")).strip())
+        parts.append("```")
+        parts.append("")
+    elif item and api_failed(item):
+        parts.append("> [!WARNING]\n")
+        parts.append(
+            "> Not verified: see the failure record in "
+            "[Verification failures](../../_verification/failures.md).\n"
+        )
     parts.append("Example:\n")
     parts.append("```curl")
     parts.append(curl_example(method, path, op))

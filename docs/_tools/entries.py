@@ -2922,7 +2922,10 @@ def area_counts(area):
             if read_text("config", s["path"]) is not None
         ]
     elif area == "api":
-        ids = [o["method"] + " " + o["path"] for o in data["operations"]]
+        ids = [
+            o.get("operation_id") or (o["method"] + " " + o["path"])
+            for o in data["operations"]
+        ]
     elif area == "mcp":
         ids = [t["name"] for t in data["tools"]]
     elif area == "rules":
