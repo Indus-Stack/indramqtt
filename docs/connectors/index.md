@@ -180,7 +180,7 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"alloydb", "aws_timestream", "azure_blob_storage", "azure_event_hub_producer", "bigquery", "clickhouse", "cockroachdb", "couchbase", "datalayers", "disk_log", "doris", "dynamo", "elasticsearch", "gcp_pubsub_producer", "greptimedb", "http", "influxdb", "iotdb", "kinesis", "mongodb", "mqtt", "kafka_producer", "redis", "rabbitmq", "pulsar", "rocketmq", "confluent_producer", "mysql", "opc_ua", "opents", "oracle", "pgsql", "redshift", "s3", "snowflake", "snowflake_streaming", "sparkplug_b", "sqlserver", "tablestore", "tdengine"}, names
+assert names == {"alloydb", "aws_timestream", "azure_blob_storage", "azure_event_hub_producer", "bigquery", "clickhouse", "cockroachdb", "couchbase", "datalayers", "disk_log", "doris", "dynamo", "elasticsearch", "gcp_pubsub_producer", "greptimedb", "http", "influxdb", "iotdb", "kinesis", "mongodb", "mqtt", "kafka_producer", "redis", "rabbitmq", "pulsar", "rocketmq", "confluent_producer", "mysql", "opents", "oracle", "pgsql", "redshift", "s3", "snowflake", "snowflake_streaming", "sqlserver", "tablestore", "tdengine"}, names
 for pending in ("aws_iot", "azure_iot", "oci_streaming", "cassandra"):
     assert pending not in names, pending
 print("ok")
