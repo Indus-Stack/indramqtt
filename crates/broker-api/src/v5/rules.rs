@@ -3060,7 +3060,8 @@ fn canonical_connector_kind(conn_type: &str) -> &str {
 fn stored_connector_kind(conn_type: &str) -> &str {
     match conn_type {
         "http" | "rest" => "http",
-        "kafka" | "kafka_producer" | "kafka_consumer" => "kafka",
+        "kafka_consumer" => "kafka_consumer",
+        "kafka" | "kafka_producer" => "kafka",
         "confluent" | "confluent_producer" | "confluent_kafka" | "confluent_cloud" => "confluent",
         other => canonical_connector_kind(other),
     }
@@ -3235,11 +3236,17 @@ fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
         );
     }
     if canonical == "kafka" {
-        // The reference names this kind `kafka_producer`.
-        // Store the reference name so the response validates.
+        // The reference names this kind `kafka_producer`. Store the
+        // reference name so the response validates. A `kafka_consumer`
+        // keeps the type that was sent.
+        let stored = if conn_type == "kafka_consumer" {
+            "kafka_consumer"
+        } else {
+            "kafka_producer"
+        };
         obj.insert(
             "type".to_string(),
-            serde_json::Value::String("kafka_producer".to_string()),
+            serde_json::Value::String(stored.to_string()),
         );
     }
     if canonical == "confluent" {

@@ -143,26 +143,58 @@ fn strip_single_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
 /// and the reference API use the same six asterisks.
 pub const SECRET_MASK: &str = "******";
 
-/// True when a config field name carries secret material. This is the
-/// one rule for every connector, action and snapshot read. The name is
-/// matched in lower case.
+/// Field names whose value is a secret. This is the one list for every
+/// connector, action, authenticator, source and snapshot read.
+///
+/// Source: every property with `"format": "password"` in the reference
+/// OpenAPI (`openapi-6.3.0.json`), except the two ids listed in
+/// [`REFERENCE_PASSWORD_IDS`]. It also holds the clear secret names that
+/// kinds outside the reference use. A match is exact, so a name such as
+/// `shared_access_key_name` or an id such as `api_key` is not a secret.
+pub const SECRET_FIELD_NAMES: &[&str] = &[
+    // Reference `format: password` properties.
+    "access_key_secret",
+    "account_key",
+    "aws_secret_access_key",
+    "client_secret",
+    "jwt",
+    "password",
+    "private_key",
+    "private_key_password",
+    "secret",
+    "secret_access_key",
+    "secret_key",
+    "security_token",
+    "sentinel_password",
+    "service_account_json",
+    "sp_private_key",
+    "token",
+    // Secret names of kinds outside the reference.
+    "access_token",
+    "api_secret",
+    "auth_token",
+    "bearer_token",
+    "credentials_json",
+    "mfa_secret",
+    "passphrase",
+    "passwd",
+    "private_key_pem",
+    "sas_token",
+    "session_token",
+    "shared_access_key",
+];
+
+/// Reference `format: password` properties that are ids, not secrets:
+/// the key id of an access key and the key id of an API key. Their secret
+/// sits in a separate field (`secret_access_key`, `api_secret`).
+pub const REFERENCE_PASSWORD_IDS: &[&str] = &["access_key_id", "api_key"];
+
+/// True when a config field name carries secret material. The match is
+/// exact and ignores case. See [`SECRET_FIELD_NAMES`].
 #[must_use]
 pub fn is_secret_key(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("passwd")
-        || lower.contains("passphrase")
-        || lower.contains("private_key")
-        || lower.contains("privatekey")
-        || lower.contains("api_key")
-        || lower.contains("apikey")
-        || lower.contains("account_key")
-        || lower.contains("shared_access_key")
-        || lower.contains("service_account")
-        || lower.contains("credentials_json")
-        || lower == "token"
-        || lower.ends_with("_token")
+    let lower = name.to_ascii_lowercase();
+    SECRET_FIELD_NAMES.contains(&lower.as_str())
 }
 
 /// Mask every secret in one document, in place. A field with a secret
@@ -253,6 +285,60 @@ pub fn restore_masked_secrets(body: &mut serde_json::Value, stored: &serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every property with `"format": "password"` in the reference
+    /// OpenAPI (`/work/team/plan/reference/openapi-6.3.0.json`, 6.3.0).
+    /// The file is outside the repository, so the names are data here.
+    const REFERENCE_PASSWORD_PROPERTIES: &[&str] = &[
+        "access_key_id",
+        "access_key_secret",
+        "account_key",
+        "api_key",
+        "aws_secret_access_key",
+        "client_secret",
+        "jwt",
+        "password",
+        "private_key",
+        "private_key_password",
+        "secret",
+        "secret_access_key",
+        "secret_key",
+        "security_token",
+        "sentinel_password",
+        "service_account_json",
+        "sp_private_key",
+        "token",
+    ];
+
+    #[test]
+    fn every_reference_password_property_is_a_secret_or_a_listed_id() {
+        for name in REFERENCE_PASSWORD_PROPERTIES {
+            assert!(
+                is_secret_key(name) || REFERENCE_PASSWORD_IDS.contains(name),
+                "reference password property {name} is not in the list"
+            );
+        }
+        for id in REFERENCE_PASSWORD_IDS {
+            assert!(!is_secret_key(id), "{id} is an id, not a secret");
+        }
+    }
+
+    #[test]
+    fn names_and_ids_are_not_secrets() {
+        for name in [
+            "shared_access_key_name",
+            "api_key",
+            "access_key_id",
+            "username",
+            "token_endpoint",
+            "password_hash_algorithm",
+        ] {
+            assert!(!is_secret_key(name), "{name}");
+        }
+        assert!(is_secret_key("Password"));
+        assert!(is_secret_key("api_secret"));
+        assert!(is_secret_key("shared_access_key"));
+    }
 
     #[test]
     fn secret_named_container_is_walked_not_replaced() {

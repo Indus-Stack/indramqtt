@@ -128,7 +128,14 @@ pub const REDACTED_SECRET: &str = "******";
 /// these substrings is treated as a secret and its whole value is replaced
 /// with [`REDACTED_SECRET`], never rendered or logged.
 fn is_secret_key(name: &str) -> bool {
-    broker_config::secrets::is_secret_key(name)
+    let lower = name.to_lowercase();
+    lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("private_key")
+        || lower.contains("privatekey")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
 }
 
 /// Copy one config document with every secret value replaced by

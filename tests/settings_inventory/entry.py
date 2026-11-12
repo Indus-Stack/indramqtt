@@ -461,13 +461,17 @@ class InventoryEntry(unittest.TestCase):
         self.addCleanup(self.scratch.cleanup)
         self.addCleanup(self.broker.stop)
 
-    @staticmethod
-    def is_secret_key(name):
-        lower = name.lower()
-        return (any(part in lower for part in (
-            "secret", "password", "passwd", "passphrase", "private_key", "privatekey", "api_key", "apikey",
-            "account_key", "shared_access_key", "service_account", "credentials_json"))
-            or lower == "token" or lower.endswith("_token"))
+    SECRET_NAMES = {
+        "access_key_secret", "account_key", "aws_secret_access_key", "client_secret", "jwt", "password",
+        "private_key", "private_key_password", "secret", "secret_access_key", "secret_key", "security_token",
+        "sentinel_password", "service_account_json", "sp_private_key", "token", "access_token", "api_secret",
+        "auth_token", "bearer_token", "credentials_json", "mfa_secret", "passphrase", "passwd",
+        "private_key_pem", "sas_token", "session_token", "shared_access_key"}
+
+    @classmethod
+    def is_secret_key(cls, name):
+        # Mirror of broker_config::secrets::SECRET_FIELD_NAMES.
+        return name.lower() in cls.SECRET_NAMES
 
     def masked(self, value):
         # Mirror of the broker rule: a secret field reads back as ******.

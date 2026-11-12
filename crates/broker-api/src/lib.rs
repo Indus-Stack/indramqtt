@@ -14019,7 +14019,9 @@ connector_id = "pending-good"
         assert_eq!(status, 200);
         assert_eq!(stored["namespace"], json!("ns-ref"));
         assert_eq!(stored["shared_access_key_name"], json!("send"));
-        assert_eq!(stored["shared_access_key"], json!("c2VjcmV0"));
+        // The key value is a secret: a read shows the mask.
+        assert_eq!(stored["shared_access_key"], json!("******"));
+        assert!(!stored.to_string().contains("c2VjcmV0"));
     }
 
     #[tokio::test]
@@ -20343,6 +20345,41 @@ connector_id = "pending-good"
         let (status, raw) = server.get_auth(&format!("{path}?secrets=raw"), &full).await;
         assert_eq!(status, 200);
         assert!(raw.to_string().contains(SECRET));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn kafka_consumer_connector_keeps_the_type_that_was_sent() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for (name, kind, expected) in [
+            ("keep-consumer", "kafka_consumer", "kafka_consumer"),
+            ("keep-producer", "kafka_producer", "kafka_producer"),
+            ("keep-kafka", "kafka", "kafka_producer"),
+        ] {
+            let (status, created) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"name": name, "type": kind, "bootstrap_hosts": "127.0.0.1:9092"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "{kind}: {created}");
+            assert_eq!(created["type"], json!(expected), "{kind} create");
+            let (status, shown) = server
+                .get_auth(&format!("/api/v5/connectors/{name}"), &token)
+                .await;
+            assert_eq!(status, 200);
+            assert_eq!(shown["type"], json!(expected), "{kind} read");
+        }
+        let (_, listed) = server.get_auth("/api/v5/connectors", &token).await;
+        let types: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["type"].as_str())
+            .collect();
+        assert!(types.contains(&"kafka_consumer"), "{types:?}");
     }
 
     #[tokio::test]

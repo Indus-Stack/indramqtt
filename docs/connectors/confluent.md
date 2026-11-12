@@ -281,7 +281,7 @@ s2, b2 = call("POST", "/api/v5/connectors",
                "topic_template": "telemetry-events", "timeout_ms": 5000})
 assert s2 in (201, 400), (s2, b2)
 if s2 == 201:
-    assert b2["type"] == "confluent", (s2, b2)
+    assert b2["type"] == "confluent_producer", (s2, b2)
 else:
     assert "confluent" in json.dumps(b2).lower(), (s2, b2)
 s3, b3 = call("POST", "/api/v5/connectors",
