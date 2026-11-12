@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::admin_users::{AdminRole, AdminUserError};
+use crate::admin_users::{AdminRole, AdminUserError, UserScopesUpdate};
 use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
@@ -74,6 +74,8 @@ pub struct TokenInfo {
     pub role: AdminRole,
     pub expires_at: Instant,
     pub must_change_password: bool,
+    /// Explicit dashboard user scopes; `None` means the role default.
+    pub scopes: Option<Vec<String>>,
 }
 
 /// Per-`ApiState` token and SCRAM-challenge store. Lives in `ApiState`
@@ -103,6 +105,7 @@ impl ApiTokens {
             role,
             expires_at: Instant::now() + TOKEN_TTL,
             must_change_password: false,
+            scopes: None,
         };
         let mut tokens = self.tokens.lock().unwrap();
         let now = Instant::now();
@@ -160,6 +163,7 @@ impl ApiTokens {
             role,
             expires_at: Instant::now() - Duration::from_secs(1),
             must_change_password: false,
+            scopes: None,
         };
         self.tokens.lock().unwrap().insert(token.clone(), info);
         token
@@ -358,6 +362,7 @@ pub(crate) fn resolve_bearer(state: &ApiState, token: &str) -> Option<TokenInfo>
         role: view.role,
         expires_at: info.expires_at,
         must_change_password: view.must_change_password,
+        scopes: view.scopes,
     })
 }
 
@@ -712,15 +717,13 @@ struct UserScopeEntry {
 /// short static string, so serving the catalogue allocates only the
 /// small bounded response body once per request.
 ///
-/// The first ten are the generic scopes shared with API keys (held by
-/// either role); the last four are login-only scopes restricted to the
-/// administrator role. This is the single registry the dashboard-user
-/// scope validation shares with the catalogue route:
-/// [`is_known_user_scope`] and [`role_may_hold_scope`] consult this
-/// same list. Vocabulary enforcement on the user write paths (rejecting
-/// unknown names, refusing non-administrators the login-only scopes)
-/// is owned by the admin-users lane; the catalogue route serves the
-/// list verbatim regardless of which scopes any stored user holds.
+/// The first ten are generic scopes shared with API keys.
+/// Either role can hold them. The last four are login-only scopes.
+/// An administrator can hold all four. A viewer can hold
+/// `mfa_management`. The catalogue route serves this list. The write
+/// paths check names and roles against
+/// [`broker_config::is_known_user_scope`] and
+/// [`broker_config::role_may_hold_user_scope`].
 // Scope names stay exact. Summaries use short operator words.
 // The catalogue records the per-scope admin flag. Writes check
 // per-scope role compatibility.
@@ -782,8 +785,8 @@ const USER_SCOPES: [UserScopeEntry; 14] = [
     },
     UserScopeEntry {
         name: "mfa_management",
-        desc: "Manage other users' multi-factor authentication",
-        admin_only: true,
+        desc: "Exempt the user's own MFA from the administrator policy locks",
+        admin_only: false,
     },
     UserScopeEntry {
         name: "sso_management",
@@ -797,28 +800,93 @@ const USER_SCOPES: [UserScopeEntry; 14] = [
     },
 ];
 
-/// Whether `name` is one of the catalogue scopes a dashboard login
-/// user may hold.
-///
-/// Shared by the dashboard-user create/update validation path and the
-/// catalogue route so both read the same registry. Advisory for now:
-/// enforcement stays with the admin-users write-path lane (see the
-/// module TODO); the catalogue route serves this list regardless.
+// TODO(parity): this broker has no force_mfa or admin_required policy lock.
+// The self-exemption effect of mfa_management cannot show until those locks
+// exist. The scope itself is validated, stored and enforced.
+
+/// Whether `name` is one of the scopes a dashboard login user may hold.
 pub fn is_known_user_scope(name: &str) -> bool {
-    USER_SCOPES.iter().any(|entry| entry.name == name)
+    broker_config::is_known_user_scope(name)
 }
 
-/// Whether `role` may hold `scope` under the catalogue's
-/// administrator-only flags: viewers hold only the generic scopes,
-/// administrators hold any catalogue scope. Unknown names fail closed
-/// (false) so validation never grants what the catalogue does not
-/// list. Advisory for now, shared with the catalogue route through
-/// [`USER_SCOPES`]; enforcement on the write paths stays with the
-/// admin-users lane until the checker pins it.
+/// Whether `role` may hold `scope`.
+/// Unknown names and unknown roles fail closed.
 pub fn role_may_hold_scope(role: &AdminRole, scope: &str) -> bool {
-    match USER_SCOPES.iter().find(|entry| entry.name == scope) {
-        Some(entry) => !entry.admin_only || *role == AdminRole::Administrator,
-        None => false,
+    broker_config::role_may_hold_user_scope(role_str(role), scope)
+}
+
+/// The implicit scopes of a dashboard role.
+pub(crate) fn default_scopes_for_role(role: AdminRole) -> Vec<String> {
+    broker_config::role_default_user_scopes(role_str(&role))
+}
+
+/// The effective scopes of a dashboard user: the explicit list when it
+/// exists, otherwise the role default.
+pub(crate) fn effective_user_scopes(role: AdminRole, scopes: &Option<Vec<String>>) -> Vec<String> {
+    match scopes {
+        Some(list) => list.clone(),
+        None => default_scopes_for_role(role),
+    }
+}
+
+/// True when two scope lists hold the same names, in any order.
+fn same_scope_set(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
+
+/// Validate an explicit scope list against the catalogue and the role.
+fn validate_scope_list(role: AdminRole, scopes: &[String]) -> Result<(), String> {
+    broker_config::validate_user_scope_list(role_str(&role), scopes)
+}
+
+/// Read a `scopes` write value into the list to store.
+/// `unset` and a list equal to the role default clear the explicit list.
+fn parse_scope_write(
+    role: AdminRole,
+    raw: &serde_json::Value,
+) -> Result<Option<Vec<String>>, String> {
+    match raw {
+        serde_json::Value::String(text) if text == "unset" => Ok(None),
+        serde_json::Value::String(_) => {
+            Err("field `scopes` must be a list of strings or \"unset\"".to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let mut scopes = Vec::with_capacity(items.len());
+            for item in items {
+                let scope = item
+                    .as_str()
+                    .ok_or_else(|| "field `scopes` must hold strings".to_string())?;
+                scopes.push(scope.to_string());
+            }
+            validate_scope_list(role, &scopes)?;
+            if same_scope_set(&scopes, &default_scopes_for_role(role)) {
+                Ok(None)
+            } else {
+                Ok(Some(scopes))
+            }
+        }
+        _ => Err("field `scopes` must be a list of strings or \"unset\"".to_string()),
+    }
+}
+
+/// Refuse a stored explicit list that the new role cannot hold.
+fn validate_stored_scopes(role: AdminRole, scopes: &Option<Vec<String>>) -> Result<(), String> {
+    if let Some(list) = scopes {
+        validate_scope_list(role, list)?;
+    }
+    Ok(())
+}
+
+/// The response value of a scope list.
+/// `None` renders the legacy `unset` sentinel.
+fn scopes_json(scopes: &Option<Vec<String>>) -> serde_json::Value {
+    match scopes {
+        Some(list) => serde_json::json!(list),
+        None => serde_json::Value::String("unset".to_string()),
     }
 }
 
@@ -826,10 +894,11 @@ pub fn role_may_hold_scope(role: &AdminRole, scope: &str) -> bool {
 /// user may hold (C05-24).
 ///
 /// Returns `{"scopes": [{"name", "desc", "admin_only"}]}` in catalogue
-/// order, served from the same [`USER_SCOPES`] registry that the
-/// dashboard-user validation predicates consult. The route is not
-/// paged and takes no parameters; unknown query parameters are ignored
-/// (the handler takes no extractor, so Axum never parses them).
+/// order, served from [`USER_SCOPES`]. The dashboard-user write paths
+/// check the names and roles against the `broker_config` lists. A test
+/// compares the two registries. The route is not paged and takes no
+/// parameters; unknown query parameters are ignored (the handler takes
+/// no extractor, so Axum never parses them).
 /// Management-plane only: reads a code-defined list, takes no lock,
 /// and publish/deliver never touch it.
 pub async fn user_scopes() -> Response {
@@ -860,17 +929,17 @@ pub async fn user_scopes() -> Response {
 /// parameters, and the management console reads an array. The array is
 /// sorted by username. An empty store reads as `[]`, never an error. Each
 /// row carries `username`, `role`, `description`, `backend` (always
-/// `local`: the broker has one user store) and `mfa`. The value of `mfa`
-/// is `totp` for a user whose second factor is on, `disabled` for a user
-/// with a pending enrolment that no code has confirmed, and `none`
-/// otherwise. Passwords are write-only and password hashes never render.
+/// `local`: the broker has one user store), `mfa` and `scopes`. The value
+/// of `mfa` is `totp` for a user whose second factor is on, `disabled`
+/// for a user with a pending enrolment that no code has confirmed, and
+/// `none` otherwise. `scopes` is the explicit list, or the legacy
+/// `unset` sentinel when the role default applies. Passwords are
+/// write-only and password hashes never render.
 /// Management-plane only: clones the sorted view list once per request
 /// under short read locks; the login and middleware consults keep reading
 /// under their own short locks and publish/deliver never touch this
 /// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
 /// (1024 entries), so the list stays small.
-// The row omits `scopes`. The broker tracks no per-user scope list.
-// The specification marks the field optional, so omission stays valid.
 pub async fn list_users(State(state): State<ApiState>) -> Response {
     let rows: Vec<_> = state
         .admin_users
@@ -888,6 +957,7 @@ pub async fn list_users(State(state): State<ApiState>) -> Response {
                 "description": u.description,
                 "backend": "local",
                 "mfa": mfa,
+                "scopes": scopes_json(&u.scopes),
             })
         })
         .collect();
@@ -907,11 +977,14 @@ pub async fn list_users(State(state): State<ApiState>) -> Response {
 /// [`crate::admin_users::MAX_ADMIN_USERS`] entries fails with
 /// `BAD_REQUEST`. Usernames must match the store charset (alphanumeric
 /// plus `_-.@`, at most 64 bytes) and passwords must be at least 8
-/// characters; both fail closed with `BAD_REQUEST`. On success answers
-/// 200 with `username`, `role`, `description`, `backend` (`local`) and
-/// `mfa` (`none`, `disabled` or `totp`). It omits `scopes`. The broker
-/// tracks no per-user scope list. The password is hashed (PBKDF2-HMAC-SHA-256
-/// SCRAM verifier) before storing; plaintext never persists. The write
+/// characters; both fail closed with `BAD_REQUEST`. An omitted `scopes`
+/// field stores the role default. The string `unset` and a list equal to
+/// the role default store no explicit list; an empty list denies each
+/// management scope. An unknown scope or a scope the role cannot hold
+/// fails with `BAD_REQUEST` and creates nothing. On success answers 200
+/// with `username`, `role`, `description`, `backend` (`local`), `mfa`
+/// (`none`, `disabled` or `totp`) and `scopes`. The password is hashed
+/// (PBKDF2-HMAC-SHA-256 SCRAM verifier) before storing; plaintext never persists. The write
 /// persists across a restart through the config registry
 /// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
 /// Management-plane only: one short existence check plus the user-map
@@ -933,10 +1006,20 @@ pub async fn create_user(State(state): State<ApiState>, body: Bytes) -> Response
         Ok(parsed) => parsed,
         Err(message) => return ApiError::BadRequest(message).into_response(),
     };
-    if let Err(error) = state
-        .admin_users
-        .create(&username, &password, role, &description)
-    {
+    let scopes = match value.get("scopes") {
+        None => Some(default_scopes_for_role(role)),
+        Some(raw) => match parse_scope_write(role, raw) {
+            Ok(scopes) => scopes,
+            Err(message) => return ApiError::BadRequest(message).into_response(),
+        },
+    };
+    if let Err(error) = state.admin_users.create_with_scopes(
+        &username,
+        &password,
+        role,
+        &description,
+        scopes.clone(),
+    ) {
         return admin_error(error);
     }
     let mfa = match state.admin_users.mfa_status(&username) {
@@ -951,7 +1034,8 @@ pub async fn create_user(State(state): State<ApiState>, body: Bytes) -> Response
             "role": role_str(&role),
             "description": description,
             "backend": "local",
-            "mfa": mfa
+            "mfa": mfa,
+            "scopes": scopes_json(&scopes),
         })),
     )
         .into_response()
@@ -1023,8 +1107,11 @@ fn parse_dashboard_user_body(
 /// on the change-password route. Unknown usernames fail with `NOT_FOUND`
 /// (404, documented shape) and create nothing. The route is not paged.
 /// On success answers 200 with `username`, `role`, `description`,
-/// `backend` (`local`) and `mfa`. It omits `scopes`. The broker tracks
-/// no per-user scope list. The write persists across a restart through the config registry
+/// `backend` (`local`), `mfa` and `scopes`. An omitted `scopes` field
+/// keeps the stored list, but the list must fit the new role. The string
+/// `unset` and a list equal to the role default store no explicit list.
+/// An unknown scope or a scope the role cannot hold fails with
+/// `BAD_REQUEST` and changes nothing. The write persists across a restart through the config registry
 /// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
 /// Management-plane only: one short user-map write lock per request
 /// (plus the registry save lock on persist); the login path keeps
@@ -1036,9 +1123,8 @@ fn parse_dashboard_user_body(
 // (404). Doubly-bad requests report the validation failure.
 // The update refuses `password`, `old_pwd` and `new_pwd` with 400. It
 // ignores other unknown fields.
-// The update accepts `role` and `description`. It ignores `scopes`.
-// The broker tracks no per-user scope list. It always applies the
-// role default. The specification marks `scopes` optional.
+// The update accepts `role`, `description` and `scopes`. A kept
+// explicit list is checked against the new role before it is stored.
 pub async fn update_user(
     State(state): State<ApiState>,
     Path(username): Path<String>,
@@ -1098,12 +1184,27 @@ pub async fn update_user(
             }
         },
     };
-    if state.admin_users.get(&username).is_none() {
+    let Some(existing) = state.admin_users.get(&username) else {
         return admin_error(AdminUserError::NotFound);
-    }
-    if let Err(error) = state
-        .admin_users
-        .update(&username, role, description.as_deref())
+    };
+    let effective_role = role.unwrap_or(existing.role);
+    let scopes_update = match obj.get("scopes") {
+        None => {
+            if let Err(message) = validate_stored_scopes(effective_role, &existing.scopes) {
+                return ApiError::BadRequest(message).into_response();
+            }
+            UserScopesUpdate::Keep
+        }
+        Some(raw) => match parse_scope_write(effective_role, raw) {
+            Ok(None) => UserScopesUpdate::Clear,
+            Ok(Some(list)) => UserScopesUpdate::Set(list),
+            Err(message) => return ApiError::BadRequest(message).into_response(),
+        },
+    };
+    if let Err(error) =
+        state
+            .admin_users
+            .update_with_scopes(&username, role, description.as_deref(), scopes_update)
     {
         return admin_error(error);
     }
@@ -1121,7 +1222,8 @@ pub async fn update_user(
                     "role": role_str(&view.role),
                     "description": view.description,
                     "backend": "local",
-                    "mfa": mfa
+                    "mfa": mfa,
+                    "scopes": scopes_json(&view.scopes),
                 })),
             )
                 .into_response()
@@ -1235,6 +1337,9 @@ pub async fn change_user_password(
         &username,
         bearer_token_from_credentials(&headers).as_deref(),
     );
+    // A changed password invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1307,7 +1412,7 @@ pub async fn list_authn_users(
 /// most [`MAX_AUTHN_USERNAME_LEN`] bytes) and `password` (non-empty, at
 /// most [`MAX_PASSWORD_BYTES`] bytes); anything else fails with
 /// `BAD_REQUEST` in the documented `{code, message}` shape. A `user_id`
-/// that already exists fails with `ALREADY_EXISTS` instead of updating
+/// that already exists fails with `BAD_REQUEST` instead of updating
 /// in place; a map that already holds [`MAX_AUTHN_USERS`] entries fails
 /// with `BAD_REQUEST`. Unknown authenticator ids fail with `NOT_FOUND`;
 /// a known non-built-in backend fails with `BAD_REQUEST`. On success
@@ -1320,7 +1425,7 @@ pub async fn list_authn_users(
 /// keeps reading under short read locks and publish/deliver never touch
 /// this store.
 // A duplicate `user_id` is rejected, never overwritten. It answers
-// 400 ALREADY_EXISTS.
+// 400 BAD_REQUEST with the documented code.
 pub async fn create_authn_user(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1347,7 +1452,7 @@ pub async fn create_authn_user(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     if state.auth.has_user(&user_id) {
-        return ApiError::AlreadyExists(format!("user {user_id:?} already exists")).into_response();
+        return ApiError::BadRequest(format!("user {user_id:?} already exists")).into_response();
     }
     if state.auth.user_count() >= MAX_AUTHN_USERS {
         return ApiError::BadRequest(format!(
@@ -1365,6 +1470,12 @@ pub async fn create_authn_user(
         }
         return mqtt_persist_error(error);
     }
+    // A changed user invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02). It also evicts the node
+    // authentication cache for this user so a changed password or a
+    // revocation is observed on the next CONNECT.
+    state.sessions.clear_all_authz_caches();
+    state.authn_node_cache.remove_user(&user_id);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -1508,6 +1619,12 @@ pub async fn update_authn_user(
         }
         return mqtt_persist_error(error);
     }
+    // A changed password invalidates cached authorization decisions so
+    // the next operation is re-authorized (AZ-02). It also evicts the
+    // node authentication cache for this user so the new credential is
+    // observed on the next CONNECT.
+    state.sessions.clear_all_authz_caches();
+    state.authn_node_cache.remove_user(&user_id);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1567,7 +1684,15 @@ pub async fn delete_authn_user(
         .into_response();
     }
     match state.auth.remove_user(&user_id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A removed user invalidates cached authorization decisions
+            // so the next operation is re-authorized (AZ-02). It also
+            // evicts the node authentication cache for this user so a
+            // revoked credential is denied on the next CONNECT.
+            state.sessions.clear_all_authz_caches();
+            state.authn_node_cache.remove_user(&user_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::NotFound(format!("user {user_id:?} not found")).into_response(),
         Err(error) => mqtt_persist_error(error),
     }
@@ -1626,21 +1751,28 @@ pub async fn import_authn_users(
         .map(|(user_id, password)| (user_id, password.into_bytes()))
         .collect();
     match state.auth.import_users(batch) {
-        Ok(summary) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "total": summary.total,
-                "success": summary.success,
-                "override": 0,
-                "skipped": 0,
-                "failed": 0,
-            })),
-        )
-            .into_response(),
+        Ok(summary) => {
+            // Imported users invalidate cached authorization decisions so
+            // the next operation is re-authorized (AZ-02). A batch may
+            // touch many names, so the node authentication cache resets.
+            state.sessions.clear_all_authz_caches();
+            state.authn_node_cache.reset();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "total": summary.total,
+                    "success": summary.success,
+                    "override": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                })),
+            )
+                .into_response()
+        }
         Err(ImportUsersError::Malformed(msg) | ImportUsersError::TooMany(msg)) => {
             ApiError::BadRequest(msg).into_response()
         }
-        Err(ImportUsersError::Duplicate(msg)) => ApiError::AlreadyExists(msg).into_response(),
+        Err(ImportUsersError::Duplicate(msg)) => ApiError::BadRequest(msg).into_response(),
         Err(ImportUsersError::Persist(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -1781,6 +1913,9 @@ pub async fn create_authz_rule(
     {
         return mqtt_persist_error(error);
     }
+    // A changed rule invalidates cached decisions so the next operation
+    // is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     StatusCode::CREATED.into_response()
 }
 
@@ -1795,7 +1930,12 @@ pub async fn delete_authz_rule(
             .into_response();
     }
     match state.auth.remove_rule(index) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A changed rule invalidates cached decisions so the next
+            // operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => mqtt_persist_error(error),
     }
@@ -1924,7 +2064,7 @@ mod authn_users_tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
         assert!(duplicate["message"].is_string());
 
         // Malformed bodies are client errors.
@@ -2556,6 +2696,53 @@ mod user_scope_tests {
         ));
         assert!(!role_may_hold_scope(&AdminRole::Viewer, "no-such-scope"));
     }
+
+    #[test]
+    fn catalogue_matches_the_broker_config_scope_lists() {
+        let mut catalogue: Vec<&str> = USER_SCOPES.iter().map(|entry| entry.name).collect();
+        catalogue.sort_unstable();
+        let mut configured: Vec<&str> = broker_config::GENERIC_USER_SCOPES
+            .iter()
+            .chain(broker_config::LOGIN_ONLY_SCOPES.iter())
+            .copied()
+            .collect();
+        configured.sort_unstable();
+        assert_eq!(catalogue, configured, "catalogue and config lists agree");
+        let mut admin_default = default_scopes_for_role(AdminRole::Administrator);
+        admin_default.sort_unstable();
+        assert_eq!(admin_default, configured, "administrator default is all");
+        let mut viewer_default = default_scopes_for_role(AdminRole::Viewer);
+        viewer_default.sort_unstable();
+        let mut generic: Vec<&str> = broker_config::GENERIC_USER_SCOPES.to_vec();
+        generic.sort_unstable();
+        assert_eq!(viewer_default, generic, "viewer default is generic");
+    }
+
+    #[test]
+    fn write_parser_refuses_duplicates_bounds_and_long_names() {
+        let admin = AdminRole::Administrator;
+        let defaults = default_scopes_for_role(admin);
+        let mut ambiguous = defaults.clone();
+        ambiguous.pop();
+        ambiguous.push(defaults[0].clone());
+        assert!(
+            parse_scope_write(admin, &serde_json::json!(ambiguous)).is_err(),
+            "a duplicate cannot stand in for a missing default scope"
+        );
+
+        let too_many = vec!["monitoring".to_string(); broker_config::MAX_USER_SCOPES + 1];
+        assert!(parse_scope_write(admin, &serde_json::json!(too_many)).is_err());
+
+        let long = "x".repeat(broker_config::MAX_USER_SCOPE_LEN + 1);
+        assert!(parse_scope_write(admin, &serde_json::json!([long])).is_err());
+
+        let restricted = vec!["monitoring".to_string()];
+        assert_eq!(
+            parse_scope_write(admin, &serde_json::json!(restricted.clone())).unwrap(),
+            Some(restricted),
+            "a restricted list stays restricted"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3032,9 +3219,7 @@ mod dashboard_users_tests {
     #[tokio::test]
     async fn create_and_update_answer_the_documented_user_shape() {
         // The documented record carries username, role, description,
-        // backend and mfa. It carries no password and no scopes.
-        // Before: create and update answered username, role and
-        // description only. The list already answered backend and mfa.
+        // backend, mfa and scopes. It carries no password.
         let state = standalone_state();
         let (status, created, raw) = parts(
             create_user(
@@ -3056,7 +3241,10 @@ mod dashboard_users_tests {
         assert_eq!(created["backend"], serde_json::json!("local"));
         assert_eq!(created["mfa"], serde_json::json!("none"));
         assert!(created.get("password").is_none());
-        assert!(created.get("scopes").is_none());
+        assert_eq!(
+            created["scopes"],
+            serde_json::json!(broker_config::GENERIC_USER_SCOPES)
+        );
         assert!(
             !String::from_utf8_lossy(&raw).contains("ShapeSecret1!"),
             "create body carries no plaintext"
@@ -3076,7 +3264,10 @@ mod dashboard_users_tests {
         assert_eq!(updated["username"], serde_json::json!("w245-shape"));
         assert_eq!(updated["backend"], serde_json::json!("local"));
         assert_eq!(updated["mfa"], serde_json::json!("none"));
-        assert!(updated.get("scopes").is_none());
+        assert_eq!(
+            updated["scopes"],
+            serde_json::json!(broker_config::GENERIC_USER_SCOPES)
+        );
 
         // The credential verifies on the login path.
         let (status, logged_in, _) = parts(
@@ -3152,6 +3343,7 @@ mod change_password_tests {
             role,
             expires_at: Instant::now() + Duration::from_secs(3600),
             must_change_password: false,
+            scopes: None,
         })
     }
 

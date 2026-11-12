@@ -447,3 +447,19 @@ is not changed.
   schema `user_provided_function` (a string `function` and an object `args`).
   The checker reports this overlap as a warning, not as an error.
 - `GET /clients/{clientid}/authorization/cache`, response 200. The specification declares one object with `access`, `result`, `topic` and `updated_time`. One session holds many decisions, one per topic and access type. The broker returns a bare array with one object per decision, oldest first. An empty cache returns an empty array. The checker reports a type error for this row.
+
+- `POST /users` and `PUT /users/{username}`, request field `scopes`, and
+  `GET /users`, response field `scopes`. The request descriptions accept
+  the literal string `unset` and a list equal to the role default as
+  "no explicit scopes". The response schema calls `unset` a legacy-only
+  sentinel. The management console decides the value. `CONSOLE/types/
+  systemModule.d.ts:9` defines `UnsetScopes = 'unset'`, and line 11
+  defines `DashboardScopes = string[] | UnsetScopes | null | undefined`.
+  `CONSOLE/types/systemModule.d.ts:125-127` lets a user update send
+  `string[] | UnsetScopes`. `CONSOLE/common/scopes.ts:7` defines the
+  same sentinel. The broker stores no explicit list for `unset` or for a
+  list equal to the role default. `GET /users` renders `unset` for that
+  state, and the write paths accept it again.
+- `POST /users`, responses 400 and 409. The specification lists only
+  200. The broker refuses duplicates with 409 and bad bodies with 400.
+  The checker accepts those statuses and checks `{code, message}`.

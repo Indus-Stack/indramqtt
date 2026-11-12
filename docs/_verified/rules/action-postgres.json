@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "postgres"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-postgres",
+        "name": "dx2-action-postgres",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "postgres"
+      },
+      "name": "dx2-action-postgres",
+      "status": 201,
+      "type": "postgres"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-postgres\" already exists"
+      },
+      "name": "dx2-action-postgres",
+      "status": 400,
+      "type": "postgres"
+    }
+  ],
+  "item": "action-postgres",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

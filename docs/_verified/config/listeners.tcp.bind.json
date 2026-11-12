@@ -1,0 +1,9 @@
+{
+  "action": "Connect one client to the configured bind.",
+  "config": "[listeners.tcp]\nbind = \"127.0.0.1:1883\"\n",
+  "item": "listeners.tcp.bind",
+  "kind": "setting",
+  "output": "connected",
+  "returncode": 0,
+  "verified": true
+}

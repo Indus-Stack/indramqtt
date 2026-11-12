@@ -487,7 +487,10 @@ async fn backup_file_download_through_broker_api() {
     use std::time::Duration;
     use tokio::net::TcpListener;
 
-    const TIMEOUT: Duration = Duration::from_secs(5);
+    // Bound for one management request in this test. Ten seconds
+    // matches STEP above; a cold debug boot plus parallel hashing
+    // and fsync completes within ten seconds under load.
+    const TIMEOUT: Duration = Duration::from_secs(10);
 
     let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
     let sessions = Arc::new(SessionManager::new());
@@ -2568,6 +2571,544 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected() {
     )
     .await;
     assert!(silent.is_err(), "A holds none of B's publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: shared subscriptions keep the tenant.
+///
+/// The kernel boots with one tenant rule. Each tenant holds one
+/// shared subscription on the same group and topic. A publish in
+/// tenant A reaches only the member in tenant A. A publish in
+/// tenant B reaches only the member in tenant B. The test uses
+/// real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_shared_subscriptions_stay_in_tenant() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    for (sock, id, user) in [
+        (&mut a_sub, "sa09-a-sub", "user-a"),
+        (&mut b_sub, "sa09-b-sub", "user-b"),
+        (&mut a_pub, "sa09-a-pub", "user-a"),
+        (&mut b_pub, "sa09-b-pub", "user-b"),
+    ] {
+        send_mqtt(sock, &sy02_connect311(id, true, 60, Some((user, b"pw")))).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x20, "kernel answers with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    }
+    // Both tenants share one group name and one topic string.
+    // Each group balances inside its own tenant only.
+    for sock in [&mut a_sub, &mut b_sub] {
+        send_mqtt(sock, &sy02_subscribe(1, &[("$share/g/sa09/shared", 1)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    // A publish in tenant A reaches A only. B stays silent.
+    send_mqtt(
+        &mut a_pub,
+        &sy02_publish311("sa09/shared", 1, 1, false, b"from-a"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "sa09/shared");
+    assert_eq!(downlink.payload, b"from-a");
+    send_mqtt(&mut a_sub, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A shared publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/shared", 2, 1, false, b"from-b"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "sa09/shared");
+    assert_eq!(downlink.payload, b"from-b");
+    send_mqtt(&mut b_sub, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B shared publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: the last will keeps the tenant.
+///
+/// The kernel boots with one tenant rule. Each tenant subscribes
+/// to one will topic. A publisher in tenant A drops without
+/// DISCONNECT. Only tenant A receives the will. Then a publisher
+/// in tenant B drops. Only tenant B receives the will. The test
+/// uses real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_will_stays_in_tenant() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_sub = dial_mqtt(kernel.mqtt_port).await;
+    for (sock, id, user) in [
+        (&mut a_sub, "sa09-will-a-sub", "user-a"),
+        (&mut b_sub, "sa09-will-b-sub", "user-b"),
+    ] {
+        send_mqtt(sock, &sy02_connect311(id, true, 60, Some((user, b"pw")))).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x20, "kernel answers with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+        send_mqtt(sock, &sy02_subscribe(1, &[("sa09/will", 0)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    }
+    // Tenant A publisher drops. Only tenant A receives the will.
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_pub,
+        &sy02_connect5(
+            "sa09-will-a-pub",
+            true,
+            60,
+            Some(("user-a", b"pw")),
+            Some(("sa09/will", b"will-a")),
+            0,
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    assert_eq!(sy02_parse_connack5(&body).1, 0);
+    drop(a_pub);
+    let (head, body) = recv_mqtt(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let first = sy02_parse_publish_classic(head, &body);
+    assert_eq!(first.topic, "sa09/will");
+    assert_eq!(first.payload, b"will-a");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A will");
+    // Tenant B publisher drops. Only tenant B receives the will.
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_pub,
+        &sy02_connect5(
+            "sa09-will-b-pub",
+            true,
+            60,
+            Some(("user-b", b"pw")),
+            Some(("sa09/will", b"will-b")),
+            0,
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    assert_eq!(sy02_parse_connack5(&body).1, 0);
+    drop(b_pub);
+    let (head, body) = recv_mqtt(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let second = sy02_parse_publish_classic(head, &body);
+    assert_eq!(second.topic, "sa09/will");
+    assert_eq!(second.payload, b"will-b");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B will");
+
+    kernel.finish().await;
+}
+
+/// SA-09: a reconnect in another tenant keeps both sessions.
+///
+/// The kernel boots with one tenant rule. One client id connects
+/// in tenant A and again in tenant B. Both connects succeed and
+/// both sessions stay live. Each publish reaches only its own
+/// tenant. A new connect in tenant A resumes A and leaves B live.
+/// The test uses real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_reconnect_in_other_tenant_keeps_both_sessions() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_sock,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    let mut b_sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_sock,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-b", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (false, 0),
+        "other tenant starts a fresh session"
+    );
+    // Both sessions subscribe to one topic string.
+    for sock in [&mut a_sock, &mut b_sock] {
+        send_mqtt(sock, &sy02_subscribe(1, &[("sa09/dup", 1)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_pub,
+        &sy02_connect311("sa09-dup-a-pub", true, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_pub,
+        &sy02_connect311("sa09-dup-b-pub", true, 60, Some(("user-b", b"pw"))),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    // A publish in tenant A reaches A only. B stays silent.
+    send_mqtt(
+        &mut a_pub,
+        &sy02_publish311("sa09/dup", 1, 1, false, b"a-1"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut a_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"a-1");
+    send_mqtt(&mut a_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/dup", 2, 1, false, b"b-1"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"b-1");
+    send_mqtt(&mut b_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B publish");
+    // A new connect in tenant A resumes A and leaves B live.
+    let mut a_re = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_re,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_re).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (true, 0),
+        "same tenant resumes its session"
+    );
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/dup", 3, 1, false, b"b-2"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"b-2");
+    send_mqtt(&mut b_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_re),
+    )
+    .await;
+    assert!(silent.is_err(), "resumed A holds none of B publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: the cluster entry is refused and the node stays single.
+///
+/// The loader refuses each cluster entry at schema load. The boot
+/// with a file entry exits. The single node binds no UDP socket.
+/// A default tenant publish reaches its own subscriber only, so
+/// no message crosses nodes. The test uses file, flag and socket
+/// entries, never the store.
+#[tokio::test]
+async fn sa09_cluster_entry_stays_single_node() {
+    // The schema refuses each entry. Each load must fail.
+    // On the base each load succeeds, so each assert fails there.
+    {
+        use broker_config::layers::{load_layered_with_env, CliOverrides};
+        let tag = format!(
+            "sa09-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        // The file seed_nodes leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-seeds"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(
+                dir.join("indra.toml"),
+                "[cluster]\nseed_nodes = [\"127.0.0.1:19883\"]\n",
+            )
+            .expect("write indra.toml");
+            let err = load_layered_with_env(&dir, &[], &CliOverrides::default())
+                .expect_err("seed_nodes file must fail");
+            assert!(
+                err.to_string().contains("cluster.seed_nodes"),
+                "error names the seed entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // The file enabled leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-enabled"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(dir.join("indra.toml"), "[cluster]\nenabled = true\n")
+                .expect("write indra.toml");
+            let err = load_layered_with_env(&dir, &[], &CliOverrides::default())
+                .expect_err("enabled file must fail");
+            assert!(
+                err.to_string().contains("cluster.enabled"),
+                "error names the enabled entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // The --cluster-seeds flag leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-flag"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            let cli = CliOverrides {
+                cluster_seeds: Some("127.0.0.1:19883".to_string()),
+                ..CliOverrides::default()
+            };
+            let err =
+                load_layered_with_env(&dir, &[], &cli).expect_err("--cluster-seeds flag must fail");
+            assert!(
+                err.to_string().contains("cluster.seed_nodes"),
+                "error names the seed entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    // The boot with a file entry exits. The file is the production entry.
+    // On the base the kernel boots, so the exit assert fails there.
+    {
+        let tag = format!(
+            "sa09-boot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
+        let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+        std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+        let bl_port = ephemeral_port();
+        let mqtt_port = ephemeral_port();
+        let ws_port = ephemeral_port();
+        let api_port = ephemeral_port();
+        std::fs::write(
+            config_dir.join("indra.toml"),
+            format!(
+                "[node]\nid = \"sa09-refuse\"\ndata_dir = \"{}\"\nbrokerlink_bind = \"127.0.0.1:{bl_port}\"\n[listeners.tcp]\nbind = \"127.0.0.1:{mqtt_port}\"\n[listeners.tls]\nenabled = false\n[listeners.ws]\nbind = \"127.0.0.1:{ws_port}\"\n[listeners.wss]\nenabled = false\n[listeners.api]\nbind = \"127.0.0.1:{api_port}\"\n[logging]\nlevel = \"warn\"\n[cluster]\nseed_nodes = [\"127.0.0.1:19883\"]\n",
+                scratch.display(),
+            ),
+        )
+        .expect("write indra.toml");
+        let mut child = tokio::process::Command::new(shard_kernel_binary())
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn real kernel");
+        let mut exited = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Ok(Some(_)) = child.try_wait() {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "kernel with cluster entry exits");
+        let _ = child.kill().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+    // The single node binds no UDP socket and forwards no default message.
+    // The default tenant publish goes through forward_cluster with no plane.
+    let kernel = spawn_kernel("").await;
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:19883")
+        .await
+        .expect("cluster UDP stays free");
+    drop(udp);
+    let mut sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut sub,
+        &sy02_connect311("sa09-cl-def-sub", true, 60, None),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send_mqtt(&mut sub, &sy02_subscribe(1, &[("sa09/cluster", 1)])).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x90, "kernel answers with SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    let mut publisher = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_connect311("sa09-cl-def-pub", true, 60, None),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sa09/cluster", 1, 1, false, b"default-only"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    assert_eq!(
+        sy02_parse_publish_classic(head, &body).payload,
+        b"default-only"
+    );
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut sub),
+    )
+    .await;
+    assert!(silent.is_err(), "default publish forwards nothing extra");
+
+    kernel.finish().await;
+}
+
+/// MV-05: the tenant session limit applies at the MQTT entry.
+///
+/// The kernel boots with one tenant rule. A management write sets
+/// `limits.max_sessions` to 1 for one tenant. The first MQTT session
+/// connects. A second client in the same tenant gets CONNACK 0x03.
+/// Another tenant still connects. The test uses real sockets and the
+/// real API, not a store read.
+#[tokio::test]
+async fn mv05_tenant_session_limit_refuses_second_mqtt_session() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let base = format!("http://127.0.0.1:{}", kernel.api_port);
+    let http = reqwest::Client::new();
+
+    let created = tokio::time::timeout(
+        STEP,
+        http.post(format!("{base}/api/v5/mt/ns/t-mv05-lim"))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({}))
+            .send(),
+    )
+    .await
+    .expect("namespace create in time")
+    .expect("namespace create sends");
+    assert_eq!(created.status(), 204, "managed namespace is created");
+
+    let limit = tokio::time::timeout(
+        STEP,
+        http.put(format!("{base}/api/v5/mt/ns/t-mv05-lim/config"))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({"limits": {"max_sessions": 1}}))
+            .send(),
+    )
+    .await
+    .expect("limit write in time")
+    .expect("limit write sends");
+    assert_eq!(limit.status(), 200, "tenant session limit is stored");
+
+    let mut first = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut first,
+        &sy02_connect311("mv05-limit-a", true, 60, Some(("mv05-lim", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut first).await;
+    assert_eq!(head, 0x20, "first session gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(reason, 0, "first session in the tenant is accepted");
+
+    let mut second = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut second,
+        &sy02_connect311("mv05-limit-b", true, 60, Some(("mv05-lim", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut second).await;
+    assert_eq!(head, 0x20, "second session gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(
+        reason, 0x03,
+        "the tenant session limit refuses the second session"
+    );
+
+    let mut other = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut other,
+        &sy02_connect311("mv05-limit-c", true, 60, Some(("mv05-other", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut other).await;
+    assert_eq!(head, 0x20, "other tenant gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(reason, 0, "another tenant still connects");
 
     kernel.finish().await;
 }
@@ -11398,4 +11939,403 @@ async fn mv02a_relational_update_and_restart_for_all_kinds() {
         }
         kernel.finish().await;
     }
+}
+/// CASE WHEN/THEN/ELSE evaluates per-message through MQTT ingress.
+#[tokio::test]
+async fn mv00_case_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "case";
+    let sql =
+        "SELECT CASE WHEN temperature > 40 THEN 'hot' ELSE 'ok' END AS state FROM \"mv00/in/case\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "CASE create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-case-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-case-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"temperature": 72.5}"#,
+        &[r#"{"state":"hot"}"#],
+    )
+    .await;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"temperature": 20.0}"#,
+        &[r#"{"state":"ok"}"#],
+    )
+    .await;
+
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": "mv00/in/case", "payload": r#"{"temperature": 72.5}"#},
+    })).await;
+    assert_eq!(status, 200, "CASE HTTP: {body}");
+    assert_eq!(body["projected"].to_string(), r#"{"state":"hot"}"#);
+
+    kernel.finish().await;
+}
+
+/// Nested expressions (parenthesised arithmetic) evaluate per-message through MQTT.
+#[tokio::test]
+async fn mv00_nested_expressions_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "nested";
+    let sql = "SELECT (a + b) * 2 AS x, abs(a - b) AS d FROM \"mv00/in/nested\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "nested create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-nested-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-nested-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"a":3,"b":5}"#,
+        &[r#"{"x":16,"d":2}"#],
+    )
+    .await;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"a":10,"b":3}"#,
+        &[r#"{"x":26,"d":7}"#],
+    )
+    .await;
+
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": "mv00/in/nested", "payload": r#"{"a":3,"b":5}"#},
+    })).await;
+    assert_eq!(status, 200, "nested HTTP: {body}");
+    assert_eq!(body["projected"].to_string(), r#"{"x":16,"d":2}"#);
+
+    kernel.finish().await;
+}
+
+/// `$events/client_connected` is accepted as a rule source and evaluates via rule_test.
+#[tokio::test]
+async fn mv00_events_client_connected_rule_test() {
+    let kernel = spawn_kernel("").await;
+    let sql = "SELECT clientid, username FROM \"$events/client_connected\"";
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "client_connected", "topic": "$events/client_connected", "payload": r#"{"clientid":"c1","username":"u1"}"#},
+    })).await;
+    assert_eq!(status, 200, "$events rule_test: {body}");
+    assert_eq!(
+        body["projected"].to_string(),
+        r#"{"clientid":"c1","username":"u1"}"#
+    );
+    kernel.finish().await;
+}
+
+/// FOREACH survives a rule replace (same shape) and a kernel restart.
+#[tokio::test]
+async fn mv00_foreach_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "foreach-update";
+    let sql_v1 = "FOREACH payload.items DO item.b AS z, item.a FROM \"mv00/in/foreach-update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "FOREACH v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-foreach-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-foreach-upd-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"items":[{"b":2,"a":1},{"b":4,"a":3}]}"#,
+        &[r#"{"z":2,"a":1}"#, r#"{"z":4,"a":3}"#],
+    )
+    .await;
+
+    // Replace with same-shape FOREACH (alias change only): accepted, output keeps flowing.
+    let sql_v2 =
+        "FOREACH payload.items DO item.b AS x, item.a AS y FROM \"mv00/in/foreach-update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/foreach-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "FOREACH replace: {body}");
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"items":[{"b":8,"a":5}]}"#,
+        &[r#"{"x":8,"y":5}"#],
+    )
+    .await;
+
+    // Restart: rule is restored from durable state and still fires.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-foreach-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-foreach-upd-pub2").await;
+    mv00_assert_publish(
+        &mut publisher2,
+        &mut subscriber2,
+        id,
+        r#"{"items":[{"b":1,"a":9}]}"#,
+        &[r#"{"x":1,"y":9}"#],
+    )
+    .await;
+
+    kernel.finish().await;
+}
+
+/// Window (GROUP BY COUNTWINDOW) survives a rule replace and a kernel restart.
+#[tokio::test]
+async fn mv00_window_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "window-update";
+    let sql_v1 =
+        "SELECT sum(v) AS s, count(*) AS n FROM \"mv00/in/window-update\" GROUP BY COUNTWINDOW(2)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "window v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-window-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-window-upd-pub").await;
+
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":1}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":3}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"s":4,"n":2}"#.as_bytes());
+
+    // Replace with same-shape window: accepted.
+    let sql_v2 = "SELECT sum(v) AS total, count(*) AS cnt FROM \"mv00/in/window-update\" GROUP BY COUNTWINDOW(2)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/window-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "window replace: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":2}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":4}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"total":6,"cnt":2}"#.as_bytes());
+
+    // Restart: rule restored and still aggregates.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-window-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-window-upd-pub2").await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":5}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":7}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber2).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"total":12,"cnt":2}"#.as_bytes());
+
+    kernel.finish().await;
+}
+
+/// GROUP BY survives a rule replace and a kernel restart.
+#[tokio::test]
+async fn mv00_group_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "group-update";
+    let sql_v1 = "SELECT k AS key, sum(v) AS s FROM \"mv00/in/group-update\" GROUP BY k";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "group v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-group-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-group-upd-pub").await;
+
+    for input in [
+        r#"{"k":"x","v":1}"#,
+        r#"{"k":"y","v":2}"#,
+        r#"{"k":"x","v":3}"#,
+    ] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        got.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+    }
+    got.sort();
+    assert_eq!(got, vec![r#"{"key":"x","s":4}"#, r#"{"key":"y","s":2}"#]);
+
+    // Replace with same-shape group: accepted.
+    let sql_v2 = "SELECT k AS key, sum(v) AS total FROM \"mv00/in/group-update\" GROUP BY k";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/group-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "group replace: {body}");
+    for input in [r#"{"k":"x","v":10}"#, r#"{"k":"z","v":5}"#] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        got.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![r#"{"key":"x","total":10}"#, r#"{"key":"z","total":5}"#]
+    );
+
+    // Restart: rule restored and still groups.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-group-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-group-upd-pub2").await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"k":"x","v":1}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"k":"x","v":2}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber2).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"key":"x","total":3}"#.as_bytes());
+
+    kernel.finish().await;
 }

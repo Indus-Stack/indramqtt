@@ -116,10 +116,33 @@ impl TopicFilter {
         Ok(())
     }
 
+    /// Whether this filter matches one topic.
+    ///
+    /// A `#` or `+` at the first level never matches a `$` topic
+    /// (MQTT 5.0 section 4.7.2). A `$` filter matches a `$` topic.
     pub fn matches(&self, topic: &Topic) -> bool {
         let filter_levels: Vec<&str> = self.0.split('/').collect();
-        let topic_levels: Vec<&str> = topic.as_str().split('/').collect();
+        // A wildcard head never reaches `$` topics.
+        if topic.as_str().starts_with('$') {
+            if let Some(&"#" | &"+") = filter_levels.first() {
+                return false;
+            }
+        }
+        Self::match_levels(&filter_levels, topic.as_str())
+    }
 
+    /// Whether this filter matches one topic on the rule path.
+    ///
+    /// The rule path ignores the `$` guard. The engine flag gates
+    /// `$SYS` topics. Other paths keep `matches`.
+    pub fn matches_for_rule_engine(&self, topic: &Topic) -> bool {
+        let filter_levels: Vec<&str> = self.0.split('/').collect();
+        Self::match_levels(&filter_levels, topic.as_str())
+    }
+
+    /// Level match without the `$` guard. Both callers share it.
+    fn match_levels(filter_levels: &[&str], topic_str: &str) -> bool {
+        let topic_levels: Vec<&str> = topic_str.split('/').collect();
         let mut t_idx = 0;
         for (f_idx, &f_part) in filter_levels.iter().enumerate() {
             if f_part == "#" {

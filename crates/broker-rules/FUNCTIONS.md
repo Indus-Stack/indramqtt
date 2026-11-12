@@ -184,8 +184,8 @@ as `new` helpers for the lowering to target.
 | `join_to_string(sep, list)` | new | Explicit-separator join. (Engine `array_join` is the same idea with reversed argument order.) |
 | `map_to_redis_hset_args(m)` | new | Redis HSET field list (`[marker, k1, v1, ...]`); non-string keys dropped, floats rendered with 6 compact decimals. |
 | `join_to_sql_values_string(list)` | new | SQL value tuple `(a, b)` quoting strings with single quotes. TODO(parity): exact quoting/escaping rules. |
-| `jq(prog, json)` | new | JSON projection. Implements the `.`-rooted dot-path subset (`.`, `.a`, `.a.b`) returning a list; anything else returns an empty list fail-closed. TODO(parity): full jq language coverage. |
-| `jq(prog, json, timeout_ms)` | new | As above with an accepted-and-ignored timeout (subset evaluates without blocking). |
+| `jq(prog, json)` | new | JSON projection. Implements the `.`-rooted dot-path subset (`.`, `.a`, `.a.b`) returning a list; anything else returns an empty list fail-closed. Default budget `DEFAULT_JQ_TIMEOUT_MS` (10 000 ms) applies. |
+| `jq(prog, json, timeout_ms)` | new | As above with an explicit budget in milliseconds (1..=3 600 000). Out-of-range or mistyped budgets return `Null`. A program past the deadline or past `MAX_JQ_PATH_SEGMENTS` (64) stops, returns `Null` and counts one `jq_timeout_count`. |
 | `unescape(s)` | new | `\\n \\t \\r \\b \\f \\v \\' \\" \\? \\\\` and `\\xHH` escapes. Unknown escapes mean `Null` (fail closed). |
 
 ## 8. Maps
@@ -222,7 +222,7 @@ as `new` helpers for the lowering to target.
 | `md5(s)` | existing | Identical (lower-case hex). |
 | `sha(s)` | adapter | SHA-1 under the historical name; engine `sha1` is the same digest. |
 | `sha256(s)` | existing | Identical. |
-| `hash(type, data)` | new | `md5/sha/sha1/sha224/sha256/sha384/sha512` dispatch (lower-case hex); unknown algorithm means `Null`. TODO(parity): `sha3_*`/`blake2*` families (no digest crate wired; fail closed). |
+| `hash(type, data)` | new | `md5/sha/sha1/sha224/sha256/sha384/sha512` dispatch (lower-case hex); unknown algorithm means `Null`. Decided (D4): the `sha3_*`/`blake2*` families have no digest crate wired; rule creation refuses a static literal naming them (400 naming the algorithm), and a dynamic value means `Null` at execution. |
 | `hash_to_range(v, min, max)` | new | SHA-256 hex mapped into `[min, max]`; bad range means `Null`. |
 | `map_to_range(v, min, max)` | new | Integer (or binary bytes as unsigned) mapped into `[min, max]`; bad range means `Null`. |
 | `zip(b)` | new | zlib-compressed bytes, base64-encoded (JSON-safe). See §11 encoding note. |
@@ -254,7 +254,7 @@ as `new` helpers for the lowering to target.
 | `date_to_unix_ts(unit, fmt, s)` | new | Parse formatted date to epoch; malformed means `Null`. |
 | `date_to_unix_ts(unit, offset, fmt, s)` | new | As above with explicit offset. |
 | `timezone_to_second(tz)` | new | Alias of `timezone_to_offset_seconds`. |
-| `timezone_to_offset_seconds(tz)` | new | `Z`/`UTC`/`+HH:MM` offsets to seconds; unknown zones mean `Null`. TODO(parity): named-zone database (unsupported here; fail closed). |
+| `timezone_to_offset_seconds(tz)` | new | `Z`/`UTC`/`+HH:MM` offsets to seconds; named zones are refused. Decided (D4): the named-zone database is unsupported; rule creation refuses a static literal naming a zone (400 naming the zone), and a dynamic value means `Null` at execution. |
 | `mongo_date()` / `mongo_date(ts)` / `mongo_date(ts, unit)` | new | RFC-3339 string of the timestamp (the tuple-to-BSON conversion lives in the connector, not the rule). TODO(parity): BSON date typing. |
 | `getenv(name)` | new | Process environment lookup; absent means `""`. Reads `std::env` directly (no cache). TODO(parity): vendor prefixing and caching policy. |
 | `random()` | adapter | Engine `rand` is the same source under another name (`[0,1)` float). |
@@ -266,8 +266,8 @@ as `new` helpers for the lowering to target.
 | `kv_store_get(k)` / `kv_store_get(k, dflt)` | new | Node-global slot; same bound as `proc_dict`. |
 | `kv_store_put(k, v)` | new | Set global slot; returns the stored value. |
 | `kv_store_del(k)` | new | Delete global slot; returns the removed value or `Null`. |
-| `schema_encode(...)` | deferred | Schema-registry family, out of the MVP per the task. |
-| `schema_decode(...)` | deferred | Schema-registry family, out of the MVP per the task. |
+| `schema_encode(...)` | deferred | Schema-registry family, out of the MVP per the task. Rule creation refuses a static call with 400 naming the function. |
+| `schema_decode(...)` | deferred | Schema-registry family, out of the MVP per the task. Rule creation refuses a static call with 400 naming the function. |
 
 ## 11. Colliding names, bounds and allocation
 
@@ -301,3 +301,40 @@ nothing. Regex helpers compile the pattern per call (one allocation) because
 there is no shared pattern cache on the publish path; a bounded cache is the
 `PERF(parity)` follow-up and must not add a lock to the hot path without
 before/after numbers.
+
+## 12. Static refusal at rule creation (MV-12b)
+
+Rule creation, rule update, the rule tester and file load refuse a rule
+whose SQL statically calls a function the broker never serves. The refusal
+is `InvalidRule` naming the function, algorithm or zone; the API answers
+400 with that message, and a refused update or file keeps the old state.
+
+Refused static calls:
+
+- `schema_encode`, `schema_decode` (any arity, any case): deferred family.
+- `hash` with a string-literal algorithm starting with `sha3` or `blake2`
+  (any case): D4, no digest crate wired.
+- `timezone_to_second`, `timezone_to_offset_seconds` with a string-literal
+  zone outside `Z`/`UTC`/`+HH:MM`: D4, no zone database wired.
+- `date_to_unix_ts` with four arguments and a string-literal zone in the
+  second position outside `Z`/`UTC`/`+HH:MM`: D4, same reason.
+
+The check walks every expression in one parsed rule. It covers the SELECT
+list, WHERE, GROUP BY, HAVING, ORDER BY and JOIN ON. It also covers the
+window filter, trigger, partition, UNION branches, FOREACH array, DO fields
+and INCASE guard. A non-literal (dynamic) argument is not statically known:
+it creates, fails closed at execution (`Null` or an empty list) and counts
+as a failed run.
+
+## 13. jq timeout (MV-12b)
+
+Mechanism: the subset evaluates inline on the rule thread with cooperative
+stops (one deadline check per path segment plus the step budget
+`MAX_JQ_PATH_SEGMENTS` = 64). A stop returns `Null`, never a partial row.
+
+- Unit: milliseconds.
+- Limits: per-call budget 1..=`MAX_JQ_CALL_TIMEOUT_MS` (3 600 000); without
+  a per-call value the documented default `DEFAULT_JQ_TIMEOUT_MS`
+  (10 000) applies; out-of-range budgets return `Null`.
+- Counter: `stdlib::jq_timeout_count` counts stopped evaluations; the rule
+  that asked for the value does not match, so its `failed` counter moves.

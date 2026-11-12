@@ -1,0 +1,1 @@
+`webhook.url` names the verdict endpoint for webhook authentication and authorization. Empty disables the webhook. Any configured endpoint disables the open mode. An unreachable endpoint denies access and never grants it.

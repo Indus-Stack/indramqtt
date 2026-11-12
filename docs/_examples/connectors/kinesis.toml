@@ -1,0 +1,20 @@
+[example]
+area = "connectors"
+item = "kinesis"
+kind = "connector-create"
+
+[[case]]
+name = "kinesis-normal"
+stream_name = "telemetry-stream"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+expect_status = 201
+
+[[case]]
+name = "kinesis-edge-empty-stream"
+stream_name = ""
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+expect_status = 400

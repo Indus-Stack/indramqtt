@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a custom push URL and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.push_gateway]\nurl = \"http://127.0.0.1:9092\"\n",
+  "item": "prometheus.push_gateway.url",
+  "kind": "setting",
+  "output": "push_url=9092",
+  "returncode": 0,
+  "verified": true
+}

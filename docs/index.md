@@ -27,6 +27,8 @@ flowchart LR
 
 The MCP bridge is deferred. This release exposes no MCP endpoint. Details live in `ROADMAP.md`.
 
+Protocol gateways, message schema validations, OpenTelemetry export and cluster links are deferred. Each list or config read answers an empty or disabled state. Each write refuses with 400. Nothing is stored.
+
 ## Before you start
 
 - Install the broker from [Install](./getting-started/install.md).

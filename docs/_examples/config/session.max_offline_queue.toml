@@ -1,0 +1,31 @@
+[example]
+area = "config"
+item = "session.max_offline_queue"
+kind = "setting"
+expect = "mqueue_len=3"
+expected = "A detached durable session keeps at most the configured three queued messages."
+source = "`crates/broker-node/src/main.rs` applies the bound to the session manager before any listener binds."
+action = "Detach a v5 session, publish six QoS 1 messages, and read `GET /api/v5/clients/<id>`."
+config = '''
+[session]
+max_offline_queue = 3
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("offline-client", v5=True, clean=False, expiry=300)
+subscribe(sock, "docs/offline", 1, v5=True)
+disconnect(sock)
+pub, ack, props = connect("offline-pub", v5=True)
+for index in range(6):
+    publish(pub, "docs/offline", f"m{index}".encode(), qos=1, v5=True)
+client = {}
+for _ in range(100):
+    status, client = http("GET", "/api/v5/clients/offline-client")
+    if status == 200 and client.get("mqueue_len") == 3:
+        break
+    time.sleep(0.05)
+assert status == 200, (status, client)
+assert client.get("mqueue_len") == 3, client.get("mqueue_len")
+disconnect(pub)
+print("mqueue_len=3")
+'''

@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "licence.license_key"
+kind = "setting"
+expect = "ok"
+expected = "The broker installs the enterprise license key at boot."
+source = "`crates/broker-node/src/main.rs` installs the file value into the licence store, and a bad key refuses boot."
+action = "Start the broker with a license key and check that `/healthz` answers OK."
+config = '''
+[licence]
+license_key = "docs-test-key"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

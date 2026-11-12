@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "rules_engine.spill_dir"
+kind = "setting"
+expect = "ok"
+expected = "The broker accepts the rule ingress spill directory and starts."
+source = "`crates/broker-config/src/schema.rs` documents `rules_engine.spill_dir` as the rule ingress spill directory."
+action = "Start the broker with a spill directory and check that `/healthz` answers OK."
+config = '''
+[rules_engine]
+spill_dir = "/tmp/docs-spill"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

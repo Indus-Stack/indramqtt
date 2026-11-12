@@ -1,0 +1,36 @@
+[example]
+area = "api"
+item = "createUser"
+kind = "api"
+request = "POST /api/v1/auth/users with username doc-user-create, a password and quota values"
+expect = "created"
+expected = "The broker stores the user and quotas, lists the user, and never returns the password."
+
+script = '''
+from config_probe import http
+
+body = {
+    "username": "doc-user-create",
+    "password": "DocsCreatePw1!",
+    "quotas": {
+        "max_connections": 2,
+        "max_publish_rate": 100,
+        "max_publish_burst": 20,
+    },
+}
+status, stored = http("POST", "/api/v1/auth/users", body)
+assert status == 201, (status, stored)
+assert stored.get("username") == "doc-user-create", stored
+quotas = stored.get("quotas") or {}
+assert quotas.get("max_connections") == 2, stored
+assert quotas.get("max_publish_rate") == 100, stored
+assert quotas.get("max_publish_burst") == 20, stored
+status, users = http("GET", "/api/v1/auth/users")
+assert status == 200, (status, users)
+match = [user for user in users if user.get("username") == "doc-user-create"]
+assert match, users
+assert "password" not in match[0], match
+code, _ = http("DELETE", "/api/v1/auth/users/doc-user-create")
+assert code == 204, code
+print("created")
+'''

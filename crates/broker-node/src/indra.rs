@@ -2421,6 +2421,11 @@ mod tests {
 
     const TEST_KEY: &str = "ctl-test-key-0001";
 
+    /// Per-call bound for the live test API. Reason: a loaded CI host can
+    /// stall the persistence fsync for tens of seconds. This bound only
+    /// stops a hang; the assertions remain unchanged.
+    const LIVE_TEST_TIMEOUT_SECS: u64 = 60;
+
     /// Live management API over loopback backed by real broker state.
     ///
     /// The `ApiState` shares one `SessionManager`, subscription router and
@@ -2555,7 +2560,7 @@ mod tests {
                 api_key: Some(TEST_KEY.to_string()),
                 api_key_file: None,
                 json,
-                timeout: 5,
+                timeout: LIVE_TEST_TIMEOUT_SECS,
                 command,
             }
         }
@@ -2568,7 +2573,7 @@ mod tests {
                 api_key: Some(key.to_string()),
                 api_key_file: None,
                 json,
-                timeout: 5,
+                timeout: LIVE_TEST_TIMEOUT_SECS,
                 command,
             }
         }

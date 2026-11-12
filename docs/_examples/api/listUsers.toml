@@ -1,0 +1,32 @@
+[example]
+area = "api"
+item = "listUsers"
+kind = "api"
+request = "GET /api/v1/auth/users after the flow creates two users"
+expect = "listed"
+expected = "The broker lists both users in sorted order and omits every password."
+
+script = '''
+from config_probe import http
+
+for username in ["doc-user-list-b", "doc-user-list-a"]:
+    status, _ = http(
+        "POST",
+        "/api/v1/auth/users",
+        {"username": username, "password": "DocsListPw1!"},
+    )
+    assert status == 201, status
+status, users = http("GET", "/api/v1/auth/users")
+assert status == 200, (status, users)
+names = [user.get("username") for user in users]
+assert "doc-user-list-a" in names, names
+assert "doc-user-list-b" in names, names
+assert names.index("doc-user-list-a") < names.index("doc-user-list-b"), names
+for user in users:
+    if user.get("username") in ("doc-user-list-a", "doc-user-list-b"):
+        assert "password" not in user, user
+for username in ["doc-user-list-a", "doc-user-list-b"]:
+    code, _ = http("DELETE", f"/api/v1/auth/users/{username}")
+    assert code == 204, code
+print("listed")
+'''

@@ -111,21 +111,22 @@ fn internal_error(message: String) -> Response {
         .into_response()
 }
 
-/// Examines the target of an MFA request. An administrator can name each
-/// user. A user who is not an administrator can name only that user:
-/// the secret of an enrolment is a credential, and a viewer must not
-/// get the secret of a different user or use up that user's attempts.
-/// A body that is not valid is not refused here: the handler gives the
-/// usual 400 for it.
+/// Examines the target of an MFA request. A user who is not an
+/// administrator can name only that user: the secret of an enrolment is
+/// a credential, and a viewer must not get the secret of a different
+/// user or use up that user's attempts. An administrator can name each
+/// user only with `mfa_management`. A body that is not valid is not
+/// refused here: the handler gives the usual 400 for it.
 fn caller_may_target(caller: &crate::v5::auth::TokenInfo, body: &[u8]) -> Option<Response> {
-    if caller.role == crate::admin_users::AdminRole::Administrator {
-        return None;
-    }
     let target = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| parse_username(&value).ok());
-    match target {
-        Some(username) if username != caller.username => Some(
+    let username = target?;
+    if username == caller.username {
+        return None;
+    }
+    if caller.role != crate::admin_users::AdminRole::Administrator {
+        return Some(
             (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
@@ -134,9 +135,22 @@ fn caller_may_target(caller: &crate::v5::auth::TokenInfo, body: &[u8]) -> Option
                 })),
             )
                 .into_response(),
-        ),
-        _ => None,
+        );
     }
+    let scopes = crate::v5::auth::effective_user_scopes(caller.role, &caller.scopes);
+    if scopes.iter().any(|scope| scope == "mfa_management") {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "FORBIDDEN",
+                "message": "this administrator needs the mfa_management scope for another user's MFA",
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// The route of [`setup`]. It examines the caller first.

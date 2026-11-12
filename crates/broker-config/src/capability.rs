@@ -437,7 +437,7 @@ pub static KIND_ROWS: &[KindRow] = &[
     },
     KindRow {
         name: "influxdb",
-        aliases: &[],
+        aliases: &["influx"],
         family: "time-series",
         owner: "MV-02b",
         state: KindState::Ready,
@@ -961,6 +961,7 @@ pub const LIVE_SINK_KIND_TABLE: &[(&str, &str)] = &[
     ("cloud_iot", "gcp_iot"),
     ("aws_timestream", "timestream"),
     ("ch", "clickhouse"),
+    ("influx", "influxdb"),
     ("opents", "opentsdb"),
     ("snowflake_streaming", "snowflake"),
     ("postgres", "pgsql"),

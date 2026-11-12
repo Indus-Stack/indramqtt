@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "session.topic_alias_maximum"
+kind = "setting"
+expect = "topic_alias_maximum=5"
+expected = "The v5 CONNACK advertises Topic Alias Maximum 5."
+source = "`crates/broker-node/src/main.rs` applies the value, and `crates/broker-node/src/native.rs` writes it into CONNACK."
+action = "Connect a v5 client and read the CONNACK property 0x22."
+config = '''
+[session]
+topic_alias_maximum = 5
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("alias-client", v5=True)
+assert props.get(0x22) == 5, props.get(0x22)
+disconnect(sock)
+print("topic_alias_maximum=5")
+'''

@@ -249,6 +249,8 @@ struct FileAdminUser {
     description: String,
     #[serde(default)]
     must_change_password: bool,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 // Reference rows for the verify-only roots. Secrets stay live.
@@ -647,6 +649,7 @@ fn merge_admin_users(value: &Value, previous: &AdminUsersConf) -> Result<AdminUs
             mfa_secret: live.mfa_secret.clone(),
             mfa_enabled: live.mfa_enabled && !live.mfa_secret.is_empty(),
             mfa_last_step: live.mfa_last_step,
+            scopes: row.scopes,
         });
     }
     let conf = AdminUsersConf { users };

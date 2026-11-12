@@ -1,0 +1,85 @@
+[example]
+area = "config"
+item = "listeners.wss.peer_cert_as_username"
+kind = "setting"
+expect = "username=k1-05-a"
+expected = "The session username is the certificate common name, not the CONNECT username."
+source = "`crates/broker-node/src/native.rs` replaces the CONNECT username with the certificate common name before authentication."
+action = "Connect one secure WebSocket client with a valid certificate and a foreign username, then read the client detail."
+config = '''
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_username = "cn"
+'''
+script = '''
+from config_probe import *
+import base64
+import os
+import socket
+import ssl
+import struct
+
+CERT = "/work/tree/crates/broker-node/tests/k1_05"
+
+def connect_bytes(client, username=None, password=None):
+    flags = 0x02 | (0x80 if username else 0) | (0x40 if password else 0)
+    body = word("MQTT") + b"\x04" + bytes([flags]) + struct.pack("!H", 60) + word(client)
+    if username:
+        body += word(username)
+    if password:
+        body += word(password)
+    return frame(0x10, body)
+
+def ws_recvn(tls, n):
+    raw = b""
+    while len(raw) < n:
+        chunk = tls.recv(n - len(raw))
+        if not chunk:
+            raise AssertionError("connection closed")
+        raw += chunk
+    return raw
+
+def ws_send(tls, payload):
+    assert len(payload) < 126
+    mask = os.urandom(4)
+    tls.sendall(bytes([0x82, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+def ws_recv(tls):
+    hdr = ws_recvn(tls, 2)
+    assert hdr[0] == 0x82, hdr
+    ln = hdr[1] & 0x7F
+    if ln == 126:
+        ln = struct.unpack("!H", ws_recvn(tls, 2))[0]
+    return ws_recvn(tls, ln)
+
+status, _ = http("POST", "/api/v1/auth/users", {"username": "k1-05-a", "password": "docs-pw-0001"})
+assert status in (200, 201), status
+raw = socket.create_connection(("127.0.0.1", 28884), timeout=10)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.load_cert_chain(CERT + "/client-a-cert.pem", CERT + "/client-a-key.pem")
+tls = ctx.wrap_socket(raw, server_hostname="localhost")
+tls.settimeout(10)
+wskey = base64.b64encode(os.urandom(16)).decode()
+tls.sendall(("GET /mqtt HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wskey + "\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n").encode())
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = tls.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+assert resp.startswith(b"HTTP/1.1 101"), resp[:60]
+ws_send(tls, connect_bytes("wss-cn-user", "intruder", "docs-pw-0001"))
+assert ws_recv(tls) == b"\x20\x02\x00\x00"
+status, detail = http("GET", "/api/v5/clients/wss-cn-user")
+assert status == 200, (status, detail)
+assert detail["username"] == "k1-05-a", detail
+tls.close()
+print("username=k1-05-a")
+'''

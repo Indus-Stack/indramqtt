@@ -196,6 +196,7 @@ fn known_prefixes() -> HashSet<String> {
     prefixes.insert("rules".to_string());
     prefixes.insert("listeners.websocket".to_string());
     prefixes.insert("tenants".to_string());
+    prefixes.insert("authz_sources".to_string());
     prefixes
 }
 
@@ -1099,6 +1100,8 @@ fn load_layered_from(
     cli.apply_to(&mut flag_table, &mut flag_provenance);
     merge_layer(&mut merged, &mut provenance, &flag_table, &flag_provenance);
 
+    refuse_unsupported_license_file(&merged, &provenance)?;
+
     let parsed: BrokerConfig = toml::Value::Table(merged).try_into().map_err(|err| {
         attribute(
             ConfigError::Invalid(format!("config value is invalid: {err}")),
@@ -1112,6 +1115,38 @@ fn load_layered_from(
         config: parsed,
         provenance,
     })
+}
+
+/// Default licence file path. Reason: the production layout keeps the
+/// key at this path. The default stays accepted so old files and the
+/// generated all-settings file keep booting (D2). An explicit path
+/// below refuses instead of loading a file the broker never reads.
+const DEFAULT_LICENSE_FILE: &str = "/etc/indramqtt/license.key";
+
+/// Refuse an explicit non-default `licence.license_file` at load.
+///
+/// The broker reads the stored licence, never this path. Silent accept
+/// would lose an operator key file without notice. A clear error names
+/// the file, the key and the reason. The default path stays accepted.
+fn refuse_unsupported_license_file(
+    merged: &toml::Table,
+    provenance: &HashMap<String, Layer>,
+) -> Result<(), ConfigError> {
+    let Some(layer) = provenance.get("licence.license_file") else {
+        return Ok(());
+    };
+    let value = get_path(merged, "licence.license_file")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or("");
+    if value == DEFAULT_LICENSE_FILE {
+        return Ok(());
+    }
+    Err(load_error(
+        layer.describe(),
+        format!(
+            "`licence.license_file` value {value:?} is not supported in this release: the broker keeps the stored licence and never reads this path (field `licence.license_file`)"
+        ),
+    ))
 }
 
 /// Read, parse, per-file check and merge one config file.
@@ -1208,8 +1243,11 @@ fn check_table(
                 }
                 check_table(nested, file, kinds, prefixes, full)?;
             }
-            toml::Value::Array(_) if dotted.starts_with("tenants") => {
-                // Array-of-tables (e.g. `[[tenants.rules]]`) is validated by
+            toml::Value::Array(_)
+                if dotted.starts_with("tenants") || dotted == "authz_sources.sources" =>
+            {
+                // Array-of-tables (e.g. `[[tenants.rules]]`,
+                // `[[authz_sources.sources]]`) is validated by
                 // `BrokerConfig::validate`, not the layer kind checker.
             }
             leaf => {
@@ -1659,6 +1697,307 @@ mod tests {
     }
 
     #[test]
+    fn bool_layers_win_in_documented_order() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let _ambient = EnvGuard::clear_all_indra();
+        let dir = unique_dir("boollayers");
+        write(&dir, "indra.toml", "[auth]\nallow_anonymous = true\n");
+        let fragments = dir.join("conf.d");
+        write(
+            &fragments,
+            "10-base.toml",
+            "[auth]\nallow_anonymous = false\n",
+        );
+        let _env = EnvGuard::set(&[("INDRA_AUTH__ALLOW_ANONYMOUS", "true")]);
+        let cli = CliOverrides {
+            allow_anonymous: true,
+            ..Default::default()
+        };
+
+        // Each layer wins over the ones before it. Provenance names it.
+        let resolved = load_layered(&dir, &cli).expect("layered load");
+        assert!(resolved.config().auth.allow_anonymous);
+        assert_eq!(
+            resolved.layer_of("auth.allow_anonymous"),
+            Layer::Flag("--allow-anonymous".to_string())
+        );
+
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert!(resolved.config().auth.allow_anonymous);
+        assert_eq!(
+            resolved.layer_of("auth.allow_anonymous"),
+            Layer::Env("INDRA_AUTH__ALLOW_ANONYMOUS".to_string())
+        );
+        drop(_env);
+
+        let _cleared = EnvGuard::clear(&["INDRA_AUTH__ALLOW_ANONYMOUS"]);
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert!(!resolved.config().auth.allow_anonymous);
+        assert!(matches!(
+            resolved.layer_of("auth.allow_anonymous"),
+            Layer::Fragment(_)
+        ));
+
+        std::fs::remove_dir_all(&fragments).expect("remove conf.d");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert!(resolved.config().auth.allow_anonymous);
+        assert!(matches!(
+            resolved.layer_of("auth.allow_anonymous"),
+            Layer::MainFile(_)
+        ));
+
+        std::fs::remove_file(dir.join("indra.toml")).expect("remove main file");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert!(!resolved.config().auth.allow_anonymous);
+        assert_eq!(resolved.layer_of("auth.allow_anonymous"), Layer::Defaults);
+        scrub(&dir);
+    }
+
+    #[test]
+    fn integer_layers_win_in_documented_order() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let _ambient = EnvGuard::clear_all_indra();
+        let dir = unique_dir("intlayers");
+        write(&dir, "indra.toml", "[session]\nmax_qos0_backlog = 7\n");
+        let fragments = dir.join("conf.d");
+        write(
+            &fragments,
+            "10-base.toml",
+            "[session]\nmax_qos0_backlog = 8\n",
+        );
+        let _env = EnvGuard::set(&[("INDRA_SESSION__MAX_QOS0_BACKLOG", "9")]);
+        let cli = CliOverrides {
+            qos0_backlog: Some(11),
+            ..Default::default()
+        };
+
+        let resolved = load_layered(&dir, &cli).expect("layered load");
+        assert_eq!(resolved.config().session.max_qos0_backlog, 11);
+        assert_eq!(
+            resolved.layer_of("session.max_qos0_backlog"),
+            Layer::Flag("--qos0-backlog".to_string())
+        );
+
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().session.max_qos0_backlog, 9);
+        assert_eq!(
+            resolved.layer_of("session.max_qos0_backlog"),
+            Layer::Env("INDRA_SESSION__MAX_QOS0_BACKLOG".to_string())
+        );
+        drop(_env);
+
+        let _cleared = EnvGuard::clear(&["INDRA_SESSION__MAX_QOS0_BACKLOG"]);
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().session.max_qos0_backlog, 8);
+        assert!(matches!(
+            resolved.layer_of("session.max_qos0_backlog"),
+            Layer::Fragment(_)
+        ));
+
+        std::fs::remove_dir_all(&fragments).expect("remove conf.d");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().session.max_qos0_backlog, 7);
+        assert!(matches!(
+            resolved.layer_of("session.max_qos0_backlog"),
+            Layer::MainFile(_)
+        ));
+
+        std::fs::remove_file(dir.join("indra.toml")).expect("remove main file");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().session.max_qos0_backlog, 1000);
+        assert_eq!(
+            resolved.layer_of("session.max_qos0_backlog"),
+            Layer::Defaults
+        );
+        scrub(&dir);
+    }
+
+    #[test]
+    fn float_layers_win_in_documented_order() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let _ambient = EnvGuard::clear_all_indra();
+        let dir = unique_dir("floatlayers");
+        write(&dir, "indra.toml", "[quotas]\nburst_multiplier = 3.0\n");
+        let fragments = dir.join("conf.d");
+        write(
+            &fragments,
+            "10-base.toml",
+            "[quotas]\nburst_multiplier = 4.0\n",
+        );
+        // No flag feeds this setting. The environment is the top layer.
+        let _env = EnvGuard::set(&[("INDRA_QUOTAS__BURST_MULTIPLIER", "4.5")]);
+
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().quotas.burst_multiplier, 4.5);
+        assert_eq!(
+            resolved.layer_of("quotas.burst_multiplier"),
+            Layer::Env("INDRA_QUOTAS__BURST_MULTIPLIER".to_string())
+        );
+        drop(_env);
+
+        let _cleared = EnvGuard::clear(&["INDRA_QUOTAS__BURST_MULTIPLIER"]);
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().quotas.burst_multiplier, 4.0);
+        assert!(matches!(
+            resolved.layer_of("quotas.burst_multiplier"),
+            Layer::Fragment(_)
+        ));
+
+        std::fs::remove_dir_all(&fragments).expect("remove conf.d");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().quotas.burst_multiplier, 3.0);
+        assert!(matches!(
+            resolved.layer_of("quotas.burst_multiplier"),
+            Layer::MainFile(_)
+        ));
+
+        std::fs::remove_file(dir.join("indra.toml")).expect("remove main file");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(resolved.config().quotas.burst_multiplier, 2.0);
+        assert_eq!(
+            resolved.layer_of("quotas.burst_multiplier"),
+            Layer::Defaults
+        );
+        scrub(&dir);
+    }
+
+    #[test]
+    fn list_layers_win_in_documented_order() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let _ambient = EnvGuard::clear_all_indra();
+        let dir = unique_dir("listlayers");
+        // Clustering is refused, so the order proof uses another list.
+        write(&dir, "indra.toml", "[kerberos]\nallowed_realms = [\"f\"]\n");
+        let fragments = dir.join("conf.d");
+        write(
+            &fragments,
+            "10-base.toml",
+            "[kerberos]\nallowed_realms = [\"g\"]\n",
+        );
+        let _env = EnvGuard::set(&[("INDRA_KERBEROS__ALLOWED_REALMS", "h, i")]);
+        let cli = CliOverrides {
+            kerberos_allowed_realms: Some("j,, k".to_string()),
+            ..Default::default()
+        };
+
+        // The flag list drops empty entries, like the environment list.
+        let resolved = load_layered(&dir, &cli).expect("layered load");
+        assert_eq!(
+            resolved.config().kerberos.allowed_realms,
+            vec!["j".to_string(), "k".to_string()]
+        );
+        assert_eq!(
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Flag("--kerberos-allowed-realms".to_string())
+        );
+
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(
+            resolved.config().kerberos.allowed_realms,
+            vec!["h".to_string(), "i".to_string()]
+        );
+        assert_eq!(
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Env("INDRA_KERBEROS__ALLOWED_REALMS".to_string())
+        );
+        drop(_env);
+
+        let _cleared = EnvGuard::clear(&["INDRA_KERBEROS__ALLOWED_REALMS"]);
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(
+            resolved.config().kerberos.allowed_realms,
+            vec!["g".to_string()]
+        );
+        assert!(matches!(
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Fragment(_)
+        ));
+
+        std::fs::remove_dir_all(&fragments).expect("remove conf.d");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert_eq!(
+            resolved.config().kerberos.allowed_realms,
+            vec!["f".to_string()]
+        );
+        assert!(matches!(
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::MainFile(_)
+        ));
+
+        std::fs::remove_file(dir.join("indra.toml")).expect("remove main file");
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
+        assert!(resolved.config().kerberos.allowed_realms.is_empty());
+        assert_eq!(
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Defaults
+        );
+        scrub(&dir);
+    }
+
+    #[test]
+    fn unknown_setting_in_a_fragment_refuses_startup() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let dir = unique_dir("unknownfrag");
+        let fragments = dir.join("conf.d");
+        let path = write(&fragments, "10-typo.toml", "[node]\nidak = \"typo\"\n");
+        let err = load_layered(&dir, &CliOverrides::default()).expect_err("unknown key must fail");
+        let text = err.to_string();
+        assert!(
+            text.contains(&path.display().to_string()),
+            "error must name the file, got: {text}"
+        );
+        assert!(
+            text.contains("node.idak"),
+            "error must name the setting, got: {text}"
+        );
+        scrub(&dir);
+    }
+
+    #[test]
+    fn explicit_license_file_is_refused_default_is_kept() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let _ambient = EnvGuard::clear_all_indra();
+        let dir = unique_dir("licfile");
+        // The broker never reads this path: an explicit path fails closed.
+        write(
+            &dir,
+            "indra.toml",
+            "[licence]\nlicense_file = \"/tmp/custom.key\"\n",
+        );
+        let err =
+            load_layered(&dir, &CliOverrides::default()).expect_err("explicit path must fail");
+        let text = err.to_string();
+        assert!(
+            text.contains("licence.license_file"),
+            "error must name the setting, got: {text}"
+        );
+        assert!(
+            text.contains("indra.toml"),
+            "error must name the file, got: {text}"
+        );
+        // The default path keeps booting (D2): old files stay valid.
+        write(
+            &dir,
+            "indra.toml",
+            "[licence]\nlicense_file = \"/etc/indramqtt/license.key\"\n",
+        );
+        let resolved = load_layered(&dir, &CliOverrides::default()).expect("default loads");
+        assert_eq!(
+            resolved.config().licence.license_file,
+            "/etc/indramqtt/license.key"
+        );
+        // An explicit variable fails the same way and names the variable.
+        let _env = EnvGuard::set(&[("INDRA_LICENCE__LICENSE_FILE", "/tmp/custom.key")]);
+        let err =
+            load_layered(&dir, &CliOverrides::default()).expect_err("explicit variable must fail");
+        assert!(
+            err.to_string().contains("INDRA_LICENCE__LICENSE_FILE"),
+            "error must name the variable, got: {err}"
+        );
+        scrub(&dir);
+    }
+
+    #[test]
     fn wrong_typed_env_value_is_a_startup_error_naming_the_variable() {
         let _serial = ENV_SERIAL.lock().expect("env serial");
         let dir = unique_dir("badenv");
@@ -1877,15 +2216,15 @@ mod tests {
             ("INDRA_AUTH__ALLOW_ANONYMOUS", "true"),
             ("INDRA_SESSION__MAX_QOS0_BACKLOG", "7"),
             ("INDRA_QUOTAS__BURST_MULTIPLIER", "3.5"),
-            ("INDRA_CLUSTER__SEED_NODES", "host1:19883, host2:19883"),
+            ("INDRA_KERBEROS__ALLOWED_REALMS", "EXAMPLE, OTHER"),
         ]);
         let resolved = load_layered(&dir, &CliOverrides::default()).expect("typed env loads");
         assert!(resolved.config().auth.allow_anonymous);
         assert_eq!(resolved.config().session.max_qos0_backlog, 7);
         assert_eq!(resolved.config().quotas.burst_multiplier, 3.5);
         assert_eq!(
-            resolved.config().cluster.seed_nodes,
-            vec!["host1:19883".to_string(), "host2:19883".to_string()]
+            resolved.config().kerberos.allowed_realms,
+            vec!["EXAMPLE".to_string(), "OTHER".to_string()]
         );
         scrub(&dir);
     }

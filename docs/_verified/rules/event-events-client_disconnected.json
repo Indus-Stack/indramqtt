@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "reason": "closed"
+      },
+      "projected": {
+        "reason": "closed"
+      },
+      "sql": "SELECT reason FROM \"$events/client_disconnected\"",
+      "topic": "$events/client_disconnected"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "reason": "closed"
+      },
+      "projected": null,
+      "sql": "SELECT reason FROM \"$events/client_disconnected\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-client_disconnected",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

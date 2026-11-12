@@ -455,10 +455,83 @@ VERIFIED_CHECK_OPS = {
     ("get", "/api/v1/rules"),
 }
 
+# Per-operation text, examples and failure records.
+API_TEXT = ROOT / "docs" / "_text" / "api"
+API_VERIFIED = ROOT / "docs" / "_verified" / "api"
+API_FAILURES = ROOT / "docs" / "_verification" / "failures.md"
+
+
+def api_text(item: str) -> str | None:
+    """Read the written explanation of one API operation."""
+    path = API_TEXT / (item + ".md")
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip()
+
+
+def api_verified(item: str) -> dict | None:
+    """Read the verified output of one API operation."""
+    path = API_VERIFIED / (item + ".json")
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def api_failed(item: str) -> bool:
+    """Return true when a failure record names this API operation."""
+    try:
+        text = API_FAILURES.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return f"item `{item}`" in text
+
+
+OPERATION_NOTES = {
+    "createUser": [
+        "Send `username` and `password`. An empty value fails with 400.",
+        "Success answers 201 with the stored row. The password is write-only.",
+        "A create for an existing username replaces the stored credential.",
+        "A password longer than 8192 bytes is refused.",
+        "The write persists and clears cached authorization decisions.",
+    ],
+    "listUsers": [
+        "Names are sorted. A password never appears in the answer.",
+        "An absent tenant reads the default tenant.",
+    ],
+    "deleteUser": [
+        "Success answers 204 with no body.",
+        "An unknown username fails with 404.",
+    ],
+    "createAcl": [
+        "Send `client_pattern`, `action`, `topic_pattern` and `allow`.",
+        "An empty client pattern fails with 400. The action must be `publish`, `subscribe` or `all`.",
+        "The topic pattern must be a valid MQTT filter.",
+        "A tenant holds at most 10000 rules.",
+        "The write persists and clears cached authorization decisions.",
+    ],
+    "listAcls": [
+        "The rules keep evaluation order. The first match wins.",
+        "An absent tenant reads the default tenant.",
+    ],
+    "deleteAcl": [
+        "`id` is the zero-based index in the tenant rule list.",
+        "Success answers 204 with no body.",
+        "An index past the end fails with 404.",
+        "The write persists and clears cached authorization decisions.",
+    ],
+    "getVerifyStats": [
+        "The counters live in memory and restart at zero.",
+        "`verifications` counts blocking password hashes. `dedup_joins` counts CONNECTs that shared one leader check.",
+    ],
+}
+
 
 def operation_notes(method: str, op: dict) -> list:
     """Build the Notes list of one operation."""
     # Each note states a limit or an error from the handler code.
+    item = op.get("operationId", "")
+    if item in OPERATION_NOTES:
+        return OPERATION_NOTES[item]
     notes = []
     body = (
         (op.get("requestBody", {}) if isinstance(op.get("requestBody"), dict) else {}).get(
@@ -490,24 +563,36 @@ def operation_notes(method: str, op: dict) -> list:
     return notes
 
 
-def operation_verified(method: str, path: str) -> str:
+def operation_verified(method: str, path: str, op: dict) -> str:
     """State where the live call of one operation runs."""
+    item = op.get("operationId", "")
+    if item and api_verified(item):
+        return (
+            "Verified: the runner ran this call through the management API. "
+            f"See `../../_verified/api/{item}.json`."
+        )
     key = (method.lower(), path)
     if key in VERIFIED_FLOW_OPS:
         return "Verified: the example flow below runs this call."
     if key in VERIFIED_CHECK_OPS:
         return "Verified: the check below runs this call."
+    if item and api_failed(item):
+        return "Not verified: see the failure record."
     return "Not verified: see `../_verification/failures.md`."
 
 
 def render_operation(method: str, path: str, op: dict, tag: str = "") -> str:
     """Render one operation with its example."""
+    item = op.get("operationId", "")
     parts = [f"### `{method.upper()} {path}`\n"]
     summary = op.get("summary", "")
     if summary:
         parts.append(f"{summary}\n")
-    if op.get("operationId"):
-        parts.append(f"Operation id: `{op['operationId']}`.\n")
+    if item:
+        parts.append(f"Operation id: `{item}`.\n")
+    text = api_text(item) if item else None
+    if text:
+        parts.append(f"{text}\n")
     parts.append("Parameters:\n")
     parts.append(render_parameters(op))
     parts.append("Request body:\n")
@@ -517,7 +602,22 @@ def render_operation(method: str, path: str, op: dict, tag: str = "") -> str:
     parts.append("Notes:\n")
     for note in operation_notes(method, op):
         parts.append(f"- {note}\n")
-    parts.append(f"{operation_verified(method, path)}\n")
+    parts.append(f"{operation_verified(method, path, op)}\n")
+    record = api_verified(item) if item else None
+    if record and record.get("verified"):
+        parts.append("Verified example:\n")
+        parts.append(f"Request: `{record.get('request', '')}`.\n")
+        parts.append("Captured output:\n")
+        parts.append("```output")
+        parts.append(str(record.get("output", "")).strip())
+        parts.append("```")
+        parts.append("")
+    elif item and api_failed(item):
+        parts.append("> [!WARNING]\n")
+        parts.append(
+            "> Not verified: see the failure record in "
+            "[Verification failures](../../_verification/failures.md).\n"
+        )
     parts.append("Example:\n")
     parts.append("```curl")
     parts.append(curl_example(method, path, op))
@@ -1039,10 +1139,16 @@ def load_fields() -> list:
     return fields
 
 
-# Verified values for the group example files. Settings without an
-# entry use their schema default. Values stay in range. Switches
-# that enable a listener, TLS, an auth backend or a remote keep
-# their default, so each file boots.
+# Extras that the setting entries read: the written text, the verified
+# output and the failure records.
+CONFIG_TEXT = ROOT / "docs" / "_text" / "config"
+CONFIG_VERIFIED = ROOT / "docs" / "_verified" / "config"
+CONFIG_FAILURES = ROOT / "docs" / "_verification" / "failures.md"
+
+# Values for the group example files. Settings without an entry use
+# their schema default. Values stay in range. Switches that enable a
+# listener, TLS, an auth backend or a remote keep their default, so
+# each file boots.
 CONFIG_EXAMPLE_VALUES = {
     "node.id": '"doc-node-1"',
     "listeners.tcp.max_connections": "500000",
@@ -1097,6 +1203,32 @@ CONFIG_UNFENCED = {
     "node.data_dir": "the boot file omits it; the test pin sets an absolute path",
 }
 
+
+def config_text(item: str) -> str | None:
+    """Read the written explanation of one setting."""
+    path = CONFIG_TEXT / (item + ".md")
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip()
+
+
+def config_verified(item: str) -> dict | None:
+    """Read the verified output of one setting."""
+    path = CONFIG_VERIFIED / (item + ".json")
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def config_failed(item: str) -> bool:
+    """Return true when a failure record names this setting."""
+    try:
+        text = CONFIG_FAILURES.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return f"item `{item}`" in text
+
+
 # One line per setting group. Short sentences only.
 GROUP_SUMMARIES = {
     "node": "Name the node. Point state at a directory.",
@@ -1121,35 +1253,62 @@ GROUP_SUMMARIES = {
 }
 
 
-def setting_entry(field: dict) -> str:
-    """Render one setting entry with its verified example line."""
-    parent, _, leaf = field["path"].rpartition(".")
-    restart = {"yes": "yes", "no": "no", "": "not proven"}[field["restart"]]
-    lines = [
-        f"### `{field['path']}`",
+def config_example_blocks(record: dict) -> list:
+    """Render the configuration, the action and its captured output."""
+    config = record.get("config", "")
+    action = record.get("action", "")
+    output = record.get("output", "")
+    return [
+        "Example configuration:",
         "",
-        field["doc"],
+        "```toml no-test",
+        "# Reason: the verifier boots the broker with this file.",
+        config.strip(),
+        "```",
+        "",
+        "Action:",
+        "",
+        "```text",
+        action.strip(),
+        "```",
+        "",
+        "Captured output:",
+        "",
+        "```output",
+        output.strip(),
+        "```",
+        "",
+    ]
+
+
+def setting_entry(field: dict) -> str:
+    """Render one setting entry from the schema, text and verified output."""
+    item = field["path"]
+    if config_failed(item):
+        return (
+            f"### `{item}`\n\n"
+            "> [!WARNING]\n"
+            "> Not verified: see the failure record in "
+            "[Verification failures](../_verification/failures.md).\n"
+        )
+    restart = {"yes": "yes", "no": "no", "": "not proven"}[field["restart"]]
+    text = config_text(item)
+    lines = [
+        f"### `{item}`",
+        "",
+        text if text else field["doc"],
         "",
         f"Type: `{field['type']}`. Default: `{field['default']}`. "
         f"Range: `{field['range']}`. Restart: `{restart}`.",
         "",
     ]
-    if field["path"] in CONFIG_UNFENCED:
-        lines.append(
-            f"Example: `{leaf} = {field['default']}` (the default); "
-            f"{CONFIG_UNFENCED[field['path']]}."
-        )
-    else:
-        value = CONFIG_EXAMPLE_VALUES.get(field["path"], field["default"])
-        lines.append(
-            f"Example: `{leaf} = {value}` in the `[{parent}]` table "
-            "of the group file below."
-        )
-    lines.append("")
-    notes = ["A bad value fails validation. Boot keeps the old file."]
+    record = config_verified(item)
+    if record and record.get("verified"):
+        lines.extend(config_example_blocks(record))
+    notes = ["A wrong type fails validation."]
     if "stores it" in field["doc"]:
         notes.append("The broker stores this value. It does not apply it.")
-    notes.append("Related settings sit in the same group file.")
+    notes.append("Related settings sit in the same group.")
     lines.append("Notes:")
     lines.append("")
     for note in notes:
@@ -1159,7 +1318,7 @@ def setting_entry(field: dict) -> str:
 
 
 def group_example_block(rows: list) -> str:
-    """Render one verified file with every setting of a group."""
+    """Render one tested file with every setting of a group."""
     tables: dict = {}
     for field in rows:
         if field["path"] in CONFIG_UNFENCED:
@@ -1223,10 +1382,10 @@ def config_page(fields: list) -> str:
         "that a reload applies the setting. Deprecated settings are marked "
         "as such in the Description column and carry no restart value.",
         "",
-        "Each setting owns one entry below with a verified example line. "
-        "Each example line sits in the group file of its section. The "
-        "drift test loads each group file through the production loader. "
-        "The docs run boots each group file.",
+        "Each setting owns one entry below. An entry with a verified "
+        "example shows the configuration, the action and the output. "
+        "An entry with a failure record shows the not-verified callout. "
+        "The verification runner writes each record from its run.",
         "",
         "| Setting | Type | Default | Range | Description | Restart |",
         "|---|---|---|---|---|---|",
@@ -1248,7 +1407,7 @@ def config_page(fields: list) -> str:
     out.append("")
     out.append("## Settings in detail")
     out.append("")
-    out.append("Each entry names one setting with its verified example line.")
+    out.append("Each entry names one setting. A verified entry carries an example.")
     out.append("")
     for section, rows in sections.items():
         out.append(f"## `{section}`")

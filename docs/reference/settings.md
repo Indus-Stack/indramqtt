@@ -121,11 +121,11 @@ flowchart LR
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `cluster.enabled` | boolean | `false` | boolean | Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only. |
+| `cluster.enabled` | boolean | `false` | boolean | Refused clustering switch. The broker fails boot when true. |
 | `cluster.bind` | string | `127.0.0.1:19883` | string | Cluster SWIM UDP bind address for peer discovery and membership. |
 | `cluster.gossip_bind` | string | `0.0.0.0:7946` | string | Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only. |
 | `cluster.quic_bind` | string | `0.0.0.0:9092` | string | Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only. |
-| `cluster.seed_nodes` | array | `[]` | array | Seed node addresses to join an existing cluster. |
+| `cluster.seed_nodes` | array | `[]` | array | Refused seed list. The broker fails boot when not empty. |
 
 ## licence
 

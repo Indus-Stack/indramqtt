@@ -1139,10 +1139,18 @@ pub async fn get_client_authz_cache(
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
-    // Snapshot holds at most 1024 entries, oldest first.
+    // Snapshot holds at most 1024 entries, oldest first. Fresh entries
+    // only: expired entries per the stored TTL read as evicted.
+    let snap = state.authz_settings.snapshot();
+    let ttl_ms = broker_config::parse_settings_duration_to_ms(&snap.cache.ttl);
+    let now = broker_session::now_ms();
     let data: Vec<serde_json::Value> = session
         .authz_cache_snapshot()
         .iter()
+        .filter(|entry| match ttl_ms {
+            Some(ttl) => now.saturating_sub(entry.updated_ms) <= ttl,
+            None => true,
+        })
         .map(|entry| {
             serde_json::json!({
                 "access": entry.action,

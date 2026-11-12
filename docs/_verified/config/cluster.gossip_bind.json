@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a gossip bind address and check that `/healthz` answers OK.",
+  "config": "[cluster]\ngossip_bind = \"127.0.0.1:7996\"\n",
+  "item": "cluster.gossip_bind",
+  "kind": "setting",
+  "output": "ok",
+  "returncode": 0,
+  "verified": true
+}

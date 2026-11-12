@@ -1,0 +1,31 @@
+[example]
+area = "config"
+item = "dbauth.read_timeout_ms"
+kind = "setting"
+expect = "accepted"
+expected = "One lookup round-trip completes within the configured read bound and the CONNECT succeeds."
+source = "`crates/broker-auth/src/db.rs` bounds each authentication lookup with `read_timeout_ms` before it fails closed."
+action = "Connect with a password while one lookup may take two seconds."
+config = '''
+[auth]
+allow_anonymous = true
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+read_timeout_ms = 2000
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+sock.settimeout(10)
+payload = word("db-docs") + word("docs-user") + word("right-password")
+body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+sock.sendall(frame(16, body))
+head, ack = packet(sock)
+sock.close()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

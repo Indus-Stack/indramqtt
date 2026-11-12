@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with the collector on and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.collectors]\nvm_memory = \"enabled\"\n",
+  "item": "prometheus.collectors.vm_memory",
+  "kind": "setting",
+  "output": "vm_memory=enabled",
+  "returncode": 0,
+  "verified": true
+}

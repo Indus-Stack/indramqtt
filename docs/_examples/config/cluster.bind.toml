@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "cluster.bind"
+kind = "setting"
+expect = "ok"
+expected = "The broker accepts the cluster SWIM UDP bind address and starts."
+source = "`crates/broker-config/src/schema.rs` documents `cluster.bind` as the cluster SWIM UDP bind address for peer discovery and membership."
+action = "Start the broker with a cluster bind address and check that `/healthz` answers OK."
+config = '''
+[cluster]
+bind = "127.0.0.1:19983"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

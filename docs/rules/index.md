@@ -38,7 +38,15 @@ flowchart LR
 | [Bit and byte functions](./functions-bits-bytes.md) | One verified entry per bit and byte function. |
 | [Type conversion functions](./functions-type-conversion.md) | One verified entry per type conversion function. |
 | [Type check functions](./functions-type-checks.md) | One verified entry per type check function. |
+| [Array functions](./functions-arrays.md) | One verified entry per array function. |
+| [Hashing functions](./functions-hashing.md) | One verified entry per hashing function. |
+| [Compression functions](./functions-compression.md) | One verified entry per compression function. |
+| [Rule state functions](./functions-state.md) | One verified entry per rule state function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
+| [Rule actions A](./actions-a.md) | One verified entry per action from alloydb to dynamodb. |
+| [Rule actions B](./actions-b.md) | One verified entry per action from elasticsearch to opentsdb. |
+| [Rule actions C](./actions-c.md) | One verified entry per action from oracle to webhook. |
+| [Rule events](./events.md) | One verified entry per rule event source. |
 
 > [!NOTE]
 > A rule keeps the tenant of its input message. A rule of tenant A never fires for a publish of tenant B. See [Multi-tenancy](../multi-tenancy/index.md).

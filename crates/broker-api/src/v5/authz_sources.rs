@@ -122,8 +122,27 @@ pub async fn create_authz_source(State(state): State<ApiState>, body: Bytes) -> 
                 .into_response();
         }
     };
+    // An already-stored kind stays a duplicate rejection. This also
+    // covers a source that an older version stored.
+    if state.authz_sources.get(&entry.source_type).is_some() {
+        return ApiError::AlreadyExists("authorization source already exists".to_string())
+            .into_response();
+    }
+    // Only the built-in database executes in this build; every other
+    // source kind is refused before anything is stored so a stored-only
+    // source can never weaken access (D2).
+    let kind = entry.source_type.clone();
+    if kind != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authorization source {kind} is not available in this broker"
+        ))
+        .into_response();
+    }
     match state.authz_sources.insert(entry) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(SourceInsertError::Duplicate) => {
             ApiError::AlreadyExists("authorization source already exists".to_string())
                 .into_response()
@@ -257,6 +276,7 @@ pub async fn clear_built_in_rules(State(state): State<ApiState>) -> Response {
         )
             .into_response();
     }
+    state.sessions.clear_all_authz_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -360,6 +380,7 @@ pub async fn replace_catch_all_rules(State(state): State<ApiState>, body: Bytes)
         )
             .into_response();
     }
+    state.sessions.clear_all_authz_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -476,6 +497,7 @@ pub async fn clear_catch_all_rules(State(state): State<ApiState>) -> Response {
         )
             .into_response();
     }
+    state.sessions.clear_all_authz_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -515,7 +537,10 @@ pub async fn replace_authz_order(State(state): State<ApiState>, body: Bytes) -> 
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authz_sources.reorder(types) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(broker_auth::SourceReorderError::Invalid(msg)) => {
             ApiError::BadRequest(msg).into_response()
         }
@@ -579,11 +604,12 @@ fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String>
 /// source is refused with `BAD_REQUEST` instead of leaving
 /// authorization open. On success returns 204 with no body. The removal
 /// persists across a restart through the config registry and the
-/// publish/subscribe consults honour it from the next verdict.
-/// Management-plane only for the write: one short registry write lock
-/// per request (plus the registry save lock on persist); the publish
-/// and subscribe consults load the lock-free order snapshot and never
-/// take this handler's lock.
+/// publish/subscribe consults honour it from the next verdict. When no
+/// unsupported source remains, the `unsupported_authorization_source`
+/// alarm clears for the default tenant. Management-plane only for the
+/// write: one short registry write lock per request (plus the registry
+/// save lock on persist); the publish and subscribe consults load the
+/// lock-free order snapshot and never take this handler's lock.
 // TODO(parity): is "last" the last entry of any kind, or the last
 // enabled entry / last live backend? The rulebook does not decide the
 // exact refusal set; the current choice refuses deleting the sole
@@ -594,7 +620,24 @@ pub async fn delete_authz_source(
     Path(source_type): Path<String>,
 ) -> Response {
     match state.authz_sources.remove(&source_type) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.sessions.clear_all_authz_caches();
+            // Clear the D2 alarm when no unsupported source remains: an
+            // operator that deletes the last such source sees the alarm
+            // clear at once (SA-22 item 5).
+            let has_unsupported = state
+                .authz_sources
+                .list()
+                .iter()
+                .any(|entry| entry.source_type != "built_in_database");
+            if !has_unsupported {
+                state.alarms.deactivate_in_tenant(
+                    broker_auth::DEFAULT_TENANT_ID,
+                    "unsupported_authorization_source",
+                );
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(broker_auth::SourceRemoveError::NotFound) => {
             ApiError::NotFound(format!("authorization source {source_type:?} not found"))
                 .into_response()
@@ -677,8 +720,9 @@ pub async fn get_authz_source(
 ///
 /// The whole replacement is validated before anything is applied: one
 /// bad field rejects the entire write with `BAD_REQUEST` and leaves the
-/// stored entry untouched. Unknown types fail with `NOT_FOUND`. A body
-/// `type` that differs from the path type is rejected. Omitted
+/// stored entry untouched. An unknown type fails with `NOT_FOUND`; a
+/// known type other than the built-in database fails with `BAD_REQUEST`.
+/// A body `type` that differs from the path type is rejected. Omitted
 /// `enable`/`config` keep their stored values, so a body carrying only
 /// the fields to change still replaces after full validation. On
 /// success returns 204 with no body, as the reference API documents.
@@ -706,6 +750,19 @@ pub async fn put_authz_source(
                 .into_response();
         }
     };
+    // Unknown types fail with NOT_FOUND. Only the built-in
+    // database executes in this build. Refuse every other known
+    // type before anything is stored (D2).
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
+    if source_type != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authorization source {source_type} is not available in this broker"
+        ))
+        .into_response();
+    }
     let Some(existing) = state.authz_sources.get(&source_type) else {
         return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
             .into_response();
@@ -715,7 +772,10 @@ pub async fn put_authz_source(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authz_sources.update(&source_type, entry) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(SourceUpdateError::NotFound) => {
             ApiError::NotFound(format!("authorization source {source_type:?} not found"))
                 .into_response()
@@ -873,7 +933,10 @@ pub async fn move_authz_source(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authz_sources.relocate(&source_type, position) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(broker_auth::SourceMoveError::NotFound) => {
             ApiError::NotFound(format!("authorization source {source_type:?} not found"))
                 .into_response()
@@ -1142,9 +1205,9 @@ mod tests {
             serde_json::json!("built_in_database")
         );
 
-        // Register one stored-only source; it reads back with its health
-        // never claimed: type/enable only, no live status invented.
-        let (status, _, _) = parts(
+        // A fresh source kind this build does not evaluate is refused
+        // and stores nothing (AZ-02).
+        let (status, refused, _) = parts(
             create_authz_source(
                 State(state.clone()),
                 body(serde_json::json!({"type": "file"})),
@@ -1152,7 +1215,19 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["code"], serde_json::json!("BAD_REQUEST"));
+
+        // An older stored source still reads back with its health never
+        // claimed: type/enable only, no live status invented.
+        state
+            .authz_sources
+            .insert(AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("seed the stored source");
 
         // List now carries both entries in stored order.
         let (status, listed, _) =
@@ -1531,15 +1606,14 @@ mod tests {
             vec!["built_in_database".to_string()]
         );
 
-        let (status, _, _) = parts(
-            create_authz_source(
-                State(state.clone()),
-                body(serde_json::json!({"type": "file"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        state
+            .authz_sources
+            .insert(AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("seed the stored source");
 
         let (status, _, raw) = put_order(&state, order_body(&["file", "built_in_database"])).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1590,15 +1664,14 @@ mod tests {
         // list back; an unknown type is 404; deleting the last live
         // source is refused instead of leaving authorization open.
         let state = standalone_state();
-        let (status, _, _) = parts(
-            create_authz_source(
-                State(state.clone()),
-                body(serde_json::json!({"type": "file"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        state
+            .authz_sources
+            .insert(AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("seed the stored source");
 
         let response = delete_authz_source(State(state.clone()), Path("file".to_string())).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1642,18 +1715,14 @@ mod tests {
         // `crates/broker-node/src/main.rs`) while the detail read
         // reports the same stored source.
         let state = standalone_state();
-        let (status, _, _) = parts(
-            create_authz_source(
-                State(state.clone()),
-                body(serde_json::json!({
-                    "type": "file",
-                    "config": {"path": "/etc/authz/rules.conf"},
-                })),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        state
+            .authz_sources
+            .insert(AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::json!({"path": "/etc/authz/rules.conf"}),
+            })
+            .expect("seed the stored source");
 
         // Read hits with the stored config and live counters; health
         // the broker does not measure is omitted, never invented.
@@ -1680,6 +1749,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(builtin["type"], serde_json::json!("built_in_database"));
         assert!(builtin.get("status").is_none());
+
+        // The publish proof below covers the built-in table. Disable the
+        // unsupported stored source so the chain has no enabled source
+        // this build does not evaluate (D2).
+        state
+            .authz_sources
+            .update(
+                "file",
+                AuthzSourceEntry {
+                    source_type: "file".to_string(),
+                    enable: false,
+                    config: serde_json::json!({"path": "/etc/authz/rules.conf"}),
+                },
+            )
+            .expect("disable the unsupported source for the built-in proof");
 
         // The stored built-in source is live on the publish path: the
         // empty table allows, and the verdict attributes to the
@@ -1737,8 +1821,22 @@ mod tests {
             )
             .expect("re-enable applies");
 
-        // Update with a valid config and read back.
-        let (status, _, raw) = parts(
+        // Restore the stored source for the detail and metric checks.
+        state
+            .authz_sources
+            .update(
+                "file",
+                AuthzSourceEntry {
+                    source_type: "file".to_string(),
+                    enable: true,
+                    config: serde_json::json!({"path": "/etc/authz/rules.conf"}),
+                },
+            )
+            .expect("re-enable the stored source");
+
+        // A refused update of an unsupported kind keeps the stored source
+        // unchanged (AZ-02).
+        let (status, refused, _) = parts(
             put_authz_source(
                 State(state.clone()),
                 Path("file".to_string()),
@@ -1750,15 +1848,21 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(raw.is_empty(), "update answers 204 with no body");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("file")),
+            "the refusal names the kind: {refused}"
+        );
         let (status, reread, _) =
             parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(reread["enable"], serde_json::json!(false));
+        assert_eq!(reread["enable"], serde_json::json!(true));
         assert_eq!(
             reread["config"]["path"],
-            serde_json::json!("/etc/authz/other.conf")
+            serde_json::json!("/etc/authz/rules.conf")
         );
         assert!(reread.get("status").is_none());
 
@@ -1792,7 +1896,8 @@ mod tests {
         assert_eq!(resumed["metrics"]["total"], serde_json::json!(1));
 
         // Unknown types miss on all three routes with the documented
-        // shape.
+        // shape; a known unavailable kind is refused before storage
+        // (AZ-02).
         let (status, missing, _) =
             parts(get_authz_source(State(state.clone()), Path("nowhere".to_string())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1824,18 +1929,14 @@ mod tests {
         // Validate-all-before-apply: bad configs are client errors and
         // the stored entry is unchanged.
         let state = standalone_state();
-        let (status, _, _) = parts(
-            create_authz_source(
-                State(state.clone()),
-                body(serde_json::json!({
-                    "type": "file",
-                    "config": {"path": "/etc/authz/keep.conf"},
-                })),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        state
+            .authz_sources
+            .insert(AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::json!({"path": "/etc/authz/keep.conf"}),
+            })
+            .expect("seed the stored source");
 
         let bad_bodies = [
             // A body `type` that differs from the path type is rejected.
@@ -1875,9 +1976,9 @@ mod tests {
             serde_json::json!("/etc/authz/keep.conf")
         );
 
-        // A body carrying only the stored `type` is a no-op replace that
-        // keeps the stored values.
-        let (status, _, _) = parts(
+        // A body carrying only the stored `type` is refused for an
+        // unavailable kind and keeps the stored values.
+        let (status, refused, _) = parts(
             put_authz_source(
                 State(state.clone()),
                 Path("file".to_string()),
@@ -1886,7 +1987,8 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["code"], serde_json::json!("BAD_REQUEST"));
         let (status, same, _) =
             parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
@@ -2061,15 +2163,14 @@ mod tests {
         // the status reads the same stored sources.
         let state = standalone_state();
         for source_type in ["file", "http"] {
-            let (status, _, _) = parts(
-                create_authz_source(
-                    State(state.clone()),
-                    body(serde_json::json!({"type": source_type})),
-                )
-                .await,
-            )
-            .await;
-            assert_eq!(status, StatusCode::NO_CONTENT, "create {source_type}");
+            state
+                .authz_sources
+                .insert(AuthzSourceEntry {
+                    source_type: source_type.to_string(),
+                    enable: true,
+                    config: serde_json::Value::Null,
+                })
+                .expect("seed the stored source");
         }
         assert_eq!(
             list_types(&state).await,
@@ -2154,6 +2255,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
+        // The publish proof below covers the built-in table. Disable the
+        // unsupported stored sources so the chain has no enabled source
+        // this build does not evaluate (D2).
+        for source_type in ["file", "http"] {
+            state
+                .authz_sources
+                .update(
+                    source_type,
+                    AuthzSourceEntry {
+                        source_type: source_type.to_string(),
+                        enable: false,
+                        config: serde_json::Value::Null,
+                    },
+                )
+                .expect("disable the unsupported source for the built-in proof");
+        }
+
         // The stored built-in source is live on the publish path: the
         // empty table allows, and the verdict attributes to the
         // built-in counters.
@@ -2168,6 +2286,21 @@ mod tests {
             .counter_snapshot("built_in_database")
             .expect("broker verdict attributes to built-in counters");
         assert_eq!(broker_counted.total, 1);
+
+        // Restore the stored sources for the counter checks.
+        for source_type in ["file", "http"] {
+            state
+                .authz_sources
+                .update(
+                    source_type,
+                    AuthzSourceEntry {
+                        source_type: source_type.to_string(),
+                        enable: true,
+                        config: serde_json::Value::Null,
+                    },
+                )
+                .expect("re-enable the stored source");
+        }
 
         // Counters move on explicit records and read back on status.
         state.authz_sources.record_allow("file");
@@ -2184,15 +2317,14 @@ mod tests {
         // Bounds-checked reorder: bad positions are client errors and
         // move nothing; unknown types are 404 with the documented shape.
         let state = standalone_state();
-        let (status, _, _) = parts(
-            create_authz_source(
-                State(state.clone()),
-                body(serde_json::json!({"type": "file"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        state
+            .authz_sources
+            .insert(AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("seed the stored source");
         let before = list_types(&state).await;
 
         let bad_bodies = [
@@ -2299,9 +2431,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_read_round_trip_each_documented_variant() {
-        // Each documented source keeps its required fields through the
-        // write and the read. The row reports them flat at the top
-        // level, so the answer matches the documented variant.
+        // A fresh kind this build does not evaluate is refused; an older
+        // stored variant keeps its required fields through the read. The
+        // row reports them flat at the top level, so the answer matches
+        // the documented variant.
         let state = standalone_state();
         let cases: Vec<serde_json::Value> = vec![
             serde_json::json!({
@@ -2341,9 +2474,25 @@ mod tests {
         ];
         for sent in &cases {
             let source_type = sent["type"].as_str().expect("case names a type");
-            let (status, _, _) =
+            // A fresh kind this build does not evaluate is refused and
+            // stores nothing (AZ-02).
+            let (status, refused, _) =
                 parts(create_authz_source(State(state.clone()), body(sent.clone())).await).await;
-            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "variant {source_type}");
+            assert_eq!(refused["code"], serde_json::json!("BAD_REQUEST"));
+            // An older stored variant still reads back its flat fields.
+            let mut config = sent.as_object().expect("case is an object").clone();
+            config.remove("type");
+            config.remove("enable");
+            config.remove("config");
+            state
+                .authz_sources
+                .insert(AuthzSourceEntry {
+                    source_type: source_type.to_string(),
+                    enable: true,
+                    config: serde_json::Value::Object(config),
+                })
+                .expect("seed the stored variant");
             let (status, read, _) =
                 parts(get_authz_source(State(state.clone()), Path(source_type.to_string())).await)
                     .await;

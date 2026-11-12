@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-azure_event_hub_producer"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-azure_event_hub_producer"
+type = "azure_event_hub_producer"
+expect_status = 201
+expect_type = "azure_event_hub_producer"
+
+[[case]]
+name = "dx2-action-azure_event_hub_producer"
+type = "azure_event_hub_producer"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

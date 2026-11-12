@@ -1,0 +1,1 @@
+`quotas.default_max_publish_rate` sets the default token-bucket publish rate in messages per second. The broker parses the value but applies no bound from it. The default is 50000. 0 means unlimited, as an explicit opt-in.

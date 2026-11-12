@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "cluster.quic_bind"
+kind = "setting"
+expect = "ok"
+expected = "The broker accepts the data plane bind address and starts."
+source = "`crates/broker-config/src/schema.rs` documents `cluster.quic_bind` as the accepted data plane bind address."
+action = "Start the broker with a data plane bind address and check that `/healthz` answers OK."
+config = '''
+[cluster]
+quic_bind = "127.0.0.1:9992"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

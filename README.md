@@ -77,7 +77,13 @@ The code still contains licence functions from the earlier model. Examples are t
 - Most connectors have tests with a test transport only. [`crates/broker-connectors/CAPABILITY.md`](crates/broker-connectors/CAPABILITY.md) shows what each connector was tested with.
 - A default build does not contain all connectors. Build with `--features full` to get all of them. The container image contains all of them.
 - Single sign-on is not stable and is not available. You can store a backend, but the login endpoints answer the error that the reference API documents (404 or 400). Log in with a user name and a password, with MFA when the user has it, or use an API key.
-- Some settings of the management API are stored and shown, but the broker does not apply them yet: the authorization settings (`no_match`, `deny_action`), the authorization cache policy and the authorization sources that are not the built-in database. The broker denies a message when access rules exist and no rule matches.
+- Protocol gateways are not available. `GET /gateways` reads `[]`. An unknown name misses with 404. Writes refuse with 400. Nothing is stored.
+- Message schema validations are not available. `GET /schema_validations` reads `[]`. An unknown name misses with 404. Writes refuse with 400. The schema registry itself stays: it stores and serves schemas.
+- OpenTelemetry export is not available. `GET /opentelemetry` reads the disabled config. `PUT /opentelemetry` refuses with 400. The broker runs no exporter.
+- Cluster links are not available on a single node. `GET /cluster/links` reads `[]`. `POST /cluster/links` refuses with 400. Clustering stays out of the MVP: the broker fails boot when a cluster entry requests it.
+- The broker applies `no_match` (allow or deny with no rule match). It applies `deny_action` (ignore or disconnect on denial). It applies `auth.allow_anonymous` (refuse anonymous CONNECT when false). It stores `auth.password_hash` without applying it (SA-21 owns it).
+- The broker enforces the authorization cache policy. `enable` selects caching. `max_size` bounds entries per client. `ttl` bounds staleness. `excludes` skips listed topics. Rule, source, user and client changes clear entries.
+- The broker refuses unevaluated source kinds with `400` at create and update. Nothing is stored. Stored sources from an older version stay unchanged. They deny each decision that would reach them. They raise an alarm that names the source. The operator can list, read and delete them through the API.
 
 ---
 

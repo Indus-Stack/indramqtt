@@ -1,0 +1,28 @@
+[example]
+area = "config"
+item = "session.max_qos1_inflight"
+kind = "setting"
+expect = "inflight_max=5"
+expected = "The live session reports the configured window of five, and ten unacknowledged messages spill past it."
+source = "`crates/broker-node/src/main.rs` applies the window to the session manager before any listener binds."
+action = "Publish ten QoS 1 messages to a subscriber that does not acknowledge them, then read `GET /api/v5/clients/<id>`."
+config = '''
+[session]
+max_qos1_inflight = 5
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("qos1-window-client", v5=True)
+subscribe(sock, "docs/qos1-window", 1, v5=True)
+pub, ack, props = connect("qos1-window-pub", v5=True)
+for index in range(10):
+    publish(pub, "docs/qos1-window", f"m{index}".encode(), qos=1, v5=True)
+time.sleep(0.3)
+status, client = http("GET", "/api/v5/clients/qos1-window-client")
+assert status == 200, (status, client)
+assert client.get("inflight_max") == 5, client.get("inflight_max")
+assert client.get("inflight_cnt") == 10, client.get("inflight_cnt")
+disconnect(sock)
+disconnect(pub)
+print("inflight_max=5")
+'''

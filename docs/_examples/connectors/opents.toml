@@ -1,0 +1,22 @@
+[example]
+area = "connectors"
+item = "opents"
+kind = "connector-create"
+
+[[case]]
+name = "opents-normal"
+endpoint = "http://127.0.0.1:4242"
+metric = "docs.metric"
+value = "temperature"
+summary = true
+tag_mappings = { site = "${payload.site}" }
+timeout_ms = 5000
+expect_status = 201
+expect_type = "opents"
+
+[[case]]
+name = "opents-edge-empty-metric"
+endpoint = "http://127.0.0.1:4242"
+metric = ""
+value = "temperature"
+expect_status = 400

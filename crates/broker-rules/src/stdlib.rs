@@ -36,7 +36,9 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Bounds: every default is finite and states its reason inline.
@@ -56,6 +58,35 @@ pub const MAX_STDLIB_ARRAY_ELEMS: usize = 10_000;
 /// memory stays bounded per node; puts past the cap return `Null` and are
 /// refused rather than evicting silently.
 pub const MAX_STDLIB_KV_ENTRIES: usize = 10_000;
+
+/// Default `jq` evaluation budget in milliseconds. Reason: the documented
+/// default timeout (`10s`); a call without an explicit timeout uses it.
+pub const DEFAULT_JQ_TIMEOUT_MS: u64 = 10_000;
+
+/// Upper bound for a per-call `jq` timeout in milliseconds. Reason: `jq`
+/// runs on the rule path, so the budget stays bounded; 1 hour is far above
+/// the documented default and refuses absurd values fail-closed.
+pub const MAX_JQ_CALL_TIMEOUT_MS: u64 = 3_600_000;
+
+/// Upper bound for dot-path segments in one `jq` program. Reason: each
+/// segment costs one map lookup on the publish path; deeper programs are
+/// not documented use and stop fail-closed instead of running unbounded.
+pub const MAX_JQ_PATH_SEGMENTS: usize = 64;
+
+/// Counts `jq` evaluations stopped by the deadline or the step budget.
+/// Lock-free; a stopped evaluation returns `Null`, so the rule that asked
+/// for it does not match and its `failed` counter moves.
+static JQ_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `jq` evaluations stopped so far by the deadline or the step
+/// budget. Monotonic; tests read the delta around one evaluation.
+pub fn jq_timeout_count() -> u64 {
+    JQ_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+fn count_jq_timeout() {
+    JQ_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Per-evaluation context for zero-argument accessors.
@@ -1858,31 +1889,69 @@ fn func_join_to_sql_values_string(args: &[Value]) -> Value {
     )
 }
 
-fn jq_dot_path(prog: &str, doc: &Value) -> Option<Vec<Value>> {
+/// Outcome of one budgeted `jq` evaluation.
+enum JqEval {
+    /// The program ran inside the budget.
+    Values(Vec<Value>),
+    /// The program is valid but selects nothing.
+    Empty,
+    /// The deadline passed or the step budget ran out. Counted.
+    Timeout,
+}
+
+fn jq_dot_path_budgeted(prog: &str, doc: &Value, deadline: Instant) -> JqEval {
     let p = prog.trim();
+    if Instant::now() >= deadline {
+        count_jq_timeout();
+        return JqEval::Timeout;
+    }
     if p == "." {
-        return Some(vec![doc.clone()]);
+        return JqEval::Values(vec![doc.clone()]);
     }
-    if let Some(path) = p.strip_prefix('.') {
-        if path.is_empty() || path.contains('[') || path.contains('*') || path.contains('|') {
-            return None;
-        }
-        let mut cur = doc.clone();
-        for part in path.split('.') {
-            if part.is_empty() {
-                return None;
-            }
-            match cur {
-                Value::Object(m) => match m.get(part) {
-                    Some(v) => cur = v.clone(),
-                    None => return Some(vec![]),
-                },
-                _ => return Some(vec![]),
-            }
-        }
-        return Some(vec![cur]);
+    let Some(path) = p.strip_prefix('.') else {
+        return JqEval::Empty;
+    };
+    if path.is_empty() || path.contains('[') || path.contains('*') || path.contains('|') {
+        return JqEval::Empty;
     }
-    None
+    // Stop a program past the step budget before traversal.
+    if path.split('.').count() > MAX_JQ_PATH_SEGMENTS {
+        count_jq_timeout();
+        return JqEval::Timeout;
+    }
+    let mut cur = doc.clone();
+    let mut steps = 0usize;
+    for part in path.split('.') {
+        steps += 1;
+        if steps > MAX_JQ_PATH_SEGMENTS {
+            count_jq_timeout();
+            return JqEval::Timeout;
+        }
+        if Instant::now() >= deadline {
+            count_jq_timeout();
+            return JqEval::Timeout;
+        }
+        if part.is_empty() {
+            return JqEval::Empty;
+        }
+        match cur {
+            Value::Object(m) => match m.get(part) {
+                Some(v) => cur = v.clone(),
+                None => return JqEval::Empty,
+            },
+            _ => return JqEval::Empty,
+        }
+    }
+    JqEval::Values(vec![cur])
+}
+
+fn jq_timeout_arg(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_i64().and_then(|v| u64::try_from(v).ok()),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+    .filter(|ms| (1..=MAX_JQ_CALL_TIMEOUT_MS).contains(ms))
 }
 
 fn func_jq(args: &[Value]) -> Value {
@@ -1892,19 +1961,39 @@ fn func_jq(args: &[Value]) -> Value {
     let (Some(prog), doc) = (str_arg(args, 0), &args[1]) else {
         return Value::Null;
     };
+    // Unit is milliseconds. The per-call value wins; without it the
+    // documented default applies. Out-of-range values fail closed.
+    let budget_ms = if args.len() == 3 {
+        let Some(ms) = jq_timeout_arg(&args[2]) else {
+            return Value::Null;
+        };
+        ms
+    } else {
+        DEFAULT_JQ_TIMEOUT_MS
+    };
+    if prog.len() > MAX_STDLIB_STRING_BYTES {
+        return Value::Null;
+    }
     let doc_value = match doc {
-        Value::String(s) => match serde_json::from_str::<Value>(s) {
-            Ok(v) => v,
-            Err(_) => return Value::Null,
-        },
+        Value::String(s) => {
+            if s.len() > MAX_STDLIB_STRING_BYTES {
+                return Value::Null;
+            }
+            match serde_json::from_str::<Value>(s) {
+                Ok(v) => v,
+                Err(_) => return Value::Null,
+            }
+        }
         other => other.clone(),
     };
-    // Subset: `.`-rooted dot paths only; anything else fails closed with an
-    // empty list.
-    // TODO(parity): full jq language coverage beyond dot-path projection.
-    match jq_dot_path(prog.as_str(), &doc_value) {
-        Some(items) => capped_array(items),
-        None => capped_array(Vec::new()),
+    // The subset evaluates inline on the rule thread with cooperative
+    // stops: one deadline check per path segment plus the step budget.
+    // A stop returns `Null`, never a partial row.
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    match jq_dot_path_budgeted(prog.as_str(), &doc_value, deadline) {
+        JqEval::Values(items) => capped_array(items),
+        JqEval::Empty => capped_array(Vec::new()),
+        JqEval::Timeout => Value::Null,
     }
 }
 
@@ -2283,9 +2372,18 @@ fn func_hash(args: &[Value]) -> Value {
     let key = algo.trim().to_ascii_lowercase();
     match digest_hex(key.as_str(), data.as_bytes()) {
         Some(hex) => capped_string(hex),
-        // TODO(parity): sha3_*/blake2* families have no digest crate wired.
+        // Decided (D4): the sha3 and blake2 families have no digest crate
+        // wired; static literals are refused at rule creation and dynamic
+        // values fail closed here.
         None => Value::Null,
     }
+}
+
+/// True when `hash()` names a refused D4 algorithm (the sha3 and blake2
+/// families). The check ignores case and surrounding space.
+pub(crate) fn refused_hash_algorithm(algo: &str) -> bool {
+    let lower = algo.trim().to_ascii_lowercase();
+    lower.starts_with("sha3") || lower.starts_with("blake2")
 }
 
 fn func_hash_to_range(args: &[Value]) -> Value {
@@ -2418,6 +2516,12 @@ fn func_zip(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Null;
     }
+    // Fail fast on huge text. Copying past the cap wastes memory.
+    if let Some(Value::String(s)) = args.first() {
+        if s.len() > MAX_STDLIB_STRING_BYTES {
+            return Value::Null;
+        }
+    }
     let Some(raw) = bytes_arg(args, 0) else {
         return Value::Null;
     };
@@ -2439,7 +2543,13 @@ fn zlib_decode_input(args: &[Value]) -> Option<Vec<u8>> {
         return None;
     }
     match &args[0] {
-        Value::String(s) => b64_to_bytes(s).or_else(|| Some(s.as_bytes().to_vec())),
+        Value::String(s) => {
+            // Fail fast on huge text. Base64 text past this size decodes past the 4 MiB cap. Raw bytes past this size also exceed the cap.
+            if s.len() > MAX_STDLIB_STRING_BYTES * 4 * 4 / 3 + 4 {
+                return None;
+            }
+            b64_to_bytes(s).or_else(|| Some(s.as_bytes().to_vec()))
+        }
         _ => bytes_arg(args, 0),
     }
 }
@@ -2482,6 +2592,12 @@ fn func_zip_uncompress(args: &[Value]) -> Value {
 fn func_gzip(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Null;
+    }
+    // Fail fast on huge text. Copying past the cap wastes memory.
+    if let Some(Value::String(s)) = args.first() {
+        if s.len() > MAX_STDLIB_STRING_BYTES {
+            return Value::Null;
+        }
     }
     let Some(raw) = bytes_arg(args, 0) else {
         return Value::Null;
@@ -2526,6 +2642,12 @@ fn func_gunzip(args: &[Value]) -> Value {
 fn func_lz4_compress(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Null;
+    }
+    // Fail fast on huge text. Copying past the cap wastes memory.
+    if let Some(Value::String(s)) = args.first() {
+        if s.len() > MAX_STDLIB_STRING_BYTES {
+            return Value::Null;
+        }
     }
     let Some(raw) = bytes_arg(args, 0) else {
         return Value::Null;
@@ -3015,7 +3137,8 @@ fn func_date_to_unix_ts(args: &[Value]) -> Value {
         let off = match &args[1] {
             Value::String(s) => match timezone_offset_secs(s) {
                 Some(off) => off,
-                // TODO(parity): named-zone database is unsupported here.
+                // Decided (D4): named zones fail closed here; static
+                // literals are refused at rule creation.
                 None => return Value::Null,
             },
             other => match as_i64(other) {
@@ -3072,11 +3195,18 @@ fn func_timezone_to_offset(args: &[Value]) -> Value {
     let Some(tz) = args[0].as_str().map(str::to_string) else {
         return Value::Null;
     };
-    // TODO(parity): named-zone database is unsupported; fail closed.
+    // Decided (D4): the named-zone database is unsupported; named zones
+    // fail closed. Static literals are refused at rule creation.
     match timezone_offset_secs(&tz) {
         Some(off) => Value::from(off),
         None => Value::Null,
     }
+}
+
+/// True when a zone value needs the named-zone database (unsupported here).
+/// `Z`, `UTC` and fixed offsets return false; every other value is named.
+pub(crate) fn is_named_zone(zone: &str) -> bool {
+    timezone_offset_secs(zone).is_none()
 }
 
 fn func_mongo_date(args: &[Value]) -> Value {

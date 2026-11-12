@@ -251,10 +251,10 @@ pub use rocketmq::{
     classify_status as classify_rocketmq_status, decode_envelope as decode_rocketmq_envelope,
     encode_envelope as encode_rocketmq_envelope, fifo_partition, fnv1a_32,
     md5_hex as rocketmq_md5_hex, resolve_system_field as resolve_rocketmq_field,
-    signing_string as rocketmq_signing_string, MockRocketMqTransport, RocketMqConnector,
-    RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink,
-    RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
-    TcpRocketMqTransport, ENVELOPE_VERSION,
+    signing_string as rocketmq_signing_string, MockRocketMqTransport, RemotingRocketMqTransport,
+    RocketMqConnector, RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome,
+    RocketMqSink, RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
+    TcpRocketMqTransport, DEFAULT_BUFFER_CAPACITY, ENVELOPE_VERSION,
 };
 pub use snowflake::{
     build_jwt_assertion as build_snowflake_jwt,

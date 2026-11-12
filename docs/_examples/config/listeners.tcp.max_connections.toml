@@ -1,0 +1,28 @@
+[example]
+area = "config"
+item = "listeners.tcp.max_connections"
+kind = "setting"
+expect = "limited"
+expected = "With a cap of one, the first client connects and the second is closed."
+source = "`crates/broker-node/src/native.rs` closes a connection past the cap, and `crates/broker-api/src/v5/listeners.rs` stores the cap from the file."
+action = "Connect two clients with a cap of one."
+config = '''
+[listeners.tcp]
+max_connections = 1
+
+[auth]
+allow_anonymous = true
+'''
+script = '''
+from config_probe import *
+first, ack, props = connect("tcp-cap-first", v5=True)
+try:
+    second, ack2, props2 = connect("tcp-cap-second", v5=True)
+except Exception:
+    print("limited")
+else:
+    disconnect(second)
+    disconnect(first)
+    raise AssertionError("the second connection survived a cap of one")
+disconnect(first)
+'''

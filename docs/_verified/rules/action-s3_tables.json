@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "s3_tables"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-s3_tables",
+        "name": "dx2-action-s3_tables",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "s3_tables"
+      },
+      "name": "dx2-action-s3_tables",
+      "status": 201,
+      "type": "s3_tables"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-s3_tables\" already exists"
+      },
+      "name": "dx2-action-s3_tables",
+      "status": 400,
+      "type": "s3_tables"
+    }
+  ],
+  "item": "action-s3_tables",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

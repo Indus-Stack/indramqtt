@@ -1,0 +1,31 @@
+[example]
+area = "config"
+item = "node.brokerlink_bind"
+kind = "setting"
+expect = "no brokerlink socket"
+expected = "No socket listens on the configured address, and the kernel still serves MQTT."
+source = "`crates/broker-node/src/main.rs` warns about the deprecated setting and starts no edge socket."
+action = "Dial the configured address, then connect one MQTT client to the kernel."
+config = '''
+[node]
+brokerlink_bind = "127.0.0.1:${BROKERLINK_PORT}"
+'''
+display_config = '''
+[node]
+brokerlink_bind = "127.0.0.1:18883"
+'''
+script = '''
+from config_probe import *
+import os
+import socket
+port = int(os.environ["BROKERLINK_PORT"])
+try:
+    socket.create_connection(("127.0.0.1", port), timeout=1)
+except OSError:
+    pass
+else:
+    raise AssertionError("the deprecated brokerlink socket answered")
+sock, ack, props = connect("native-client", v5=True)
+disconnect(sock)
+print("no brokerlink socket")
+'''

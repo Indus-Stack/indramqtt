@@ -1,0 +1,1 @@
+`dbauth.mysql_url` names the MySQL source for database authentication. Empty disables the MySQL source. Any configured source disables the open mode. An unreachable database denies access and never grants it.

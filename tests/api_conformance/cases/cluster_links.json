@@ -1,0 +1,1 @@
+[{"body": null, "cleanup": [], "expect_status": 200, "operation": "GET /cluster/links", "path_params": {}, "query": {}, "setup": []}, {"body": {"name": "conf-mv15-link", "server": "127.0.0.1:1883"}, "cleanup": [], "expect_status": 400, "operation": "POST /cluster/links", "path_params": {}, "query": {}, "setup": []}]

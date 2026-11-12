@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "redshift"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-redshift",
+        "name": "dx2-action-redshift",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "redshift"
+      },
+      "name": "dx2-action-redshift",
+      "status": 201,
+      "type": "redshift"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-redshift\" already exists"
+      },
+      "name": "dx2-action-redshift",
+      "status": 400,
+      "type": "redshift"
+    }
+  ],
+  "item": "action-redshift",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "aws_timestream"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-aws_timestream",
+        "name": "dx2-action-aws_timestream",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "aws_timestream"
+      },
+      "name": "dx2-action-aws_timestream",
+      "status": 201,
+      "type": "aws_timestream"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-aws_timestream\" already exists"
+      },
+      "name": "dx2-action-aws_timestream",
+      "status": 400,
+      "type": "aws_timestream"
+    }
+  ],
+  "item": "action-aws_timestream",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

@@ -179,6 +179,12 @@ async fn mcp_client_proof() {
     for tool in body["result"]["tools"].as_array().expect("tools array") {
         assert!(tool["inputSchema"].is_object(), "{tool}");
         assert!(tool["annotations"]["readOnlyHint"].is_boolean(), "{tool}");
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{tool}"
+        );
     }
 
     // tools/list of a named set gives that set plus list_toolsets.

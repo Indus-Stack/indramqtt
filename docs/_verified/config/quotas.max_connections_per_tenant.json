@@ -1,0 +1,9 @@
+{
+  "action": "Connect two clients with the same username and a cap of one.",
+  "config": "[quotas]\nmax_connections_per_tenant = 1\nmax_sessions_per_tenant = 0\nmax_retained_per_tenant = 0\n\n[[tenants.rules]]\nexpression = \"t-${username}\"\n",
+  "item": "quotas.max_connections_per_tenant",
+  "kind": "setting",
+  "output": "limited",
+  "returncode": 0,
+  "verified": true
+}

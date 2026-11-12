@@ -1,0 +1,9 @@
+{
+  "action": "Read the node list with `GET /api/v5/nodes` and check the directory.",
+  "config": "[node]\ndata_dir = \"docs-data\"\n",
+  "item": "node.data_dir",
+  "kind": "setting",
+  "output": "docs-data",
+  "returncode": 0,
+  "verified": true
+}

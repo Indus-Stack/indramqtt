@@ -1,0 +1,21 @@
+[example]
+area = "connectors"
+item = "pgsql"
+kind = "connector-create"
+
+[[case]]
+name = "pgsql-normal"
+server = "127.0.0.1:5432"
+database = "telemetry"
+username = "indra_loader"
+password = "secret"
+expect_status = 201
+expect_type = "pgsql"
+
+[[case]]
+name = "pgsql-edge-empty-server"
+server = ""
+database = "telemetry"
+username = "indra_loader"
+password = "secret"
+expect_status = 400

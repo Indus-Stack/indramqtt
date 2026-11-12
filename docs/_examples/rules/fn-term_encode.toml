@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-term_encode"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT term_encode(42) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "42"}'
+
+[[case]]
+sql = "SELECT term_encode(true) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "true"}'
+
+[[case]]
+sql = "SELECT term_encode() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

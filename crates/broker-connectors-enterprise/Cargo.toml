@@ -204,8 +204,12 @@ couchbase = ["dep:couchbase"]
 mongodb = ["dep:mongodb"]
 gcp_pubsub = ["dep:google-cloud-pubsub", "dep:google-cloud-gax"]
 kinesis = ["dep:aws-sdk-kinesis"]
+opc_ua = []
 
 [dev-dependencies]
 axum = { workspace = true }
 apache-avro = { version = "0.15" }
 broker-rules = { workspace = true }
+# Qual only: the rocketmq qual drives both production entries.
+# Reason: the qual must fail when either entry breaks.
+broker-api = { workspace = true }

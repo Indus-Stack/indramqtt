@@ -42,6 +42,7 @@
     "greptime",
     "greptimedb",
     "http",
+    "influx",
     "influxdb",
     "iotdb",
     "kafka",

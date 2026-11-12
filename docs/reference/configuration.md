@@ -29,7 +29,7 @@ flowchart LR
 
 > **Note:** The Restart column stays empty unless the code proves that a reload applies the setting. Deprecated settings are marked as such in the Description column and carry no restart value.
 
-Each setting owns one entry below with a verified example line. Each example line sits in the group file of its section. The drift test loads each group file through the production loader. The docs run boots each group file.
+Each setting owns one entry below. An entry with a verified example shows the configuration, the action and the output. An entry with a failure record shows the not-verified callout. The verification runner writes each record from its run.
 
 | Setting | Type | Default | Range | Description | Restart |
 |---|---|---|---|---|---|
@@ -103,11 +103,11 @@ Each setting owns one entry below with a verified example line. Each example lin
 | `auth.allow_anonymous` | bool | `false` | true \| false | Whether anonymous connections are accepted while no users are configured. |  |
 | `auth.superusers` | string list | `["admin", "root"]` | 0..=100 entries | Superuser usernames bypassing ACL rules. |  |
 | **cluster** | | | | | |
-| `cluster.enabled` | bool | `false` | true \| false | Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only. |  |
+| `cluster.enabled` | bool | `false` | false only | Refused clustering switch. The broker fails boot when true. |  |
 | `cluster.bind` | socket address string | `"127.0.0.1:19883"` | valid host:port, port 1..=65535 | Cluster SWIM UDP bind address for peer discovery and membership. |  |
 | `cluster.gossip_bind` | socket address string | `"0.0.0.0:7946"` | valid host:port, port 1..=65535 | Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only. |  |
 | `cluster.quic_bind` | socket address string | `"0.0.0.0:9092"` | valid host:port, port 1..=65535 | Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only. |  |
-| `cluster.seed_nodes` | string list | `[]` | 0..=64 entries, each host:port | Seed node addresses to join an existing cluster. |  |
+| `cluster.seed_nodes` | string list | `[]` | must stay empty | Refused seed list. The broker fails boot when not empty. |  |
 | **licence** | | | | | |
 | `licence.license_file` | path string | `"/etc/indramqtt/license.key"` | any path; empty means none installed | Path to the enterprise cryptographic license key file. |  |
 | `licence.license_key` | string | `""` | any string; empty means use stored token or environment | Enterprise commercial license key for multi-node clustering. |  |
@@ -192,7 +192,7 @@ Each setting owns one entry below with a verified example line. Each example lin
 
 ## Settings in detail
 
-Each entry names one setting with its verified example line.
+Each entry names one setting. A verified entry carries an example.
 
 ## `node`
 
@@ -200,42 +200,18 @@ Name the node. Point state at a directory.
 
 ### `node.id`
 
-Unique identifier for this broker node within the cluster.
-
-Type: `string`. Default: `"indra-node-1"`. Range: `1..=64 chars, letters/digits/dots/dashes`. Restart: `not proven`.
-
-Example: `id = "doc-node-1"` in the `[node]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `node.data_dir`
 
-Directory holding kernel persistent state (state.toml). Created on boot when missing.
-
-Type: `path string`. Default: `"./data"`. Range: `non-empty path`. Restart: `not proven`.
-
-Example: `data_dir = "./data"` (the default); the boot file omits it; the test pin sets an absolute path.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `node.brokerlink_bind`
 
-Deprecated. Ignored. The kernel serves clients directly.
-
-Type: `socket address string`. Default: `"127.0.0.1:18883"`. Range: `any string, ignored`. Restart: `not proven`.
-
-Example: `brokerlink_bind = "127.0.0.1:18883"` in the `[node]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -253,471 +229,1199 @@ Open the MQTT, WebSocket and API sockets.
 
 ### `listeners.tcp.enabled`
 
-Whether the plaintext MQTT listener accepts connections.
+`listeners.tcp.enabled` switches the plaintext MQTT listener on. Set it to false to close the TCP socket. The API still answers when MQTT is off.
+
+The default is true.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[listeners.tcp]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+enabled = false
+
+[auth]
+allow_anonymous = true
+```
+
+Action:
+
+```text
+Stop the TCP listener and dial the MQTT port.
+```
+
+Captured output:
+
+```output
+refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.bind`
 
-Bind address for the plaintext MQTT listener.
+`listeners.tcp.bind` sets the bind address of the plaintext MQTT listener. Use loopback for local clients only.
+
+The default is `0.0.0.0:1883`.
 
 Type: `socket address string`. Default: `"0.0.0.0:1883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:1883"` in the `[listeners.tcp]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+bind = "127.0.0.1:1883"
+```
+
+Action:
+
+```text
+Connect one client to the configured bind.
+```
+
+Captured output:
+
+```output
+connected
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.max_connections`
 
-Maximum concurrent connections on the plaintext MQTT listener.
+`listeners.tcp.max_connections` caps concurrent connections on the plaintext listener. The kernel closes a new connection past the cap. The same cap also sizes the TLS, WS and WSS rows.
+
+The default is 1000000.
 
 Type: `u32`. Default: `1000000`. Range: `1..=10000000`. Restart: `not proven`.
 
-Example: `max_connections = 500000` in the `[listeners.tcp]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+max_connections = 1
+
+[auth]
+allow_anonymous = true
+```
+
+Action:
+
+```text
+Connect two clients with a cap of one.
+```
+
+Captured output:
+
+```output
+limited
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.backlog`
 
-Listener accept backlog for the plaintext MQTT listener.
-
-Type: `u32`. Default: `1024`. Range: `1..=65536`. Restart: `not proven`.
-
-Example: `backlog = 2048` in the `[listeners.tcp]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `listeners.tcp.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.tcp.native` is deprecated. The kernel ignores the value and always serves the listener. Boot logs a warning when a file sets it.
+
+The default is false.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.tcp]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+native = true
+
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+```
+
+Action:
+
+```text
+Set the deprecated flag and connect one client.
+```
+
+Captured output:
+
+```output
+ignored
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.enabled`
 
-Whether the secure TLS MQTT listener accepts connections.
+`listeners.tls.enabled` enables the secure MQTT listener. The default `false` keeps the port closed. Set `true` with a certificate and a key. The broker then accepts TLS handshakes on `listeners.tls.bind`. Boot fails when the certificate or the key is missing and PSK is off.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = false` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client with a username and a password, then read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+tls-serves
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.bind`
 
-Bind address for the secure TLS MQTT listener.
+`listeners.tls.bind` sets the address of the secure MQTT listener. The default is `0.0.0.0:8883`. Use `127.0.0.1:8883` to keep the port on loopback. Boot fails when the value is not a valid host and port.
 
 Type: `socket address string`. Default: `"0.0.0.0:8883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:8883"` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client to the configured bind, then read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+bind=127.0.0.1:28883
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.cert_file`
 
-Path to the PEM server certificate for the TLS listener.
+`listeners.tls.cert_file` points to the PEM server certificate. The listener needs it when `enabled` is true and PSK is off. The file must hold at least one certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when TLS is enabled`. Restart: `not proven`.
 
-Example: `cert_file = ""` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run a TLS handshake against the secure listener and read the served certificate.
+```
+
+Captured output:
+
+```output
+server-cn=localhost
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.key_file`
 
-Path to the PEM private key for the TLS listener.
+`listeners.tls.key_file` points to the PEM private key. The listener needs it when `enabled` is true and PSK is off. The key must match the certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when TLS is enabled`. Restart: `not proven`.
 
-Example: `key_file = ""` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client with a username and a password, then read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+tls-key-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.tls.native` does nothing. The kernel always serves this listener. Leave the default `false`. The broker boots with either value. The listener behavior never changes.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+native = true
+```
+
+Action:
+
+```text
+Connect one plaintext client and read `GET /api/v5/listeners/ssl:default`.
+```
+
+Captured output:
+
+```output
+native-ignored
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.psk_enabled`
 
-Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.
+`listeners.tls.psk_enabled` switches the TLS listener to pre-shared-key mode. The default `false` keeps certificate handshakes unchanged. With `true`, the broker boots with no certificate.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `psk_enabled = false` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+psk_enabled = true
+```
+
+Action:
+
+```text
+Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.
+```
+
+Captured output:
+
+```output
+psk-no-cert-boot
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.psk_keys_file`
 
-Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.
+`listeners.tls.psk_keys_file` names the PSK identity file. The default `""` keeps the path empty. Set it only when PSK is on. The broker boots with the empty path.
 
 Type: `path string`. Default: `""`. Range: `file path; empty means no identities`. Restart: `not proven`.
 
-Example: `psk_keys_file = ""` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+psk_enabled = true
+psk_keys_file = ""
+```
+
+Action:
+
+```text
+Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.
+```
+
+Captured output:
+
+```output
+psk-empty-store
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.verify_client_cert`
 
-Whether the TLS listener requests and verifies a client certificate.
+`listeners.tls.verify_client_cert` asks clients for a certificate. The default `false` keeps handshakes unchanged. With `true`, the listener needs `cacertfile`. A missing certificate is refused at the bind. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `verify_client_cert = false` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify_client_cert = true
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+verify-legacy-refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.verify`
 
-Client certificate chain check mode of the TLS listener.
+`listeners.tls.verify` sets the chain check mode. `verify_none` checks nothing. `verify_peer` checks the chain against `cacertfile`. Any other value fails boot.
 
 Type: `string`. Default: `"verify_none"`. Range: `verify_none | verify_peer`. Restart: `not proven`.
 
-Example: `verify = "verify_none"` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+verify-peer-optional-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.cacertfile`
 
-CA file for client certificate checks of the TLS listener.
+`listeners.tls.cacertfile` points to the CA file for client checks. The listener needs it when verification is on. The file must hold at least one CA certificate. Boot fails when it is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when client verification is on`. Restart: `not proven`.
 
-Example: `cacertfile = ""` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Connect one TLS client with a valid certificate and one with a foreign certificate.
+```
+
+Captured output:
+
+```output
+ca-anchors-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.fail_if_no_peer_cert`
 
-Whether the TLS listener refuses a handshake without a certificate.
+`listeners.tls.fail_if_no_peer_cert` refuses handshakes without a certificate. It needs verification on. Without verification, boot fails. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `fail_if_no_peer_cert = false` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+fail_if_no_peer_cert = true
+```
+
+Action:
+
+```text
+Connect one TLS client without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+no-cert-refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.peer_cert_as_username`
 
-Source for the bind username from the client certificate.
+`listeners.tls.peer_cert_as_username` takes the bind username from the client certificate. `disabled` keeps the CONNECT username. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_username = "disabled"` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_username = "cn"
+```
+
+Action:
+
+```text
+Connect one TLS client with a valid certificate and a foreign username, then read the client detail.
+```
+
+Captured output:
+
+```output
+username=k1-05-a
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.peer_cert_as_clientid`
 
-Source for the bind client identifier from the client certificate.
+`listeners.tls.peer_cert_as_clientid` takes the bind client identifier from the client certificate. `disabled` keeps the CONNECT identifier. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_clientid = "disabled"` in the `[listeners.tls]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_clientid = "cn"
+```
+
+Action:
+
+```text
+Connect one TLS client with a valid certificate and an ignored identifier, then read the client detail.
+```
+
+Captured output:
+
+```output
+clientid=k1-05-a
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.enabled`
 
-Whether the MQTT-over-WebSocket listener accepts connections.
+`listeners.ws.enabled` switches the WebSocket listener on. Set it to false to close the WebSocket socket. Plain MQTT still serves when WebSocket is off.
+
+The default is true.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[listeners.ws]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+enabled = false
+bind = "127.0.0.1:8083"
+```
+
+Action:
+
+```text
+Stop the WebSocket listener and dial its port.
+```
+
+Captured output:
+
+```output
+refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.bind`
 
-Bind address for the MQTT-over-WebSocket listener.
+`listeners.ws.bind` sets the bind address of the WebSocket listener. Use loopback for local clients only.
+
+The default is `0.0.0.0:8083`.
 
 Type: `socket address string`. Default: `"0.0.0.0:8083"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:8083"` in the `[listeners.ws]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+bind = "127.0.0.1:8083"
+```
+
+Action:
+
+```text
+Run the WebSocket upgrade on the configured bind.
+```
+
+Captured output:
+
+```output
+ws-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.path`
 
-HTTP path serving MQTT-over-WebSocket traffic.
+`listeners.ws.path` sets the HTTP path of the WebSocket listener. The upgrade must name this path. A wrong path gets 404.
+
+The default is `/mqtt`.
 
 Type: `string`. Default: `"/mqtt"`. Range: `must start with '/'`. Restart: `not proven`.
 
-Example: `path = "/mqtt"` in the `[listeners.ws]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+bind = "127.0.0.1:8083"
+path = "/docs-mqtt"
+```
+
+Action:
+
+```text
+Run the upgrade on the configured path and on a wrong path.
+```
+
+Captured output:
+
+```output
+path-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.ws.native` is deprecated. The kernel ignores the value and always serves the listener. Boot logs a warning when a file sets it.
+
+The default is false.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.ws]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+native = true
+bind = "127.0.0.1:8083"
+```
+
+Action:
+
+```text
+Set the deprecated flag and run the upgrade.
+```
+
+Captured output:
+
+```output
+ignored
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.enabled`
 
-Whether the secure WebSocket listener accepts connections.
+`listeners.wss.enabled` enables the secure WebSocket listener. The default `false` keeps the port closed. Set `true` with a certificate and a key. The broker then accepts TLS WebSocket handshakes on `listeners.wss.bind`. Boot fails when the certificate or the key is missing.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = false` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade, then read `GET /api/v5/listeners/wss:default`.
+```
+
+Captured output:
+
+```output
+wss-serves
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.bind`
 
-Bind address for the secure WebSocket listener.
+`listeners.wss.bind` sets the address of the secure WebSocket listener. The default is `0.0.0.0:8084`. Use `127.0.0.1:8084` to keep the port on loopback. Boot fails when the value is not a valid host and port.
 
 Type: `socket address string`. Default: `"0.0.0.0:8084"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:8084"` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade on the configured bind, then read `GET /api/v5/listeners/wss:default`.
+```
+
+Captured output:
+
+```output
+bind=127.0.0.1:28884
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.path`
 
-HTTP path serving secure WebSocket traffic.
+`listeners.wss.path` sets the HTTP path of the secure WebSocket listener. The default is `/mqtt`. The path must start with `/`. A handshake on another path fails.
 
 Type: `string`. Default: `"/mqtt"`. Range: `must start with '/'`. Restart: `not proven`.
 
-Example: `path = "/mqtt"` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+path = "/docs-mqtt"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade on the configured path.
+```
+
+Captured output:
+
+```output
+path=/docs-mqtt
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.cert_file`
 
-Path to the PEM server certificate for the secure WebSocket listener.
+`listeners.wss.cert_file` points to the PEM server certificate. The listener needs it when `enabled` is true. The file must hold at least one certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when secure WebSocket is enabled`. Restart: `not proven`.
 
-Example: `cert_file = ""` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run a TLS handshake against the secure WebSocket listener and read the served certificate.
+```
+
+Captured output:
+
+```output
+server-cn=localhost
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.key_file`
 
-Path to the PEM private key for the secure WebSocket listener.
+`listeners.wss.key_file` points to the PEM private key. The listener needs it when `enabled` is true. The key must match the certificate. Boot fails when the file is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when secure WebSocket is enabled`. Restart: `not proven`.
 
-Example: `key_file = ""` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+```
+
+Action:
+
+```text
+Run one secure WebSocket upgrade, then send MQTT CONNECT and read CONNACK.
+```
+
+Captured output:
+
+```output
+wss-mqtt-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.verify_client_cert`
 
-Whether the secure WebSocket listener requests and verifies a client certificate.
+`listeners.wss.verify_client_cert` asks clients for a certificate. The default `false` keeps handshakes unchanged. With `true`, the listener needs `cacertfile`. A missing certificate is refused at the bind. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `verify_client_cert = false` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify_client_cert = true
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Upgrade one secure WebSocket client without a certificate and one with a valid certificate, then send MQTT CONNECT on each.
+```
+
+Captured output:
+
+```output
+verify-legacy-refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.verify`
 
-Client certificate chain check mode of the secure WebSocket listener.
+`listeners.wss.verify` sets the chain check mode. `verify_none` checks nothing. `verify_peer` checks the chain against `cacertfile`. Any other value fails boot.
 
 Type: `string`. Default: `"verify_none"`. Range: `verify_none | verify_peer`. Restart: `not proven`.
 
-Example: `verify = "verify_none"` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Upgrade one secure WebSocket client without a certificate and one with a valid certificate, then send MQTT CONNECT on each.
+```
+
+Captured output:
+
+```output
+verify-peer-optional-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.cacertfile`
 
-CA file for client certificate checks of the secure WebSocket listener.
+`listeners.wss.cacertfile` points to the CA file for client checks. The listener needs it when verification is on. The file must hold at least one CA certificate. Boot fails when it is missing or empty.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when client verification is on`. Restart: `not proven`.
 
-Example: `cacertfile = ""` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+```
+
+Action:
+
+```text
+Run one secure upgrade with a valid certificate and one with a foreign certificate.
+```
+
+Captured output:
+
+```output
+ca-anchors-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.fail_if_no_peer_cert`
 
-Whether the secure WebSocket listener refuses a handshake without a certificate.
+`listeners.wss.fail_if_no_peer_cert` refuses handshakes without a certificate. It needs verification on. Without verification, boot fails. A client with a valid certificate still connects.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `fail_if_no_peer_cert = false` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+fail_if_no_peer_cert = true
+```
+
+Action:
+
+```text
+Run one secure upgrade without a certificate and one with a valid certificate.
+```
+
+Captured output:
+
+```output
+no-cert-refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.peer_cert_as_username`
 
-Source for the bind username from the client certificate.
+`listeners.wss.peer_cert_as_username` takes the bind username from the client certificate. `disabled` keeps the CONNECT username. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_username = "disabled"` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_username = "cn"
+```
+
+Action:
+
+```text
+Connect one secure WebSocket client with a valid certificate and a foreign username, then read the client detail.
+```
+
+Captured output:
+
+```output
+username=k1-05-a
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.peer_cert_as_clientid`
 
-Source for the bind client identifier from the client certificate.
+`listeners.wss.peer_cert_as_clientid` takes the bind client identifier from the client certificate. `disabled` keeps the CONNECT identifier. `cn` uses the common name. It needs verification on.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_clientid = "disabled"` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+peer_cert_as_clientid = "cn"
+```
+
+Action:
+
+```text
+Connect one secure WebSocket client with a valid certificate and an ignored identifier, then read the client detail.
+```
+
+Captured output:
+
+```output
+clientid=k1-05-a
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.wss.native` does nothing. The kernel always serves this listener. Leave the default `false`. The broker boots with either value. The listener behavior never changes.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.wss]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.wss]
+native = true
+```
+
+Action:
+
+```text
+Connect one plaintext client and read `GET /api/v5/listeners/wss:default`.
+```
+
+Captured output:
+
+```output
+native-ignored
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.api.enabled`
 
-Whether the management REST API and dashboard serve requests.
-
-Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
-
-Example: `enabled = true` in the `[listeners.api]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `listeners.api.bind`
 
-Bind address for the management REST API. Empty disables the API.
+`listeners.api.bind` sets the bind address of the management API.
+
+The default is `0.0.0.0:18083`.
 
 Type: `socket address string`. Default: `"0.0.0.0:18083"`. Range: `valid host:port, port 1..=65535; empty disables the API`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:18083"` in the `[listeners.api]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.api]
+bind = "127.0.0.1:18083"
+```
+
+Action:
+
+```text
+Read the health endpoint on the configured bind.
+```
+
+Captured output:
+
+```output
+api-bind-ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -777,81 +1481,126 @@ Cap connections, sessions and publish rates.
 
 ### `quotas.default_max_connections`
 
-Default max connections per authenticated username (0 = unlimited).
-
-Type: `u32`. Default: `10000`. Range: `0..=1000000 (0 = unlimited opt-in)`. Restart: `not proven`.
-
-Example: `default_max_connections = 5000` in the `[quotas]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `quotas.max_connections_per_tenant`
 
-Default max live connections per tenant (0 = unlimited).
+`quotas.max_connections_per_tenant` caps live connections in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. The default tenant holds no bound. The default is 0, which means unlimited.
 
 Type: `u32`. Default: `0`. Range: `0..=1000000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `max_connections_per_tenant = 100` in the `[quotas]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[quotas]
+max_connections_per_tenant = 1
+max_sessions_per_tenant = 0
+max_retained_per_tenant = 0
+
+[[tenants.rules]]
+expression = "t-${username}"
+```
+
+Action:
+
+```text
+Connect two clients with the same username and a cap of one.
+```
+
+Captured output:
+
+```output
+limited
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.max_sessions_per_tenant`
 
-Default max sessions per tenant (0 = unlimited).
+`quotas.max_sessions_per_tenant` caps sessions in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. The default tenant holds no bound. The default is 0, which means unlimited.
 
 Type: `u32`. Default: `0`. Range: `0..=100000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `max_sessions_per_tenant = 100` in the `[quotas]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[quotas]
+max_connections_per_tenant = 0
+max_sessions_per_tenant = 1
+max_retained_per_tenant = 0
+
+[[tenants.rules]]
+expression = "t-${username}"
+```
+
+Action:
+
+```text
+Connect two client ids with the same username and a cap of one.
+```
+
+Captured output:
+
+```output
+limited
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.max_retained_per_tenant`
 
-Default max retained topics per tenant (0 = unlimited).
+`quotas.max_retained_per_tenant` caps retained topics in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. Past the cap, new topics drop while delivery continues. The default is 0, which means unlimited.
 
 Type: `u32`. Default: `0`. Range: `0..=100000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `max_retained_per_tenant = 100` in the `[quotas]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[quotas]
+max_connections_per_tenant = 0
+max_sessions_per_tenant = 0
+max_retained_per_tenant = 1
+
+[[tenants.rules]]
+expression = "t-${username}"
+```
+
+Action:
+
+```text
+Publish two retained topics with one username and read the retained count.
+```
+
+Captured output:
+
+```output
+retained=1
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.default_max_publish_rate`
 
-Default token-bucket publish rate limit in messages per second (0 = unlimited).
-
-Type: `u32`. Default: `50000`. Range: `0..=10000000 msg/s (0 = unlimited opt-in)`. Restart: `not proven`.
-
-Example: `default_max_publish_rate = 10000` in the `[quotas]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `quotas.burst_multiplier`
 
-Token bucket burst multiplier (allows bursts up to burst times rate).
-
-Type: `f64`. Default: `2.0`. Range: `1.0..=10.0`. Restart: `not proven`.
-
-Example: `burst_multiplier = 3.0` in the `[quotas]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -873,120 +1622,48 @@ Bound queues, windows and packet sizes.
 
 ### `session.max_session_expiry_secs`
 
-Max session expiry interval in seconds.
-
-Type: `u64`. Default: `86400`. Range: `0..=2592000 seconds (0 = unlimited opt-in)`. Restart: `not proven`.
-
-Example: `max_session_expiry_secs = 3600` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_offline_queue`
 
-Maximum queued offline messages per session.
-
-Type: `u32`. Default: `50000`. Range: `1..=1000000`. Restart: `not proven`.
-
-Example: `max_offline_queue = 10000` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_inflight_messages`
 
-Maximum inflight unacknowledged QoS 1 and QoS 2 messages.
-
-Type: `u32`. Default: `65535`. Range: `1..=65535`. Restart: `not proven`.
-
-Example: `max_inflight_messages = 10000` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_qos0_backlog`
 
-Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.
-
-Type: `usize`. Default: `1000`. Range: `1..=100000`. Restart: `not proven`.
-
-Example: `max_qos0_backlog = 2000` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.keep_alive_grace`
 
-Keep-alive grace multiplier before disconnect.
-
-Type: `f64`. Default: `1.5`. Range: `1.0..=5.0`. Restart: `not proven`.
-
-Example: `keep_alive_grace = 2.0` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_qos1_inflight`
 
-Per-session QoS 1 inflight window bound.
-
-Type: `usize`. Default: `100`. Range: `1..=100000`. Restart: `not proven`.
-
-Example: `max_qos1_inflight = 50` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_qos1_spill`
 
-Per-session QoS 1 spill bound past the window.
-
-Type: `usize`. Default: `1000`. Range: `1..=100000`. Restart: `not proven`.
-
-Example: `max_qos1_spill = 500` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.topic_alias_maximum`
 
-Inbound topic-alias maximum advertised in CONNACK.
-
-Type: `u16`. Default: `10`. Range: `0..=65535`. Restart: `not proven`.
-
-Example: `topic_alias_maximum = 5` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_packet_size`
 
-Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.
-
-Type: `u32`. Default: `1048576`. Range: `1..=268435455`. Restart: `not proven`.
-
-Example: `max_packet_size = 1048576` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1011,16 +1688,8 @@ Set kernel log verbosity.
 
 ### `logging.level`
 
-Logging verbosity for the kernel (trace, debug, info, warn, error).
-
-Type: `enum string`. Default: `"info"`. Range: `trace | debug | info | warn | error`. Restart: `not proven`.
-
-Example: `level = "warn"` in the `[logging]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1037,42 +1706,104 @@ Size the rule ingress buffer.
 
 ### `rules_engine.window_channel_depth`
 
-Ingress ring buffer channel depth for stateful window worker tasks.
+`rules_engine.window_channel_depth` sets the ingress ring buffer channel depth for stateful window worker tasks.
+
+The broker accepts values from 1 to 1000000. The default is 65536.
+Read the live value from `GET /api/v1/nodes`.
 
 Type: `u32`. Default: `65536`. Range: `1..=1000000`. Restart: `not proven`.
 
-Example: `window_channel_depth = 32768` in the `[rules_engine]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[rules_engine]
+window_channel_depth = 1024
+```
+
+Action:
+
+```text
+Start the broker with a custom channel depth and read the live depth from `GET /api/v1/nodes`.
+```
+
+Captured output:
+
+```output
+depth=1024
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `rules_engine.backpressure_policy`
 
-Default memory backpressure policy when the rule buffer is full.
+`rules_engine.backpressure_policy` sets the default memory backpressure policy when the rule buffer is full. The values are Block, DropNewest, DropOldest, SpillToDisk and RejectPublisher.
+
+The default is DropOldest.
+Read the live value from `GET /api/v1/nodes`.
 
 Type: `enum string`. Default: `"DropOldest"`. Range: `Block | DropNewest | DropOldest | SpillToDisk | RejectPublisher`. Restart: `not proven`.
 
-Example: `backpressure_policy = "DropOldest"` in the `[rules_engine]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[rules_engine]
+backpressure_policy = "Block"
+```
+
+Action:
+
+```text
+Start the broker with a backpressure policy and read the live policy from `GET /api/v1/nodes`.
+```
+
+Captured output:
+
+```output
+policy=Block
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `rules_engine.spill_dir`
 
-Rule ingress spill directory.
+`rules_engine.spill_dir` sets the rule ingress spill directory. Empty keeps memory-only delivery. Set a directory to spill rule ingress to disk.
+
+The default is empty.
 
 Type: `string`. Default: `""`. Range: `empty or directory path`. Restart: `not proven`.
 
-Example: `spill_dir = ""` in the `[rules_engine]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[rules_engine]
+spill_dir = "/tmp/docs-spill"
+```
+
+Action:
+
+```text
+Start the broker with a spill directory and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1095,12 +1826,10 @@ Whether authentication checks apply to client connects.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `auth.password_hash`
 
@@ -1108,12 +1837,10 @@ Password hashing algorithm for stored credentials.
 
 Type: `enum string`. Default: `"sha256"`. Range: `sha256 | bcrypt`. Restart: `not proven`.
 
-Example: `password_hash = "sha256"` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `auth.allow_anonymous`
 
@@ -1121,12 +1848,10 @@ Whether anonymous connections are accepted while no users are configured.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `allow_anonymous = false` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `auth.superusers`
 
@@ -1134,12 +1859,10 @@ Superuser usernames bypassing ACL rules.
 
 Type: `string list`. Default: `["admin", "root"]`. Range: `0..=100 entries`. Restart: `not proven`.
 
-Example: `superusers = ["admin", "root"]` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1159,71 +1882,170 @@ Join nodes into one cluster.
 
 ### `cluster.enabled`
 
-Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.
+`cluster.enabled` switches clustering on. The only accepted value is false. Setting it to true refuses boot.
 
-Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+The broker starts in single-node mode when clustering is off. The default is false.
 
-Example: `enabled = false` in the `[cluster]` table of the group file below.
+Type: `bool`. Default: `false`. Range: `false only`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+enabled = false
+```
+
+Action:
+
+```text
+Start the broker and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- The broker stores this value. It does not apply it.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `cluster.bind`
 
-Cluster SWIM UDP bind address for peer discovery and membership.
+`cluster.bind` sets the cluster SWIM UDP bind address for peer discovery and membership. The broker stores the address.
+
+Clustering binds from `--cluster-bind` only when clustering is on. The default is `127.0.0.1:19883`.
 
 Type: `socket address string`. Default: `"127.0.0.1:19883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "127.0.0.1:19883"` in the `[cluster]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+bind = "127.0.0.1:19983"
+```
+
+Action:
+
+```text
+Start the broker with a cluster bind address and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `cluster.gossip_bind`
 
-Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.
+`cluster.gossip_bind` sets the gossip bind address. The broker stores the address. It binds clustering from `--cluster-bind` only.
+
+The default is `0.0.0.0:7946`.
 
 Type: `socket address string`. Default: `"0.0.0.0:7946"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `gossip_bind = "0.0.0.0:7946"` in the `[cluster]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+gossip_bind = "127.0.0.1:7996"
+```
+
+Action:
+
+```text
+Start the broker with a gossip bind address and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
+- A wrong type fails validation.
 - The broker stores this value. It does not apply it.
-- Related settings sit in the same group file.
+- Related settings sit in the same group.
 
 ### `cluster.quic_bind`
 
-Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.
+`cluster.quic_bind` sets the data plane bind address. The broker stores the address. It binds clustering from `--cluster-bind` only.
+
+The default is `0.0.0.0:9092`.
 
 Type: `socket address string`. Default: `"0.0.0.0:9092"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `quic_bind = "0.0.0.0:9092"` in the `[cluster]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+quic_bind = "127.0.0.1:9992"
+```
+
+Action:
+
+```text
+Start the broker with a data plane bind address and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
+- A wrong type fails validation.
 - The broker stores this value. It does not apply it.
-- Related settings sit in the same group file.
+- Related settings sit in the same group.
 
 ### `cluster.seed_nodes`
 
-Seed node addresses to join an existing cluster.
+`cluster.seed_nodes` lists seed nodes for clustering. The broker refuses boot when the list is not empty.
 
-Type: `string list`. Default: `[]`. Range: `0..=64 entries, each host:port`. Restart: `not proven`.
+The list must stay empty. The default is an empty list.
 
-Example: `seed_nodes = []` in the `[cluster]` table of the group file below.
+Type: `string list`. Default: `[]`. Range: `must stay empty`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+seed_nodes = []
+```
+
+Action:
+
+```text
+Start the broker with an empty seed list and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1244,81 +2066,61 @@ Install and monitor the commercial licence.
 
 ### `licence.license_file`
 
-Path to the enterprise cryptographic license key file.
-
-Type: `path string`. Default: `"/etc/indramqtt/license.key"`. Range: `any path; empty means none installed`. Restart: `not proven`.
-
-Example: `license_file = "/etc/indramqtt/license.key"` in the `[licence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.license_key`
 
-Enterprise commercial license key for multi-node clustering.
-
-Type: `string`. Default: `""`. Range: `any string; empty means use stored token or environment`. Restart: `not proven`.
-
-Example: `license_key = ""` in the `[licence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.trusted_keys_path`
 
-Trusted licence-signing keys: a JSON file or directory of JSON files.
-
-Type: `path string`. Default: `""`. Range: `JSON file or directory; empty trusts nothing`. Restart: `not proven`.
-
-Example: `trusted_keys_path = ""` in the `[licence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.request_out`
 
-Write the installation licence request to this path and exit.
-
-Type: `path string`. Default: `""`. Range: `any path; empty disables request generation`. Restart: `not proven`.
-
-Example: `request_out = ""` in the `[licence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.install_file`
 
-Install the licence token read from this path and exit.
-
-Type: `path string`. Default: `""`. Range: `any path; empty disables licence installation`. Restart: `not proven`.
-
-Example: `install_file = ""` in the `[licence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.expiry_warn_days`
 
-Days before expiry that the approaching-expiry alarm and log warning start.
+`licence.expiry_warn_days` sets the days before expiry that the approaching-expiry alarm and log warning start. It applies to the trial and to licensed expiry alike.
+
+The value is 0 to 365 days. The default is 30.
 
 Type: `u64`. Default: `30`. Range: `0..=365 days`. Restart: `not proven`.
 
-Example: `expiry_warn_days = 7` in the `[licence]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[licence]
+expiry_warn_days = 7
+```
+
+Action:
+
+```text
+Start the broker with custom warning days, call `GET /api/v1/licence/status`, and check `expiry_warn_days`.
+```
+
+Captured output:
+
+```output
+expiry_warn_days=7
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1344,12 +2146,10 @@ Whether the MCP endpoint on the management listener serves tool calls.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[mcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `mcp.read_only`
 
@@ -1357,12 +2157,10 @@ Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay 
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `read_only = false` in the `[mcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1380,16 +2178,8 @@ Expose the CoAP gateway.
 
 ### `gateway.coap_bind`
 
-CoAP gateway UDP listen address. Empty disables the gateway.
-
-Type: `socket address string`. Default: `""`. Range: `empty disables the gateway, else valid host:port`. Restart: `not proven`.
-
-Example: `coap_bind = ""` in the `[gateway]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1406,16 +2196,8 @@ Journal publishes to disk.
 
 ### `persistence.stream_dir`
 
-Durable stream journal directory. Empty disables journaling.
-
-Type: `path string`. Default: `""`. Range: `any directory; empty disables journaling`. Restart: `not proven`.
-
-Example: `stream_dir = ""` in the `[persistence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1436,12 +2218,10 @@ Directory server URL for LDAP authentication. Empty disables LDAP.
 
 Type: `string`. Default: `""`. Range: `empty disables LDAP, else ldap:// or ldaps:// URL`. Restart: `not proven`.
 
-Example: `server_url = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.base_dn`
 
@@ -1449,12 +2229,10 @@ Base DN under which directory users are searched.
 
 Type: `string`. Default: `""`. Range: `any DN; required when LDAP is enabled`. Restart: `not proven`.
 
-Example: `base_dn = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.bind_dn`
 
@@ -1462,12 +2240,10 @@ Service account DN used for the initial bind plus search.
 
 Type: `string`. Default: `""`. Range: `any DN`. Restart: `not proven`.
 
-Example: `bind_dn = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.bind_password`
 
@@ -1475,12 +2251,10 @@ Service account password for the initial bind.
 
 Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
 
-Example: `bind_password = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.user_filter`
 
@@ -1488,12 +2262,10 @@ User search filter with a {username} placeholder, escaped per RFC 4515.
 
 Type: `string`. Default: `"(uid={username})"`. Range: `must contain {username} when LDAP is enabled`. Restart: `not proven`.
 
-Example: `user_filter = "(uid={username})"` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.group_attribute`
 
@@ -1501,12 +2273,10 @@ User-entry attribute listing directory groups.
 
 Type: `string`. Default: `"memberOf"`. Range: `non-empty when LDAP is enabled`. Restart: `not proven`.
 
-Example: `group_attribute = "memberOf"` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.required_group`
 
@@ -1514,12 +2284,10 @@ Required group DN: the entry must list this DN to connect.
 
 Type: `string`. Default: `""`. Range: `any DN; empty disables the group check`. Restart: `not proven`.
 
-Example: `required_group = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.ca_cert_path`
 
@@ -1527,12 +2295,10 @@ Path to a PEM CA certificate for private directories.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; empty uses system roots`. Restart: `not proven`.
 
-Example: `ca_cert_path = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.pool_size`
 
@@ -1540,12 +2306,10 @@ Bound on concurrent directory authentications.
 
 Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
 
-Example: `pool_size = 4` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.connect_timeout_ms`
 
@@ -1553,12 +2317,10 @@ Timeout covering TCP connect plus TLS handshake.
 
 Type: `u64`. Default: `5000`. Range: `100..=60000 ms`. Restart: `not proven`.
 
-Example: `connect_timeout_ms = 3000` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.read_timeout_ms`
 
@@ -1566,12 +2328,10 @@ Timeout covering each directory bind/search round-trip.
 
 Type: `u64`. Default: `5000`. Range: `100..=60000 ms`. Restart: `not proven`.
 
-Example: `read_timeout_ms = 3000` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1602,12 +2362,10 @@ Keytab file for Kerberos authentication. Empty disables Kerberos.
 
 Type: `path string`. Default: `""`. Range: `keytab v2 file; empty disables Kerberos`. Restart: `not proven`.
 
-Example: `keytab_path = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.service_principal`
 
@@ -1615,12 +2373,10 @@ Service principal name held in the keytab.
 
 Type: `string`. Default: `""`. Range: `required when Kerberos is enabled`. Restart: `not proven`.
 
-Example: `service_principal = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.realm`
 
@@ -1628,12 +2384,10 @@ Expected service realm. Empty disables the realm check on the service name.
 
 Type: `string`. Default: `""`. Range: `any realm; empty disables the realm check`. Restart: `not proven`.
 
-Example: `realm = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.allowed_realms`
 
@@ -1641,12 +2395,10 @@ Trusted client realms. Empty allows any realm that verifies.
 
 Type: `string list`. Default: `[]`. Range: `0..=32 entries`. Restart: `not proven`.
 
-Example: `allowed_realms = []` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.clock_skew_secs`
 
@@ -1654,12 +2406,10 @@ Clock-skew allowance in seconds for ticket validity and authenticator timestamps
 
 Type: `u64`. Default: `300`. Range: `1..=3600 seconds`. Restart: `not proven`.
 
-Example: `clock_skew_secs = 120` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.role_map`
 
@@ -1667,12 +2417,10 @@ Comma-separated principal=role mappings for verified client principals.
 
 Type: `string`. Default: `""`. Range: `comma-separated principal=role pairs; empty leaves every principal at user`. Restart: `not proven`.
 
-Example: `role_map = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.replay_max_entries`
 
@@ -1680,12 +2428,10 @@ Replay-cache bound for Kerberos authenticators.
 
 Type: `usize`. Default: `1024`. Range: `16..=8192`. Restart: `not proven`.
 
-Example: `replay_max_entries = 512` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1708,16 +2454,8 @@ Bound delayed message deferrals.
 
 ### `delayed.max_secs`
 
-Upper bound for delayed deferrals in seconds.
-
-Type: `u64`. Default: `86400`. Range: `1..=86400`. Restart: `not proven`.
-
-Example: `max_secs = 3600` in the `[delayed]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1734,16 +2472,8 @@ Set the monitor sampling interval.
 
 ### `observability.monitor_sample_secs`
 
-Monitor sampling interval in seconds.
-
-Type: `u64`. Default: `10`. Range: `0..=3600`. Restart: `not proven`.
-
-Example: `monitor_sample_secs = 5` in the `[observability]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1760,133 +2490,82 @@ Check JWT clients against an endpoint.
 
 ### `jwks.url`
 
-JWKS endpoint URL for JWT authentication.
+`jwks.url` names the JWKS endpoint for JWT authentication. Empty disables JWT authentication. The broker enables the JWT path only for `https://` URLs. JWT-shaped passwords verify against this endpoint. An unreachable endpoint denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or https URL`. Restart: `not proven`.
 
-Example: `url = ""` in the `[jwks]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[jwks]
+url = "https://127.0.0.1:9/jwks.json"
+```
+
+Action:
+
+```text
+Connect anonymously and with a JWT-shaped password while the JWKS endpoint stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.issuer`
 
-Expected JWT issuer.
-
-Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
-
-Example: `issuer = ""` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.audience`
 
-Expected JWT audience.
-
-Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
-
-Example: `audience = ""` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.refresh_period_secs`
 
-Seconds between background JWKS refreshes.
-
-Type: `u64`. Default: `300`. Range: `1..=86400`. Restart: `not proven`.
-
-Example: `refresh_period_secs = 120` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.fetch_timeout_ms`
 
-Timeout for one JWKS fetch in milliseconds.
-
-Type: `u64`. Default: `5000`. Range: `100..=60000`. Restart: `not proven`.
-
-Example: `fetch_timeout_ms = 3000` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.refresh_timeout_ms`
 
-Longest a CONNECT waits for a JWKS refresh in milliseconds.
-
-Type: `u64`. Default: `5000`. Range: `100..=60000`. Restart: `not proven`.
-
-Example: `refresh_timeout_ms = 3000` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.cache_max_keys`
 
-Most JWKS keys held in the cache.
-
-Type: `usize`. Default: `32`. Range: `1..=256`. Restart: `not proven`.
-
-Example: `cache_max_keys = 16` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.cache_ttl_secs`
 
-Seconds a cached JWKS key stays valid.
-
-Type: `u64`. Default: `300`. Range: `1..=86400`. Restart: `not proven`.
-
-Example: `cache_ttl_secs = 120` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.clock_skew_secs`
 
-Clock skew tolerated when checking token times, in seconds.
-
-Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
-
-Example: `clock_skew_secs = 30` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.ca_cert`
 
-Extra CA certificate trusted for the JWKS endpoint.
-
-Type: `string`. Default: `""`. Range: `empty or path to a PEM file`. Restart: `not proven`.
-
-Example: `ca_cert = ""` in the `[jwks]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1912,120 +2591,197 @@ Check passwords against a database.
 
 ### `dbauth.postgres_url`
 
-PostgreSQL URL for database authentication.
+`dbauth.postgres_url` names the PostgreSQL source for database authentication. Empty disables the PostgreSQL source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `postgres_url = ""` in the `[dbauth]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the PostgreSQL source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.mysql_url`
 
-MySQL URL for database authentication.
+`dbauth.mysql_url` names the MySQL source for database authentication. Empty disables the MySQL source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `mysql_url = ""` in the `[dbauth]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+mysql_url = "mysql://docs:docs@127.0.0.1:9/docs"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the MySQL source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.redis_url`
 
-Redis URL for database authentication.
+`dbauth.redis_url` names the Redis source for database authentication. Empty disables the Redis source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `redis_url = ""` in the `[dbauth]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+redis_url = "redis://127.0.0.1:9/0"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the Redis source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.mongodb_url`
 
-MongoDB URL for database authentication.
+`dbauth.mongodb_url` names the MongoDB source for database authentication. Empty disables the MongoDB source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `mongodb_url = ""` in the `[dbauth]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+mongodb_url = "mongodb://127.0.0.1:9/docs"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the MongoDB source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.pool_size`
 
-Connections kept per authentication database.
+`dbauth.pool_size` sets the connections kept per authentication database. The default is 8. The range is 1 to 32. The broker logs the value at boot when a database source is set.
 
 Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
 
-Example: `pool_size = 4` in the `[dbauth]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "info"
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+pool_size = 4
+```
+
+Action:
+
+```text
+Boot with four pooled connections and a PostgreSQL source, read the boot log, and connect anonymously.
+```
+
+Captured output:
+
+```output
+pool-logged anonymous-refused
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.connect_timeout_ms`
 
-Timeout for connecting to an authentication database in milliseconds.
-
-Type: `u64`. Default: `3000`. Range: `100..=60000`. Restart: `not proven`.
-
-Example: `connect_timeout_ms = 2000` in the `[dbauth]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `dbauth.read_timeout_ms`
 
-Timeout for one authentication lookup in milliseconds.
-
-Type: `u64`. Default: `3000`. Range: `100..=60000`. Restart: `not proven`.
-
-Example: `read_timeout_ms = 2000` in the `[dbauth]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `dbauth.cache_size`
 
-Cached database verdicts per source; 0 disables the cache.
-
-Type: `usize`. Default: `1024`. Range: `0..=100000`. Restart: `not proven`.
-
-Example: `cache_size = 512` in the `[dbauth]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `dbauth.cache_ttl_secs`
 
-Seconds a cached database verdict stays valid.
-
-Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
-
-Example: `cache_ttl_secs = 30` in the `[dbauth]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -2050,94 +2806,100 @@ Ask a webhook for verdicts.
 
 ### `webhook.url`
 
-HTTP webhook verdict endpoint.
+`webhook.url` names the verdict endpoint for webhook authentication and authorization. Empty disables the webhook. Any configured endpoint disables the open mode. An unreachable endpoint denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `url = ""` in the `[webhook]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the webhook endpoint stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.pool_size`
 
-Concurrent requests allowed to the webhook endpoint.
-
-Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
-
-Example: `pool_size = 4` in the `[webhook]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.timeout_ms`
 
-Timeout for one webhook request in milliseconds.
-
-Type: `u64`. Default: `2000`. Range: `100..=60000`. Restart: `not proven`.
-
-Example: `timeout_ms = 3000` in the `[webhook]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.breaker_threshold`
 
-Consecutive webhook failures that open the circuit breaker.
+`webhook.breaker_threshold` sets the consecutive failures that open the circuit breaker. The default is 5. The range is 1 to 100. An open breaker refuses without network use.
 
 Type: `u32`. Default: `5`. Range: `1..=100`. Restart: `not proven`.
 
-Example: `breaker_threshold = 3` in the `[webhook]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+breaker_threshold = 3
+```
+
+Action:
+
+```text
+Deny three CONNECTs with a password and read the circuit-open line in the boot log.
+```
+
+Captured output:
+
+```output
+breaker-open credential-denied
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.breaker_reset_ms`
 
-Milliseconds an open circuit breaker waits before retrying the webhook.
-
-Type: `u64`. Default: `30000`. Range: `1000..=600000`. Restart: `not proven`.
-
-Example: `breaker_reset_ms = 15000` in the `[webhook]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.cache_size`
 
-Cached webhook verdicts; 0 disables the cache.
-
-Type: `usize`. Default: `1024`. Range: `0..=100000`. Restart: `not proven`.
-
-Example: `cache_size = 512` in the `[webhook]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.cache_ttl_secs`
 
-Seconds a cached webhook verdict stays valid.
-
-Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
-
-Example: `cache_ttl_secs = 30` in the `[webhook]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -2160,172 +2922,432 @@ Shape the metrics exposition.
 
 ### `prometheus.enable_basic_auth`
 
-Require credentials on the scrape endpoints.
+`prometheus.enable_basic_auth` sets the scrape auth flag. The broker stores the flag and shows it in `GET /api/v5/prometheus`. It does not change scrape auth.
+
+The default is true.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enable_basic_auth = true` in the `[prometheus]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus]
+enable_basic_auth = false
+```
+
+Action:
+
+```text
+Start the broker with the flag off and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+basic_auth=false
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.latency_buckets`
 
-Latency histogram buckets for the exposition.
+`prometheus.latency_buckets` sets the latency bucket list text. The broker stores the text and shows it in `GET /api/v5/prometheus`. No histogram reads it.
+
+The default is `10ms, 100ms, 1s, 5s, 30s`.
 
 Type: `string`. Default: `"10ms, 100ms, 1s, 5s, 30s"`. Range: `comma-separated durations`. Restart: `not proven`.
 
-Example: `latency_buckets = "10ms, 100ms, 1s, 5s, 30s"` in the `[prometheus]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus]
+latency_buckets = "5ms, 50ms"
+```
+
+Action:
+
+```text
+Start the broker with a custom bucket list and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+buckets=5ms, 50ms
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.enable`
 
-Stored push intent. The broker runs no push client.
+`prometheus.push_gateway.enable` sets the push intent flag. The broker stores the flag and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is false.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enable = false` in the `[prometheus.push_gateway]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+enable = true
+```
+
+Action:
+
+```text
+Start the broker with push intent on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_enable=true
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.url`
 
-Push target URL for the exposition.
+`prometheus.push_gateway.url` sets the push target URL text. The broker stores the text and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is `http://127.0.0.1:9091`.
 
 Type: `string`. Default: `"http://127.0.0.1:9091"`. Range: `http(s) URL`. Restart: `not proven`.
 
-Example: `url = "http://127.0.0.1:9091"` in the `[prometheus.push_gateway]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+url = "http://127.0.0.1:9092"
+```
+
+Action:
+
+```text
+Start the broker with a custom push URL and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_url=9092
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.interval`
 
-Push interval for the exposition.
+`prometheus.push_gateway.interval` sets the push interval text. The broker stores the text and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is `15s`.
 
 Type: `string`. Default: `"15s"`. Range: `duration text`. Restart: `not proven`.
 
-Example: `interval = "15s"` in the `[prometheus.push_gateway]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+interval = "30s"
+```
+
+Action:
+
+```text
+Start the broker with a custom push interval and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_interval=30s
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.job_name`
 
-Job name template for each push.
+`prometheus.push_gateway.job_name` sets the push job name template. The broker stores the template and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is `${name}/instance/${name}~${host}`.
 
 Type: `string`. Default: `"${name}/instance/${name}~${host}"`. Range: `template text`. Restart: `not proven`.
 
-Example: `job_name = "${name}/instance/${name}~${host}"` in the `[prometheus.push_gateway]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+job_name = "docs-push-job"
+```
+
+Action:
+
+```text
+Start the broker with a custom job name and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_job=docs-push-job
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.method`
 
-Push method for the exposition.
+`prometheus.push_gateway.method` sets the push method. The broker stores the value and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The value is `put` or `post`. The default is `put`.
 
 Type: `string`. Default: `"put"`. Range: `put | post`. Restart: `not proven`.
 
-Example: `method = "put"` in the `[prometheus.push_gateway]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+method = "post"
+```
+
+Action:
+
+```text
+Start the broker with method post and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_method=post
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.mnesia`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.mnesia` sets the store collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `mnesia = "disabled"` in the `[prometheus.collectors]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+mnesia = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+mnesia=enabled
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_dist`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_dist` sets the distribution collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_dist = "disabled"` in the `[prometheus.collectors]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_dist = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_dist=enabled
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_memory`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_memory` sets the memory collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_memory = "disabled"` in the `[prometheus.collectors]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_memory = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_memory=enabled
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_msacc`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_msacc` sets the microstate collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_msacc = "disabled"` in the `[prometheus.collectors]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_msacc = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_msacc=enabled
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_statistics`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_statistics` sets the statistics collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_statistics = "disabled"` in the `[prometheus.collectors]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_statistics = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_statistics=enabled
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_system_info`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_system_info` sets the system collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_system_info = "disabled"` in the `[prometheus.collectors]` table of the group file below.
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_system_info = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_system_info=enabled
+```
 
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.

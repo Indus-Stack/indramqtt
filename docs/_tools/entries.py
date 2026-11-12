@@ -14,7 +14,13 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --write --area rules
   python3 docs/_tools/entries.py --check --area rules
   python3 docs/_tools/entries.py --coverage --area rules
-  python3 docs/_tools/entries.py --write --area rules-functions
+   python3 docs/_tools/entries.py --write --area rules-actions-a
+   python3 docs/_tools/entries.py --check --area rules-actions-a
+    python3 docs/_tools/entries.py --write --area rules-actions-b
+    python3 docs/_tools/entries.py --check --area rules-actions-b
+    python3 docs/_tools/entries.py --write --area rules-actions-c
+    python3 docs/_tools/entries.py --check --area rules-actions-c
+   python3 docs/_tools/entries.py --write --area rules-functions
   python3 docs/_tools/entries.py --check --area rules-functions
   python3 docs/_tools/entries.py --write --area rules-math-bitwise
   python3 docs/_tools/entries.py --write --area rules-bits-bytes
@@ -23,6 +29,16 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-type-conversion
   python3 docs/_tools/entries.py --write --area rules-type-checks
   python3 docs/_tools/entries.py --check --area rules-type-checks
+  python3 docs/_tools/entries.py --write --area rules-arrays
+  python3 docs/_tools/entries.py --check --area rules-arrays
+  python3 docs/_tools/entries.py --write --area rules-hashing
+  python3 docs/_tools/entries.py --check --area rules-hashing
+  python3 docs/_tools/entries.py --write --area rules-compression
+  python3 docs/_tools/entries.py --check --area rules-compression
+   python3 docs/_tools/entries.py --write --area rules-state
+   python3 docs/_tools/entries.py --check --area rules-state
+   python3 docs/_tools/entries.py --write --area rules-events
+   python3 docs/_tools/entries.py --check --area rules-events
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -327,8 +343,9 @@ def rules_stem(kind, name):
     Clauses and operators own short stems (clause-select, op-and).
     Later waves add function, action and event stems. The rulebook
     does not decide the shape, so this mapping is the choice:
-    lowercase, spaces to dashes (TODO(parity): keep one shape
-    across every DX2 task).
+    lowercase, spaces to dashes. Event stems also replace `$events/`
+    with `events-` and drop any other `$` or `/`, so each stem is
+    one flat file name (DX2-018 keeps one shape across every task).
     """
     slug = name.lower().replace(" ", "-")
     if kind == "clause":
@@ -339,6 +356,7 @@ def rules_stem(kind, name):
         return "fn-" + slug
     if kind == "action":
         return "action-" + slug
+    slug = slug.replace("$events/", "events-").replace("$", "").replace("/", "-")
     return "event-" + slug
 
 
@@ -378,6 +396,22 @@ RULES_SYNTAX = {
     "op-in": "`<value> IN (<member> [, ...])`",
     "op-like": "`<text> LIKE '<pattern>'` with `%` and `_`",
     "op-not": "`NOT <test>`, `NOT BETWEEN`, `NOT IN`, `NOT LIKE`",
+    # DX2-018 event stems: one FROM source per inventory name.
+    "event-events-client_check_authz_complete": '`FROM "$events/client_check_authz_complete"`',
+    "event-events-client_connack": '`FROM "$events/client_connack"`',
+    "event-events-client_connected": '`FROM "$events/client_connected"`',
+    "event-events-client_disconnected": '`FROM "$events/client_disconnected"`',
+    "event-events-delivery_dropped": '`FROM "$events/delivery_dropped"`',
+    "event-events-message_acked": '`FROM "$events/message_acked"`',
+    "event-events-message_delivered": '`FROM "$events/message_delivered"`',
+    "event-events-message_dropped": '`FROM "$events/message_dropped"`',
+    "event-events-message_publish": '`FROM "$events/message_publish"` (no producer fires it)',
+    "event-events-no_such_event": '`FROM "$events/no_such_event"` (no producer fires it)',
+    "event-events-session_subscribed": '`FROM "$events/session_subscribed"`',
+    "event-events-session_unsubscribed": '`FROM "$events/session_unsubscribed"`',
+    "event-description": "`FROM description` (a bare stream name, not an event)",
+    "event-event": "`FROM event` (a bare stream name, not an event)",
+    "event-message_publish": "`FROM message_publish` (a bare stream name, not an event)",
 }
 
 # Extra note lines per DX2-001 stem. Each states an observed limit.
@@ -399,6 +433,67 @@ RULES_NOTES = {
     ],
     "op-in": [
         "An empty list matches nothing.",
+    ],
+    # DX2-018 event stems. Each states an observed fact about the source.
+    "event-events-client_check_authz_complete": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row omits `retain` for a subscribe check.",
+    ],
+    "event-events-client_connack": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the answer code in `return_code`.",
+    ],
+    "event-events-client_connected": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the connect arguments `keepalive`, `proto_ver` and `clean_start`.",
+    ],
+    "event-events-client_disconnected": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row omits `disconnect_code` when the edge sends none.",
+    ],
+    "event-events-delivery_dropped": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The kernel fires it at route failure for dead connections.",
+    ],
+    "event-events-message_acked": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the packet id in `msg_id`.",
+    ],
+    "event-events-message_delivered": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the delivered bytes in `payload`.",
+    ],
+    "event-events-message_dropped": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The kernel fires it at quota shed and at detached clean sessions.",
+    ],
+    "event-events-message_publish": [
+        "`GET /api/v1/rules/sources` omits this name.",
+        "No kernel producer fires it. A rule that names it never runs in production.",
+    ],
+    "event-events-no_such_event": [
+        "`GET /api/v1/rules/sources` omits this name.",
+        "No kernel producer fires it. A rule that names it never runs in production.",
+    ],
+    "event-events-session_subscribed": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the subscribe options `nl`, `rap` and `rh`.",
+    ],
+    "event-events-session_unsubscribed": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the filter in `topic`.",
+    ],
+    "event-description": [
+        "This name selects no event.",
+        "As a bare stream name it constrains nothing. The rule matches every message.",
+    ],
+    "event-event": [
+        "This name selects no event.",
+        "As a bare stream name it constrains nothing. The rule matches every message.",
+    ],
+    "event-message_publish": [
+        "This name selects no event.",
+        "As a bare stream name it constrains nothing. The rule matches every message.",
     ],
 }
 
@@ -668,6 +763,141 @@ def render_rules_page():
             f"operator {operator}", rules_stem("operator", operator)
         )
     out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-018 event entries: produced sources first,
+# then inventory names that select no event.
+RULES_EVENT_ORDER = [
+    "$events/client_check_authz_complete",
+    "$events/client_connack",
+    "$events/client_connected",
+    "$events/client_disconnected",
+    "$events/delivery_dropped",
+    "$events/message_acked",
+    "$events/message_delivered",
+    "$events/message_dropped",
+    "$events/session_subscribed",
+    "$events/session_unsubscribed",
+]
+
+# Inventory names that select no event (DX2-018).
+RULES_EVENT_NON_SOURCES = [
+    "$events/message_publish",
+    "$events/no_such_event",
+    "description",
+    "event",
+    "message_publish",
+]
+
+
+def render_rules_events_page():
+    """Render the rule events page (DX2-018)."""
+    out = [
+        "---",
+        "title: Rule events",
+        "description: Verified entries for each rule event source.",
+        "sidebar:",
+        "  order: 57",
+        "---",
+        "",
+        "# Rule events",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An event source turns a broker event into one rule row. A "
+        "connect, a subscribe, a delivery and a drop each fire one row. "
+        "Use this page when a rule must react to the broker itself and "
+        "not to a message. You get one entry per inventory name, each "
+        "with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Con["CONNECT :1883"] -- "bind" --> Eng["rule engine"]',
+                '    Sub["SUBSCRIBE"] -- "subscribe" --> Eng',
+                '    Pub["PUBLISH"] -- "fan-out or drop" --> Eng',
+                '    Eng -- "fire event record" --> Rec["$events/... row"]',
+                '    Rec -- "FROM event source" --> Sel["SELECT shape"]',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "Name the source in `FROM`. The kernel fires the source on the "
+        "publish-path drain. An event source never matches an MQTT "
+        "message. The engine drops such a message before evaluation. "
+        "The docs run checks source selection only through "
+        "`POST /api/v1/rules/test`. No client connects during the run.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- List the live sources with `GET /api/v1/rules/sources`.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Events",
+        "",
+        "| Event | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_EVENT_ORDER:
+        stem = rules_stem("event", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` fires one row per broker event."
+        out.append(f"| `{name}` | {first} |")
+    out += [
+        "",
+        "## Names that select no event",
+        "",
+        "These inventory names select no event. A `$events/...` name "
+        "here has no producer. A bare name here is a stream and "
+        "constrains nothing.",
+        "",
+        "| Name | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_EVENT_NON_SOURCES:
+        stem = rules_stem("event", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` selects no event."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Events in detail", ""]
+    for name in RULES_EVENT_ORDER:
+        out += render_rules_entry(f"event {name}", rules_stem("event", name))
+    out += ["## Names that select no event in detail", ""]
+    for name in RULES_EVENT_NON_SOURCES:
+        out += render_rules_entry(f"event {name}", rules_stem("event", name))
+    out += [
+        "## Check that it works",
+        "",
+        "Dry-run one event source and one miss:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own values.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"sql_query": "SELECT clientid FROM \\"$events/client_connected\\"", "topic": "$events/client_connected", "payload": {"clientid": "sensor-1"}}\' \\',
+        "  http://127.0.0.1:18083/api/v1/rules/test",
+        "```",
+        "",
+        "The answer is `matched: true` with "
+        "`projected: {\"clientid\": \"sensor-1\"}`. The same call with "
+        "`\"topic\": \"sensors/kitchen\"` answers `matched: false`.",
+        "",
         "## Next steps",
         "",
         "- Write the query with [Rule SQL](./sql.md).",
@@ -1351,15 +1581,1351 @@ def render_rules_type_checks_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-009 function entries (arrays).
+RULES_ARRAY_FUNCTIONS = [
+    "nth",
+    "length",
+    "sublist",
+    "first",
+    "last",
+    "contains",
+    "std_length",
+]
+
+# One signature line per DX2-009 stem, taken from the broker code.
+RULES_ARRAY_SYNTAX = {
+    "fn-nth": "`nth(<n>, <list>)`",
+    "fn-length": "`length(<value>)`",
+    "fn-sublist": "`sublist(<len>, <list>)` or `sublist(<start>, <len>, <list>)`",
+    "fn-first": "`first(<list>)`",
+    "fn-last": "`last(<list>)`",
+    "fn-contains": "`contains(<element>, <list>)`",
+    "fn-std_length": "`std_length(<value>)`",
+}
+
+# Extra note lines per DX2-009 stem. Each states an observed limit.
+RULES_ARRAY_NOTES = {
+    "fn-nth": [
+        "The position counts from 1. A position below 1 and a position past the end return an empty text, not null.",
+        "A value that is not a list returns null. A wrong argument count returns null.",
+    ],
+    "fn-length": [
+        "A list returns its element count; a text returns its character count. Any other value returns null.",
+        "The engine rewrites `length` to `std_length` before it parses the query, so the standard semantics apply.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-sublist": [
+        "The two-argument form takes the first `len` elements. The three-argument form counts from 1 and clamps at the end of the list.",
+        "A negative count, or a `start` below 1, returns null. A wrong argument count returns null.",
+    ],
+    "fn-first": [
+        "An empty list returns null. A value that is not a list returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-last": [
+        "An empty list returns null. A value that is not a list returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-contains": [
+        "The argument order is `(element, list)`.",
+        "Equality is strict: the integer `1` and the float `1.0` are different values.",
+        "A value that is not a list returns null. A wrong argument count returns null.",
+    ],
+    "fn-std_length": [
+        "The call reads the same as `length`.",
+        "A list returns its element count; a text returns its character count. Any other value returns null.",
+        "A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_arrays_page():
+    """Render the array function page (DX2-009)."""
+    out = [
+        "---",
+        "title: Rule functions: arrays",
+        "description: Verified entries for the array functions.",
+        "sidebar:",
+        "  order: 50",
+        "---",
+        "",
+        "# Rule functions: arrays",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An array function reads or changes a JSON list. It returns an "
+        "element, a shorter list, a count, or a boolean. Use this page "
+        "when a rule must pick or measure a field that holds a list. You "
+        "get one entry per function, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    In["list value"] -- "nth or first or last" --> El["element"]',
+                '    In -- "length or std_length" --> N["count"]',
+                '    In -- "sublist" --> Slice["shorter list"]',
+                '    El -- "SELECT AS" --> Sel["result column"]',
+                '    N -- "SELECT AS" --> Sel',
+                '    Slice -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value that is not a list "
+        "reads as null where the function needs a list. A null value "
+        "never stops the rule. The `length` row also counts the "
+        "characters of a text.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ARRAY_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` reads a list."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_ARRAY_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_ARRAY_SYNTAX,
+            RULES_ARRAY_NOTES,
+            "`{name}` reads a list.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-010 function entries (hashing).
+RULES_HASHING_FUNCTIONS = [
+    "sha",
+    "hash",
+    "hash_to_range",
+    "map_to_range",
+]
+
+# One signature line per DX2-010 stem, taken from the broker code.
+RULES_HASHING_SYNTAX = {
+    "fn-sha": "`sha(<s>)`",
+    "fn-hash": "`hash(<algo>, <data>)`",
+    "fn-hash_to_range": "`hash_to_range(<key>, <min>, <max>)`",
+    "fn-map_to_range": "`map_to_range(<value>, <min>, <max>)`",
+}
+
+# Extra note lines per DX2-010 stem. Each states an observed limit.
+RULES_HASHING_NOTES = {
+    "fn-sha": [
+        "The digest is SHA-1 in lower-case hex. An empty text returns the empty digest.",
+        "A null value returns null. A wrong argument count returns null.",
+    ],
+    "fn-hash": [
+        "The name ignores case and edge space. Supported names are `md5`, `sha`, `sha1`, `sha224`, `sha256`, `sha384` and `sha512`.",
+        "Any other name fails closed. A null value returns null. A wrong argument count returns null.",
+    ],
+    "fn-hash_to_range": [
+        "The broker hashes the key with SHA-256 and returns `min` plus the remainder modulo the span (`max` minus `min` plus one).",
+        "An empty key, a non-text key, or a `min` above `max` returns null. A wrong argument count returns null.",
+    ],
+    "fn-map_to_range": [
+        "A number maps by its value modulo the span (`max` minus `min` plus one). A text maps by its first 16 bytes as an unsigned big-endian number modulo the span.",
+        "An empty text, a value that is not a number or text, or a `min` above `max` returns null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_hashing_page():
+    """Render the hashing function page (DX2-010)."""
+    out = [
+        "---",
+        "title: Rule functions: hashing",
+        "description: Verified entries for the hashing functions.",
+        "sidebar:",
+        "  order: 51",
+        "---",
+        "",
+        "# Rule functions: hashing",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A hashing function digests a value or maps a key into a range. "
+        "Use this page when a rule must hash a field or pick a shard. You "
+        "get one entry per function, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Txt["text value"] -- "sha or hash" --> Hex["hex digest"]',
+                '    Key["text key"] -- "hash_to_range" --> N["integer in range"]',
+                '    Val["number or text"] -- "map_to_range" --> M["integer in range"]',
+                '    Hex -- "SELECT AS" --> Sel["result column"]',
+                '    N -- "SELECT AS" --> Sel',
+                '    M -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value the call cannot "
+        "use reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_HASHING_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` hashes a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_HASHING_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_HASHING_SYNTAX,
+            RULES_HASHING_NOTES,
+            "`{name}` hashes a value.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-011 function entries (compression).
+RULES_COMPRESSION_FUNCTIONS = [
+    "zip",
+    "unzip",
+    "gzip",
+    "gunzip",
+    "zip_compress",
+    "zip_uncompress",
+    "lz4_compress",
+    "lz4_uncompress",
+]
+
+# One signature line per DX2-011 stem, taken from the broker code.
+RULES_COMPRESSION_SYNTAX = {
+    "fn-zip": "`zip(<v>)`",
+    "fn-unzip": "`unzip(<s>)`",
+    "fn-gzip": "`gzip(<v>)`",
+    "fn-gunzip": "`gunzip(<s>)`",
+    "fn-zip_compress": "`zip_compress(<v>)`",
+    "fn-zip_uncompress": "`zip_uncompress(<s>)`",
+    "fn-lz4_compress": "`lz4_compress(<v>)`",
+    "fn-lz4_uncompress": "`lz4_uncompress(<s>)`",
+}
+
+# Extra note lines per DX2-011 stem. Each states an observed limit.
+RULES_COMPRESSION_NOTES = {
+    "fn-zip": [
+        "The result is base64 text of the zlib bytes. Decode it with `unzip(<s>)`.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-unzip": [
+        "The call accepts base64 text first and raw bytes next. A base64 string of zlib bytes returns the source text.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+    "fn-gzip": [
+        "The result is base64 text of the gzip bytes. Decode it with `gunzip(<s>)`.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-gunzip": [
+        "The call accepts base64 text first and raw bytes next. A base64 string of gzip bytes returns the source text.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+    "fn-zip_compress": [
+        "The call is an alias of `zip(<v>)`. The wire form is the same base64 zlib text.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-zip_uncompress": [
+        "The call is an alias of `unzip(<s>)`. It accepts base64 text first and raw bytes next.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+    "fn-lz4_compress": [
+        "The result is base64 text of the LZ4 frame bytes. Decode it with `lz4_uncompress(<s>)`.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-lz4_uncompress": [
+        "The call accepts base64 text first and raw bytes next. An empty input reads as null.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_compression_page():
+    """Render the compression function page (DX2-011)."""
+    out = [
+        "---",
+        "title: Rule functions: compression",
+        "description: Verified entries for the compression functions.",
+        "sidebar:",
+        "  order: 52",
+        "---",
+        "",
+        "# Rule functions: compression",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A compression function shrinks a value for transport and restores "
+        "it on read. Use this page when a rule must pack a field before it "
+        "forwards it. You get one entry per function, each with a run "
+        "against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Txt["text value"] -- "zip or gzip or lz4_compress" --> B64["base64 bytes"]',
+                '    B64 -- "unzip or gunzip or lz4_uncompress" --> Back["source text"]',
+                '    B64 -- "SELECT AS" --> Sel["result column"]',
+                '    Back -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value the call cannot "
+        "use reads as null. A null value never stops the rule. Each "
+        "compress call returns base64 text. Each expand call returns text.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_COMPRESSION_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` packs a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_COMPRESSION_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_COMPRESSION_SYNTAX,
+            RULES_COMPRESSION_NOTES,
+            "`{name}` packs a value.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-014 function entries (rule state).
+RULES_STATE_FUNCTIONS = [
+    "proc_dict_get",
+    "proc_dict_put",
+    "proc_dict_del",
+    "kv_store_get",
+    "kv_store_put",
+    "kv_store_del",
+]
+
+# One signature line per DX2-014 stem, taken from the broker code.
+RULES_STATE_SYNTAX = {
+    "fn-proc_dict_get": "`proc_dict_get(<key>)`",
+    "fn-proc_dict_put": "`proc_dict_put(<key>, <value>)`",
+    "fn-proc_dict_del": "`proc_dict_del(<key>)`",
+    "fn-kv_store_get": "`kv_store_get(<key> [, <default>])`",
+    "fn-kv_store_put": "`kv_store_put(<key>, <value>)`",
+    "fn-kv_store_del": "`kv_store_del(<key>)`",
+}
+
+# Extra note lines per DX2-014 stem. Each states an observed limit.
+# TODO(parity, DX2-014): Check tenant scope. The code keys the shared
+# map by key only. One tenant may read the key of another tenant.
+RULES_STATE_NOTES = {
+    "fn-proc_dict_get": [
+        "The map is rule-local. One rule cannot read the slot of another rule.",
+        "A missing key reads as null. A wrong argument count returns null.",
+    ],
+    "fn-proc_dict_put": [
+        "The test entry never writes. It returns null and keeps the old state.",
+        "A key longer than 4096 characters reads as null. The map holds 10000 entries at most.",
+        "A put past the cap returns null. A wrong argument count returns null.",
+    ],
+    "fn-proc_dict_del": [
+        "The test entry never deletes. It returns null and keeps the old state.",
+        "A missing key reads as null. A wrong argument count returns null.",
+    ],
+    "fn-kv_store_get": [
+        "The map is node-global. All rules share the same map.",
+        "A missing key without a default reads as null. A missing key with a default returns the default.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-kv_store_put": [
+        "The test entry never writes. It returns null and keeps the old state.",
+        "A key longer than 4096 characters reads as null. The map holds 10000 entries at most.",
+        "A put past the cap returns null. A wrong argument count returns null.",
+    ],
+    "fn-kv_store_del": [
+        "The test entry never deletes. It returns null and keeps the old state.",
+        "A missing key reads as null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_state_page():
+    """Render the rule state function page (DX2-014)."""
+    out = [
+        "---",
+        "title: Rule functions: rule state",
+        "description: Verified entries for the rule state functions.",
+        "sidebar:",
+        "  order: 53",
+        "---",
+        "",
+        "# Rule functions: rule state",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A rule state function reads or writes a key slot outside the "
+        "message. Use this page when a rule must keep a value across "
+        "messages. You get one entry per function, each with a run "
+        "against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Msg["message field"] -- "proc_dict_put or kv_store_put" --> Slot["key slot"]',
+                '    Slot -- "proc_dict_get or kv_store_get" --> Val["stored value"]',
+                '    Slot -- "proc_dict_del or kv_store_del" --> Gone["removed slot"]',
+                '    Val -- "SELECT AS" --> Sel["result column"]',
+                '    Gone -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "The `proc_dict` map is rule-local. The `kv_store` map is "
+        "node-global. The test entry never writes: a put or a delete "
+        "through it returns null and keeps the old state. A wrong "
+        "argument count reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_STATE_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` keeps state."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_STATE_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_STATE_SYNTAX,
+            RULES_STATE_NOTES,
+            "`{name}` keeps state across messages.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-015 action entries (actions A).
+RULES_ACTIONS_A = [
+    "alloydb",
+    "aws_iot",
+    "aws_timestream",
+    "azure_blob",
+    "azure_blob_storage",
+    "azure_event_grid",
+    "azure_event_hub_producer",
+    "azure_eventhubs",
+    "azure_iot",
+    "bigquery",
+    "cassandra",
+    "clickhouse",
+    "cockroachdb",
+    "confluent",
+    "confluent_producer",
+    "console",
+    "couchbase",
+    "databricks",
+    "datalayers",
+    "disk_log",
+    "doris",
+    "dynamo",
+    "dynamodb",
+]
+
+# One signature line per DX2-015 stem: the verified management call.
+RULES_ACTIONS_A_SYNTAX = {
+    rules_stem("action", name): (
+        f"`POST /api/v5/actions` with "
+        f"`{{\"type\": \"{name}\", \"name\": \"<id>\"}}`"
+    )
+    for name in RULES_ACTIONS_A
+}
+
+# Extra note lines per DX2-015 stem. Each states an observed fact.
+RULES_ACTIONS_A_NOTES = {
+    "action-alloydb": [
+        "The type catalogue lists this name.",
+        "The connector config names `table` and `column_mappings`.",
+        "The tier is enterprise.",
+    ],
+    "action-aws_iot": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `endpoint`, `region` and `topic_mappings`.",
+        "The tier is enterprise.",
+    ],
+    "action-aws_timestream": [
+        "The type catalogue lists this name. It is the console name for the `timestream` runtime.",
+        "The connector config names the database, the table and `dimensions`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_blob": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `azure_blob_storage` for the same runtime.",
+        "The connector config names `container_name` and `blob_path_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_blob_storage": [
+        "The type catalogue lists this name. It is the console name for the `azure_blob` runtime.",
+        "The connector config names `container_name` and `blob_path_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_event_grid": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "No send runtime stands behind this name in this build. No rows leave the broker through it.",
+    ],
+    "action-azure_event_hub_producer": [
+        "The type catalogue lists this name. It is the console name for the `azure_eventhubs` runtime.",
+        "The connector config names `namespace`, `event_hub` and `partition_key_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_eventhubs": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `azure_event_hub_producer` for the same runtime.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_iot": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `iot_hub_name` and `device_id`.",
+        "The tier is enterprise.",
+    ],
+    "action-bigquery": [
+        "The type catalogue lists this name.",
+        "The connector config names `project_id`, `dataset_id` and `table_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-cassandra": [
+        "The type catalogue lists this name.",
+        "The connector config names `contact_points`, `keyspace` and `cql_statement_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-clickhouse": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `database` and `table`.",
+        "The tier is community.",
+    ],
+    "action-cockroachdb": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_string` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-confluent": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `confluent_producer` for the same runtime.",
+        "The tier is enterprise.",
+    ],
+    "action-confluent_producer": [
+        "The type catalogue lists this name. It is the console name for the `confluent` runtime.",
+        "The connector config names `bootstrap_servers` and `topic_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-console": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "A created row reads `connected` when enabled. The broker runs no probe behind it.",
+        "The tier is community.",
+    ],
+    "action-couchbase": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_string`, `bucket` and `doc_id_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-databricks": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `host`, `catalog` and `table_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-datalayers": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-disk_log": [
+        "The type catalogue lists this name.",
+        "The connector config names `directory` and `filename_prefix`.",
+        "The tier is community.",
+    ],
+    "action-doris": [
+        "The type catalogue lists this name.",
+        "The connector config names `fe_host`, `database` and `table_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-dynamo": [
+        "The type catalogue lists this name. It is the console name for the `dynamodb` runtime.",
+        "The connector config names `table_name` and the key mapping.",
+        "The tier is enterprise.",
+    ],
+    "action-dynamodb": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `dynamo` for the same runtime.",
+        "The tier is enterprise.",
+    ],
+}
+
+
+def render_rule_action_entry(name, stem, syntax_map, notes_map):
+    """Render one rule action entry from text and verified output."""
+    out = [f"### `{name}`", ""]
+    text = read_text("rules", stem)
+    if text:
+        out.append(text)
+    else:
+        out.append(f"`{name}` names one rule action.")
+    out.append("")
+    syntax = syntax_map.get(stem)
+    if syntax:
+        out.append(f"Signature: {syntax}.")
+        out.append("")
+    record = read_verified("rules", stem)
+    if record and record.get("verified"):
+        cases = record.get("cases", [])
+        if cases:
+            first = cases[0]
+            body = first.get("body", {})
+            out.append("Example (verified through `POST /api/v5/actions`):")
+            out.append("")
+            out.append("```json no-test")
+            out.append(
+                json.dumps(
+                    {"type": first.get("type"), "name": first.get("name")},
+                    sort_keys=True,
+                )
+            )
+            out.append("```")
+            out.append("")
+            out.append(
+                f"The broker answered `{first.get('status')}` with "
+                f"`\"type\": \"{body.get('type')}\"` and "
+                f"`\"status\": \"{body.get('status')}\"`."
+            )
+            for extra in cases[1:]:
+                ebody = extra.get("body", {})
+                if extra.get("status") == 400:
+                    out.append(
+                        f"Another create with the same name answered `400` "
+                        f"with code `{ebody.get('code')}`."
+                    )
+                else:
+                    out.append(
+                        f"Another create answered `{extra.get('status')}` "
+                        f"with `\"type\": \"{ebody.get('type')}\"`."
+                    )
+            out.append("")
+            if record.get("listed_in_action_types"):
+                out.append("`GET /api/v5/action_types` lists this name.")
+            else:
+                out.append("`GET /api/v5/action_types` omits this name.")
+            out.append("")
+            out.append(
+                f"Verified: `POST /api/v5/actions` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+        else:
+            out.append(
+                f"Verified: `POST /api/v5/actions` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+    else:
+        out.append(f"> **{NOT_VERIFIED}**")
+    out.append("")
+    out.append("Notes:")
+    out.append("")
+    for note in notes_map.get(stem, []):
+        out.append(f"- {note}")
+    out.append("- The docs run verifies creation only. No external server runs, so no rows reach the backend.")
+    out.append("- Repeat the check with the same call against a live broker.")
+    out.append("")
+    return out
+
+
+def render_rules_actions_a_page():
+    """Render the rule actions A page (DX2-015)."""
+    out = [
+        "---",
+        "title: Rule actions A: alloydb to dynamodb",
+        "description: Verified entries for each rule action from alloydb to dynamodb.",
+        "sidebar:",
+        "  order: 54",
+        "---",
+        "",
+        "# Rule actions A: alloydb to dynamodb",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An action sends each result row to a backend. You create it "
+        "through the management API and you point a rule at it. Use this "
+        "page when a rule must reach a database, a cloud service or a "
+        "log. You get one entry per action, each with a run against the "
+        "broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Row["result row"] -- "forward" --> Act["action store"]',
+                '    Act -- "connector id" --> Conn["connector"]',
+                '    Conn -- "batch send" --> Ext["external system"]',
+                '    Row -- "republish" --> T["fixed topic"]',
+                '    Row -- "console" --> Log["broker log"]',
+                '    T -- "deliver" --> Sub["subscriber"]',
+            ]
+        ),
+        "",
+        "Create the connector first, then the action, then the rule. "
+        "A created action reads `connected` when enabled. The broker "
+        "runs no probe behind that status; the status mirrors the "
+        "enable flag. The docs run verifies creation only; no external "
+        "server runs, so no rows reach a backend here.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Create each connector before an action names it. See [Connectors](../connectors/index.md).",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v5/actions`.",
+        "",
+        "## Actions",
+        "",
+        "| Action | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ACTIONS_A:
+        stem = rules_stem("action", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` sends rows out."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Actions in detail", ""]
+    for name in RULES_ACTIONS_A:
+        out += render_rule_action_entry(
+            name,
+            rules_stem("action", name),
+            RULES_ACTIONS_A_SYNTAX,
+            RULES_ACTIONS_A_NOTES,
+        )
+    out += [
+        "## Check that it works",
+        "",
+        "Create one action and read it back:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own name.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"type": "disk_log", "name": "dx-check"}\' \\',
+        "  http://127.0.0.1:18083/api/v5/actions",
+        "```",
+        "",
+        "The answer is `201` with the stored shape. A second create "
+        "with the same name answers `400` with code `ALREADY_EXISTS`.",
+        "",
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-016 action entries (actions B).
+RULES_ACTIONS_B = [
+    "elasticsearch",
+    "gcp_iot",
+    "gcp_pubsub",
+    "gcp_pubsub_consumer",
+    "gcp_pubsub_producer",
+    "greptimedb",
+    "http",
+    "influxdb",
+    "iotdb",
+    "kafka",
+    "kafka_consumer",
+    "kafka_producer",
+    "kinesis",
+    "mongodb",
+    "mqtt",
+    "mqtt_bridge",
+    "mssql",
+    "mysql",
+    "oci_streaming",
+    "opc_ua",
+    "opents",
+    "opentsdb",
+]
+
+# One signature line per DX2-016 stem: the verified management call.
+RULES_ACTIONS_B_SYNTAX = {
+    rules_stem("action", name): (
+        f"`POST /api/v5/actions` with "
+        f"`{{\"type\": \"{name}\", \"name\": \"<id>\"}}`"
+    )
+    for name in RULES_ACTIONS_B
+}
+
+# Extra note lines per DX2-016 stem. Each states an observed fact.
+RULES_ACTIONS_B_NOTES = {
+    "action-elasticsearch": [
+        "The type catalogue lists this name.",
+        "The connector config names `url` and `index_template`.",
+        "The tier is community.",
+    ],
+    "action-gcp_iot": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `project_id`, `registry_id` and `device_id`.",
+        "The tier is enterprise.",
+    ],
+    "action-gcp_pubsub": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `gcp_pubsub_producer` for the same runtime.",
+        "The connector config names `project_id` and `topic`.",
+        "The tier is enterprise.",
+    ],
+    "action-gcp_pubsub_consumer": [
+        "The type catalogue omits this name. The action store rejects it.",
+        "It is a source name: the source catalogue lists it with `project_id` and `topic`.",
+        "Use `gcp_pubsub_producer` for the send path.",
+    ],
+    "action-gcp_pubsub_producer": [
+        "The type catalogue lists this name. It is the console name for the `gcp_pubsub` runtime.",
+        "The connector config names `project_id` and `topic`.",
+        "The tier is community.",
+    ],
+    "action-greptimedb": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `database` and `table`.",
+        "The tier is community.",
+    ],
+    "action-http": [
+        "The type catalogue lists this name.",
+        "The sink posts each row to the `url`. A missing URL fails the send closed.",
+        "The tier is community.",
+    ],
+    "action-influxdb": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `org`, `bucket` and `token`.",
+        "The tier is community.",
+    ],
+    "action-iotdb": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-kafka": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `kafka_producer` for the same runtime.",
+        "The connector config names `bootstrap_servers` and `topic`.",
+        "The tier is community.",
+    ],
+    "action-kafka_consumer": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "It is the console name for the Kafka ingress source. It runs on the `kafka` runtime.",
+        "The source config names `bootstrap_hosts` and `topic`.",
+        "The tier is community.",
+    ],
+    "action-kafka_producer": [
+        "The type catalogue lists this name. It is the console name for the `kafka` runtime.",
+        "The connector config names `bootstrap_servers` and `topic`.",
+        "The tier is community.",
+    ],
+    "action-kinesis": [
+        "The type catalogue lists this name.",
+        "The connector config names `stream_name` and `region`.",
+        "The tier is enterprise.",
+    ],
+    "action-mongodb": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_string`, `database` and `collection`.",
+        "The tier is enterprise.",
+    ],
+    "action-mqtt": [
+        "The type catalogue lists this name. It is the console name for the `mqtt_bridge` runtime.",
+        "The connector config names `endpoint` and `topic_template`.",
+        "The tier is community.",
+    ],
+    "action-mqtt_bridge": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `mqtt` for the same runtime.",
+        "The connector config names `endpoint` and `topic_template`.",
+        "The tier is community.",
+    ],
+    "action-mssql": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `sqlserver` for the same runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-mysql": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-oci_streaming": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `stream_ocid` and `compartment_ocid`.",
+        "The tier is enterprise.",
+    ],
+    "action-opc_ua": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `endpoint_url`, `security_policy` and `node_id`.",
+        "The tier is enterprise.",
+    ],
+    "action-opents": [
+        "The type catalogue lists this name. It is the console name for the `opentsdb` runtime.",
+        "The connector config names `host` and `port`.",
+        "The tier is community.",
+    ],
+    "action-opentsdb": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `opents` for the same runtime.",
+        "The connector config names `host` and `port`.",
+        "The tier is community.",
+    ],
+}
+
+
+def render_rules_actions_b_page():
+    """Render the rule actions B page (DX2-016)."""
+    out = [
+        "---",
+        "title: Rule actions B: elasticsearch to opentsdb",
+        "description: Verified entries for each rule action from elasticsearch to opentsdb.",
+        "sidebar:",
+        "  order: 55",
+        "---",
+        "",
+        "# Rule actions B: elasticsearch to opentsdb",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An action sends each result row to a backend. You create it "
+        "through the management API and you point a rule at it. Use this "
+        "page when a rule must reach a search index, a queue, a database "
+        "or a device cloud. You get one entry per action, each with a "
+        "run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Row["result row"] -- "forward" --> Act["action store"]',
+                '    Act -- "connector id" --> Conn["connector"]',
+                '    Conn -- "batch send" --> Ext["external system"]',
+                '    Row -- "bridge" --> Br["remote broker"]',
+                '    Row -- "webhook" --> Http["HTTP target"]',
+                '    Br -- "deliver" --> Sub["subscriber"]',
+            ]
+        ),
+        "",
+        "Create the connector first, then the action, then the rule. "
+        "A created action reads `connected` when enabled. The broker "
+        "runs no probe behind that status; the status mirrors the "
+        "enable flag. The docs run verifies creation only; no external "
+        "server runs, so no rows reach a backend here.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Create each connector before an action names it. See [Connectors](../connectors/index.md).",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v5/actions`.",
+        "",
+        "## Actions",
+        "",
+        "| Action | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ACTIONS_B:
+        stem = rules_stem("action", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` sends rows out."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Actions in detail", ""]
+    for name in RULES_ACTIONS_B:
+        out += render_rule_action_entry(
+            name,
+            rules_stem("action", name),
+            RULES_ACTIONS_B_SYNTAX,
+            RULES_ACTIONS_B_NOTES,
+        )
+    out += [
+        "## Check that it works",
+        "",
+        "Create one action and read it back:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own name.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"type": "mqtt", "name": "dx-check"}\' \\',
+        "  http://127.0.0.1:18083/api/v5/actions",
+        "```",
+        "",
+        "The answer is `201` with the stored shape. A second create "
+        "with the same name answers `400` with code `ALREADY_EXISTS`.",
+        "",
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-017 action entries (actions C).
+RULES_ACTIONS_C = [
+    "oracle",
+    "pgsql",
+    "postgres",
+    "pulsar",
+    "rabbitmq",
+    "redis",
+    "redshift",
+    "rocketmq",
+    "s3",
+    "s3_tables",
+    "s3tables",
+    "snowflake",
+    "snowflake_streaming",
+    "sparkplug_b",
+    "sqlserver",
+    "tablestore",
+    "tdengine",
+    "test",
+    "timescale",
+    "timescaledb",
+    "timestream",
+    "webhook",
+]
+
+# One signature line per DX2-017 stem: the verified management call.
+RULES_ACTIONS_C_SYNTAX = {
+    rules_stem("action", name): (
+        f"`POST /api/v5/actions` with "
+        f"`{{\"type\": \"{name}\", \"name\": \"<id>\"}}`"
+    )
+    for name in RULES_ACTIONS_C
+}
+
+# Extra note lines per DX2-017 stem. Each states an observed fact.
+RULES_ACTIONS_C_NOTES = {
+    "action-oracle": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-pgsql": [
+        "The type catalogue lists this name.",
+        "The connector config names `server`, `database`, `username` and `password`.",
+        "The historic name `postgres` runs on the same runtime.",
+        "The tier is community.",
+    ],
+    "action-postgres": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `pgsql` for the same runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-pulsar": [
+        "The type catalogue lists this name.",
+        "The connector config names `service_url` and `topic`.",
+        "The tier is enterprise.",
+    ],
+    "action-rabbitmq": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `exchange` and `routing_key`.",
+        "The tier is community.",
+    ],
+    "action-redis": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint` and `key`.",
+        "The tier is community.",
+    ],
+    "action-redshift": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `table`, `user` and `password`.",
+        "The tier is enterprise.",
+    ],
+    "action-rocketmq": [
+        "The type catalogue lists this name.",
+        "The connector config names `name_server` and `topic`.",
+        "The tier is enterprise.",
+    ],
+    "action-s3": [
+        "The type catalogue lists this name.",
+        "The connector config names `bucket`, `region` and `key_template`.",
+        "The tier is community.",
+    ],
+    "action-s3_tables": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `s3tables` for the same runtime.",
+        "The connector config names `table_bucket_arn` and `table_name`.",
+        "The tier is enterprise.",
+    ],
+    "action-s3tables": [
+        "The type catalogue lists this name. It is the console name for the `s3_tables` runtime.",
+        "The connector config names `table_bucket_arn` and `table_name`.",
+        "The tier is enterprise.",
+    ],
+    "action-snowflake": [
+        "The type catalogue lists this name.",
+        "The connector config names `account`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-snowflake_streaming": [
+        "The type catalogue lists this name. It is the console name for the `snowflake` runtime.",
+        "The connector config names `account`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-sparkplug_b": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `group_id`, `edge_node_id` and `device_id`.",
+        "The tier is enterprise.",
+    ],
+    "action-sqlserver": [
+        "The type catalogue lists this name. It is the console name for the `mssql` runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-tablestore": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `instance` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-tdengine": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-test": [
+        "The type catalogue omits this name. The action store rejects it.",
+        "It is a unit-test helper with no send path. Use `console` for the log path.",
+    ],
+    "action-timescale": [
+        "The type catalogue lists this name. It is the console name for the `timescaledb` runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-timescaledb": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `timescale` for the same runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-timestream": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `aws_timestream` for the same runtime.",
+        "The connector config names `database`, `table` and `region`.",
+        "The tier is enterprise.",
+    ],
+    "action-webhook": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `http` for the same runtime.",
+        "The connector config names `url`.",
+        "The tier is community.",
+    ],
+}
+
+
+def render_rules_actions_c_page():
+    """Render the rule actions C page (DX2-017)."""
+    out = [
+        "---",
+        "title: Rule actions C: oracle to webhook",
+        "description: Verified entries for each rule action from oracle to webhook.",
+        "sidebar:",
+        "  order: 56",
+        "---",
+        "",
+        "# Rule actions C: oracle to webhook",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An action sends each result row to a backend. You create it "
+        "through the management API and you point a rule at it. Use this "
+        "page when a rule must reach a relational store, a stream, a "
+        "lake, a warehouse or a webhook. You get one entry per action, "
+        "each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Row["result row"] -- "forward" --> Act["action store"]',
+                '    Act -- "connector id" --> Conn["connector"]',
+                '    Conn -- "batch send" --> Ext["external system"]',
+                '    Row -- "alias create" --> Same["shared runtime"]',
+                '    Same -- "batch send" --> Ext',
+                '    Row -- "webhook" --> Http["HTTP target"]',
+            ]
+        ),
+        "",
+        "Create the connector first, then the action, then the rule. "
+        "A created action reads `connected` when enabled. The broker "
+        "runs no probe behind that status; the status mirrors the "
+        "enable flag. The docs run verifies creation only; no external "
+        "server runs, so no rows reach a backend here.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Create each connector before an action names it. See [Connectors](../connectors/index.md).",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v5/actions`.",
+        "",
+        "## Actions",
+        "",
+        "| Action | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ACTIONS_C:
+        stem = rules_stem("action", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` sends rows out."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Actions in detail", ""]
+    for name in RULES_ACTIONS_C:
+        out += render_rule_action_entry(
+            name,
+            rules_stem("action", name),
+            RULES_ACTIONS_C_SYNTAX,
+            RULES_ACTIONS_C_NOTES,
+        )
+    out += [
+        "## Check that it works",
+        "",
+        "Create one action and read it back:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own name.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"type": "redis", "name": "dx-check"}\' \\',
+        "  http://127.0.0.1:18083/api/v5/actions",
+        "```",
+        "",
+        "The answer is `201` with the stored shape. A second create "
+        "with the same name answers `400` with code `ALREADY_EXISTS`.",
+        "",
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
     if area == "cli":
         ids = [item for item, _, _ in cli_items()]
     elif area == "config":
-        ids = [s["path"] for s in data["settings"]]
+        ids = [
+            s["path"]
+            for s in data["settings"]
+            if read_text("config", s["path"]) is not None
+        ]
     elif area == "api":
-        ids = [o["method"] + " " + o["path"] for o in data["operations"]]
+        ids = [
+            o.get("operation_id") or (o["method"] + " " + o["path"])
+            for o in data["operations"]
+        ]
     elif area == "mcp":
         ids = [t["name"] for t in data["tools"]]
     elif area == "rules":
@@ -1392,6 +2958,25 @@ def coverage(area=""):
         if name == "cli" and missing:
             print(f"coverage: cli misses {missing} items")
             code = 1
+        if name == "config":
+            claimed_missing = 0
+            data = json.loads(
+                (INVENTORY / "config.json").read_text(encoding="utf-8")
+            )
+            for setting in data["settings"]:
+                item = setting["path"]
+                if read_text(name, item) is None:
+                    continue
+                if read_verified(name, item):
+                    print(f"item={item} verified")
+                elif failure_recorded(item):
+                    print(f"item={item} failed")
+                else:
+                    print(f"item={item} missing")
+                    claimed_missing += 1
+            if claimed_missing:
+                print(f"coverage: config misses {claimed_missing} claimed items")
+                code = 1
         if name == "rules":
             claimed_missing = 0
             for label, stem in rules_inventory_ids():
@@ -1563,6 +3148,190 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-type-checks.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-arrays":
+        fresh = render_rules_arrays_page()
+        path = ROOT / "docs" / "rules" / "functions-arrays.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-arrays.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-arrays.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-arrays.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-hashing":
+        fresh = render_rules_hashing_page()
+        path = ROOT / "docs" / "rules" / "functions-hashing.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-hashing.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-hashing.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-hashing.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-compression":
+        fresh = render_rules_compression_page()
+        path = ROOT / "docs" / "rules" / "functions-compression.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-compression.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-compression.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-compression.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-state":
+        fresh = render_rules_state_page()
+        path = ROOT / "docs" / "rules" / "functions-state.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-state.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-state.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-state.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-actions-a":
+        fresh = render_rules_actions_a_page()
+        path = ROOT / "docs" / "rules" / "actions-a.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/actions-a.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/actions-a.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/actions-a.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-actions-b":
+        fresh = render_rules_actions_b_page()
+        path = ROOT / "docs" / "rules" / "actions-b.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/actions-b.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/actions-b.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/actions-b.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-actions-c":
+        fresh = render_rules_actions_c_page()
+        path = ROOT / "docs" / "rules" / "actions-c.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/actions-c.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/actions-c.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/actions-c.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-events":
+        fresh = render_rules_events_page()
+        path = ROOT / "docs" / "rules" / "events.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/events.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/events.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/events.md")
             return 0
         parser.print_help()
         return 2

@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-uuid_v4"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT 1 AS v FROM "sensors/+" WHERE uuid_v4() IS NOT NULL'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 1}'
+
+[[case]]
+sql = 'SELECT uuid_v4(1) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

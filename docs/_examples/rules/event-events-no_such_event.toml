@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "event-events-no_such_event"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT reason FROM "$events/no_such_event"'
+topic = "sensors/kitchen"
+payload = '{"reason": "x"}'
+expect_matched = false
+
+[[case]]
+sql = 'SELECT reason FROM "$events/no_such_event"'
+topic = "$events/client_connected"
+payload = '{"reason": "x"}'
+expect_matched = false

@@ -778,7 +778,11 @@ pub async fn create_action(
     // reason and the run reads `disconnected` until the connector
     // arrives. A connector that resolves but stays incomplete (its own
     // credential is missing) stores the same way.
-    let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
+    let staged = match crate::v5::action_sinks::stage_action_sink_with_engine(
+        &state.connectors,
+        Some(&state.engine),
+        &entry,
+    ) {
         Ok(staged) => staged,
         Err(message) => return ApiError::AlreadyExists(message).into_response(),
     };
@@ -827,13 +831,17 @@ pub async fn create_action(
             let probe_on_create = staged.probe_on_create;
             let previous = state.engine.connectors().get(&key);
             if let Some(sink) = staged.sink {
-                let sink = crate::v5::action_sinks::wrap_action_runtime(
-                    &state.engine,
-                    &key,
-                    sink,
-                    staged.resource_opts,
-                    staged.health_target,
-                );
+                let sink = if staged.reuse_connector_runtime {
+                    sink
+                } else {
+                    crate::v5::action_sinks::wrap_action_runtime(
+                        &state.engine,
+                        &key,
+                        sink,
+                        staged.resource_opts,
+                        staged.health_target,
+                    )
+                };
                 state
                     .engine
                     .connectors()
@@ -1045,12 +1053,27 @@ pub async fn update_action(
     if super::rules::kind_refusal(&entry.action_type).is_some() {
         super::rules::raise_unavailable_kind_alarm(&state, &entry.action_type);
     }
+    // An update must not drop every action-owned setting. A row that
+    // had parameters and now has none is refused with the field named,
+    // so the old sink keeps delivering.
+    if crate::v5::action_sinks::is_connector_only_action(&entry)
+        && !crate::v5::action_sinks::is_connector_only_action(&stored)
+    {
+        match crate::v5::action_sinks::required_action_parameters(&entry) {
+            Ok(()) => {}
+            Err(message) => return ApiError::BadRequest(message).into_response(),
+        }
+    }
     // MV-01 (R2-03/04): stage the owned sink built from the NEW entry
     // (never registered). A build that cannot complete for an
     // action-side reason is refused with 400 naming the action and the
     // field; every old sink keeps delivering and the stored row is
     // untouched. A connector-side gap stores with failed wiring.
-    let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
+    let staged = match crate::v5::action_sinks::stage_action_sink_with_engine(
+        &state.connectors,
+        Some(&state.engine),
+        &entry,
+    ) {
         Ok(staged) => staged,
         Err(message) => return ApiError::BadRequest(message).into_response(),
     };
@@ -1092,13 +1115,17 @@ pub async fn update_action(
     let probe_on_create = staged.probe_on_create;
     match &staged.sink {
         Some(sink) => {
-            let sink = crate::v5::action_sinks::wrap_action_runtime(
-                &state.engine,
-                &key,
-                Arc::clone(sink),
-                staged.resource_opts.clone(),
-                staged.health_target.clone(),
-            );
+            let sink = if staged.reuse_connector_runtime {
+                Arc::clone(sink)
+            } else {
+                crate::v5::action_sinks::wrap_action_runtime(
+                    &state.engine,
+                    &key,
+                    Arc::clone(sink),
+                    staged.resource_opts.clone(),
+                    staged.health_target.clone(),
+                )
+            };
             // A down server is stored and reports `disconnected` from
             // this real connection attempt; the sink retries. Probe
             // before the swap so the previous generation stays live

@@ -38,7 +38,7 @@ flowchart LR
 | gcp_pubsub | gcp, pubsub, gcp_pubsub_consumer, gcp_pubsub_producer | cloud-messaging | MV-03b | ready | yes | yes | no | yes | yes | gcp_pubsub |
 | greptimedb | greptime | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | http | rest | http | MV-03c | ready | yes | yes | yes | yes | yes | - |
-| influxdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
+| influxdb | influx | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | iotdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | kafka | kafka_producer, kafka_consumer | message-broker | MV-03a | ready | yes | yes | yes | yes | yes | kafka |
 | kinesis | aws_kinesis | cloud-messaging | MV-03b | ready | yes | yes | yes | yes | yes | kinesis |

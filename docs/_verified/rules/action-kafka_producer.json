@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "kafka_producer"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-kafka_producer",
+        "name": "dx2-action-kafka_producer",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "kafka_producer"
+      },
+      "name": "dx2-action-kafka_producer",
+      "status": 201,
+      "type": "kafka_producer"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-kafka_producer\" already exists"
+      },
+      "name": "dx2-action-kafka_producer",
+      "status": 400,
+      "type": "kafka_producer"
+    }
+  ],
+  "item": "action-kafka_producer",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

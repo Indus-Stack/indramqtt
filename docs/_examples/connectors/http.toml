@@ -1,0 +1,16 @@
+[example]
+area = "connectors"
+item = "http"
+kind = "connector-create"
+
+[[case]]
+name = "http-normal"
+url = "http://127.0.0.1:8080/hook"
+method = "post"
+expect_status = 201
+
+[[case]]
+name = "http-edge-non-http-url"
+url = "ftp://example.com/hook"
+method = "post"
+expect_status = 400

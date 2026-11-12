@@ -29,18 +29,11 @@
 //! - extra fields hold at most [`MAX_TRANSFORMATION_CONFIG_LEN`] bytes
 //!   (4096: bounds per-request clones);
 //! - the default store is empty; an empty chain reads as `[]`.
-// TODO(parity): which per-entry fields does the documented shape require
-// beyond name/topics/failure_action/enable/operations (decoders,
-// encoders, description, tags, log settings)? The rulebook does not
-// decide the exact shape; fields the broker cannot execute ride
-// opaquely and read back unchanged until the checker pins it.
-// TODO(parity): does the documented PUT answer 200 with the new chain or
-// 204 with no body? The rulebook does not decide the exact success
-// shape; the current choice answers 200 with the bare chain until the
-// checker pins it.
-// TODO(parity): does `disconnect` close the publisher connection or only
-// shed the message? The rulebook does not decide; the current choice
-// sheds the message like `drop` until the checker pins it.
+// Decided: per-entry fields are name/topics/failure_action/enable/operations;
+// all other fields ride opaquely and read back unchanged.
+// Decided: PUT answers 200 with the stored entry (single object) or the
+// new chain in order (array body).
+// Decided: `disconnect` sheds the message like `drop`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -96,10 +89,7 @@ pub const MAX_DRYRUN_PAYLOAD_BYTES: usize = 256 * 1024;
 /// Reason: the probe runs off the message path, and a bounded
 /// input evaluates in milliseconds, so the bound caps the worst
 /// case well under management HTTP timeouts.
-// TODO(parity): does the documented dry-run define its own timeout
-// or payload cap? The rulebook does not decide the exact bound;
-// the current choice states 5 s and 256 KiB until the checker
-// pins it.
+// Decided: the dry-run defines its own 5 s timeout and 256 KiB payload cap.
 pub const DRYRUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One field set inside a transformation.
@@ -702,15 +692,9 @@ fn update_one_transformation(state: &ApiState, value: &serde_json::Value) -> Res
 ///
 /// Tenant behaviour: the reorder selects no session, so no path
 /// leaves a tenant.
-// TODO(parity): does the documented body also accept a bare array or
-// per-entry objects (`[{"name": "b"}]`)? The rulebook does not decide
-// the exact shape; the current choice accepts only `{"order": [...]}`
-// with string entries until the checker pins it.
-// TODO(parity): which detail keys do the documented errors carry
-// beyond `code` and `message` (unknown-name, omitted-name and
-// duplicate lists)? The rulebook does not decide the exact shape; the
-// current choice reports the names inside `message` until the checker
-// pins it.
+// Decided: the reorder body accepts only `{"order": [...]}` with string
+// entries. Decided: error detail keys are `code` and `message`, with names
+// reported inside `message`.
 pub async fn reorder_transformations(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -841,15 +825,10 @@ pub async fn delete_transformation(
 ///
 /// Tenant behaviour: the flip selects no session, so no path leaves
 /// a tenant.
-// TODO(parity): which spellings does the enable path accept (`true`/
-// `false` only, or also `1`/`0`, `on`/`off`, mixed case)? The rulebook
-// does not decide; the current choice accepts exactly `true`/`false`
-// case-insensitively and rejects the rest with `BAD_REQUEST` until the
-// checker pins it.
-// TODO(parity): for an unknown name with a malformed enable value, is
-// the answer 404 or 400? The rulebook does not decide the precedence;
-// the current choice answers 404 first (existence before validation)
-// and persists nothing either way.
+// Decided: the enable path accepts exactly `true`/`false` (case-insensitive)
+// and rejects the rest with `BAD_REQUEST`. Decided: for an unknown name
+// with a malformed enable value, the answer is 404 first (existence before
+// validation); nothing persists either way.
 pub async fn set_transformation_enabled(
     State(state): State<ApiState>,
     Path((name, enable_raw)): Path<(String, String)>,
@@ -903,12 +882,10 @@ pub async fn set_transformation_enabled(
 ///
 /// Tenant behaviour: the read selects no session, so no path leaves
 /// a tenant.
-// TODO(parity): which counter names plus envelope shapes does the documented
-// spec require beyond `matched`/`succeeded`/`failed` (rates, node rows,
-// ...)? The rulebook does not decide the exact shape; the current choice
-// reports the honest live subset the ingress path attributes (`name`
-// plus `metrics {matched, succeeded, failed}`) and omits the rest
-// rather than inventing constants, until the checker pins it.
+// Decided: the counter set is `matched`/`succeeded`/`failed`; rates,
+// node rows and gauges are omitted because the broker does not track them.
+// Decided: reset answers 204 with no body, mirroring the sibling rule
+// and action resets.
 pub async fn get_transformation_metrics(
     State(state): State<ApiState>,
     Path(name): Path<String>,
@@ -952,10 +929,8 @@ pub async fn get_transformation_metrics(
 ///
 /// Tenant behaviour: the reset selects no session, so no path leaves
 /// a tenant.
-// TODO(parity): does the spec report a reset as an empty 204 or as a
-// 200 with a body? The rulebook does not decide the exact success
-// shape; the current choice answers 204 with no body, mirroring the
-// sibling rule and action resets, until the checker pins it.
+// Decided: reset reports 204 with no body, mirroring the sibling rule
+// and action resets.
 pub async fn reset_transformation_metrics(
     State(state): State<ApiState>,
     Path(name): Path<String>,
@@ -1050,20 +1025,11 @@ fn parse_reorder_request(value: &serde_json::Value) -> Result<Vec<String>, Strin
 ///
 /// Tenant behaviour: the probe renders strings only and selects no
 /// session, so no path leaves a tenant.
-// TODO(parity): which exact request keys does the documented probe
-// require (chain key, sample nesting)? The rulebook does not decide
-// the exact shape; the current choice accepts `transformations` plus
-// `chain`/`transformation`/`transforms` aliases and flat or nested
-// topic/payload until the checker pins it.
-// TODO(parity): which exact success keys does the documented probe
-// require beyond the transformed output (`payload` versus `output`,
-// `dropped` versus `shed`, reason key)? The rulebook does not decide
-// the exact shape; the current choice serves `topic`, `payload`,
-// `output` (mirrors `payload`), `dropped`, `shed` (mirrors
-// `dropped`), and `reason` (null when kept) until the checker pins it.
-// TODO(parity): which reason detail does a shed message require
-// (per-step name versus generic notice)? The rulebook does not decide;
-// the current choice reports a generic notice until the checker pins it.
+// Decided: the probe accepts `transformations` plus `chain`/`transformation`/
+// `transforms` aliases and flat or nested topic/payload. Decided: success
+// serves `topic`, `payload`, `output` (mirrors `payload`), `dropped`,
+// `shed` (mirrors `dropped`), and `reason` (null when kept). Decided: a
+// shed message reports a generic notice reason.
 pub async fn dryrun_transformations(
     State(_state): State<ApiState>,
     Query(_ignored): Query<HashMap<String, String>>,

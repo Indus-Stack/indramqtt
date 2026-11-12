@@ -1,0 +1,27 @@
+[example]
+area = "connectors"
+item = "timescale"
+kind = "connector-create"
+
+[[case]]
+name = "timescale-normal"
+connection_url = "postgresql://u:p@127.0.0.1:5432/db"
+hypertable = "sensor_metrics"
+time_column = "time"
+sql_template = "INSERT INTO sensor_metrics (time, device_id, topic, metrics) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics"
+pool_size = 2
+batch_size = 50
+batch_timeout_ms = 25
+expect_status = 201
+expect_type = "timescaledb"
+
+[[case]]
+name = "timescale-edge-bad-scheme"
+connection_url = "mysql://u:p@127.0.0.1:5432/db"
+hypertable = "sensor_metrics"
+time_column = "time"
+sql_template = "INSERT INTO sensor_metrics (time, device_id, topic, metrics) VALUES ($1, $2, $3, $4::jsonb)"
+pool_size = 2
+batch_size = 50
+batch_timeout_ms = 25
+expect_status = 400

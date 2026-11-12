@@ -1,0 +1,38 @@
+[example]
+area = "config"
+item = "webhook.breaker_reset_ms"
+kind = "setting"
+expect = "accepted"
+expected = "An open breaker admits one probe after the configured wait, and the CONNECT succeeds when the endpoint answers."
+source = "`crates/broker-auth/src/webhook.rs` moves an open breaker to half-open after `breaker_reset_ms` and admits one probe."
+action = "Open the breaker with a denied CONNECT, then connect again after the reset wait."
+config = '''
+[auth]
+allow_anonymous = true
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+breaker_threshold = 1
+breaker_reset_ms = 15000
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def credentialed(client):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    payload = word(client) + word("docs-user") + word("wrong-password")
+    body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    sock.close()
+    return head, ack
+
+head, ack = credentialed("hook-docs-0")
+assert head == 0x20 and ack == b"\x00\x04", (head, ack.hex())
+head, ack = credentialed("hook-docs-1")
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

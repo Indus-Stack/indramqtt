@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-proc_dict_del"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT proc_dict_del('dx2-state-missing-1') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = 'SELECT proc_dict_del() AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

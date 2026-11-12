@@ -9,7 +9,7 @@
 #   tools/boot_smoke.sh <dir with indramqtt and indra>
 #
 # Build the input first:
-#   cargo build -p broker-node --bins
+#   cargo build -p broker-node --features full --bins
 #
 # The script exits with 0 if all the checks are satisfactory. It prints
 # one line for each check.
@@ -94,6 +94,11 @@ bind = "127.0.0.1:$API_PORT"
 [logging]
 level = "warn"
 
+# The smoke clients connect without credentials: the smoke broker opts
+# into anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
 # Exporter settings (AP-09). The kernel seeds the registry from these
 # file values at boot, so the settings read and the text exposition
 # observe them without any API write.
@@ -103,6 +108,11 @@ latency_buckets = "7ms, 70ms, 700ms"
 [prometheus.push_gateway]
 url = "http://127.0.0.1:9199"
 interval = "31s"
+
+# Offline bound (MV-11c). The file value seeds the live cap at boot.
+# The smoke value differs from the default, so the check observes it.
+[session]
+max_offline_queue = 7
 
 # A client with a username goes into the tenant of that username.
 [[tenants.rules]]
@@ -496,6 +506,33 @@ for line in text.splitlines():
 report("the metrics exposition serves live counters over HTTP",
        status == 200 and ctype.startswith("text/plain")
        and received is not None and received >= 1)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4d2. The file offline bound is in operation at boot ---
+# The file sets session.max_offline_queue to 7. The kernel installs
+# the value into the live manager at boot. The check reads
+# global_zone over HTTP. It proves the file value drives the live
+# cap.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request
+port, key = sys.argv[1], sys.argv[2]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def api(path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v5{path}",
+        headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=5) as res:
+        return res.status, json.loads(res.read().decode())
+status, body = api("/configs/global_zone")
+mqueue = (body.get("mqtt") or {}).get("max_mqueue_len")
+report("session.max_offline_queue from indra.toml is the live max_mqueue_len in global_zone",
+       status == 200 and mqueue == 7)
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
@@ -1182,6 +1219,106 @@ plain.close()
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a6. Anonymous CONNECT is refused when auth.allow_anonymous is false ---
+# A second kernel boots from the same file kind with the flag off.
+# No users exist. The broker refuses an anonymous CONNECT before any session exists.
+# It returns 5 for 3.1.1 and 0x87 for 5.0. The stored config stays
+# untouched. The operator still lists, reads and deletes records over
+# the API. The affected MQTT access stays denied (D2).
+read -r REFUSAL_API REFUSAL_MQTT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/refcfg" "$ROOT/refdata"
+cat > "$ROOT/refcfg/indra.toml" <<EOF
+[node]
+id = "boot-smoke-refusal"
+data_dir = "$ROOT/refdata"
+
+[listeners.tcp]
+bind = "127.0.0.1:$REFUSAL_MQTT"
+
+[listeners.api]
+bind = "127.0.0.1:$REFUSAL_API"
+
+[logging]
+level = "warn"
+
+[auth]
+allow_anonymous = false
+EOF
+"$KERNEL" --config-dir "$ROOT/refcfg" > "$ROOT/refusal.log" 2>&1 &
+REFUSAL_PID=$!
+refusal_up=0
+for _ in $(seq 1 50); do
+    if python3 - "$REFUSAL_API" >/dev/null 2>&1 <<'PY'
+import sys, urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1)
+PY
+    then
+        refusal_up=1
+        break
+    fi
+    kill -0 "$REFUSAL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+if [ "$refusal_up" = 1 ]; then
+    python3 - "$REFUSAL_MQTT" <<'PY'
+import socket, struct, sys
+def frame(kind, body):
+    head = bytearray([kind])
+    remaining = len(body)
+    while True:
+        digit = remaining % 128
+        remaining //= 128
+        head.append(digit | (128 if remaining else 0))
+        if not remaining:
+            return bytes(head) + body
+def word(value):
+    raw = value.encode() if isinstance(value, str) else value
+    return struct.pack("!H", len(raw)) + raw
+def packet(sock):
+    head = sock.recv(1)
+    if not head:
+        return head[0], b""
+    remaining = 0
+    scale = 1
+    while True:
+        digit = sock.recv(1)[0]
+        remaining += (digit & 127) * scale
+        if not digit & 128:
+            break
+        scale *= 128
+    body = b""
+    while len(body) < remaining:
+        chunk = sock.recv(remaining - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return head[0], body
+port = int(sys.argv[1])
+sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+sock.sendall(frame(16, b"\x00\x04MQTT\x04\x02\x00\x3c" + word("refusal-anon")))
+head, ack = packet(sock)
+sock.close()
+sys.exit(0 if head == 32 and ack == b"\x00\x05" else 1)
+PY
+    check "an anonymous CONNECT is refused when allow_anonymous is false" $?
+else
+    check "an anonymous CONNECT is refused when allow_anonymous is false" 1
+    head -20 "$ROOT/refusal.log" 2>/dev/null || true
+fi
+kill "$REFUSAL_PID" 2>/dev/null
+wait "$REFUSAL_PID" 2>/dev/null
 
 # --- 4b. Tenant filters on the client list keep tenants apart ---
 # Run this check before the first user exists. The broker stays open.
@@ -2019,6 +2156,11 @@ bind = "127.0.0.1:$SESSION_API_PORT"
 [session]
 max_session_expiry_secs = 3600
 
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
 [logging]
 level = "warn"
 EOF
@@ -2062,6 +2204,210 @@ PY
 [ $? = 0 ] || failures=$((failures + 1))
 kill "$SESSION_KERNEL_PID" 2>/dev/null
 wait "$SESSION_KERNEL_PID" 2>/dev/null
+
+# --- 13. A disabled API listener opens no socket ---
+# An operator sets listeners.api.enabled to false in indra.toml. MQTT
+# still serves from the same file, but the API port refuses. The API
+# bind runs before the MQTT binds. An MQTT accept proves the boot
+# reached the API decision: a refusal then means no socket, not a slow
+# boot. A second MQTT accept proves the kernel is still alive. This
+# kernel runs its own config and ports so it does not disturb the
+# checks above.
+read -r NOAPI_MQTT_PORT NOAPI_API_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-noapi" "$ROOT/data-noapi"
+cat > "$ROOT/cfg-noapi/indra.toml" <<EOF
+[node]
+id = "boot-smoke-noapi"
+data_dir = "$ROOT/data-noapi"
+
+[listeners.tcp]
+bind = "127.0.0.1:$NOAPI_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$NOAPI_API_PORT"
+enabled = false
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+"$KERNEL" --config-dir "$ROOT/cfg-noapi" > "$ROOT/kernel-noapi.log" 2>&1 &
+NOAPI_KERNEL_PID=$!
+python3 - "$NOAPI_MQTT_PORT" "$NOAPI_API_PORT" <<'PY'
+import socket, sys, time
+mqtt_port, api_port = sys.argv[1:3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def wait_port(port):
+    for _ in range(200):
+        try:
+            sock = socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+            sock.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+report("the no-API kernel serves MQTT from indra.toml", wait_port(mqtt_port))
+try:
+    sock = socket.create_connection(("127.0.0.1", int(api_port)), timeout=5)
+    sock.close()
+    refused = False
+except OSError:
+    refused = True
+report("listeners.api.enabled = false from indra.toml opens no socket", refused)
+report("the no-API kernel is still alive after the refused API dial",
+       wait_port(mqtt_port))
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$NOAPI_KERNEL_PID" 2>/dev/null
+wait "$NOAPI_KERNEL_PID" 2>/dev/null
+
+# --- 14. A disabled MCP endpoint answers 404 ---
+# The kernel boots with `[mcp] enabled = false`. It still serves
+# `/healthz` and MQTT. Each `POST /mcp` call answers 404.
+# A key and no key both get 404: disabled wins over auth.
+# This kernel uses its own config and ports. It does not disturb
+# the checks above.
+read -r MCP_OFF_MQTT_PORT MCP_OFF_API_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-mcp-off" "$ROOT/data-mcp-off"
+cat > "$ROOT/cfg-mcp-off/indra.toml" <<EOF
+[node]
+id = "boot-smoke-mcp-off"
+data_dir = "$ROOT/data-mcp-off"
+
+[listeners.tcp]
+bind = "127.0.0.1:$MCP_OFF_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$MCP_OFF_API_PORT"
+
+[mcp]
+enabled = false
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg-mcp-off" > "$ROOT/kernel-mcp-off.log" 2>&1 &
+MCP_OFF_KERNEL_PID=$!
+for _ in $(seq 1 50); do
+    if python3 - "$MCP_OFF_API_PORT" >/dev/null 2>&1 <<'PY'
+import sys, urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1)
+PY
+    then
+        break
+    fi
+    kill -0 "$MCP_OFF_KERNEL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+python3 - "$MCP_OFF_MQTT_PORT" "$MCP_OFF_API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, time, urllib.request, urllib.error
+mqtt_port, api_port, key = sys.argv[1], sys.argv[2], sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the disabled-MCP kernel listener does not listen")
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+try:
+    healthz = urllib.request.urlopen(
+        f"http://127.0.0.1:{api_port}/healthz", timeout=5).read().decode()
+except OSError:
+    healthz = ""
+report("the disabled-MCP kernel serves /healthz from indra.toml",
+       healthz == "OK")
+sub = wait_port(mqtt_port)
+sub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-mcp-off-sub")))
+sub_ok = sub.recv(4) == b"\x20\x02\x00\x00"
+topic = b"smoke/mcp-off/check"
+token = os.urandom(6).hex().encode()
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+suback_ok = sub.recv(5)[:1] == b"\x90"
+pub = wait_port(mqtt_port)
+pub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-mcp-off-pub")))
+pub_ok = pub.recv(4) == b"\x20\x02\x00\x00"
+pub.sendall(packet(0x30, field(topic) + token))
+sub.settimeout(5)
+try:
+    delivered = sub.recv(100)
+except OSError:
+    delivered = b""
+report("a publish goes to a subscriber when MCP is disabled",
+       sub_ok and suback_ok and pub_ok and delivered.endswith(token))
+def post(body, auth):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/mcp", data=data, method="POST",
+        headers={"Content-Type": "application/json"})
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as err:
+        try:
+            return err.code, json.loads(err.read().decode())
+        except ValueError:
+            return err.code, {}
+    except OSError:
+        return 0, {}
+status, body = post({"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+                    f"Bearer {key}")
+report("the disabled MCP endpoint answers 404 with a key",
+       status == 404 and body.get("code") == "NOT_FOUND")
+status, _ = post({"jsonrpc": "2.0", "method": "ping", "id": 2}, None)
+report("the disabled MCP endpoint answers 404 with no key", status == 404)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$MCP_OFF_KERNEL_PID" 2>/dev/null
+wait "$MCP_OFF_KERNEL_PID" 2>/dev/null
 
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"

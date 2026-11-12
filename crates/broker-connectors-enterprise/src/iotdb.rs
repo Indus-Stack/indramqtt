@@ -1173,7 +1173,9 @@ mod tests {
     ///  IOTDB_PASSWORD=root IOTDB_DEVICE=root.qual_b323 \
     ///  cargo +1.96.0 test -p broker-connectors-enterprise --all-features --lib iotdb::tests::test_qualify_write_path -- --ignored --nocapture --test-threads=1`
     ///
-    /// - Write 500 rows through [`IotDbSink`] on [`HttpIotDbTransport`].
+    /// - Write 500 rows through the broker rule path
+    ///   ([`broker_connectors::ConnectorManager`] ->
+    ///   [`IotDbSink`], Basic auth).
     /// - Assert the exact count and the first/last content through
     ///   `/rest/v2/query`.
     /// - Prove bad credentials fail as a dispatch error with the server text.
@@ -1306,6 +1308,10 @@ mod tests {
         );
         let sink = Arc::new(IotDbSink::new(config.clone(), transport).expect("qual sink builds"));
         assert_eq!(sink.kind(), "iotdb");
+        // Broker path: rule actions send through the shared manager.
+        // The qual sends through it, never `sink.send` direct.
+        let manager = Arc::new(broker_connectors::ConnectorManager::new());
+        manager.register("qual-iotdb", sink.clone());
 
         const ROWS: usize = 500;
         let topic = Topic::new("qual/iotdb/b323").unwrap();
@@ -1314,7 +1320,8 @@ mod tests {
             // point, so the read-back compares without rounding doubt.
             let reading = 20.0 + seq as f64 * 0.5;
             let payload = Bytes::from(format!(r#"{{"seq":{seq},"reading":{reading:.1}}}"#));
-            sink.send(&topic, &payload, QoS::AtLeastOnce)
+            manager
+                .send("qual-iotdb", &topic, &payload, QoS::AtLeastOnce)
                 .await
                 .expect("qual send");
             // Reason: one row per 2 ms keeps timestamps unique (the
@@ -1437,8 +1444,11 @@ mod tests {
         );
         let bad_sink =
             Arc::new(IotDbSink::new(bad_config, bad_transport).expect("qual bad sink builds"));
-        bad_sink
+        let bad_manager = Arc::new(broker_connectors::ConnectorManager::new());
+        bad_manager.register("qual-iotdb-bad", bad_sink.clone());
+        bad_manager
             .send(
+                "qual-iotdb-bad",
                 &topic,
                 &Bytes::from_static(br#"{"seq":1,"reading":20.5}"#),
                 QoS::AtLeastOnce,

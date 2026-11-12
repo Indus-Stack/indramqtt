@@ -1,13 +1,11 @@
 use async_trait::async_trait;
 use broker_auth::{
-    AuthnChain, AuthnSettingsStore, AuthzNodeCache, AuthzSettingsStore, AuthzSourceRegistry,
-    DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig, KerberosAuthenticator,
-    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache, WebhookAuth,
-    WebhookConfig,
+    AuthnChain, AuthnEntry, AuthnSettingsStore, AuthzNodeCache, AuthzSettingsStore,
+    AuthzSourceRegistry, DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig,
+    KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
+    NodeAuthCache, WebhookAuth, WebhookConfig,
 };
-use broker_cluster::{
-    ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
-};
+use broker_cluster::{ClusterMessage, InstallationState, RoutingPlane, TrustedKeys};
 use broker_config::{CliOverrides, ConfigError, ConfigRegistry, LayeredConfig};
 use broker_delayed::{DelayedEntry, DelayedScheduler, DEFAULT_MAX_DELAYED_SECS, DELAYED_TICK_MS};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
@@ -564,6 +562,11 @@ const V5_RC_PACKET_TOO_LARGE: u8 = 0x95;
 /// session created.
 const V5_RC_PROTOCOL_ERROR: u8 = 0x82;
 
+/// v5 bind refusal: empty client id without clean start. Reason: the
+/// specification forbids that combination (section 3.1.3.1). Fail
+/// closed with no session created.
+const V5_RC_CLIENT_ID_REJECTED: u8 = 0x85;
+
 /// v5 quota refusal on CONNECT (too many connections for the user).
 /// Version-4 binds keep the existing `0x8B` byte unchanged; version-5
 /// binds carry the documented quota code below with a reason string.
@@ -791,6 +794,25 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
                     );
                 }
             };
+            // An empty client id without a clean start is refused
+            // with no session created. Reason: the specification
+            // forbids it ([MQTT-3.1.3-8] for 3.1.1, section 3.1.3.1
+            // for v5 with code 0x85). An empty id with a clean start
+            // stays accepted, as before.
+            if req.client_id.is_empty() && !req.clean_start {
+                let rc = if req.protocol_version == 5 {
+                    V5_RC_CLIENT_ID_REJECTED
+                } else {
+                    2u8
+                };
+                return refusal_for_req(
+                    frame,
+                    &req,
+                    rc,
+                    sessions.max_topic_alias(),
+                    server_max_pkt,
+                );
+            }
             // X1-02: a Receive Maximum of 0 is a protocol error on the
             // wire (the client would accept no QoS 1/2 downlink at
             // all). Fail closed with no session created.
@@ -1184,6 +1206,233 @@ async fn verify_jwks_connect(
     }
 }
 
+/// One successful chain verdict for a credentialed CONNECT.
+struct ChainAllow {
+    /// Id of the entry that allowed. Drives per-entry success counts.
+    id: String,
+    /// The directory cast the deciding verdict. Selects quota handling.
+    via_ldap: bool,
+    /// Kerberos cast the deciding verdict. Selects quota handling.
+    via_kerberos: bool,
+    /// The JWKS endpoint cast the deciding verdict. Selects quota use.
+    via_jwks: bool,
+    /// A database source cast the deciding verdict. Selects quota use.
+    via_db: bool,
+    /// The webhook cast the deciding verdict. Selects quota handling.
+    via_webhook: bool,
+    /// Verified JWT subject on JWKS success. Stamps the session.
+    jwks_subject: Option<String>,
+    /// Verified Kerberos principal on success. Stamps the session.
+    kerberos_principal: Option<String>,
+    /// Mapped Kerberos role on success. Feeds the role invariant.
+    kerberos_role: Option<String>,
+}
+
+impl ChainAllow {
+    /// Empty verdict for `id`: no backend decided yet.
+    fn none(id: String) -> Self {
+        Self {
+            id,
+            via_ldap: false,
+            via_kerberos: false,
+            via_jwks: false,
+            via_db: false,
+            via_webhook: false,
+            jwks_subject: None,
+            kerberos_principal: None,
+            kerberos_role: None,
+        }
+    }
+}
+
+/// One refused chain verdict for a credentialed CONNECT.
+struct ChainDeny {
+    /// Id of the entry that denied. Empty when all entries abstained.
+    id: String,
+    /// Backend of the denying entry. Empty when all entries abstained.
+    backend: String,
+}
+
+/// Run one credentialed CONNECT through the stored chain order (MV-09a).
+///
+/// Iterates `entries` in stored order and skips disabled entries: a
+/// disabled entry never executes. Each backend maps to its live
+/// authenticator. An entry that does not know the credential abstains
+/// and the next enabled entry runs. A deny stops the chain at once and
+/// never falls through to a later allow. All abstain denies fail-closed
+/// with an empty id. Backends with no live code here (`scram`, `file`,
+/// `cinfo`) always abstain. CONNECT-only, never on the delivery path.
+async fn decide_chain_auth(
+    shared: &Shared,
+    entries: &[AuthnEntry],
+    tenant: &str,
+    client_id: &str,
+    username: Option<&str>,
+    password: Option<&[u8]>,
+) -> Result<ChainAllow, ChainDeny> {
+    for entry in entries {
+        if !entry.enable {
+            continue;
+        }
+        let deny = || ChainDeny {
+            id: entry.id.clone(),
+            backend: entry.backend.clone(),
+        };
+        match entry.backend.as_str() {
+            "built_in_database" => {
+                // An unknown name abstains, except open mode allows.
+                // Open mode needs an empty store and no other live entry.
+                // A live entry decides, so the built-in entry abstains.
+                if !username.is_some_and(|name| shared.auth.has_user_in_tenant(tenant, name)) {
+                    if shared.auth.user_count() != 0 {
+                        continue;
+                    }
+                    let other_live = entries.iter().any(|other| {
+                        if !other.enable || other.id == entry.id {
+                            return false;
+                        }
+                        match other.backend.as_str() {
+                            "ldap" => shared.ldap.is_some(),
+                            "kerberos" => shared.kerberos.as_ref().is_some_and(|k| k.is_enabled()),
+                            "jwt" => shared.jwks.as_ref().is_some_and(|j| j.is_enabled()),
+                            "mysql" | "postgresql" | "mongodb" | "redis" => {
+                                shared.db_auth.as_ref().is_some_and(|d| d.is_configured())
+                            }
+                            "http" => shared.webhook.is_some(),
+                            _ => false,
+                        }
+                    });
+                    if other_live {
+                        continue;
+                    }
+                    return Ok(ChainAllow::none(entry.id.clone()));
+                }
+                // A known local name with a wrong password denies here.
+                let ok = shared
+                    .auth
+                    .authenticate_in_tenant(tenant, client_id, username, password)
+                    .await
+                    .is_ok();
+                if ok {
+                    return Ok(ChainAllow::none(entry.id.clone()));
+                }
+                return Err(deny());
+            }
+            "jwt" => {
+                let Some(jwks) = shared.jwks.as_ref() else {
+                    continue;
+                };
+                if !jwks.is_enabled() {
+                    continue;
+                }
+                if !password.is_some_and(JwksAuthenticator::looks_like_jwt) {
+                    continue;
+                }
+                match verify_jwks_connect(shared, tenant, client_id, password).await {
+                    Ok(subject) => {
+                        let mut allow = ChainAllow::none(entry.id.clone());
+                        allow.via_jwks = true;
+                        allow.jwks_subject = subject;
+                        return Ok(allow);
+                    }
+                    Err(()) => {
+                        return Err(deny());
+                    }
+                }
+            }
+            "kerberos" => {
+                let Some(kerberos) = shared.kerberos.as_ref() else {
+                    continue;
+                };
+                if !kerberos.is_enabled() {
+                    continue;
+                }
+                let Some(token) = password else {
+                    continue;
+                };
+                if token.is_empty() || (token[0] != 0x60 && token[0] != 0x6E) {
+                    continue;
+                }
+                match kerberos.verify_token_in_tenant(tenant, client_id, token) {
+                    Ok(verified) => {
+                        // Wire every verified field live, as the fixed
+                        // order path does. Audit-logged for SSO use.
+                        let expected_service = kerberos.config().service_principal_name.clone();
+                        tracing::info!(
+                            client_principal = %verified.client_principal,
+                            service_principal = %verified.service_principal,
+                            expected_service = %expected_service,
+                            role = %verified.role,
+                            session_key_len = verified.session_key.len(),
+                            "Kerberos CONNECT accepted"
+                        );
+                        debug_assert_eq!(verified.service_principal, expected_service);
+                        debug_assert_eq!(verified.session_key.len(), 32);
+                        let mut allow = ChainAllow::none(entry.id.clone());
+                        allow.via_kerberos = true;
+                        allow.kerberos_principal = Some(verified.client_principal);
+                        allow.kerberos_role = Some(verified.role);
+                        return Ok(allow);
+                    }
+                    Err(_) => {
+                        return Err(deny());
+                    }
+                }
+            }
+            "ldap" => {
+                let Some(ldap) = shared.ldap.as_ref() else {
+                    continue;
+                };
+                if ldap
+                    .authenticate_in_tenant(tenant, client_id, username, password)
+                    .await
+                    .is_ok()
+                {
+                    let mut allow = ChainAllow::none(entry.id.clone());
+                    allow.via_ldap = true;
+                    return Ok(allow);
+                }
+                return Err(deny());
+            }
+            "mysql" | "postgresql" | "mongodb" | "redis" => {
+                let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) else {
+                    continue;
+                };
+                if db
+                    .authenticate_in_tenant(tenant, client_id, username, password)
+                    .await
+                    .is_ok()
+                {
+                    let mut allow = ChainAllow::none(entry.id.clone());
+                    allow.via_db = true;
+                    return Ok(allow);
+                }
+                return Err(deny());
+            }
+            "http" => {
+                let Some(webhook) = shared.webhook.as_ref() else {
+                    continue;
+                };
+                if webhook
+                    .authenticate_in_tenant(tenant, client_id, username, password)
+                    .await
+                    .is_ok()
+                {
+                    let mut allow = ChainAllow::none(entry.id.clone());
+                    allow.via_webhook = true;
+                    return Ok(allow);
+                }
+                return Err(deny());
+            }
+            _ => {}
+        }
+    }
+    Err(ChainDeny {
+        id: String::new(),
+        backend: String::new(),
+    })
+}
+
 /// Authenticated bind for the live path: credentialed requests verify
 /// against the auth store first (failure short-circuits to return code
 /// `0x86`, bad username/password, with no session created), then the
@@ -1427,7 +1676,12 @@ async fn apply_bind_request_inner(
                 || jwks_enabled
                 || db_configured
                 || shared.webhook.is_some()
+                || !shared.allow_anonymous
             {
+                // `auth.allow_anonymous = false` refuses an anonymous CONNECT
+                // even while the user store is empty: the flag is applied
+                // before the session is created, with the version-correct
+                // code (3.1.1: return code 5, 5.0: reason code 0x87).
                 shared.metrics.inc_auth_failures();
                 // W2-08: anonymous refusal is a failed verdict on the
                 // first enabled built-in entry when one exists.
@@ -1481,7 +1735,70 @@ async fn apply_bind_request_inner(
             // verdict below. Like directory and Kerberos users, webhook
             // users have no local quotas (unlimited).
             let mut via_webhook = false;
-            if local_has_users {
+            // MV-09a: chain-driven dispatch. A stored non-empty chain
+            // decides in its own order with its own enable flags, never
+            // in the fixed order below. An empty chain keeps the fixed
+            // order path unchanged. One lock-free snapshot per connect.
+            let chain_entries = shared.authn_chain.snapshot();
+            if !chain_entries.is_empty() {
+                match decide_chain_auth(
+                    shared,
+                    &chain_entries,
+                    &tenant_for_auth,
+                    &req.client_id,
+                    req.username.as_deref(),
+                    password,
+                )
+                .await
+                {
+                    Ok(allow) => {
+                        via_ldap = allow.via_ldap;
+                        via_kerberos = allow.via_kerberos;
+                        via_jwks = allow.via_jwks;
+                        via_db = allow.via_db;
+                        via_webhook = allow.via_webhook;
+                        jwks_subject = allow.jwks_subject;
+                        kerberos_principal = allow.kerberos_principal;
+                        kerberos_role = allow.kerberos_role;
+                        // Attribute the verdict to the deciding entry so
+                        // status shows which backend allowed the CONNECT.
+                        // CONNECT-only; publish/deliver never touch this.
+                        if via_ldap || via_kerberos || via_jwks || via_db || via_webhook {
+                            shared.authn_chain.record_success(&allow.id);
+                        }
+                    }
+                    Err(deny) => {
+                        shared.metrics.inc_auth_failures();
+                        if deny.id.is_empty() {
+                            // No entry decided: fail closed and attribute
+                            // the refusal to the first entry so status
+                            // shows the outage. CONNECT-only.
+                            shared.authn_chain.record_first_failed();
+                            tracing::warn!(
+                                client_id = %req.client_id,
+                                "authentication chain abstained: refusing CONNECT"
+                            );
+                        } else {
+                            // A deny stops the chain: the next backend
+                            // never runs. Count, attribute and log it.
+                            shared.authn_chain.record_failed(&deny.id);
+                            tracing::warn!(
+                                client_id = %req.client_id,
+                                entry = %deny.id,
+                                backend = %deny.backend,
+                                "authentication chain denied the credential: refusing CONNECT"
+                            );
+                        }
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
+                    }
+                }
+            } else if local_has_users {
                 // Tenant scope (MT-06): the same username in two tenants
                 // is two independent identities, so the local lookup runs
                 // in the bind's own tenant resolved above. The default
@@ -1500,6 +1817,29 @@ async fn apply_bind_request_inner(
                     .is_ok();
                 if local_ok {
                     // Local credential accepted; quotas apply below.
+                } else if req
+                    .username
+                    .as_deref()
+                    .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant_for_auth, u))
+                {
+                    // A known local user with a wrong password denies here.
+                    // A deny never falls through to a later allow: the
+                    // chain stops instead of trying the next backend.
+                    // An unknown local name ignores to the next backend.
+                    tracing::warn!(
+                        client_id = %req.client_id,
+                        "known local user gave a wrong password: refusing CONNECT"
+                    );
+                    shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 } else if jwks_enabled && looks_jwt {
                     // B5-02: JWT-shaped passwords verify against the live
                     // JWKS endpoint when configured; success carries the
@@ -2162,6 +2502,19 @@ async fn apply_bind_request_inner(
                     ));
                 }
             };
+            // An empty client id without a clean start is refused
+            // with no session created. Reason: the specification
+            // forbids it ([MQTT-3.1.3-8] for 3.1.1, section 3.1.3.1
+            // for v5 with code 0x85). An empty id with a clean start
+            // stays accepted, as before.
+            if req.client_id.is_empty() && !req.clean_start {
+                let rc = if req.protocol_version == 5 {
+                    V5_RC_CLIENT_ID_REJECTED
+                } else {
+                    2u8
+                };
+                return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
+            }
             // X1-02: a Receive Maximum of 0 is a protocol error on the
             // wire. Fail closed with no session created (see the
             // synchronous path for the code-choice rationale).
@@ -2378,7 +2731,12 @@ fn is_binding_accepted(reply: &BrokerFrame) -> bool {
 /// bad template can never fail a connect; the stored templates themselves
 /// are validated at the management write, so skips only cover
 /// placeholder edge cases.
-fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>, conn_id: u64) {
+async fn apply_auto_subscribe(
+    shared: &Shared,
+    client_id: &str,
+    username: Option<&str>,
+    conn_id: u64,
+) {
     let entries = shared.auto_subscribe.list();
     if entries.is_empty() {
         return;
@@ -2396,6 +2754,17 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
             continue;
         };
         let Ok(qos) = QoS::try_from(entry.qos) else {
+            continue;
+        };
+        // AZ-02: an automatic subscription follows the same subscribe
+        // ACL as a manual one. A denied entry registers nothing, so a
+        // denied client receives nothing through auto-subscribe (D2).
+        if shared
+            .auth
+            .authorize_subscribe_in_tenant(&tenant, client_id, &filter)
+            .await
+            .is_err()
+        {
             continue;
         };
         // B4-08 bound: a full subscription table denies the entry fail
@@ -4213,6 +4582,9 @@ impl Shared {
         let sessions = Arc::new(SessionManager::new());
         let router = Arc::new(Router::new());
         let conns = Arc::new(ConnTable::default());
+        // Boot default: 1024 is the ingress queue capacity. The window task
+        // depth defaults to 65,536 inside the engine. Boot applies the file
+        // `rules_engine.window_channel_depth` and `backpressure_policy` next.
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
         // Enterprise window split (X1-06): windowed rules execute in the
         // enterprise crate; attach its executor before any rule is
@@ -4738,6 +5110,31 @@ fn apply_prometheus_file_settings(
     }
     next.validate()?;
     registry.commit_prometheus(next)?;
+    registry.save()?;
+    Ok(())
+}
+
+/// Copy authorization sources set through the startup layers into the
+/// config registry.
+///
+/// The file home replaces the stored source order only when a startup
+/// layer sets `authz_sources.sources`; a later boot without the key keeps
+/// the stored order. Boot-time only: one snapshot clone plus at most one
+/// commit and one save.
+fn apply_authz_sources_file_settings(
+    layered: &LayeredConfig,
+    registry: &ConfigRegistry,
+) -> Result<(), ConfigError> {
+    const PATH: &str = "authz_sources.sources";
+    if !layered.provenance().contains_key(PATH) {
+        return Ok(());
+    }
+    let next = layered.config().authz_sources.clone();
+    if next == registry.snapshot().authz_sources {
+        return Ok(());
+    }
+    next.validate()?;
+    registry.commit_authz_sources(next)?;
     registry.save()?;
     Ok(())
 }
@@ -5603,7 +6000,8 @@ where
                             &req.client_id,
                             req.username.as_deref(),
                             frame.header.conn_id,
-                        );
+                        )
+                        .await;
                     }
                 }
                 let replayed = match native_bind {
@@ -5940,19 +6338,43 @@ async fn apply_subscribe(
         // Tenant scope (MT-06): authorisation runs in the subscriber's
         // own tenant resolved above, so a rule in one tenant never
         // grants subscribe in another. Same single-guard discipline as
-        // the publish path.
-        if shared
-            .auth
-            .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
-            .await
-            .is_err()
-        {
+        // the publish path. The stored cache policy is consulted first.
+        let cached_subscribe = owner.as_ref().and_then(|session| {
+            cached_authz_lookup(
+                shared,
+                session,
+                "subscribe",
+                filter.as_str(),
+                qos_raw,
+                false,
+            )
+        });
+        let local_denied = match cached_subscribe {
+            Some(allow) => !allow,
+            None => shared
+                .auth
+                .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
+                .await
+                .is_err(),
+        };
+        if local_denied {
             // Per-client decision cache (W2-01): record the denial on the
             // owning tenant's session so the management read observes it.
             // One bounded per-session insert on the subscribe
             // authorization event only; delivery never touches this lock.
-            if let Some(session) = owner.as_ref() {
-                session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
+            // A cache hit needs no new insert.
+            if cached_subscribe.is_none() {
+                if let Some(session) = owner.as_ref() {
+                    record_authz_under_policy(
+                        shared,
+                        session,
+                        "subscribe",
+                        filter.as_str(),
+                        qos_raw,
+                        false,
+                        false,
+                    );
+                }
             }
             // Fire $events/client_check_authz_complete.
             // Rules belong to the default tenant, so another tenant fires
@@ -5999,52 +6421,68 @@ async fn apply_subscribe(
         // rule as the publish path: session username, else client id).
         // The username rides the owning tenant's session resolved above,
         // never a default-tenant namesake. A database outage fails closed
-        // like a local denial.
-        if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-            let username = owner.as_ref().and_then(|s| s.username.read().clone());
-            // Tenant scope (MT-06): the probe and the lookup run in the
-            // subscriber's own tenant (deferred: only the built-in table
-            // holds per-tenant state).
-            let is_local = username
-                .as_deref()
-                .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
-            if !is_local {
-                let key = username.as_deref().unwrap_or(&client_id);
-                if db
-                    .authorize_subscribe_in_tenant(&tenant, key, &filter)
-                    .await
-                    .is_err()
-                {
-                    if shared.engine.is_event_source_selected(
-                        broker_rules::EventSource::ClientCheckAuthzComplete,
-                    ) && is_default_tenant(&tenant)
+        // like a local denial. A cached allow skips this leg.
+        if cached_subscribe != Some(true) {
+            if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+                let username = owner.as_ref().and_then(|s| s.username.read().clone());
+                // Tenant scope (MT-06): the probe and the lookup run in the
+                // subscriber's own tenant (deferred: only the built-in table
+                // holds per-tenant state).
+                let is_local = username
+                    .as_deref()
+                    .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
+                if !is_local {
+                    let key = username.as_deref().unwrap_or(&client_id);
+                    if db
+                        .authorize_subscribe_in_tenant(&tenant, key, &filter)
+                        .await
+                        .is_err()
                     {
-                        if let Some(session) = owner.as_ref() {
-                            let username = session.username.read().clone();
-                            let peerhost = session.peerhost.read().clone();
-                            shared.engine.fire_client_check_authz_complete(
-                                broker_rules::ClientCheckAuthzCompleteEvent {
-                                    client_id: client_id.clone(),
-                                    username,
-                                    peerhost,
-                                    action: "subscribe".to_string(),
-                                    topic: filter.as_str().to_string(),
-                                    qos: qos_raw,
-                                    retain: None,
-                                    allow: false,
-                                    source: "database".to_string(),
-                                },
-                            );
+                        if shared.engine.is_event_source_selected(
+                            broker_rules::EventSource::ClientCheckAuthzComplete,
+                        ) && is_default_tenant(&tenant)
+                        {
+                            if let Some(session) = owner.as_ref() {
+                                let username = session.username.read().clone();
+                                let peerhost = session.peerhost.read().clone();
+                                shared.engine.fire_client_check_authz_complete(
+                                    broker_rules::ClientCheckAuthzCompleteEvent {
+                                        client_id: client_id.clone(),
+                                        username,
+                                        peerhost,
+                                        action: "subscribe".to_string(),
+                                        topic: filter.as_str().to_string(),
+                                        qos: qos_raw,
+                                        retain: None,
+                                        allow: false,
+                                        source: "database".to_string(),
+                                    },
+                                );
+                            }
                         }
+                        // The database denial follows the same version split
+                        // as the local denial above. Record it under the cache
+                        // policy so the next operation reuses it until TTL.
+                        if cached_subscribe.is_none() {
+                            if let Some(session) = owner.as_ref() {
+                                record_authz_under_policy(
+                                    shared,
+                                    session,
+                                    "subscribe",
+                                    filter.as_str(),
+                                    qos_raw,
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                        codes.push(if entry.has_options {
+                            V5_SUBACK_NOT_AUTHORIZED
+                        } else {
+                            V5_SUBACK_UNSPECIFIED
+                        });
+                        continue;
                     }
-                    // The database denial follows the same version split
-                    // as the local denial above.
-                    codes.push(if entry.has_options {
-                        V5_SUBACK_NOT_AUTHORIZED
-                    } else {
-                        V5_SUBACK_UNSPECIFIED
-                    });
-                    continue;
                 }
             }
         }
@@ -6087,9 +6525,19 @@ async fn apply_subscribe(
         // Same bounded per-session insert, same event; delivery never
         // touches this lock. Recorded only after the router accepts the
         // entry so a quota denial records nothing and changes no session
-        // state.
-        if let Some(session) = owner.as_ref() {
-            session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
+        // state. A cache hit needs no new insert.
+        if cached_subscribe.is_none() {
+            if let Some(session) = owner.as_ref() {
+                record_authz_under_policy(
+                    shared,
+                    session,
+                    "subscribe",
+                    filter.as_str(),
+                    qos_raw,
+                    false,
+                    true,
+                );
+            }
         }
         // Mirror the grant with its full v5 options on the owning
         // tenant's session for observability (the router stays the
@@ -6841,28 +7289,44 @@ async fn apply_publish(
             username.as_deref(),
             peerhost.as_deref(),
         ) {
-            let ack = match qos {
-                QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                QoS::AtMostOnce => None,
-            };
+            let protocol_version = publisher_session
+                .as_ref()
+                .map_or(4, |session| session.protocol_version());
+            let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
             return (ack, Vec::new());
         }
         // Tenant scope (MT-06): authorisation runs in the publisher's
         // own tenant resolved above, so a rule in one tenant never
         // grants publish in another. One short guard with no new lock
-        // and no allocation on the single-tenant fast path.
-        let allowed = shared
-            .auth
-            .authorize_publish_in_tenant(tenant, &publisher, topic)
-            .await
-            .is_ok();
+        // and no allocation on the single-tenant fast path. The stored
+        // cache policy is consulted first.
+        let cached_publish = publisher_session.as_ref().and_then(|session| {
+            cached_authz_lookup(shared, session, "publish", topic.as_str(), qos_raw, retain)
+        });
+        let allowed = match cached_publish {
+            Some(allow) => allow,
+            None => shared
+                .auth
+                .authorize_publish_in_tenant(tenant, &publisher, topic)
+                .await
+                .is_ok(),
+        };
         // Per-client decision cache (W2-01): record the publish decision
         // so the management read observes edge publishers. One bounded
         // per-session insert on the publish authorization event only;
-        // delivery never touches this lock.
-        if let Some(session) = publisher_session.as_ref() {
-            session.record_authz_decision("publish", topic.as_str(), qos_raw, retain, allowed);
+        // delivery never touches this lock. A cache hit needs no insert.
+        if cached_publish.is_none() {
+            if let Some(session) = publisher_session.as_ref() {
+                record_authz_under_policy(
+                    shared,
+                    session,
+                    "publish",
+                    topic.as_str(),
+                    qos_raw,
+                    retain,
+                    allowed,
+                );
+            }
         }
         if !allowed {
             // Fire the authz event. Rules belong to the default tenant.
@@ -6886,11 +7350,10 @@ async fn apply_publish(
                     },
                 );
             }
-            let ack = match qos {
-                QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                QoS::AtMostOnce => None,
-            };
+            let protocol_version = publisher_session
+                .as_ref()
+                .map_or(4, |session| session.protocol_version());
+            let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
             // AP-11: a denied publish with the stored `deny_action:
             // disconnect` closes the connection with 0x87 after the ack
             // above is built, so the publisher still observes its ack.
@@ -6911,45 +7374,59 @@ async fn apply_publish(
         // fan-out locks. The database leg is bounded: one short cache lock
         // plus one small key allocation on a hit, one semaphore permit
         // (pool_size bound, default 8) plus one DB round-trip consulting at
-        // most MAX_ACL_ROWS rows on a miss.
-        if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-            // Tenant scope (MT-06): the local-user probe and the database
-            // lookup both run in the publisher's own tenant (deferred:
-            // only the built-in table holds per-tenant state).
-            let is_local = username
-                .as_deref()
-                .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u));
-            if !is_local {
-                let key = username.as_deref().unwrap_or(&publisher);
-                if db
-                    .authorize_publish_in_tenant(tenant, key, topic)
-                    .await
-                    .is_err()
-                {
-                    if shared.engine.is_event_source_selected(
-                        broker_rules::EventSource::ClientCheckAuthzComplete,
-                    ) && is_default_tenant(tenant)
+        // most MAX_ACL_ROWS rows on a miss. A cached allow skips this leg.
+        if cached_publish != Some(true) {
+            if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+                // Tenant scope (MT-06): the local-user probe and the database
+                // lookup both run in the publisher's own tenant (deferred:
+                // only the built-in table holds per-tenant state).
+                let is_local = username
+                    .as_deref()
+                    .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u));
+                if !is_local {
+                    let key = username.as_deref().unwrap_or(&publisher);
+                    if db
+                        .authorize_publish_in_tenant(tenant, key, topic)
+                        .await
+                        .is_err()
                     {
-                        shared.engine.fire_client_check_authz_complete(
-                            broker_rules::ClientCheckAuthzCompleteEvent {
-                                client_id: publisher.clone(),
-                                username: username.clone(),
-                                peerhost: peerhost.clone(),
-                                action: "publish".to_string(),
-                                topic: topic.to_string(),
-                                qos: qos_raw,
-                                retain: Some(retain),
-                                allow: false,
-                                source: "database".to_string(),
-                            },
-                        );
+                        if shared.engine.is_event_source_selected(
+                            broker_rules::EventSource::ClientCheckAuthzComplete,
+                        ) && is_default_tenant(tenant)
+                        {
+                            shared.engine.fire_client_check_authz_complete(
+                                broker_rules::ClientCheckAuthzCompleteEvent {
+                                    client_id: publisher.clone(),
+                                    username: username.clone(),
+                                    peerhost: peerhost.clone(),
+                                    action: "publish".to_string(),
+                                    topic: topic.to_string(),
+                                    qos: qos_raw,
+                                    retain: Some(retain),
+                                    allow: false,
+                                    source: "database".to_string(),
+                                },
+                            );
+                        }
+                        let protocol_version = publisher_session
+                            .as_ref()
+                            .map_or(4, |session| session.protocol_version());
+                        let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
+                        if cached_publish.is_none() {
+                            if let Some(session) = publisher_session.as_ref() {
+                                record_authz_under_policy(
+                                    shared,
+                                    session,
+                                    "publish",
+                                    topic.as_str(),
+                                    qos_raw,
+                                    retain,
+                                    false,
+                                );
+                            }
+                        }
+                        return (ack, Vec::new());
                     }
-                    let ack = match qos {
-                        QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                        QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                        QoS::AtMostOnce => None,
-                    };
-                    return (ack, Vec::new());
                 }
             }
         }
@@ -6973,40 +7450,54 @@ async fn apply_publish(
         // does not decide those paths; gateway (CoAP) and cluster forwards
         // carry no MQTT credential context, so they keep the local ACL
         // rather than inventing a publish context for them.
-        if let Some(webhook) = shared.webhook.as_ref() {
-            // Tenant scope (MT-06): the verdict carries the publisher's
-            // own tenant (deferred: only the built-in table holds
-            // per-tenant state).
-            if webhook
-                .authorize_publish_in_tenant(tenant, &publisher, topic)
-                .await
-                .is_err()
-            {
-                if shared
-                    .engine
-                    .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
-                    && is_default_tenant(tenant)
+        // A cached allow skips this leg.
+        if cached_publish != Some(true) {
+            if let Some(webhook) = shared.webhook.as_ref() {
+                // Tenant scope (MT-06): the verdict carries the publisher's
+                // own tenant (deferred: only the built-in table holds
+                // per-tenant state).
+                if webhook
+                    .authorize_publish_in_tenant(tenant, &publisher, topic)
+                    .await
+                    .is_err()
                 {
-                    shared.engine.fire_client_check_authz_complete(
-                        broker_rules::ClientCheckAuthzCompleteEvent {
-                            client_id: publisher.clone(),
-                            username,
-                            peerhost,
-                            action: "publish".to_string(),
-                            topic: topic.to_string(),
-                            qos: qos_raw,
-                            retain: Some(retain),
-                            allow: false,
-                            source: "webhook".to_string(),
-                        },
-                    );
+                    if shared.engine.is_event_source_selected(
+                        broker_rules::EventSource::ClientCheckAuthzComplete,
+                    ) && is_default_tenant(tenant)
+                    {
+                        shared.engine.fire_client_check_authz_complete(
+                            broker_rules::ClientCheckAuthzCompleteEvent {
+                                client_id: publisher.clone(),
+                                username,
+                                peerhost,
+                                action: "publish".to_string(),
+                                topic: topic.to_string(),
+                                qos: qos_raw,
+                                retain: Some(retain),
+                                allow: false,
+                                source: "webhook".to_string(),
+                            },
+                        );
+                    }
+                    let protocol_version = publisher_session
+                        .as_ref()
+                        .map_or(4, |session| session.protocol_version());
+                    let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
+                    if cached_publish.is_none() {
+                        if let Some(session) = publisher_session.as_ref() {
+                            record_authz_under_policy(
+                                shared,
+                                session,
+                                "publish",
+                                topic.as_str(),
+                                qos_raw,
+                                retain,
+                                false,
+                            );
+                        }
+                    }
+                    return (ack, Vec::new());
                 }
-                let ack = match qos {
-                    QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                    QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                    QoS::AtMostOnce => None,
-                };
-                return (ack, Vec::new());
             }
         }
         // Fire the allowed-publish authz event. Rules belong to the
@@ -7063,7 +7554,7 @@ async fn apply_publish(
     // Rate policing (INDRA-128): token bucket per publishing client,
     // configured per user. Over quota the message dies here — QoS 0 is
     // dropped and counted, QoS 1 gets its PubAck stamped 0x97, QoS 2
-    // completes its handshake with PUBREC but stores nothing.
+    // gets its PubRec stamped 0x97 and stores nothing.
     if !check_publish_quota(frame, shared).await {
         shared.metrics.inc_messages_dropped();
         shared.metrics.inc_overload_dropped();
@@ -7093,11 +7584,10 @@ async fn apply_publish(
                     reason: "quota_exceeded".to_string(),
                 });
         }
-        let ack = match qos {
-            QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x97),
-            QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-            QoS::AtMostOnce => None,
-        };
+        let protocol_version = publisher_session
+            .as_ref()
+            .map_or(4, |session| session.protocol_version());
+        let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x97);
         return (ack, Vec::new());
     }
 
@@ -8887,6 +9377,32 @@ async fn check_publish_quota(frame: &BrokerFrame, shared: &Shared) -> bool {
     )
 }
 
+/// Build the acknowledgement for a denied QoS 1 or QoS 2 publish.
+/// Version 5 carries `reason_code` on the ack. Version 3.1.1 has no ack
+/// reason code, so the reason stays 0 and the edge sends the short form.
+fn denied_publish_ack(
+    frame: &BrokerFrame,
+    packet_id: u16,
+    qos: QoS,
+    protocol_version: u8,
+    reason_code: u8,
+) -> Option<BrokerFrame> {
+    match qos {
+        QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, reason_code),
+        QoS::ExactlyOnce => qos2_reply_with_reason(
+            OpCode::PubRecOut,
+            frame,
+            packet_id,
+            if protocol_version == 5 {
+                reason_code
+            } else {
+                0
+            },
+        ),
+        QoS::AtMostOnce => None,
+    }
+}
+
 /// Build one `PubAckOut` reply mirroring the request identity.
 fn pub_ack_reply(frame: &BrokerFrame, packet_id: u16, return_code: u8) -> Option<BrokerFrame> {
     let mut meta = Vec::with_capacity(3);
@@ -9437,24 +9953,39 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     ) {
         return Vec::new();
     }
-    // Per-client decision cache (W2-01): record the will-publish decision
-    // like any other publish from this client. Same bounded per-session
-    // insert; delivery never touches this lock.
+    // Per-client decision cache (W2-01): consult and record the
+    // will-publish decision like any other publish from this client.
+    // Same bounded per-session insert; delivery never touches this lock.
     // Tenant scope (MT-06): the will authorises in its own tenant (the
     // session's tenant captured above), like any other publish from this
     // client. Disconnect events only; never on the hot path.
-    let will_allowed = shared
-        .auth
-        .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
-        .await
-        .is_ok();
-    session.record_authz_decision(
+    let cached_will = cached_authz_lookup(
+        shared,
+        &session,
         "publish",
         will.topic.as_str(),
         u8::from(will.qos),
         will.retain,
-        will_allowed,
     );
+    let will_allowed = match cached_will {
+        Some(allow) => allow,
+        None => shared
+            .auth
+            .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
+            .await
+            .is_ok(),
+    };
+    if cached_will.is_none() {
+        record_authz_under_policy(
+            shared,
+            &session,
+            "publish",
+            will.topic.as_str(),
+            u8::from(will.qos),
+            will.retain,
+            will_allowed,
+        );
+    }
     if !will_allowed {
         return Vec::new();
     }
@@ -10037,6 +10568,63 @@ fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
 /// Order a DISCONNECT for one denied publish or subscribe (AP-11, stored
 /// `deny_action: disconnect`).
 ///
+/// Look up a cached authorization verdict for one operation.
+/// Returns `None` when caching is off, the topic is excluded, the TTL
+/// does not parse, or no fresh entry exists. Reads the stored cache
+/// policy (`enable`, `max_size`, `ttl`, `excludes`) with one lock-free
+/// load. One short per-session lock for the lookup only.
+fn cached_authz_lookup(
+    shared: &Shared,
+    session: &broker_session::Session,
+    action: &str,
+    topic: &str,
+    qos: u8,
+    retain: bool,
+) -> Option<bool> {
+    // The webhook keeps its own TTL. Skip the session cache for
+    // publishes while the webhook is on, so the broker asks again.
+    if action == "publish" && shared.webhook.is_some() {
+        return None;
+    }
+    let snap = shared.authz_settings.snapshot();
+    if !snap.cache.enable {
+        return None;
+    }
+    if broker_session::Session::authz_topic_excluded(topic, &snap.cache.excludes) {
+        return None;
+    }
+    let ttl_ms = broker_config::parse_settings_duration_to_ms(&snap.cache.ttl)?;
+    session.cached_authz_verdict(action, topic, qos, retain, ttl_ms)
+}
+
+/// Record one authorization verdict under the stored cache policy.
+/// Skips excluded topics and a disabled cache. Trims the per-client
+/// cache to the stored `max_size`. One bounded per-session insert.
+fn record_authz_under_policy(
+    shared: &Shared,
+    session: &broker_session::Session,
+    action: &str,
+    topic: &str,
+    qos: u8,
+    retain: bool,
+    allow: bool,
+) {
+    // Do not store publishes while the webhook is on. The broker
+    // asks the webhook again after its TTL ends.
+    if action == "publish" && shared.webhook.is_some() {
+        return;
+    }
+    let snap = shared.authz_settings.snapshot();
+    if !snap.cache.enable {
+        return;
+    }
+    if broker_session::Session::authz_topic_excluded(topic, &snap.cache.excludes) {
+        return;
+    }
+    session.record_authz_decision(action, topic, qos, retain, allow);
+    session.trim_authz_cache_to(snap.cache.max_size);
+}
+
 /// Best-effort and idempotent like [`order_alias_disconnect`]: routes a
 /// `ConnClose` frame carrying 0x87 so the edge closes the socket (a
 /// version-5 edge sends DISCONNECT 0x87 first), then detaches the session
@@ -10498,6 +11086,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Seeding already ran inside `ApiState::new`; sharing replaces that
     // fresh instance with the kernel's so no second copy diverges.
     state.authz_sources = shared.authz_sources.clone();
+    // Link the rule table to the shared registry again. `ApiState::new`
+    // linked its own instance; without this link a management delete,
+    // reorder or update reaches the API copy only, not the authorize
+    // path. One `Arc` clone at boot.
+    shared
+        .auth
+        .set_authz_sources(Arc::clone(&shared.authz_sources));
     // Share the management API key directory (W2-25) so validated
     // management mints and revocations are visible to reads without a
     // restart. One `Arc` clone; management-plane only, never on the
@@ -10721,6 +11316,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Any other start returns the error and exits 1.
         return Err(err.into());
     }
+    // Fix the node name before any component reads it. The name has
+    // process scope and the first read wins. Late init lets a restart
+    // with stored connectors cache the default name instead.
+    broker_api::node_scope::init_local_node_name(&args.node_id);
     let cfg = layered.config().clone();
     // Start the log output after the configuration is resolved. Thus
     // `logging.level` applies. If the configuration has an error, `main`
@@ -10745,6 +11344,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shared = Shared::new();
     shared.allow_anonymous = args.allow_anonymous;
     shared.node_id = args.node_id.clone();
+    // DX2-057: apply the rule engine tuning from the startup layers.
+    // Reason: the file value must size live window tasks. Two relaxed
+    // stores at boot; task spawn pays one load, publish pays no new lock.
+    {
+        let depth = cfg.rules_engine.window_channel_depth.max(1) as usize;
+        shared.engine.set_window_channel_depth(depth);
+        let policy = match cfg.rules_engine.backpressure_policy.as_str() {
+            "Block" => BackpressurePolicy::Block,
+            "DropNewest" => BackpressurePolicy::DropNewest,
+            "DropOldest" => BackpressurePolicy::DropOldest,
+            "SpillToDisk" => BackpressurePolicy::SpillToDisk,
+            "RejectPublisher" => BackpressurePolicy::RejectPublisher,
+            _ => BackpressurePolicy::DropOldest,
+        };
+        if cfg.rules_engine.spill_dir.is_empty() {
+            if policy == BackpressurePolicy::SpillToDisk {
+                return Err(
+                    "rules_engine.backpressure_policy SpillToDisk needs rules_engine.spill_dir"
+                        .into(),
+                );
+            }
+            shared.engine.set_backpressure_policy(policy);
+        } else {
+            shared
+                .engine
+                .set_backpressure_policy(BackpressurePolicy::SpillToDisk);
+        }
+        info!(
+            "Rule engine tuning: window_channel_depth={} backpressure_policy={}",
+            depth, cfg.rules_engine.backpressure_policy
+        );
+    }
     // D1-02: apply the configured per-subscriber QoS 0 backlog bound to
     // the shared delivery table before any edge binds. One atomic store
     // at boot; the hot publish path pays a single relaxed load.
@@ -10763,6 +11394,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .sessions
         .set_max_qos1_spill(cfg.session.max_qos1_spill);
+    // MV-11c: apply the configured offline queue bound to the session
+    // manager before any edge binds. One atomic store at boot; detached
+    // durable sessions inherit it for buffering and restore, and the
+    // zone view reads the same live value. A kept zone value still wins
+    // when set. Resolves through the layers
+    // (`session.max_offline_queue`).
+    shared
+        .sessions
+        .set_max_offline_queue(Some(cfg.session.max_offline_queue as usize));
     // B4-05: apply the configured inbound topic-alias bound to the
     // session manager before any edge binds. One atomic store at boot;
     // future sessions inherit it at creation and advertise it in CONNACK.
@@ -10842,6 +11482,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exposition observe them from boot. Only keys a layer set move;
     // runtime changes through `PUT /prometheus` keep every other key.
     apply_prometheus_file_settings(&layered, &shared.config)?;
+    // Authorization sources (AZ-02): when a startup layer sets the source
+    // list, persist it before the boot replay reads the registry. A file
+    // or environment list replaces the stored order; an absent key keeps
+    // the stored state, so operator recovery is not undone at boot.
+    apply_authz_sources_file_settings(&layered, &shared.config)?;
     // Delayed publishes (B4-03): apply the configured delay bound, point
     // the wheel at the kernel data dir, reload pending entries, then
     // start the single driver task. Torn or expired rows are discarded
@@ -10907,6 +11552,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .auth
         .seed_from_registry(&shared.config)
         .map_err(|e| format!("seeding MQTT users from the config registry failed: {e}"))?;
+    // Authentication hashing policy (SA-21): apply the file value to
+    // new and changed verifiers. Supported values come from the
+    // validated schema (`sha256`, `bcrypt`); any other value fails
+    // the start at validation, so the match below stays exhaustive.
+    // Existing verifiers keep verifying and migrate lazily on login.
+    let hash_algorithm = match cfg.auth.password_hash.as_str() {
+        "sha256" => broker_auth::PasswordAlgorithm::Sha256Legacy,
+        "bcrypt" => broker_auth::PasswordAlgorithm::Bcrypt,
+        other => {
+            return Err(format!(
+                "auth.password_hash {other:?} is not supported: must be one of sha256, bcrypt (field `auth.password_hash`)"
+            )
+            .into());
+        }
+    };
+    let hash_policy = broker_auth::PasswordHashPolicy {
+        default_algorithm: hash_algorithm,
+        ..Default::default()
+    };
+    shared.auth.set_policy(hash_policy);
+    // Superusers (MV-09a): apply the configured list from boot.
+    // An empty list keeps current behaviour with no bypass.
+    shared.auth.set_superusers(cfg.auth.superusers.clone());
     // Authenticator chain (W2-02): seed the shared chain in place (the
     // same instance `serve_api` shares with `ApiState`), so the CONNECT
     // consult enforces the persisted chain from the first connection.
@@ -10945,6 +11613,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // management reads observe the persisted sources from the first
     // connection. Defaults yield the built-in database source.
     shared.authz_sources.seed_from_registry(&shared.config);
+    // D2: a stored source this build does not evaluate must never weaken
+    // access. Keep the unchanged record. The operator sees and removes it.
+    // Deny each decision that reaches it. Raise a named alarm. Log it.
+    for source in shared.authz_sources.snapshot().iter() {
+        if source.source_type == "built_in_database" {
+            continue;
+        }
+        let source_type = &source.source_type;
+        tracing::warn!(source_type, "authorization source {source_type} is not evaluated by this broker version: access it guards is denied; the stored record is unchanged");
+        shared.alarms.activate_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "unsupported_authorization_source",
+            &format!(
+                "authorization source {source_type} is not available in this broker; access it guards is denied"
+            ),
+            serde_json::json!({"source_type": source.source_type}),
+        );
+    }
     // Link the shared registry into the shared rule table (AP-06):
     // publish/subscribe verdicts attribute to the built-in counters and
     // honour the stored enable flag and order. One `Arc` clone.
@@ -11107,6 +11793,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cfg.rules_engine.spill_dir.is_empty() {
         match RuleEngine::new_with_spill(1024, cfg.rules_engine.spill_dir.as_str()) {
             Ok(engine) => {
+                // DX2-057: carry the file window depth onto the spill engine.
+                // Reason: the spill path must use the same task depth.
+                // One relaxed store at boot; task spawn pays one load.
+                engine.set_window_channel_depth(
+                    cfg.rules_engine.window_channel_depth.max(1) as usize,
+                );
                 let engine = Arc::new(engine);
                 engine.set_metrics(&shared.metrics);
                 // B4-07 boot wiring: carry the live broker sink onto the
@@ -11222,6 +11914,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user_filter: args.ldap_user_filter.clone(),
             group_attribute: args.ldap_group_attribute.clone(),
             required_group: args.ldap_required_group.clone(),
+            // Bound on concurrent directory authentications.
+            // Reason: one slot per CONNECT keeps bursts bounded.
+            // Exhaustion fails closed and never stalls accepts.
+            pool_size: cfg.ldap.pool_size,
+            // Bound on TCP connect plus TLS handshake.
+            // Reason: a slow directory fails fast and never stalls accepts.
+            connect_timeout_ms: cfg.ldap.connect_timeout_ms,
+            // Bound on each bind and search round-trip.
+            // Reason: a silent directory fails fast and never stalls accepts.
+            read_timeout_ms: cfg.ldap.read_timeout_ms,
             ca_cert_path: if args.ldap_ca_cert.is_empty() {
                 None
             } else {
@@ -11403,7 +12105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let licence_state = match shared
+    let mut licence_state = match shared
         .licence
         .load_from_data_dir(std::path::Path::new(&args.data_dir), now_licence)
     {
@@ -11412,6 +12114,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("cannot load licence state from {}: {e}", args.data_dir).into());
         }
     };
+    // DX2-057: apply `licence.license_key` from the startup layers.
+    // Reason: the file value must install the token. A bad token fails
+    // boot loudly, never with a silent trial. Empty keeps stored state.
+    let licence_key = cfg.licence.license_key.trim().to_string();
+    if !licence_key.is_empty() {
+        match shared.licence.install(&licence_key, now_licence) {
+            Ok(payload) => {
+                info!(
+                    "Licence key installed for '{}' (max {} nodes)",
+                    payload.customer, payload.max_nodes
+                );
+                licence_state = match shared
+                    .licence
+                    .load_from_data_dir(std::path::Path::new(&args.data_dir), now_licence)
+                {
+                    Ok(state) => state,
+                    Err(e) => {
+                        return Err(format!(
+                            "cannot reload licence state from {}: {e}",
+                            args.data_dir
+                        )
+                        .into());
+                    }
+                };
+            }
+            Err(e) => {
+                return Err(format!("licence.license_key install refused: {e}").into());
+            }
+        }
+    }
     // File commands for sites with no dashboard: generate the request or
     // install a licence, then exit without starting the broker.
     if !args.licence_request_out.trim().is_empty() {
@@ -11457,77 +12189,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     log_licence_lifecycle(&licence_state, args.licence_expiry_warn_days);
     shared.licence.refresh_alarms(&shared.alarms, now_licence);
-    if let Some(seeds) = &args.cluster_seeds {
-        info!("Cluster mode enabled with seeds: {}", seeds);
-        // The licence binds to the stable cluster identity (one licence
-        // covers the whole cluster): the stored token wins when present,
-        // otherwise the explicit flag or environment provides it. Joiners
-        // adopt the cluster identity and receive the licence as part of
-        // joining, so adding a node never needs another round trip.
-        let cluster_id = shared
-            .licence
-            .cluster_identity()
-            .unwrap_or_else(|| args.node_id.clone());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let license_key = shared
-            .licence
-            .stored_token()
-            .or_else(|| args.license_key.clone())
-            .or_else(|| std::env::var("INDRA_LICENSE_KEY").ok());
-        let status =
-            ClusterLicense::evaluate(license_key.as_deref(), 1, now, &cluster_id, &trusted_keys);
-        ClusterLicense::log_status_banner(&status);
-
-        let local_node = broker_cluster::NodeId::new(&args.node_id);
-        if let Ok(bind_addr) = args.cluster_bind.parse::<std::net::SocketAddr>() {
-            match broker_cluster::UdpSwimTransport::bind(local_node.clone(), bind_addr).await {
-                Ok(transport) => {
-                    let swim = broker_cluster::SwimMembership::new(
-                        local_node.clone(),
-                        Some(args.cluster_bind.clone()),
-                        broker_cluster::SwimConfig::default(),
-                        transport.clone(),
-                    );
-                    swim.set_license_key(license_key);
-                    swim.set_trusted_keys(trusted_keys.clone());
-                    swim.set_cluster_identity(
-                        cluster_id.clone(),
-                        shared.licence.cluster_trial_started_at(),
-                    );
-                    let route_table =
-                        Arc::new(broker_cluster::ClusterRouteTable::new(local_node.clone()));
-                    swim.attach_route_table(route_table);
-                    swim.clone().run_background();
-
-                    for seed_str in seeds.split(',') {
-                        let seed_str = seed_str.trim();
-                        if !seed_str.is_empty() {
-                            if let Ok(seed_addr) = seed_str.parse::<std::net::SocketAddr>() {
-                                let seed_node =
-                                    broker_cluster::NodeId::new(format!("seed-{}", seed_addr));
-                                transport.register_peer(seed_node.clone(), seed_addr);
-                                let _ = swim.join_seed(&seed_node).await;
-                            }
-                        }
-                    }
-                    info!(
-                        "SWIM gossip cluster engine initialized for node {}",
-                        args.node_id
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to bind cluster UDP socket on {}: {}",
-                        args.cluster_bind, e
-                    );
-                }
-            }
-        }
+    // MV-11b: clustering stays out of the MVP. The schema refuses its entry.
+    // The broker never binds a cluster socket. This check fails closed.
+    // Reason: the cluster path cannot keep tenants apart.
+    let cluster_flag = args
+        .cluster_seeds
+        .as_ref()
+        .is_some_and(|seeds| !seeds.trim().is_empty());
+    let cluster_file = cfg.cluster.enabled || !cfg.cluster.seed_nodes.is_empty();
+    if cluster_flag || cluster_file {
+        return Err("clustering is not in the MVP: remove cluster.enabled, cluster.seed_nodes and --cluster-seeds and run single-node"
+            .to_string()
+            .into());
     }
-    if !args.api_bind.is_empty() {
+    // A disabled API listener opens no socket. The bind flag alone
+    // never enables it. No flag sets `enabled`, so a file or variable
+    // with `enabled = false` wins over a bind value (fail closed).
+    if cfg.listeners.api.enabled && !args.api_bind.is_empty() {
         let listener = tokio::net::TcpListener::bind(&args.api_bind).await?;
         info!("Management API listening on {}", args.api_bind);
         // Cluster text (AP-03): name the kept description once at boot,
@@ -11654,7 +12332,6 @@ mod tests {
              [listeners.api]\nbind = \"127.0.0.1:28099\"\n\
              [session]\nmax_qos0_backlog = 7\n\
              [auth]\nallow_anonymous = true\n\
-             [cluster]\nseed_nodes = [\"a:1\", \"b:2\"]\n\
              [webhook]\nbreaker_threshold = 9\n",
         )
         .expect("write indra.toml");
@@ -11665,7 +12342,6 @@ mod tests {
         assert_eq!(args.api_bind, "127.0.0.1:28099");
         assert_eq!(args.qos0_backlog, 7);
         assert!(args.allow_anonymous);
-        assert_eq!(args.cluster_seeds.as_deref(), Some("a:1,b:2"));
         assert_eq!(args.webhook_breaker_threshold, 9);
 
         // A typed flag overrides the file. The file sets the other values.
@@ -11781,7 +12457,7 @@ mod tests {
         }
 
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         // One free loopback port for the test listener.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
         let port = probe.local_addr().expect("probe addr").port();
@@ -12388,7 +13064,9 @@ mod tests {
     }
 
     fn test_shared() -> Shared {
-        Shared::new()
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
+        shared
     }
 
     #[test]
@@ -12786,7 +13464,7 @@ mod tests {
         // Use the live edge path.
         // Send each v5 bind over TCP.
         // Read the granted expiry from the socket reply.
-        let shared = Shared::new();
+        let shared = test_shared();
         assert_eq!(shared.sessions.max_session_expiry_secs(), 86_400);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -13227,7 +13905,7 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_connection(stream, Shared::new())
+            handle_connection(stream, test_shared())
                 .await
                 .expect("handle");
         });
@@ -16416,7 +17094,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_then_publish_routes_to_subscriber_transport() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
@@ -16491,7 +17169,8 @@ mod tests {
     async fn rule_republish_reaches_alert_subscriber() {
         use broker_rules::RuleAction;
 
-        let shared = Shared::new();
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
         // Ingress rule: anything under sensors/+ is republished to
         // alerts/critical. No MQTT loopback involved: delivery flows
         // engine -> in-memory sink -> subscriber mailbox.
@@ -16580,7 +17259,7 @@ mod tests {
     async fn rule_sql_transforms_payload_end_to_end() {
         use broker_rules::RuleAction;
 
-        let shared = Shared::new();
+        let shared = test_shared();
         // Streaming SQL rule: project only `temperature` out of raw
         // payloads. The secret field must never reach subscribers.
         shared
@@ -16682,7 +17361,8 @@ mod tests {
 
     #[tokio::test]
     async fn retained_message_delivered_to_late_subscriber() {
-        let shared = Shared::new();
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -16774,7 +17454,7 @@ mod tests {
             }
         }
 
-        let shared = Shared::new();
+        let shared = test_shared();
         // Two stored transforms append in chain order through the
         // production store plus the engine snapshot (the same path the
         // management handlers drive).
@@ -16863,7 +17543,7 @@ mod tests {
         use broker_api::v5::transformations::{TransformOperation, TransformRecord};
         use broker_rules::RuleAction;
 
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .transformations
             .insert(TransformRecord {
@@ -16981,7 +17661,7 @@ mod tests {
     async fn transform_metrics_move_on_real_publish_and_reset() {
         use broker_api::v5::transformations::{TransformOperation, TransformRecord};
 
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .transformations
             .insert(TransformRecord {
@@ -17064,7 +17744,7 @@ mod tests {
 
     #[tokio::test]
     async fn offline_queue_replays_on_durable_reconnect() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -17509,8 +18189,10 @@ mod tests {
         ChannelRoutingPlane::link(&plane1, &plane2);
 
         let mut shared1 = Shared::new();
+        shared1.allow_anonymous = true;
         shared1.cluster = Some(plane1.clone() as Arc<dyn RoutingPlane>);
         let mut shared2 = Shared::new();
+        shared2.allow_anonymous = true;
         shared2.cluster = Some(plane2.clone() as Arc<dyn RoutingPlane>);
 
         // One link-harness listener per node. The production
@@ -17790,7 +18472,7 @@ config = '{"connector":"pending-timescaledb"}'
 
     #[tokio::test]
     async fn api_metrics_reflect_edge_traffic() {
-        let shared = Shared::new();
+        let shared = test_shared();
 
         // Management API on an ephemeral port, sharing node state.
         let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -17853,7 +18535,7 @@ config = '{"connector":"pending-timescaledb"}'
         // sample the live counters the way the timer does, then read the
         // shared ring through the management API. A store-only test would
         // prove only the store; this one proves the kernel drives it.
-        let shared = Shared::new();
+        let shared = test_shared();
 
         // Management API on an ephemeral port, sharing node state
         // (including the monitor ring via `serve_api`).
@@ -18537,7 +19219,7 @@ config = '{"connector":"pending-timescaledb"}'
         // output with no threshold assert; counts are CI sample sizes, not
         // SLOs. Per-message bound: one delivery per publish, no new
         // buffering beyond the existing mailbox.
-        let shared = Shared::new();
+        let shared = test_shared();
         // FX-02 default is enabled; force the disabled BEFORE explicitly.
         shared.slow_subs_settings.set_enabled(false);
         let bind = bind_frame(71, 1, encode_bind_meta("q1-slow-time", false, 60));
@@ -18660,6 +19342,21 @@ config = '{"connector":"pending-timescaledb"}'
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_auth_rejects_anonymous_when_allow_flag_is_false() {
+        // Fail closed: the flag refuses an anonymous CONNECT while the
+        // user store is empty.
+        let mut shared = test_shared();
+        shared.allow_anonymous = false;
+
+        let frame = bind_frame(84, 1, encode_bind_meta("dev-f", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x87, "anonymous bind must yield return code 0x87");
+        assert!(!present);
+        assert!(shared.sessions.get("dev-f").is_none());
     }
 
     #[tokio::test]
@@ -19670,6 +20367,1170 @@ config = '{"connector":"pending-timescaledb"}'
             0x87,
             "publish during an outage is refused like an ACL denial"
         );
+    }
+
+    /// Boot one kernel-owned TCP listener on `shared` for socket tests.
+    /// Returns the loopback port. Follows the orderly-stop test: the
+    /// kernel serves the row by default, with no edge in the path.
+    async fn sock_listener(shared: Shared) -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        port
+    }
+
+    /// Encode one MQTT remaining length as varint bytes.
+    fn sock_remaining(mut len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (len % 128) as u8;
+            len /= 128;
+            if len > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Build one 3.1.1 CONNECT packet with username and password.
+    fn sock_connect_v4(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0xC2, 0x00, 0x3C];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        body.extend_from_slice(username.as_bytes());
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10];
+        packet.extend_from_slice(&sock_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Build one MQTT 5 CONNECT packet with username and password.
+    /// Property length is zero. Long passwords use varint length.
+    fn sock_connect_v5(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![
+            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0xC2, 0x00, 0x3C, 0x00,
+        ];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        body.extend_from_slice(username.as_bytes());
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10];
+        packet.extend_from_slice(&sock_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Read one full MQTT packet from a socket, at most five seconds.
+    async fn sock_read(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut first = [0u8; 1];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut first),
+        )
+        .await
+        .expect("packet in time")
+        .expect("socket stays open");
+        let mut packet = vec![first[0]];
+        let mut multiplier = 1usize;
+        let mut remaining = 0usize;
+        loop {
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_exact(&mut byte),
+            )
+            .await
+            .expect("length in time")
+            .expect("socket stays open");
+            packet.push(byte[0]);
+            remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+            multiplier *= 128;
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+        }
+        if remaining > 0 {
+            let mut body = vec![0u8; remaining];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_exact(&mut body),
+            )
+            .await
+            .expect("body in time")
+            .expect("socket stays open");
+            packet.extend_from_slice(&body);
+        }
+        packet
+    }
+
+    /// Send one CONNECT on a new socket. Return the CONNACK packet.
+    async fn sock_connack(port: u16, packet: &[u8]) -> Vec<u8> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        stream.write_all(packet).await.expect("CONNECT sends");
+        sock_read(&mut stream).await
+    }
+
+    /// Return code of a 3.1.1 CONNACK packet.
+    fn sock_connack_v4(packet: &[u8]) -> u8 {
+        assert_eq!(packet[0], 0x20, "a CONNACK is expected");
+        assert!(packet.len() >= 4, "v4 CONNACK carries a code");
+        packet[3]
+    }
+
+    /// Reason code of a v5 CONNACK packet.
+    fn sock_connack_v5(packet: &[u8]) -> u8 {
+        assert_eq!(packet[0], 0x20, "a CONNACK is expected");
+        let mut at = 1usize;
+        while packet[at] & 0x80 != 0 {
+            at += 1;
+        }
+        let body = &packet[at + 1..];
+        assert!(body.len() >= 2, "v5 CONNACK carries flags and reason");
+        body[1]
+    }
+
+    /// Store one enabled chain entry for the socket tests.
+    fn sock_chain_entry(id: &str, mechanism: &str, backend: &str) -> AuthnEntry {
+        AuthnEntry {
+            id: id.to_string(),
+            mechanism: mechanism.to_string(),
+            backend: backend.to_string(),
+            enable: true,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    /// MV-09a: directory CONNECTs through real TCP sockets for both
+    /// protocol versions. The stored chain order drives the decision
+    /// through the broker; the directory stays the authority. A valid
+    /// bind connects, a wrong password is refused.
+    #[tokio::test]
+    async fn mv09a_ldap_auth_over_tcp_v4_and_v5() {
+        const BASE_DN: &str = "dc=example,dc=com";
+        const SERVICE_DN: &str = "cn=reader,dc=example,dc=com";
+        const SERVICE_PW: &str = "readerpw";
+        const REQUIRED_GROUP: &str = "cn=mqtt-users,ou=groups,dc=example,dc=com";
+
+        let dir_yaml = format!(
+            "directory:\n  base_dn: {BASE_DN}\nentries:\n  - dn: {BASE_DN}\n    objectClass: [top, domain]\n    dc: example\n  - dn: ou=users,{BASE_DN}\n    objectClass: [top, organizationalUnit]\n    ou: users\n  - dn: ou=groups,{BASE_DN}\n    objectClass: [top, organizationalUnit]\n    ou: groups\n  - dn: {SERVICE_DN}\n    objectClass: [top, person]\n    cn: reader\n    sn: reader\n    userPassword: {SERVICE_PW}\n  - dn: uid=alice,ou=users,{BASE_DN}\n    objectClass: [top, person, inetOrgPerson]\n    uid: alice\n    cn: Alice\n    sn: Alice\n    userPassword: alicepw\n    memberOf: {REQUIRED_GROUP}\n  - dn: {REQUIRED_GROUP}\n    objectClass: [top, groupOfNames]\n    cn: mqtt-users\n    member: uid=alice,ou=users,{BASE_DN}\n"
+        );
+        let dir_file = tempfile::NamedTempFile::new().expect("temp directory YAML");
+        std::fs::write(dir_file.path(), dir_yaml).expect("write directory YAML");
+        let directory_config = crate::test_directory_server::Config::new(dir_file.path())
+            .with_bind_address("127.0.0.1:0".parse().expect("loopback"));
+        let directory = crate::test_directory_server::Server::new(directory_config)
+            .await
+            .expect("directory starts");
+        let handle = directory.start().await.expect("directory listens");
+        let url = format!("ldap://{}", handle.local_addr());
+
+        let ldap_config = LdapConfig {
+            server_url: url,
+            base_dn: BASE_DN.to_string(),
+            bind_dn: SERVICE_DN.to_string(),
+            bind_password: SERVICE_PW.to_string(),
+            user_filter: "(uid={username})".to_string(),
+            group_attribute: "memberOf".to_string(),
+            required_group: REQUIRED_GROUP.to_string(),
+            pool_size: 4,
+            connect_timeout_ms: 3_000,
+            read_timeout_ms: 3_000,
+            timeout_ms: 0,
+            tls_verify: true,
+            ca_cert_path: None,
+            bind_dn_template: String::new(),
+            filter_template: String::new(),
+        };
+        let mut shared = test_shared();
+        shared.ldap = Some(std::sync::Arc::new(LdapAuthenticator::new(ldap_config)));
+        // Stored chain drives the socket decision: the built-in entry
+        // abstains (no local users) and the directory entry decides.
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:ldap",
+                "password_based",
+                "ldap",
+            ))
+            .expect("chain insert");
+        let port = sock_listener(shared).await;
+
+        // v4 valid directory bind connects.
+        let reply = sock_connack(port, &sock_connect_v4("ldap-v4-ok", "alice", b"alicepw")).await;
+        assert_eq!(
+            sock_connack_v4(&reply),
+            0,
+            "v4 valid directory bind connects"
+        );
+        // v4 wrong directory password is refused.
+        let reply = sock_connack(port, &sock_connect_v4("ldap-v4-bad", "alice", b"wrong")).await;
+        assert_ne!(
+            sock_connack_v4(&reply),
+            0,
+            "v4 wrong directory password is refused"
+        );
+        // v5 valid directory bind connects.
+        let reply = sock_connack(port, &sock_connect_v5("ldap-v5-ok", "alice", b"alicepw")).await;
+        assert_eq!(
+            sock_connack_v5(&reply),
+            0,
+            "v5 valid directory bind connects"
+        );
+        // v5 wrong directory password is refused.
+        let reply = sock_connack(port, &sock_connect_v5("ldap-v5-bad", "alice", b"wrong")).await;
+        assert_ne!(
+            sock_connack_v5(&reply),
+            0,
+            "v5 wrong directory password is refused"
+        );
+    }
+
+    /// MV-09a: JWT CONNECTs through real TCP sockets for both protocol
+    /// versions. The stored chain order drives the decision through the
+    /// broker; the JWKS endpoint stays the authority. A valid token
+    /// connects, a bad token is refused.
+    #[tokio::test]
+    async fn mv09a_jwks_auth_over_tcp_v4_and_v5() {
+        let signing = JwksSigningKey::generate("sock-key-a");
+        let server = JwksTestServer::start(vec![signing.jwk_json()]).await;
+        let shared = jwks_test_shared(server.url());
+        // Stored chain drives the socket decision: the built-in entry
+        // abstains (no local users) and the JWT entry decides.
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry("jwt:jwt", "jwt", "jwt"))
+            .expect("chain insert");
+        let port = sock_listener(shared).await;
+        let token = signing.mint("https://issuer.example", "indra-mqtt", 3600, false);
+
+        // v4 valid JWT connects.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("jwt-v4-ok", "jwt-user", token.as_bytes()),
+        )
+        .await;
+        assert_eq!(sock_connack_v4(&reply), 0, "v4 valid JWT connects");
+        // v4 bad token is refused.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("jwt-v4-bad", "jwt-user", b"plain-wrong-password"),
+        )
+        .await;
+        assert_ne!(sock_connack_v4(&reply), 0, "v4 bad token is refused");
+        // v5 valid JWT connects.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("jwt-v5-ok", "jwt-user", token.as_bytes()),
+        )
+        .await;
+        assert_eq!(sock_connack_v5(&reply), 0, "v5 valid JWT connects");
+        // v5 expired token is refused.
+        let old = signing.mint("https://issuer.example", "indra-mqtt", -300, false);
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("jwt-v5-old", "jwt-user", old.as_bytes()),
+        )
+        .await;
+        assert_ne!(sock_connack_v5(&reply), 0, "v5 expired token is refused");
+    }
+
+    /// MV-09a: database CONNECTs through real TCP sockets for both
+    /// protocol versions. The database is unreachable, so every
+    /// credentialed CONNECT fails closed through the broker with a
+    /// refusal and no session.
+    #[tokio::test]
+    async fn mv09a_db_auth_over_tcp_v4_and_v5() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port");
+        let closed_addr = closed.local_addr().expect("local addr");
+        drop(closed);
+        let db_config = DbAuthSetConfig {
+            postgres_url: format!("postgresql://qual:qualpass1@{closed_addr}/qual"),
+            mysql_url: String::new(),
+            redis_url: String::new(),
+            mongodb_url: String::new(),
+            pool_size: 2,
+            connect_timeout_ms: 500,
+            read_timeout_ms: 500,
+            cache_max_entries: 16,
+            cache_ttl_secs: 60,
+        };
+        let mut shared = test_shared();
+        shared.db_auth = Some(std::sync::Arc::new(DbAuthSet::new(&db_config)));
+        // Stored chain drives the socket decision: the built-in entry
+        // abstains (no local users) and the database entry denies.
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:postgresql",
+                "password_based",
+                "postgresql",
+            ))
+            .expect("chain insert");
+        let port = sock_listener(shared).await;
+
+        // v4 CONNECT against the unreachable database is refused.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("db-v4-1", "qualuser", b"qual-pass-1"),
+        )
+        .await;
+        assert_ne!(
+            sock_connack_v4(&reply),
+            0,
+            "v4 database outage fails closed"
+        );
+        // v5 CONNECT against the unreachable database is refused.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("db-v5-1", "qualuser", b"qual-pass-1"),
+        )
+        .await;
+        assert_ne!(
+            sock_connack_v5(&reply),
+            0,
+            "v5 database outage fails closed"
+        );
+    }
+
+    /// MV-09a: webhook CONNECTs through real TCP sockets for both
+    /// protocol versions. The stored chain order drives the decision
+    /// through the broker; the verdict endpoint stays the authority. An
+    /// allow verdict connects, a deny verdict is refused.
+    #[tokio::test]
+    async fn mv09a_webhook_auth_over_tcp_v4_and_v5() {
+        let server = Arc::new(WebhookTestServer::new("alice", b"webhook-pass"));
+        let (handle, url) = start_webhook_test_server(server.clone()).await;
+        let mut shared = test_shared();
+        shared.webhook = Some(Arc::new(WebhookAuth::new(webhook_test_config(url))));
+        // Stored chain drives the socket decision: the built-in entry
+        // abstains (no local users) and the webhook entry decides.
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:http",
+                "password_based",
+                "http",
+            ))
+            .expect("chain insert");
+        let port = sock_listener(shared).await;
+
+        // v4 allow verdict connects.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("hook-v4-ok", "alice", b"webhook-pass"),
+        )
+        .await;
+        assert_eq!(sock_connack_v4(&reply), 0, "v4 webhook allow connects");
+        // v4 deny verdict is refused.
+        let reply = sock_connack(port, &sock_connect_v4("hook-v4-bad", "alice", b"wrong")).await;
+        assert_ne!(sock_connack_v4(&reply), 0, "v4 webhook deny is refused");
+        // v5 allow verdict connects.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("hook-v5-ok", "alice", b"webhook-pass"),
+        )
+        .await;
+        assert_eq!(sock_connack_v5(&reply), 0, "v5 webhook allow connects");
+        // v5 deny verdict is refused.
+        let reply = sock_connack(port, &sock_connect_v5("hook-v5-bad", "alice", b"wrong")).await;
+        assert_ne!(sock_connack_v5(&reply), 0, "v5 webhook deny is refused");
+        // Every CONNECT asked the endpoint: the verdicts are live.
+        assert!(
+            server.hits.load(Ordering::Relaxed) >= 4,
+            "each socket CONNECT consults the endpoint"
+        );
+        handle.abort();
+    }
+
+    /// MV-09a: Kerberos CONNECTs through real TCP sockets for both
+    /// protocol versions. The stored chain order drives the decision
+    /// through the broker; the keytab stays the authority. A valid
+    /// ticket connects, a bad token is refused.
+    #[tokio::test]
+    async fn mv09a_kerberos_auth_over_tcp_v4_and_v5() {
+        use std::collections::HashMap;
+        use std::io::Write as _;
+
+        const REALM: &str = "EXAMPLE.COM";
+        const SERVICE_FULL: &str = "mqtt/broker.example.com@EXAMPLE.COM";
+
+        fn krb_len(len: usize) -> Vec<u8> {
+            if len < 128 {
+                vec![len as u8]
+            } else {
+                let mut bytes = Vec::new();
+                let mut n = len;
+                while n > 0 {
+                    bytes.push((n & 0xFF) as u8);
+                    n >>= 8;
+                }
+                bytes.reverse();
+                let mut out = vec![0x80 | (bytes.len() as u8)];
+                out.extend_from_slice(&bytes);
+                out
+            }
+        }
+
+        fn krb_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            out.extend_from_slice(&krb_len(content.len()));
+            out.extend_from_slice(content);
+            out
+        }
+
+        fn krb_u32(v: u32) -> Vec<u8> {
+            let mut bytes = v.to_be_bytes().to_vec();
+            while bytes.len() > 1 && bytes[0] == 0 {
+                bytes.remove(0);
+            }
+            if bytes[0] & 0x80 != 0 {
+                let mut prefixed = vec![0x00];
+                prefixed.extend_from_slice(&bytes);
+                bytes = prefixed;
+            }
+            krb_tlv(0x02, &bytes)
+        }
+
+        fn krb_general_string(s: &str) -> Vec<u8> {
+            krb_tlv(0x1B, s.as_bytes())
+        }
+
+        fn krb_octets(b: &[u8]) -> Vec<u8> {
+            krb_tlv(0x04, b)
+        }
+
+        fn krb_seq(content: &[u8]) -> Vec<u8> {
+            krb_tlv(0x30, content)
+        }
+
+        fn krb_ctx(n: u8, content: &[u8]) -> Vec<u8> {
+            krb_tlv(0xA0 | n, content)
+        }
+
+        fn krb_app(n: u8, content: &[u8]) -> Vec<u8> {
+            krb_tlv(0x60 | n, content)
+        }
+
+        fn krb_oid_content(numbers: &[u64]) -> Vec<u8> {
+            let mut out = vec![(numbers[0] * 40 + numbers[1]) as u8];
+            for n in &numbers[2..] {
+                let mut stack = Vec::new();
+                let mut v = *n;
+                loop {
+                    stack.push((v & 0x7F) as u8);
+                    v >>= 7;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                stack.reverse();
+                for (i, b) in stack.iter().enumerate() {
+                    if i + 1 < stack.len() {
+                        out.push(b | 0x80);
+                    } else {
+                        out.push(*b);
+                    }
+                }
+            }
+            out
+        }
+
+        fn krb_oid(numbers: &[u64]) -> Vec<u8> {
+            krb_tlv(0x06, &krb_oid_content(numbers))
+        }
+
+        fn krb_cts_encrypt(key: &[u8; 32], key_usage: i32, plain: &[u8]) -> Vec<u8> {
+            use picky_krb::crypto::CipherSuite;
+            CipherSuite::Aes256CtsHmacSha196
+                .cipher()
+                .encrypt(key, key_usage, plain)
+                .expect("CTS encrypt")
+        }
+
+        fn krb_realm(s: &str) -> picky_krb::data_types::Realm {
+            use picky_asn1::restricted_string::IA5String;
+            picky_krb::data_types::Realm::from(picky_asn1::wrapper::GeneralStringAsn1::from(
+                IA5String::from_string(s.to_string()).expect("realm as IA5"),
+            ))
+        }
+
+        fn krb_principal(name_type: u8, comps: &[String]) -> picky_krb::data_types::PrincipalName {
+            use picky_asn1::restricted_string::IA5String;
+            use picky_asn1::wrapper::{Asn1SequenceOf, ExplicitContextTag0, ExplicitContextTag1};
+            let strings: Vec<picky_krb::data_types::KerberosStringAsn1> = comps
+                .iter()
+                .map(|c| {
+                    picky_krb::data_types::KerberosStringAsn1::from(
+                        IA5String::from_string(c.clone()).expect("component as IA5"),
+                    )
+                })
+                .collect();
+            picky_krb::data_types::PrincipalName {
+                name_type: ExplicitContextTag0::from(picky_asn1::wrapper::IntegerAsn1::from(vec![
+                    name_type,
+                ])),
+                name_string: ExplicitContextTag1::from(Asn1SequenceOf::from(strings)),
+            }
+        }
+
+        fn krb_time(secs: i64) -> picky_krb::data_types::KerberosTime {
+            use picky_asn1::date::GeneralizedTime;
+            let dt = time::OffsetDateTime::from_unix_timestamp(secs).expect("valid time");
+            picky_krb::data_types::KerberosTime::from(GeneralizedTime::from(dt))
+        }
+
+        fn krb_ticket_inner(
+            client: &str,
+            _service: &str,
+            start: i64,
+            end: i64,
+            session_key: &[u8],
+        ) -> Vec<u8> {
+            use picky_asn1::wrapper::{
+                ExplicitContextTag0, ExplicitContextTag1, ExplicitContextTag2, ExplicitContextTag3,
+                ExplicitContextTag4, ExplicitContextTag5, ExplicitContextTag6, ExplicitContextTag7,
+                OctetStringAsn1, Optional,
+            };
+            use picky_krb::data_types::{
+                EncTicketPart, EncTicketPartInner, EncryptionKey, TransitedEncoding,
+            };
+            let (cname_part, crealm_part) =
+                client.split_once('@').unwrap_or((client, "EXAMPLE.COM"));
+            let cname = krb_principal(1, &[cname_part.to_string()]);
+            let crealm = krb_realm(crealm_part);
+            let enc_part = EncTicketPart::from(EncTicketPartInner {
+                flags: ExplicitContextTag0::from(picky_asn1::wrapper::BitStringAsn1::default()),
+                key: ExplicitContextTag1::from(EncryptionKey {
+                    key_type: ExplicitContextTag0::from(picky_asn1::wrapper::IntegerAsn1::from(
+                        vec![18u8],
+                    )),
+                    key_value: ExplicitContextTag1::from(OctetStringAsn1::from(
+                        session_key.to_vec(),
+                    )),
+                }),
+                crealm: ExplicitContextTag2::from(crealm),
+                cname: ExplicitContextTag3::from(cname),
+                transited: ExplicitContextTag4::from(TransitedEncoding {
+                    tr_type: ExplicitContextTag0::from(picky_asn1::wrapper::IntegerAsn1::from(
+                        vec![0u8],
+                    )),
+                    contents: ExplicitContextTag1::from(OctetStringAsn1::from(vec![1u8])),
+                }),
+                auth_time: ExplicitContextTag5::from(krb_time(start)),
+                starttime: Optional::from(Some(ExplicitContextTag6::from(krb_time(start)))),
+                endtime: ExplicitContextTag7::from(krb_time(end)),
+                renew_till: Optional::from(None),
+                caddr: Optional::from(None),
+                authorization_data: Optional::from(None),
+            });
+            picky_asn1_der::to_vec(&enc_part).expect("encode EncTicketPart")
+        }
+
+        fn krb_auth_inner(client: &str, ts: i64, usec: u32) -> Vec<u8> {
+            use picky_asn1::wrapper::{
+                ExplicitContextTag0, ExplicitContextTag1, ExplicitContextTag2, ExplicitContextTag4,
+                ExplicitContextTag5, IntegerAsn1, Optional,
+            };
+            use picky_krb::data_types::{Authenticator, AuthenticatorInner};
+            let (cname_part, crealm_part) =
+                client.split_once('@').unwrap_or((client, "EXAMPLE.COM"));
+            let cname = krb_principal(1, &[cname_part.to_string()]);
+            let crealm = krb_realm(crealm_part);
+            let mut usec_bytes = usec.to_be_bytes().to_vec();
+            while usec_bytes.len() > 1 && usec_bytes[0] == 0 {
+                usec_bytes.remove(0);
+            }
+            if usec_bytes[0] & 0x80 != 0 {
+                let mut prefixed = vec![0x00];
+                prefixed.extend_from_slice(&usec_bytes);
+                usec_bytes = prefixed;
+            }
+            let auth = Authenticator::from(AuthenticatorInner {
+                authenticator_vno: ExplicitContextTag0::from(IntegerAsn1::from(vec![5u8])),
+                crealm: ExplicitContextTag1::from(crealm),
+                cname: ExplicitContextTag2::from(cname),
+                cksum: Optional::from(None),
+                cusec: ExplicitContextTag4::from(IntegerAsn1::from(usec_bytes)),
+                ctime: ExplicitContextTag5::from(krb_time(ts)),
+                subkey: Optional::from(None),
+                seq_number: Optional::from(None),
+                authorization_data: Optional::from(None),
+            });
+            picky_asn1_der::to_vec(&auth).expect("encode Authenticator")
+        }
+
+        fn krb_principal_name(comps: &[String]) -> Vec<u8> {
+            let mut strings = Vec::new();
+            for c in comps {
+                strings.extend_from_slice(&krb_general_string(c));
+            }
+            let seq = krb_seq(&strings);
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_u32(1)));
+            content.extend_from_slice(&krb_ctx(1, &seq));
+            krb_seq(&content)
+        }
+
+        fn krb_encrypted(cipher: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_tlv(0x02, &[18])));
+            content.extend_from_slice(&krb_ctx(2, &krb_octets(cipher)));
+            krb_seq(&content)
+        }
+
+        fn krb_ticket(realm: &str, comps: &[String], cipher: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_u32(5)));
+            content.extend_from_slice(&krb_ctx(1, &krb_general_string(realm)));
+            content.extend_from_slice(&krb_ctx(2, &krb_principal_name(comps)));
+            content.extend_from_slice(&krb_ctx(3, &krb_encrypted(cipher)));
+            krb_app(1, &krb_seq(&content))
+        }
+
+        fn krb_ap_req(ticket: &[u8], auth_cipher: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_u32(5)));
+            content.extend_from_slice(&krb_ctx(1, &krb_u32(14)));
+            content.extend_from_slice(&krb_ctx(2, &krb_tlv(0x03, &[0x00])));
+            let mut ticket_field = vec![0xA3];
+            ticket_field.extend_from_slice(&krb_len(ticket.len()));
+            ticket_field.extend_from_slice(ticket);
+            content.extend_from_slice(&ticket_field);
+            content.extend_from_slice(&krb_ctx(4, &krb_encrypted(auth_cipher)));
+            krb_app(14, &krb_seq(&content))
+        }
+
+        fn krb_spnego(ap_req: &[u8]) -> Vec<u8> {
+            let kerberos_oid = krb_oid(&[1, 2, 840, 113554, 1, 2, 2]);
+            let mut mech_list = Vec::new();
+            mech_list.extend_from_slice(&kerberos_oid);
+            let mech_seq = krb_seq(&mech_list);
+            let mut neg = Vec::new();
+            neg.extend_from_slice(&krb_ctx(0, &mech_seq));
+            neg.extend_from_slice(&krb_ctx(2, &krb_octets(ap_req)));
+            let neg_seq = krb_seq(&neg);
+            let spnego_oid = krb_oid(&[1, 3, 6, 1, 5, 5, 2]);
+            let mut outer = Vec::new();
+            outer.extend_from_slice(&spnego_oid);
+            outer.extend_from_slice(&neg_seq);
+            krb_app(0, &outer)
+        }
+
+        fn krb_random_key() -> [u8; 32] {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let rng = SystemRandom::new();
+            let mut key = [0u8; 32];
+            rng.fill(&mut key).expect("system randomness");
+            key
+        }
+
+        fn krb_now() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        }
+
+        // Test KDC state: service key shared with the keytab file.
+        let service_key = krb_random_key();
+        let service_comps = vec!["mqtt".to_string(), "broker.example.com".to_string()];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keytab_path = dir.path().join("broker.keytab");
+        {
+            let mut file = vec![0x05u8, 0x02u8];
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&2u16.to_be_bytes());
+            entry.extend_from_slice(&(REALM.len() as u16).to_be_bytes());
+            entry.extend_from_slice(REALM.as_bytes());
+            for comp in &service_comps {
+                entry.extend_from_slice(&(comp.len() as u16).to_be_bytes());
+                entry.extend_from_slice(comp.as_bytes());
+            }
+            entry.extend_from_slice(&1u32.to_be_bytes());
+            entry.extend_from_slice(&0u32.to_be_bytes());
+            entry.push(1u8);
+            entry.extend_from_slice(&18u16.to_be_bytes());
+            entry.extend_from_slice(&32u16.to_be_bytes());
+            entry.extend_from_slice(&service_key);
+            entry.extend_from_slice(&1u32.to_be_bytes());
+            file.extend_from_slice(&(entry.len() as i32).to_be_bytes());
+            file.extend_from_slice(&entry);
+            let mut handle = std::fs::File::create(&keytab_path).expect("write keytab");
+            handle.write_all(&file).expect("write keytab");
+        }
+        let mint = |client: &str, start: i64, end: i64, ts: i64, usec: u32| {
+            let session_key = krb_random_key();
+            let inner = krb_ticket_inner(client, SERVICE_FULL, start, end, &session_key);
+            let ticket_cipher = krb_cts_encrypt(&service_key, 2, &inner);
+            let ticket = krb_ticket(REALM, &service_comps, &ticket_cipher);
+            let auth_inner = krb_auth_inner(client, ts, usec);
+            let auth_cipher = krb_cts_encrypt(&session_key, 11, &auth_inner);
+            krb_ap_req(&ticket, &auth_cipher)
+        };
+
+        let kerberos_config = KerberosConfig {
+            service_principal_name: SERVICE_FULL.to_string(),
+            realm: REALM.to_string(),
+            allowed_realms: vec![REALM.to_string()],
+            keytab_path: keytab_path.to_string_lossy().to_string(),
+            clock_skew_secs: 300,
+            replay_max_entries: broker_auth::REPLAY_MAX_ENTRIES,
+            principal_role_map: HashMap::from([(
+                "alice@EXAMPLE.COM".to_string(),
+                "publisher".to_string(),
+            )]),
+        };
+        let mut shared = test_shared();
+        shared.kerberos = Some(std::sync::Arc::new(KerberosAuthenticator::new(
+            kerberos_config,
+        )));
+        assert!(
+            shared.kerberos.as_ref().is_some_and(|k| k.is_enabled()),
+            "test keytab must enable Kerberos"
+        );
+        // Stored chain drives the socket decision: the built-in entry
+        // abstains (no local users) and the Kerberos entry decides.
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry("gssapi:kerberos", "gssapi", "kerberos"))
+            .expect("chain insert");
+        let port = sock_listener(shared).await;
+
+        // v4 valid ticket connects. Each leg mints a fresh token: the
+        // replay cache refuses a reused token.
+        let now = krb_now();
+        let token_v4 = mint("alice@EXAMPLE.COM", now - 60, now + 3600, now, 41);
+        let reply = sock_connack(port, &sock_connect_v4("krb-v4-ok", "alice", &token_v4)).await;
+        assert_eq!(sock_connack_v4(&reply), 0, "v4 valid ticket connects");
+        // v5 valid ticket connects.
+        let token_v5 = mint("alice@EXAMPLE.COM", now - 60, now + 3600, now, 42);
+        let reply = sock_connack(port, &sock_connect_v5("krb-v5-ok", "alice", &token_v5)).await;
+        assert_eq!(sock_connack_v5(&reply), 0, "v5 valid ticket connects");
+        // v4 bad token is refused.
+        let bad_spnego = krb_spnego(&[0xde, 0xad]);
+        let reply = sock_connack(port, &sock_connect_v4("krb-v4-bad", "alice", &bad_spnego)).await;
+        assert_ne!(sock_connack_v4(&reply), 0, "v4 bad token is refused");
+        // v5 bad token is refused.
+        let reply = sock_connack(port, &sock_connect_v5("krb-v5-bad", "alice", &bad_spnego)).await;
+        assert_ne!(sock_connack_v5(&reply), 0, "v5 bad token is refused");
+    }
+
+    /// MV-09a: two authenticators decide in stored order through real
+    /// TCP sockets for both protocol versions. A deny stops the chain:
+    /// with the built-in entry first the webhook password is denied and
+    /// the endpoint sees no request; with the webhook entry first the
+    /// same credential connects. Per-entry counters show the decider.
+    #[tokio::test]
+    async fn mv09a_chain_order_decides_over_tcp_v4_and_v5() {
+        let server = Arc::new(WebhookTestServer::new("alice", b"webhook-pass"));
+        let (handle, url) = start_webhook_test_server(server.clone()).await;
+        let mut shared = test_shared();
+        shared
+            .auth
+            .add_user("alice", b"local-pass")
+            .expect("seed local user");
+        // The verdict cache stays off: every CONNECT must ask the
+        // endpoint, so the hit count proves the chain position.
+        let mut hook_config = webhook_test_config(url);
+        hook_config.cache_ttl_secs = 0;
+        shared.webhook = Some(Arc::new(WebhookAuth::new(hook_config)));
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:http",
+                "password_based",
+                "http",
+            ))
+            .expect("chain insert");
+        let port = sock_listener(shared.clone()).await;
+
+        // Built-in first: the known-user wrong password denies at once.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("order-v4-deny", "alice", b"webhook-pass"),
+        )
+        .await;
+        assert_ne!(
+            sock_connack_v4(&reply),
+            0,
+            "built-in first denies the webhook password"
+        );
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("order-v5-deny", "alice", b"webhook-pass"),
+        )
+        .await;
+        assert_ne!(
+            sock_connack_v5(&reply),
+            0,
+            "built-in first denies the webhook password on v5"
+        );
+        assert_eq!(
+            server.hits.load(Ordering::Relaxed),
+            0,
+            "a local deny never asks the next authenticator"
+        );
+        // The local password still connects through the first backend.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("order-v4-local", "alice", b"local-pass"),
+        )
+        .await;
+        assert_eq!(
+            sock_connack_v4(&reply),
+            0,
+            "local password connects with built-in first"
+        );
+        let built_in = shared
+            .authn_chain
+            .counter_snapshot("password_based:built_in_database")
+            .expect("built-in counters exist");
+        assert_eq!(built_in.failed, 2, "two denies hit the first entry");
+        assert_eq!(built_in.success, 1, "one allow hits the first entry");
+        let http = shared
+            .authn_chain
+            .counter_snapshot("password_based:http")
+            .expect("webhook counters exist");
+        assert_eq!((http.success, http.failed), (0, 0));
+
+        // Webhook first: the same credential now connects.
+        shared
+            .authn_chain
+            .reorder(vec![
+                "password_based:http".to_string(),
+                "password_based:built_in_database".to_string(),
+            ])
+            .expect("reorder applies");
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("order-v4-allow", "alice", b"webhook-pass"),
+        )
+        .await;
+        assert_eq!(
+            sock_connack_v4(&reply),
+            0,
+            "webhook first allows the webhook password"
+        );
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("order-v5-allow", "alice", b"webhook-pass"),
+        )
+        .await;
+        assert_eq!(
+            sock_connack_v5(&reply),
+            0,
+            "webhook first allows the webhook password on v5"
+        );
+        // The local password now meets the webhook first and is denied.
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("order-v4-stop", "alice", b"local-pass"),
+        )
+        .await;
+        assert_ne!(
+            sock_connack_v4(&reply),
+            0,
+            "webhook first denies the local password"
+        );
+        assert_eq!(
+            server.hits.load(Ordering::Relaxed),
+            3,
+            "three CONNECTs reached the endpoint after the reorder"
+        );
+        let http = shared
+            .authn_chain
+            .counter_snapshot("password_based:http")
+            .expect("webhook counters exist");
+        assert_eq!(http.success, 2, "two allows hit the webhook entry");
+        assert_eq!(http.failed, 1, "one deny hits the webhook entry");
+        let built_in = shared
+            .authn_chain
+            .counter_snapshot("password_based:built_in_database")
+            .expect("built-in counters exist");
+        assert_eq!((built_in.success, built_in.failed), (1, 2));
+        handle.abort();
+    }
+
+    /// MV-09a: the enable flag decides through a real TCP socket.
+    /// A disabled entry denies on both protocol versions.
+    #[tokio::test]
+    async fn mv09a_chain_enable_toggles_socket_decision() {
+        let shared = test_shared();
+        shared
+            .auth
+            .add_user("alice", b"local-pass")
+            .expect("seed local user");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        let port = sock_listener(shared.clone()).await;
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("enable-v4-allow", "alice", b"local-pass"),
+        )
+        .await;
+        assert_eq!(sock_connack_v4(&reply), 0, "enabled entry allows on v4");
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("enable-v5-allow", "alice", b"local-pass"),
+        )
+        .await;
+        assert_eq!(sock_connack_v5(&reply), 0, "enabled entry allows on v5");
+        let mut disabled = sock_chain_entry(
+            "password_based:built_in_database",
+            "password_based",
+            "built_in_database",
+        );
+        disabled.enable = false;
+        shared
+            .authn_chain
+            .update("password_based:built_in_database", disabled)
+            .expect("disable applies");
+        let reply = sock_connack(
+            port,
+            &sock_connect_v4("enable-v4-deny", "alice", b"local-pass"),
+        )
+        .await;
+        assert_ne!(sock_connack_v4(&reply), 0, "disabled entry denies on v4");
+        let reply = sock_connack(
+            port,
+            &sock_connect_v5("enable-v5-deny", "alice", b"local-pass"),
+        )
+        .await;
+        assert_ne!(sock_connack_v5(&reply), 0, "disabled entry denies on v5");
+    }
+
+    /// MV-09a: the node cache fills through a socket CONNECT.
+    /// A password change evicts it and the next CONNECT sees it.
+    #[tokio::test]
+    async fn mv09a_node_cache_evicts_on_user_change_over_tcp() {
+        let shared = test_shared();
+        shared
+            .auth
+            .add_user("alice", b"old-pass")
+            .expect("seed local user");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        let port = sock_listener(shared.clone()).await;
+        assert_eq!(shared.authn_node_cache.len(), 0);
+        let reply =
+            sock_connack(port, &sock_connect_v4("cache-v4-one", "alice", b"old-pass")).await;
+        assert_eq!(sock_connack_v4(&reply), 0, "old password connects");
+        assert_eq!(
+            shared.authn_node_cache.len(),
+            1,
+            "socket CONNECT populates the cache"
+        );
+        // Change the password through the production HTTP entry.
+        // The handler evicts the cached user on the next CONNECT.
+        let mut api_state = broker_api::ApiState::standalone(shared.engine.clone());
+        api_state.auth = shared.auth.clone();
+        api_state.authn_chain = shared.authn_chain.clone();
+        api_state.authn_node_cache = shared.authn_node_cache.clone();
+        api_state.sessions = shared.sessions.clone();
+        api_state.config = shared.config.clone();
+        api_state
+            .admin_users
+            .create(
+                "op-admin",
+                "Adm1n-test-pass!",
+                broker_api::admin_users::AdminRole::Administrator,
+                "",
+            )
+            .expect("admin creates");
+        let token = api_state.tokens.issue(
+            "op-admin",
+            broker_api::admin_users::AdminRole::Administrator,
+        );
+        let app = broker_api::router(api_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind management server");
+        let http_port = listener.local_addr().expect("local addr").port();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve management app");
+        });
+        let body = serde_json::json!({"password": "new-pass"});
+        let raw = serde_json::to_string(&body).expect("body serialises");
+        let head = format!(
+            "PUT /api/v5/authentication/password_based:built_in_database/users/alice HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",
+            raw.len()
+        );
+        let status = {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", http_port))
+                .await
+                .expect("dial management server");
+            stream
+                .write_all(head.as_bytes())
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let text = String::from_utf8(buf).expect("response is UTF-8");
+            let code: u16 = text.lines().next().expect("status line")[9..12]
+                .parse()
+                .expect("status code");
+            code
+        };
+        task.abort();
+        assert_eq!(status, 200, "password change through HTTP applies");
+        assert_eq!(shared.authn_node_cache.len(), 0, "user change evicts cache");
+        let reply =
+            sock_connack(port, &sock_connect_v4("cache-v4-old", "alice", b"old-pass")).await;
+        assert_ne!(
+            sock_connack_v4(&reply),
+            0,
+            "old password fails after change"
+        );
+        let reply =
+            sock_connack(port, &sock_connect_v4("cache-v4-new", "alice", b"new-pass")).await;
+        assert_eq!(sock_connack_v4(&reply), 0, "new password connects");
+    }
+
+    /// MV-09a: two tenants stay isolated through a real TCP socket.
+    /// No tenant falls back to another tenant user.
+    #[tokio::test]
+    async fn mv09a_two_tenant_chain_isolation_over_tcp() {
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .auth
+            .add_user_in_tenant("t-a", "alice", b"pass-a")
+            .expect("seed tenant t-a");
+        shared
+            .auth
+            .add_user_in_tenant("t-b", "alice", b"pass-b")
+            .expect("seed tenant t-b");
+        shared
+            .authn_chain
+            .insert(sock_chain_entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("chain insert");
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${client_id}")])
+            .expect("tenant rules store");
+        let port = sock_listener(shared.clone()).await;
+        let reply = sock_connack(port, &sock_connect_v4("a", "alice", b"pass-a")).await;
+        assert_eq!(sock_connack_v4(&reply), 0, "tenant t-a allows its password");
+        let reply = sock_connack(port, &sock_connect_v4("a", "alice", b"pass-b")).await;
+        assert_ne!(
+            sock_connack_v4(&reply),
+            0,
+            "tenant t-a denies the other tenant password"
+        );
+        let reply = sock_connack(port, &sock_connect_v5("b", "alice", b"pass-b")).await;
+        assert_eq!(sock_connack_v5(&reply), 0, "tenant t-b allows its password");
+        let reply = sock_connack(port, &sock_connect_v5("b", "alice", b"pass-a")).await;
+        assert_ne!(
+            sock_connack_v5(&reply),
+            0,
+            "tenant t-b denies the other tenant password"
+        );
+        let reply = sock_connack(port, &sock_connect_v4("c", "alice", b"pass-a")).await;
+        assert_ne!(sock_connack_v4(&reply), 0, "unknown tenant fails closed");
     }
 
     /// B5-04: the breaker trips open under consecutive endpoint faults,
@@ -20959,7 +22820,7 @@ config = '{"connector":"pending-timescaledb"}'
             Ok(packet)
         }
 
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .auth
             .add_rule(AclRule::new(
@@ -21026,6 +22887,299 @@ config = '{"connector":"pending-timescaledb"}'
             .is_empty());
     }
 
+    /// SA-23 items 1 and 2 over a real socket: a narrow rule never covers
+    /// a wider request. Rule `a/+` denies `a/#`, rule `+` denies `#`,
+    /// while `a/b` and `x` still subscribe under the covering rules.
+    #[tokio::test]
+    async fn sa23_narrow_rule_denies_wider_request_over_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect_v4(client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn subscribe_once(packet_id: u16, filter: &str) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            body.extend_from_slice(filter.as_bytes());
+            body.push(0x00);
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+        async fn suback_code(client: &mut TcpStream, packet_id: u16, filter: &str) -> u8 {
+            client
+                .write_all(&subscribe_once(packet_id, filter))
+                .await
+                .expect("SUBSCRIBE sends");
+            let suback =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(client))
+                    .await
+                    .expect("SUBACK in time")
+                    .expect("SUBACK reads");
+            assert_eq!(suback[0], 0x90);
+            *suback.last().expect("suback has a code")
+        }
+
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new(
+                "sa23-cover",
+                AclAction::Subscribe,
+                "a/+",
+                true,
+            ))
+            .expect("memory-only persist cannot fail");
+        shared
+            .auth
+            .add_rule(AclRule::new("sa23-cover", AclAction::Subscribe, "+", true))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client dials");
+        client
+            .write_all(&connect_v4("sa23-cover"))
+            .await
+            .expect("CONNECT sends");
+        let connack =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                .await
+                .expect("CONNACK in time")
+                .expect("CONNACK reads");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+        // `a/+` does not cover `a/#`; `+` does not cover `#`.
+        assert_eq!(suback_code(&mut client, 7, "a/#").await, 0x80u8);
+        assert_eq!(suback_code(&mut client, 8, "#").await, 0x80u8);
+        // The covered requests still subscribe.
+        assert_eq!(suback_code(&mut client, 9, "a/b").await, 0x00u8);
+        assert_eq!(suback_code(&mut client, 10, "x").await, 0x00u8);
+        assert!(!shared
+            .router
+            .matches(&Topic::new("a/b").unwrap())
+            .is_empty());
+        assert!(shared
+            .router
+            .matches(&Topic::new("secret/x").unwrap())
+            .is_empty());
+    }
+
+    /// SA-23 item 2 over a real socket: a deny rule applies on overlap.
+    /// Deny `secret/#` plus allow `#` denies `#` and `secret/x` but
+    /// still grants `other/x`.
+    #[tokio::test]
+    async fn sa23_deny_overlap_blocks_hash_over_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect_v4(client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn subscribe_once(packet_id: u16, filter: &str) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            body.extend_from_slice(filter.as_bytes());
+            body.push(0x00);
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+        async fn suback_code(client: &mut TcpStream, packet_id: u16, filter: &str) -> u8 {
+            client
+                .write_all(&subscribe_once(packet_id, filter))
+                .await
+                .expect("SUBSCRIBE sends");
+            let suback =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(client))
+                    .await
+                    .expect("SUBACK in time")
+                    .expect("SUBACK reads");
+            assert_eq!(suback[0], 0x90);
+            *suback.last().expect("suback has a code")
+        }
+
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new(
+                "sa23-deny",
+                AclAction::Subscribe,
+                "secret/#",
+                false,
+            ))
+            .expect("memory-only persist cannot fail");
+        shared
+            .auth
+            .add_rule(AclRule::new("sa23-deny", AclAction::Subscribe, "#", true))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client dials");
+        client
+            .write_all(&connect_v4("sa23-deny"))
+            .await
+            .expect("CONNECT sends");
+        let connack =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                .await
+                .expect("CONNACK in time")
+                .expect("CONNACK reads");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+        // `#` reaches `secret/...`, so the deny overlaps and denies.
+        assert_eq!(suback_code(&mut client, 7, "#").await, 0x80u8);
+        assert_eq!(suback_code(&mut client, 8, "secret/x").await, 0x80u8);
+        // Outside the denied branch the later allow still grants.
+        assert_eq!(suback_code(&mut client, 9, "other/x").await, 0x00u8);
+        assert!(!shared
+            .router
+            .matches(&Topic::new("other/x").unwrap())
+            .is_empty());
+        assert!(shared
+            .router
+            .matches(&Topic::new("secret/x").unwrap())
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn publish_denied_yields_puback_0x87_and_drops() {
         let shared = test_shared();
@@ -21048,6 +23202,146 @@ config = '{"connector":"pending-timescaledb"}'
         let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
         assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
         assert!(deliveries.is_empty(), "denied publish must not fan out");
+    }
+
+    /// A denied QoS 2 publish reads the version-correct PUBREC from a real
+    /// socket. Version 5 carries reason 0x87 (Not authorized). Version
+    /// 3.1.1 has no PUBREC reason code, so the short form is correct.
+    #[tokio::test]
+    async fn denied_qos2_publish_pubrec_reason_matches_version_over_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect(level: u8, client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', level, 0x02, 0x00, 0x3C];
+            if level == 5 {
+                body.push(0x00);
+            }
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn publish_qos2(level: u8, topic: &str, packet_id: u16) -> Vec<u8> {
+            let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(topic.as_bytes());
+            body.extend_from_slice(&packet_id.to_be_bytes());
+            if level == 5 {
+                body.push(0x00);
+            }
+            let mut packet = vec![0x34];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new("*", AclAction::Publish, "#", false))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        for (level, client_id, packet_id, expected) in [
+            (
+                4u8,
+                "denied-qos2-v4",
+                0x11u16,
+                vec![0x50u8, 0x02, 0x00, 0x11],
+            ),
+            (
+                5u8,
+                "denied-qos2-v5",
+                0x12u16,
+                vec![0x50u8, 0x03, 0x00, 0x12, 0x87],
+            ),
+        ] {
+            let mut client = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("client dials");
+            client
+                .write_all(&connect(level, client_id))
+                .await
+                .expect("CONNECT sends");
+            let connack =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                    .await
+                    .expect("CONNACK in time")
+                    .expect("CONNACK reads");
+            assert_eq!(connack[0], 0x20, "CONNACK for protocol level {level}");
+            client
+                .write_all(&publish_qos2(level, "denied/topic", packet_id))
+                .await
+                .expect("PUBLISH sends");
+            let pubrec =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                    .await
+                    .expect("PUBREC in time")
+                    .expect("PUBREC reads");
+            assert_eq!(pubrec, expected, "PUBREC for protocol level {level}");
+        }
     }
 
     /// Write the authorization settings through the shared store: the
@@ -23615,7 +25909,7 @@ config = '{"connector":"pending-timescaledb"}'
 
     #[tokio::test]
     async fn shared_subscriptions_balance_across_workers() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -23762,7 +26056,7 @@ config = '{"connector":"pending-timescaledb"}'
                 .expect("write hook response");
         });
 
-        let shared = Shared::new();
+        let shared = test_shared();
         // Rule projects telemetry and forwards to the webhook sink: no
         // MQTT subscribers are involved at all.
         let sink = Arc::new(HttpWebhookSink::new(
@@ -24066,7 +26360,8 @@ config = '{"connector":"pending-timescaledb"}'
 
     #[tokio::test]
     async fn delayed_publish_end_to_end_over_tcp() {
-        let shared = Shared::new();
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
         shared.spawn_delayed_driver();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -24400,7 +26695,7 @@ config = '{"connector":"pending-timescaledb"}'
         let bind = bind_frame(501, 1, encode_bind_meta("w139-fresh", true, 60));
         let reply = apply_bind(&bind, &shared).await.expect("bind replies");
         assert!(is_binding_accepted(&reply));
-        apply_auto_subscribe(&shared, "w139-fresh", None, 501);
+        apply_auto_subscribe(&shared, "w139-fresh", None, 501).await;
 
         // Session mirror and router both hold the new subscription.
         let session = shared.sessions.get("w139-fresh").expect("session row");
@@ -24433,7 +26728,7 @@ config = '{"connector":"pending-timescaledb"}'
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bind = bind_frame(502, 1, encode_bind_meta("w139-ph", true, 60));
         apply_bind(&bind, &shared).await.expect("bind replies");
-        apply_auto_subscribe(&shared, "w139-ph", None, 502);
+        apply_auto_subscribe(&shared, "w139-ph", None, 502).await;
         assert!(
             shared
                 .sessions
@@ -24489,7 +26784,7 @@ config = '{"connector":"pending-timescaledb"}'
 
         let (session, _) = shared.sessions.get_or_create("quota-auto", true);
         *session.conn_id.write() = Some(9091);
-        apply_auto_subscribe(&shared, "quota-auto", None, 9091);
+        apply_auto_subscribe(&shared, "quota-auto", None, 9091).await;
 
         assert!(
             session
@@ -24739,7 +27034,7 @@ config = '{"connector":"pending-timescaledb"}'
     /// before PUBREL.
     #[tokio::test]
     async fn qos2_end_to_end_exactly_once() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {

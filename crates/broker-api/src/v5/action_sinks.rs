@@ -1390,6 +1390,9 @@ pub(crate) struct ActionSinkStage {
     /// secret resolver, so a target behind a secret reference is dialled
     /// too.
     pub probe_on_create: bool,
+    /// The sink is the referenced connector's already built runtime.
+    /// The caller registers it as-is, without a second action wrapper.
+    pub reuse_connector_runtime: bool,
 }
 
 /// Resolve the connector an action references and stage its owned
@@ -1404,8 +1407,20 @@ pub(crate) struct ActionSinkStage {
 ///   reason. Nothing is dialled, no value invented.
 /// - Everything else (missing field, bad parameter) is a build failure:
 ///   the caller refuses with a message that names the action and field.
+#[cfg(test)]
 pub(crate) fn stage_action_sink(
     connectors: &ConnectorStore,
+    record: &ActionRecord,
+) -> Result<ActionSinkStage, String> {
+    stage_action_sink_with_engine(connectors, None, record)
+}
+
+/// Stage one action's sink with the live connector runtimes available.
+/// A connector reference row reuses the connector's built runtime, so the
+/// row delivers through the same sink as the connector it names.
+pub(crate) fn stage_action_sink_with_engine(
+    connectors: &ConnectorStore,
+    engine: Option<&broker_rules::RuleEngine>,
     record: &ActionRecord,
 ) -> Result<ActionSinkStage, String> {
     if let Some(message) = super::rules::kind_refusal(&record.action_type) {
@@ -1428,9 +1443,9 @@ pub(crate) fn stage_action_sink(
             resource_opts,
             health_target: None,
             probe_on_create: false,
+            reuse_connector_runtime: false,
         });
     }
-    required_action_parameters(record)?;
     if canonical_action_kind(&record.action_type) == "console"
         && action_connector_references(record).is_empty()
     {
@@ -1450,6 +1465,7 @@ pub(crate) fn stage_action_sink(
             resource_opts,
             health_target: None,
             probe_on_create: false,
+            reuse_connector_runtime: false,
         });
     }
     let reference = action_connector_references(record)
@@ -1462,6 +1478,9 @@ pub(crate) fn stage_action_sink(
             )
         })?;
     let Some((_, doc)) = super::rules::resolve_action_connector(connectors, &reference) else {
+        // A dangling connector does not accept an action that is
+        // missing its own required field.
+        required_action_parameters(record)?;
         return Ok(ActionSinkStage {
             sink: None,
             wiring: ActionWiring::Failed(format!(
@@ -1470,8 +1489,37 @@ pub(crate) fn stage_action_sink(
             resource_opts,
             health_target: None,
             probe_on_create: false,
+            reuse_connector_runtime: false,
         });
     };
+    if is_connector_only_action(record) {
+        // The row keeps its settings on the connector. Use the connector
+        // runtime that the connector builder already registered. The row
+        // then delivers through the same sink as the connector it names.
+        // A connector with no runtime falls through to the normal build.
+        if let Some(sink) = engine.and_then(|engine| connector_runtime(engine, record)) {
+            return Ok(ActionSinkStage {
+                sink: Some(sink),
+                wiring: ActionWiring::Live,
+                resource_opts,
+                health_target: None,
+                probe_on_create: false,
+                reuse_connector_runtime: true,
+            });
+        }
+        // A connector with no live runtime keeps the row persist-only.
+        // Rule delivery falls back to the connector id, as the persisted
+        // lane A form does.
+        return Ok(ActionSinkStage {
+            sink: None,
+            wiring: ActionWiring::None,
+            resource_opts,
+            health_target: None,
+            probe_on_create: false,
+            reuse_connector_runtime: false,
+        });
+    }
+    required_action_parameters(record)?;
     let sink = build_action_sink_with_dir(record, &doc, &resource_opts, &connectors.data_dir())?;
     let has_sink = sink.is_some();
     // A console sink logs locally and dials no target. It keeps no
@@ -1495,7 +1543,21 @@ pub(crate) fn stage_action_sink(
         // target that arrives through a secret reference. The resolver
         // runs first, so the probe dials the real target.
         probe_on_create: has_sink,
+        reuse_connector_runtime: false,
     })
+}
+
+/// Find the live runtime of the connector that a reference row names.
+fn connector_runtime(
+    engine: &broker_rules::RuleEngine,
+    record: &ActionRecord,
+) -> Option<Arc<dyn broker_connectors::Sink>> {
+    let reference = record.connector.trim();
+    let bare = crate::v5::typed::bare_name(reference, &record.action_type);
+    engine
+        .connectors()
+        .get(reference)
+        .or_else(|| engine.connectors().get(&bare))
 }
 
 /// Build (never register) one action's owned sink from the referenced
@@ -1693,13 +1755,27 @@ fn param_string_map(record: &ActionRecord, key: &str) -> std::collections::HashM
         .unwrap_or_default()
 }
 
-/// Check the action-owned value shapes before the connector is
-/// resolved. Presence is checked later against the merged view (the
-/// action parameter, else the connector document), so a dangling
-/// connector still reports the dangling reference first. Thus a
-/// dangling connector does not accept an action that is missing its
-/// own required field.
-fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
+/// True when the action uses the persisted lane A connector-only form:
+/// its own id names the connector and it carries no action-owned
+/// settings. Such a row uses the connector runtime for delivery.
+pub(crate) fn is_connector_only_action(record: &ActionRecord) -> bool {
+    !record.connector.trim().is_empty()
+        && crate::v5::typed::bare_name(record.connector.trim(), &record.action_type) == record.id
+        && record
+            .parameters
+            .as_object()
+            .is_some_and(|params| params.is_empty())
+        && record
+            .params
+            .as_object()
+            .is_none_or(|params| params.is_empty())
+}
+
+/// Check the action-owned value shapes before the sink is built.
+/// Presence is checked against the merged view (the action parameter,
+/// else the connector document). A connector-only row skips this
+/// check because it stores no action-owned settings.
+pub(crate) fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
     if matches!(
         canonical_action_kind(record.action_type.as_str()),
         "pgsql" | "mysql" | "mssql" | "oracle" | "alloydb" | "cockroachdb" | "redshift"
@@ -5804,17 +5880,22 @@ pub(crate) fn build_bigquery_sink(
 }
 
 #[cfg(feature = "bigquery")]
-fn bigquery_auth(
+pub(crate) fn bigquery_auth(
     connector_doc: &serde_json::Value,
     connector: &str,
     action_id: &str,
 ) -> Result<(String, broker_connectors_enterprise::gcp_pubsub::GcpAuth), String> {
     use broker_connectors_enterprise::gcp_pubsub::GcpAuth;
-    let authentication = connector_doc.get("authentication").ok_or_else(|| {
-        format!(
-            "connector {connector:?} is missing required field: authentication (action {action_id:?})"
-        )
-    })?;
+    // The native form names `authentication`; the reference form names
+    // the same object `auth`. Both carry the operator credential.
+    let authentication = connector_doc
+        .get("authentication")
+        .or_else(|| connector_doc.get("auth"))
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: authentication (action {action_id:?})"
+            )
+        })?;
     let kind = authentication
         .get("type")
         .and_then(|value| value.as_str())
@@ -5897,8 +5978,33 @@ fn bigquery_auth(
                 .unwrap_or(GcpAuth::None);
             Ok((project_id, auth))
         }
+        "access_token" => {
+            // The reference token form names the bearer value under
+            // `token`; the top-level `access_token` is its alias.
+            let token = authentication
+                .get("token")
+                .or_else(|| authentication.get("access_token"))
+                .or_else(|| connector_doc.get("access_token"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "connector {connector:?} field `authentication.token` is missing (action {action_id:?})"
+                    )
+                })?
+                .to_string();
+            let project_id = authentication
+                .get("gcp_project_id")
+                .or_else(|| connector_doc.get("gcp_project_id"))
+                .or_else(|| connector_doc.get("project_id"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            Ok((project_id, GcpAuth::AccessToken { token }))
+        }
         other => Err(format!(
-            "connector {connector:?} field `authentication.type` value {other:?} is not supported: use a service account key or the attached account"
+            "connector {connector:?} field `authentication.type` value {other:?} is not supported: use a service account key, an access token or the attached account"
         )),
     }
 }
@@ -8183,6 +8289,8 @@ pub(crate) fn rocketmq_sink_config(
             record.id
         ));
     }
+    let security_token = nested_field(connector_doc, &["security_token", "securityToken"])
+        .map(|value| value.into_owned());
     let strategy = param_string(record, "strategy").unwrap_or_else(|| "roundrobin".to_string());
     // `key_dispatch` hashes the keys. `roundrobin` sends with no keys
     // so the proxy spreads rows.
@@ -8200,6 +8308,7 @@ pub(crate) fn rocketmq_sink_config(
         message_group_template: None,
         access_key,
         secret_key,
+        security_token,
         batch_size: Some(MV03A_BATCH_SIZE_ONE),
         // Bounded inner buffer: 1024 rows cap the memory the proxy
         // client holds while the runtime owns batching (RO-01).
@@ -8216,15 +8325,28 @@ pub(crate) fn build_rocketmq_sink(
     record: &ActionRecord,
     connector_doc: &serde_json::Value,
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
-    use broker_connectors_enterprise::rocketmq::{RocketMqSink, TcpRocketMqTransport};
+    use broker_connectors_enterprise::rocketmq::{
+        RemotingRocketMqTransport, RocketMqSink, RocketMqTransport, TcpRocketMqTransport,
+    };
     let config = rocketmq_sink_config(record, connector_doc)?;
-    let transport = TcpRocketMqTransport::new(&config).map_err(|error| {
-        format!(
-            "action {:?} cannot build its rocketmq transport: {error}",
-            record.id
-        )
-    })?;
-    let sink = RocketMqSink::new(config, Arc::new(transport)).map_err(|error| {
+    // The proxy ignores the session token. Use the vendor transport
+    // when a token is set so the broker applies the setting.
+    let transport: Arc<dyn RocketMqTransport> = if config.security_token.is_some() {
+        Arc::new(RemotingRocketMqTransport::new(&config).map_err(|error| {
+            format!(
+                "action {:?} cannot build its rocketmq transport: {error}",
+                record.id
+            )
+        })?)
+    } else {
+        Arc::new(TcpRocketMqTransport::new(&config).map_err(|error| {
+            format!(
+                "action {:?} cannot build its rocketmq transport: {error}",
+                record.id
+            )
+        })?)
+    };
+    let sink = RocketMqSink::new(config, transport).map_err(|error| {
         format!(
             "action {:?} cannot build its rocketmq sink: {error}",
             record.id
@@ -8407,7 +8529,7 @@ fn rebuild_action_sinks(
             alarms.deactivate(&format!("action_build_failed:{}", record.id));
             continue;
         }
-        let stage = match stage_action_sink(connectors, &record) {
+        let stage = match stage_action_sink_with_engine(connectors, Some(engine), &record) {
             Ok(stage) => stage,
             Err(message) => {
                 // Keep the previous sink: a reload or restore that cannot
@@ -8420,13 +8542,17 @@ fn rebuild_action_sinks(
             ActionWiring::Live => {
                 // Live wiring always carries its sink by construction.
                 if let Some(sink) = stage.sink {
-                    let sink = wrap_action_runtime(
-                        engine,
-                        &key,
-                        sink,
-                        stage.resource_opts,
-                        stage.health_target,
-                    );
+                    let sink = if stage.reuse_connector_runtime {
+                        sink
+                    } else {
+                        wrap_action_runtime(
+                            engine,
+                            &key,
+                            sink,
+                            stage.resource_opts,
+                            stage.health_target,
+                        )
+                    };
                     // A console action shares its captured output with
                     // the connector read path. Register the same runtime
                     // under the bare connector name, as create does.

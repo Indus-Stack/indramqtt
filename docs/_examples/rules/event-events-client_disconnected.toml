@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-client_disconnected"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT reason FROM "$events/client_disconnected"'
+topic = "$events/client_disconnected"
+payload = '{"reason": "closed"}'
+expect_matched = true
+expect_projected = '{"reason": "closed"}'
+
+[[case]]
+sql = 'SELECT reason FROM "$events/client_disconnected"'
+topic = "sensors/kitchen"
+payload = '{"reason": "closed"}'
+expect_matched = false

@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "azure_event_grid"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-azure_event_grid",
+        "name": "dx2-action-azure_event_grid",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "azure_event_grid"
+      },
+      "name": "dx2-action-azure_event_grid",
+      "status": 201,
+      "type": "azure_event_grid"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-azure_event_grid\" already exists"
+      },
+      "name": "dx2-action-azure_event_grid",
+      "status": 400,
+      "type": "azure_event_grid"
+    }
+  ],
+  "item": "action-azure_event_grid",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

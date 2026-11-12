@@ -71,8 +71,10 @@ pub async fn get_authz_settings(
 /// replaces the stored settings, it never merges into them. Unknown query
 /// parameters are rejected fail-closed. On success returns 200 with the
 /// stored settings (the documented shape) and the settings persist across
-/// a restart through the config registry. Management-plane only: one
-/// snapshot swap per request; publish and deliver never touch this store.
+/// a restart through the config registry. A successful replace clears the
+/// per-session decision caches so the next publish or subscribe uses the
+/// new policy at once. Management-plane only: one snapshot swap per
+/// request; publish and deliver never touch this store.
 pub async fn put_authz_settings(
     State(state): State<ApiState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -121,17 +123,22 @@ pub async fn put_authz_settings(
         }
     };
     match state.authz_settings.replace(candidate) {
-        Ok(stored) => match serde_json::to_value(&stored) {
-            Ok(body) => (StatusCode::OK, axum::Json(body)).into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({
-                    "code": "INTERNAL_ERROR",
-                    "message": format!("cannot render authorization settings: {error}"),
-                })),
-            )
-                .into_response(),
-        },
+        Ok(stored) => {
+            // A settings change invalidates cached decisions so the next
+            // operation uses the new policy at once (SA-22 item 4).
+            state.sessions.clear_all_authz_caches();
+            match serde_json::to_value(&stored) {
+                Ok(body) => (StatusCode::OK, axum::Json(body)).into_response(),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({
+                        "code": "INTERNAL_ERROR",
+                        "message": format!("cannot render authorization settings: {error}"),
+                    })),
+                )
+                    .into_response(),
+            }
+        }
         Err(AuthzSettingsUpdateError::Invalid(reason)) => {
             ApiError::BadRequest(reason).into_response()
         }

@@ -42,10 +42,8 @@
 // with 204 (mirroring the sibling clears) until the checker pins it.
 // TODO(parity): is the duplicate scope (clientid, topic, action), and is
 // an unknown client id on delete a NOT_FOUND or a CLIENTID_NOT_FOUND?
-// The rulebook does not decide either; the current choice rejects the
-// same client, topic and action as ALREADY_EXISTS and answers unknown
-// ids with NOT_FOUND (mirroring the sibling authz 404s) until the
-// checker pins it.
+// The rulebook does not decide either. The current choice rejects a
+// duplicate create as ALREADY_EXISTS. It answers unknown ids with NOT_FOUND.
 // Shape note: the detail envelope carries the key (`clientid` or
 // `username`) plus `rules`. The replace body carries `rules`, with an
 // optional key that must match the path.
@@ -140,7 +138,12 @@ pub async fn create_client_rule(State(state): State<ApiState>, body: Bytes) -> R
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.add_client_rule(rule) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A new client permission invalidates cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("client rule already exists".to_string()).into_response()
         }
@@ -246,7 +249,12 @@ pub async fn delete_client_rules(
     Path(clientid): Path<String>,
 ) -> Response {
     match state.auth.remove_client_rules(&clientid) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // Removed client permissions invalidate cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::NotFound(format!(
             "client authorization rules for {clientid:?} not found"
         ))
@@ -358,7 +366,13 @@ pub async fn replace_client_rules(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.replace_client_rules(&clientid, rules) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A replaced client permission set invalidates cached
+            // authorization decisions so the next operation is
+            // re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("client rule already exists".to_string()).into_response()
         }
@@ -517,7 +531,12 @@ pub async fn create_user_rule(State(state): State<ApiState>, body: Bytes) -> Res
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.add_user_rule(rule) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A new user permission invalidates cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
         }
@@ -663,7 +682,12 @@ pub async fn delete_user_rules(
     Path(username): Path<String>,
 ) -> Response {
     match state.auth.remove_user_rules(&username) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // Removed user permissions invalidate cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::NotFound(format!(
             "user authorization rules for {username:?} not found"
         ))
@@ -726,7 +750,13 @@ pub async fn replace_user_rules(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.replace_user_rules(&username, rules) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A replaced user permission set invalidates cached
+            // authorization decisions so the next operation is
+            // re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
         }

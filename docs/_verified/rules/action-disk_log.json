@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "disk_log"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-disk_log",
+        "name": "dx2-action-disk_log",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "disk_log"
+      },
+      "name": "dx2-action-disk_log",
+      "status": 201,
+      "type": "disk_log"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-disk_log\" already exists"
+      },
+      "name": "dx2-action-disk_log",
+      "status": 400,
+      "type": "disk_log"
+    }
+  ],
+  "item": "action-disk_log",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

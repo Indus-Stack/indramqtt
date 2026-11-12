@@ -1,0 +1,9 @@
+{
+  "action": "Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.",
+  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\npsk_enabled = true\npsk_keys_file = \"\"\n",
+  "item": "listeners.tls.psk_keys_file",
+  "kind": "setting",
+  "output": "psk-empty-store",
+  "returncode": 0,
+  "verified": true
+}

@@ -63,6 +63,7 @@ azure_iot = ["broker-connectors-enterprise/azure_iot"]
 dynamodb = ["broker-connectors-enterprise/dynamodb"]
 gcp_iot = ["broker-connectors-enterprise/gcp_iot"]
 kinesis = ["broker-connectors-enterprise/kinesis"]
+opc_ua = ["broker-connectors-enterprise/opc_ua"]
 
 [dev-dependencies]
 broker-connectors-enterprise = { workspace = true }

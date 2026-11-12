@@ -15,7 +15,7 @@ use broker_session::SessionManager;
 use brokerlink::BrokerFrame;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::admin_users::AdminUsers;
@@ -857,10 +857,40 @@ fn defaults_registry() -> Arc<ConfigRegistry> {
     Arc::new(ConfigRegistry::load(&dir).expect("validated defaults always load"))
 }
 
+/// One-time route table, shared by every caller. Built on first
+/// use; every later call clones it. A test-only counter tracks builds.
+static SHARED_ROUTES: OnceLock<Router<ApiState>> = OnceLock::new();
+
+/// Count of route table builds. Tests read this; production ignores it.
+static ROUTE_BUILDS: AtomicU64 = AtomicU64::new(0);
+
 /// Public routes (dashboard assets, health, login, MQTT-over-WebSocket)
 /// stay outside the authentication layer; every other route requires a
 /// bearer token enforced by [`api_auth::require_api_auth`].
-pub fn router(state: ApiState) -> Router {
+///
+/// The table holds no state. [`router`] sets the live state per call
+/// with `with_state`. The MCP endpoint reuses this table through its
+/// own one-time cache. Authentication runs per request against the
+/// current stores. Concurrent calls share the table. No cycle exists:
+/// the table never points back at the outer router or the state.
+pub(crate) fn router_routes() -> Router<ApiState> {
+    SHARED_ROUTES
+        .get_or_init(|| {
+            ROUTE_BUILDS.fetch_add(1, Ordering::Relaxed);
+            build_router_routes()
+        })
+        .clone()
+}
+
+/// Count of route table builds. Tests read this; production ignores it.
+#[cfg(test)]
+pub(crate) fn router_route_builds() -> u64 {
+    ROUTE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Build the full route table: protected routes behind the auth
+/// layer plus the public routes. Holds no state.
+fn build_router_routes() -> Router<ApiState> {
     let protected: Router<ApiState> = Router::new()
         .route("/schemas", get(v5::schemas::list_schemas))
         .route("/schemas/:name", get(v5::schemas::get_schema))
@@ -905,10 +935,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/licence/request", get(licence::get_request))
         .route("/api/v1/licence/install", post(licence::install_licence))
         .route("/api/v1/licence/status", get(licence::get_status))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            api_auth::require_api_auth,
-        ));
+        .layer(axum::middleware::from_fn(api_auth::require_api_auth));
     let public: Router<ApiState> = Router::new()
         .route("/", get(redirect_to_dashboard))
         .route("/dashboard", get(get_dashboard))
@@ -942,7 +969,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/status", get(v5::status::get_status))
         .nest("/api/v5", v5::public_router())
         .merge(protected);
-    public.with_state(state)
+    public
+}
+
+/// Serve-ready router: the shared route table with the live state set.
+/// Each call clones the table, so no caller rebuilds the routes.
+pub fn router(state: ApiState) -> Router {
+    router_routes()
+        .layer(axum::Extension(state.clone()))
+        .with_state(state)
 }
 
 /// Serve the management API on an already-bound listener.
@@ -1413,6 +1448,9 @@ async fn create_user(
     // Quotas always render as an object (all-null when unset) so GET
     // and POST share one shape.
     let stored = state.auth.get_quotas_in_tenant(&tenant, &req.username);
+    // A changed user invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "username": req.username, "quotas": stored })),
@@ -1489,6 +1527,9 @@ async fn create_acl(
     ) {
         return persist_error(error);
     }
+    // A changed rule invalidates cached decisions so the next operation
+    // is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -1530,7 +1571,12 @@ async fn delete_acl(
         Err(response) => return *response,
     };
     match state.auth.remove_rule_in_tenant(&tenant, id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A changed rule invalidates cached decisions so the next
+            // operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => persist_error(error),
     }
@@ -1542,14 +1588,18 @@ fn node_id() -> String {
         .unwrap_or_else(|_| "local".to_string())
 }
 
-/// Node status, version, live connection count, and rule count.
+/// Node status, version, live counts, and live rule engine tuning.
 async fn get_nodes(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    // Live tuning values. Reason: the docs prove the file setting
+    // applies by reading the running engine, not the stored file.
     Json(serde_json::json!({
         "node_id": node_id(),
         "status": "running",
         "version": env!("CARGO_PKG_VERSION"),
         "connections": state.metrics.connections_active(),
         "rules": state.engine.list_rules().len(),
+        "window_channel_depth": state.engine.window_channel_depth(),
+        "backpressure_policy": format!("{:?}", state.engine.backpressure_policy()),
     }))
 }
 
@@ -1588,13 +1638,13 @@ async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<serde_json::V
 /// Creation payload for a streaming connector. `kind` selects the sink
 /// family; `config` carries that family's fields verbatim. Streaming
 /// sinks connect lazily on first delivery, so creation never blocks on
-/// external brokers.
+/// external brokers. Qualification builds this payload directly.
 #[derive(Debug, Deserialize)]
-struct CreateConnectorRequest {
-    id: String,
-    kind: String,
+pub struct CreateConnectorRequest {
+    pub id: String,
+    pub kind: String,
     #[serde(default)]
-    config: serde_json::Value,
+    pub config: serde_json::Value,
 }
 
 async fn create_connector(
@@ -1645,8 +1695,8 @@ async fn create_connector(
 /// Build one streaming connector from a creation request: parse the
 /// kind-specific config, validate it, and wire the sink to its
 /// transport. Pure construction except `disk_log`, which opens its
-/// directory (hence async).
-async fn build_connector(
+/// directory (hence async). Qualification calls this entry directly.
+pub async fn build_connector(
     req: &CreateConnectorRequest,
 ) -> Result<(String, std::sync::Arc<dyn broker_connectors::Sink>), String> {
     let kind = req.kind.to_ascii_lowercase();
@@ -2183,9 +2233,15 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid rocketmq config: {e}"))?;
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::TcpRocketMqTransport::new(&config)
-                        .map_err(|e| format!("invalid rocketmq transport: {e}"))?,
+                // All configs use the vendor path.
+                // Reason: the vendor server only speaks remoting.
+                let transport: std::sync::Arc<
+                    dyn broker_connectors_enterprise::rocketmq::RocketMqTransport,
+                > = std::sync::Arc::new(
+                    broker_connectors_enterprise::rocketmq::RemotingRocketMqTransport::new(
+                        &config,
+                    )
+                    .map_err(|e| format!("invalid rocketmq transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::RocketMqSink::new(config, transport)
                     .map_err(|e| format!("invalid rocketmq sink: {e}"))?;
@@ -2580,6 +2636,7 @@ mod tests {
         router: Arc<SubscriptionRouter>,
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
+        authz_sources: Arc<broker_auth::AuthzSourceRegistry>,
         admin_users: Arc<crate::admin_users::AdminUsers>,
         tokens: Arc<crate::v5::auth::ApiTokens>,
         alarms: Arc<crate::v5::alarms::AlarmStore>,
@@ -2624,6 +2681,7 @@ mod tests {
                 router: sub_router.clone(),
                 metrics: metrics.clone(),
                 auth: auth.clone(),
+                authz_sources: api_state.authz_sources.clone(),
                 admin_users: api_state.admin_users.clone(),
                 tokens: api_state.tokens.clone(),
                 alarms: api_state.alarms.clone(),
@@ -16371,6 +16429,117 @@ connector_id = "pending-good"
         assert_eq!(body["code"], json!("NOT_FOUND"));
     }
 
+    /// Honest markers of deferred functions (MV-15): gateways, schema
+    /// validations, OpenTelemetry export and cluster links. Reads answer
+    /// the documented shape with a true empty or disabled state. Writes
+    /// refuse with the documented 400 code. Nothing is stored, so a
+    /// second read shows the same empty state.
+    #[tokio::test]
+    async fn test_deferred_features_are_honest() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Gateways read empty; the console gateway page loads this list.
+        let (status, body) = server.get_auth("/api/v5/gateways", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server.get_auth("/api/v5/gateways/stomp", &token).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .put_auth("/api/v5/gateways/stomp", json!({"enable": true}), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not available")));
+        let (status, body) = server
+            .put_auth("/api/v5/gateways/stomp/enable/true", json!({}), &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // A refused write stores nothing: the list still reads empty.
+        let (status, body) = server.get_auth("/api/v5/gateways", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // Schema validations read empty; writes refuse with the
+        // documented codes and store nothing.
+        let (status, body) = server.get_auth("/api/v5/schema_validations", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/schema_validations",
+                json!({"name": "mv15-v1", "strategy": "all_pass", "failure_action": "drop", "checks": [], "topics": "mv15/t"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/schema_validations",
+                json!({"name": "mv15-v1", "strategy": "all_pass", "failure_action": "drop", "checks": [], "topics": "mv15/t"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/schema_validations/validation/mv15-v1", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .delete_auth("/api/v5/schema_validations/validation/mv15-v1", &token)
+            .await;
+        assert_eq!(status, 404);
+        let (status, body) = server.get_auth("/api/v5/schema_validations", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // OpenTelemetry reads disabled; the write refuses and stores
+        // nothing.
+        let (status, body) = server.get_auth("/api/v5/opentelemetry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("generic"));
+        assert_eq!(body["logs"]["enable"], json!(false));
+        assert_eq!(body["metrics"]["enable"], json!(false));
+        assert_eq!(body["traces"]["enable"], json!(false));
+        let (status, refused) = server
+            .put_auth(
+                "/api/v5/opentelemetry",
+                json!({"metrics": {"enable": true}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(refused["code"], json!("BAD_REQUEST"));
+        // A refused write stores nothing: the read still shows disabled.
+        let (status, reread) = server.get_auth("/api/v5/opentelemetry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(reread, body);
+
+        // Cluster links read empty; the write refuses and stores nothing.
+        let (status, body) = server.get_auth("/api/v5/cluster/links", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/cluster/links",
+                json!({"name": "mv15-link", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server.get_auth("/api/v5/cluster/links", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+    }
+
     #[tokio::test]
     async fn test_rules_crud_lifecycle() {
         let (server, _state) = TestServer::start().await;
@@ -17896,6 +18065,115 @@ connector_id = "pending-good"
         assert_eq!(status, 404);
         assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
         assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn client_authz_cache_ttl_filter_round_trip() {
+        // TTL filter through the production router: one fresh decision
+        // reads as a list with one entry, one expired decision reads as empty.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Connect and subscribe through the broker.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-01-cache-ttl", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("conf/authz/ttl", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+
+        // Fresh entry reads as a list with one entry.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-ttl/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["topic"], json!("conf/authz/ttl"));
+        assert_eq!(entries[0]["access"], json!("subscribe"));
+        assert_eq!(entries[0]["result"], json!("allow"));
+        assert!(entries[0]["updated_time"].is_number());
+
+        // Short TTL expires the entry. Wait past the TTL.
+        // Short TTL keeps the wait small. Long wait avoids timing luck.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/settings",
+                json!({
+                    "no_match": "deny",
+                    "deny_action": "ignore",
+                    "cache": {
+                        "enable": true,
+                        "max_size": 32,
+                        "ttl": "1ms",
+                        "excludes": [],
+                    },
+                    "include_mountpoint": false,
+                    "ignore_backend_failures": false,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-ttl/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+    }
+
+    #[tokio::test]
+    async fn client_authz_cache_latest_decision_round_trip() {
+        // Latest decision through the production router: two fresh
+        // subscribes, the read returns both entries with the latest last.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-01-cache-latest", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("conf/authz/latest-a", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        subscriber
+            .send_bin(&mqtt_subscribe(8, &[("conf/authz/latest-b", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-latest/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["topic"], json!("conf/authz/latest-b"));
+        assert_eq!(entries[1]["access"], json!("subscribe"));
+        assert_eq!(entries[1]["result"], json!("allow"));
+        assert!(entries[1]["updated_time"].is_number());
     }
 
     #[tokio::test]
@@ -20446,6 +20724,227 @@ connector_id = "pending-good"
         assert_eq!(status, 200);
     }
 
+    /// An administrator resets the password of a different user without
+    /// the old password. The same user must prove the old password. A
+    /// refused update keeps the old password. Old sessions end.
+    #[tokio::test]
+    async fn mv09c_admin_reset_needs_no_old_password_own_change_does() {
+        // MV-09c broker-through test: every step uses the served
+        // management API on `ApiState` (the same state the kernel shares
+        // in `crates/broker-node/src/main.rs`, `serve_api`), not the
+        // store. Management-plane only; publish and deliver never touch
+        // these stores.
+        let (server, _state) = TestServer::start().await;
+        let admin = server.login_as_admin().await;
+
+        // Create one viewer through the router.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!", "role": "viewer"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Two live viewer sessions on the login path.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_old = body["token"].as_str().expect("viewer token").to_string();
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_other = body["token"].as_str().expect("second token").to_string();
+        assert_ne!(viewer_old, viewer_other);
+
+        // An administrator reset needs no old password.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"new_pwd": "NewSecret2!"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
+        assert!(body.is_null());
+
+        // The new password logs in; the old one does not.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "NewSecret2!"}),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let viewer = body["token"].as_str().expect("new token").to_string();
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+
+        // Both old sessions end: the reset revokes every live token of
+        // the user.
+        let (status, _) = server.get_auth("/api/v5/current_user", &viewer_old).await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_auth("/api/v5/current_user", &viewer_other).await;
+        assert_eq!(status, 401);
+
+        // An own change without the old password is refused.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"new_pwd": "ThirdSecret3!"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("ERROR_PWD_NOT_MATCH"));
+
+        // An own change with a wrong old password is refused.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"old_pwd": "Wrong-old-1!", "new_pwd": "ThirdSecret3!"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("ERROR_PWD_NOT_MATCH"));
+
+        // A weak new password is refused and keeps the old one.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"old_pwd": "NewSecret2!", "new_pwd": "short"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "NewSecret2!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // A second session of the same user, then an own change with the
+        // old password. The other session ends; the caller keeps working.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "NewSecret2!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_second = body["token"].as_str().expect("second token").to_string();
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"old_pwd": "NewSecret2!", "new_pwd": "ThirdSecret3!"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
+        let (status, _) = server
+            .get_auth("/api/v5/current_user", &viewer_second)
+            .await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_auth("/api/v5/current_user", &viewer).await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "ThirdSecret3!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    /// The router refuses a wrong MFA code.
+    /// The router refuses a used code.
+    #[tokio::test]
+    async fn mv09c_mfa_verify_refuses_wrong_and_replayed_codes_via_http() {
+        // MV-09c broker-through test: setup runs through the served
+        // management API on `ApiState`. Verify runs through the same API.
+        // The kernel shares this state in `serve_api`. The test avoids
+        // the store. Management-plane only; publish and deliver
+        // never touch these maps. Codes and secrets never reach logs.
+        let (server, _state) = TestServer::start().await;
+        let admin = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "mv09c-mfa", "password": "MfaSecret1!", "role": "viewer"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Setup enrols and returns the secret one time.
+        let (status, setup) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "mv09c-mfa"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "{setup}");
+        let secret = crate::mfa_totp::base32_decode(setup["secret"].as_str().expect("secret"))
+            .expect("setup returns base32");
+
+        // A wrong code is refused and does not enable.
+        let step = crate::mfa_totp::totp_counter(crate::mfa_totp::unix_now_secs());
+        let good = crate::mfa_totp::totp_code(&secret, step);
+        let mut wrong = good.clone();
+        wrong.replace_range(0..1, if &good[0..1] == "0" { "1" } else { "0" });
+        assert_ne!(wrong, good);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/verify",
+                json!({"username": "mv09c-mfa", "code": wrong}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // A correct code enables.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/verify",
+                json!({"username": "mv09c-mfa", "code": good.clone()}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["enabled"], json!(true));
+
+        // The same code cannot be used again.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/verify",
+                json!({"username": "mv09c-mfa", "code": good}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
     #[tokio::test]
     async fn lowercase_bearer_scheme_is_accepted() {
         let (server, _state) = TestServer::start().await;
@@ -20573,7 +21072,7 @@ connector_id = "pending-good"
         let (status, _) = server
             .put_auth(
                 "/api/v5/users/b-admin",
-                json!({"role": "viewer"}),
+                json!({"role": "viewer", "scopes": "unset"}),
                 &admin_token,
             )
             .await;
@@ -20624,6 +21123,634 @@ connector_id = "pending-good"
         let (status, body) = server.get_auth("/api/v5/current_user", &v_token).await;
         assert_eq!(status, 401);
         assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    /// MV-05: the create, update and read paths carry the dashboard user
+    /// scopes of the reference contract.
+    #[tokio::test]
+    async fn dashboard_user_scope_contract_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let mut admin_scopes: Vec<&str> = broker_config::GENERIC_USER_SCOPES.to_vec();
+        admin_scopes.extend_from_slice(&broker_config::LOGIN_ONLY_SCOPES);
+
+        // An omitted scope list on create stores the role default.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-admin-default", "password": "Scope-pass-1a",
+                       "role": "administrator"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create admin default: {created}");
+        assert_eq!(created["scopes"], json!(admin_scopes));
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-viewer-default", "password": "Scope-pass-1a",
+                       "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create viewer default: {created}");
+        assert_eq!(created["scopes"], json!(broker_config::GENERIC_USER_SCOPES));
+
+        // An empty list denies each management scope.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-deny", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": []}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create deny-all: {created}");
+        assert_eq!(created["scopes"], json!([]));
+
+        // `unset` and a list equal to the role default store no explicit
+        // list, and the read renders the sentinel.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-unset", "password": "Scope-pass-1a",
+                       "role": "administrator", "scopes": "unset"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create unset: {created}");
+        assert_eq!(created["scopes"], json!("unset"));
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-default-list", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": broker_config::GENERIC_USER_SCOPES}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create default-equivalent list: {created}");
+        assert_eq!(created["scopes"], json!("unset"));
+
+        // A restricted list stores and renders as written.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-monitor", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create restricted list: {created}");
+        assert_eq!(created["scopes"], json!(["monitoring"]));
+
+        // A duplicate and one missing default scope do not normalise to
+        // the full role default.
+        let mut ambiguous: Vec<String> = broker_config::GENERIC_USER_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect();
+        ambiguous.pop();
+        ambiguous.push("connections".to_string());
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-duplicate", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ambiguous}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 400, "duplicate scope: {body}");
+
+        // Unknown and role-forbidden scopes fail closed.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-unknown", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["not_a_scope"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown scope: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-forbidden", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["user_management"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 400, "viewer user_management: {body}");
+
+        // mfa_management is valid for a viewer.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-mfa", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["mfa_management"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "viewer mfa_management: {created}");
+        assert_eq!(created["scopes"], json!(["mfa_management"]));
+
+        // Own MFA stays public. Another user's MFA needs mfa_management.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-mfa", "password": "Scope-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "mfa user login: {body}");
+        let mfa_token = body["token"].as_str().expect("mfa token").to_string();
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "scope-mfa"}),
+                &mfa_token,
+            )
+            .await;
+        assert_eq!(status, 200, "own MFA: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "admin"}),
+                &mfa_token,
+            )
+            .await;
+        assert_eq!(status, 403, "viewer targets another user: {body}");
+
+        for (name, scopes) in [
+            ("scope-limited-admin", json!(["monitoring"])),
+            ("scope-mfa-admin", json!(["mfa_management"])),
+        ] {
+            let (status, created) = server
+                .post_auth(
+                    "/api/v5/users",
+                    json!({"username": name, "password": "Scope-pass-1a",
+                           "role": "administrator", "scopes": scopes}),
+                    &admin_token,
+                )
+                .await;
+            assert_eq!(status, 200, "create {name}: {created}");
+        }
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-limited-admin", "password": "Scope-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let limited_token = body["token"].as_str().expect("limited token").to_string();
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-mfa-admin", "password": "Scope-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let mfa_admin_token = body["token"].as_str().expect("mfa admin token").to_string();
+
+        // A limited administrator cannot target another user.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "unused", "new_pwd": "Unused-pass-1a"}),
+                &limited_token,
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "limited admin targets another password: {body}"
+        );
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "admin"}),
+                &limited_token,
+            )
+            .await;
+        assert_eq!(status, 403, "limited admin targets another MFA: {body}");
+
+        // mfa_management allows another user's MFA, not another password.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "admin"}),
+                &mfa_admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "mfa_management targets another MFA: {body}");
+        let (status, body) = server
+            .post_auth("/api/v5/users/admin/mfa", json!({}), &mfa_admin_token)
+            .await;
+        assert_eq!(status, 204, "mfa_management enrols another user: {body}");
+        let (status, body) = server
+            .post_auth("/api/v5/users/admin/mfa", json!({}), &limited_token)
+            .await;
+        assert_eq!(status, 403, "limited admin enrols another user: {body}");
+
+        // GET /users shows the stored value, and a read-modify-write
+        // succeeds with the body that the read returned.
+        let (status, users) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let users = users.as_array().expect("users is an array");
+        let monitor = users
+            .iter()
+            .find(|row| row["username"] == json!("scope-monitor"))
+            .expect("monitor row");
+        assert_eq!(monitor["scopes"], json!(["monitoring"]));
+        let unset = users
+            .iter()
+            .find(|row| row["username"] == json!("scope-unset"))
+            .expect("unset row");
+        assert_eq!(unset["scopes"], json!("unset"));
+        let (status, updated) = server
+            .put_auth(
+                "/api/v5/users/scope-monitor",
+                json!({
+                    "role": monitor["role"],
+                    "description": monitor["description"],
+                    "scopes": monitor["scopes"],
+                }),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "round-trip PUT: {updated}");
+        assert_eq!(updated["scopes"], json!(["monitoring"]));
+    }
+
+    /// MV-05: a deny-all user keeps only the public management routes.
+    #[tokio::test]
+    async fn dashboard_user_deny_all_keeps_public_paths() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-deny-all", "password": "Deny-pass-1a",
+                       "role": "viewer", "scopes": []}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-deny-all", "password": "Deny-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "login: {body}");
+        let token = body["token"].as_str().expect("token").to_string();
+
+        for path in [
+            "/api/v5/metrics",
+            "/api/v5/clients",
+            "/api/v5/users",
+            "/api/v5/api_key",
+        ] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert_eq!(status, 403, "deny-all GET {path}: {body}");
+        }
+        let (status, _) = server.post_auth("/api/v5/users", json!({}), &token).await;
+        assert_eq!(status, 403, "deny-all write");
+
+        for path in [
+            "/api/v5/current_user",
+            "/api/v5/user_scopes",
+            "/api/v5/api_key_scopes",
+            "/api/v5/status?format=json",
+            "/schemas/hotconf",
+        ] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "public GET {path}: {body}");
+        }
+
+        // The own password change and MFA self-service stay open.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/scope-deny-all/change_pwd",
+                json!({"old_pwd": "Deny-pass-1a", "new_pwd": "Deny-pass-2b"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204, "own password change: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "scope-deny-all"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "own MFA setup: {body}");
+        assert!(body["secret"].is_string());
+
+        let (status, _) = server.post_auth("/api/v5/logout", json!({}), &token).await;
+        assert_eq!(status, 204, "logout");
+    }
+
+    /// MV-05: a scope change or a role change applies to a token that
+    /// was issued before the change.
+    #[tokio::test]
+    async fn dashboard_user_scope_and_role_changes_reach_existing_tokens() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-live", "password": "Live-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-live", "password": "Live-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("token").to_string();
+        let (status, _) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_auth("/api/v5/listeners", &token).await;
+        assert_eq!(status, 403);
+
+        // The same token sees the new scope on its next request.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/scope-live",
+                json!({"scopes": ["system"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "scope change: {body}");
+        let (status, _) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 403);
+        let (status, body) = server.get_auth("/api/v5/listeners", &token).await;
+        assert_eq!(status, 200, "new scope on old token: {body}");
+
+        // Role demotion also applies to the existing token.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-role", "password": "Role-pass-1a",
+                       "role": "administrator", "scopes": "unset"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-role", "password": "Role-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let role_token = body["token"].as_str().expect("role token").to_string();
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-role-probe", "password": "Probe-pass-1a"}),
+                &role_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/scope-role",
+                json!({"role": "viewer", "scopes": "unset"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "demotion: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-role-probe2", "password": "Probe-pass-1a"}),
+                &role_token,
+            )
+            .await;
+        assert_eq!(status, 403, "old admin token after demotion: {body}");
+    }
+
+    /// MV-05: scopes persist across a restart and still limit the token.
+    #[tokio::test]
+    async fn dashboard_user_scopes_survive_restart() {
+        let dir = unique_data_dir("user-scopes");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-restart", "password": "Restart-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        drop(server);
+        drop(registry);
+
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-restart", "password": "Restart-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "login after restart: {body}");
+        let token = body["token"].as_str().expect("token").to_string();
+        let (status, _) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 403);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let admin_token = body["token"].as_str().expect("admin token").to_string();
+        let (status, users) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("users is an array")
+            .iter()
+            .find(|row| row["username"] == json!("scope-restart"))
+            .expect("stored user");
+        assert_eq!(row["scopes"], json!(["monitoring"]));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// MV-05: the scope check uses a normalized path and does not open the
+    /// MCP door to a dashboard login token.
+    #[tokio::test]
+    async fn dashboard_user_scope_paths_are_normalized() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-url", "password": "Url-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-url", "password": "Url-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("token").to_string();
+
+        // An encoded path that reaches the user route must not pass the
+        // monitoring scope. A route miss is also a denial.
+        for path in [
+            "/api/v5/%75sers",
+            "/api/v5/metrics/../users",
+            "/api/v5/users/",
+            "/api/v5/%2e%2e/users",
+        ] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert!(
+                status == 403 || status == 404,
+                "{path} must not pass the monitoring scope: {status} {body}"
+            );
+        }
+        // The monitoring scope still opens its own encoded path when the
+        // router resolves it.
+        let (status, _) = server.get_auth("/api/v5/stat%73", &token).await;
+        assert!(status == 200 || status == 404, "encoded stats: {status}");
+
+        // MCP accepts API keys only, so a login token cannot bypass scopes
+        // there.
+        let (status, body) = server
+            .post_auth(
+                "/mcp",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 401, "MCP with a login token: {body}");
+
+        // A limited key reaches /mcp with monitoring. A management route
+        // outside that scope is refused through the tool call.
+        let (_key_id, secret) = make_key(
+            &server,
+            &admin_token,
+            json!({"name": "scope-mcp-key", "scopes": ["monitoring"]}),
+        )
+        .await;
+        let bearer = format!("Bearer {secret}");
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_users", "arguments": {}}, "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200, "MCP users call answers: {body}");
+        assert_eq!(
+            body["result"]["isError"],
+            json!(true),
+            "limited key cannot call users: {body}"
+        );
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("FORBIDDEN") || text.contains("403"),
+            "users refusal names the code: {text}"
+        );
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_metrics", "arguments": {}}, "id": 3}),
+        )
+        .await;
+        assert_eq!(status, 200, "MCP metrics call answers: {body}");
+        assert!(
+            body["result"].get("isError").is_none(),
+            "monitoring key calls metrics: {body}"
+        );
+    }
+
+    /// MV-05: a default administrator keeps the bearer management routes.
+    #[tokio::test]
+    async fn default_administrator_keeps_bearer_management_routes() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in ["/api/v5/users", "/api/v5/user_scopes"] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "default admin GET {path}: {body}");
+        }
+    }
+
+    /// MV-05: a limited administrator keeps tenant checks and can write a
+    /// tenant limit. The MQTT refusal is proved by
+    /// `mv05_tenant_session_limit_refuses_second_mqtt_session` in
+    /// `tests/e2e_integration.rs`.
+    #[tokio::test]
+    async fn dashboard_user_scopes_keep_tenant_checks() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-tenant", "password": "Tenant-pass-1a",
+                       "role": "administrator", "scopes": ["system"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-tenant", "password": "Tenant-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("token").to_string();
+
+        // The limited administrator cannot manage users.
+        let (status, _) = server.get_auth("/api/v5/users", &token).await;
+        assert_eq!(status, 403);
+
+        let (status, body) = server
+            .post_auth("/api/v5/mt/ns/scope-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204, "create tenant: {body}");
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/mt/ns/scope-tenant/config",
+                json!({"limits": {"max_sessions": 1}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "set tenant limit: {body}");
+        assert_eq!(body["limits"]["max_sessions"], json!(1));
+        let (status, body) = server
+            .get_auth("/api/v5/mt/ns/scope-tenant/config", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["limits"]["max_sessions"], json!(1));
+        // A missing tenant still fails, whatever the scope.
+        let (status, body) = server
+            .get_auth("/api/v5/mt/ns/scope-tenant-missing/config", &token)
+            .await;
+        assert_eq!(status, 404, "missing tenant: {body}");
     }
 
     /// Unique scratch data dir under the OS temp dir (no dev-dependency).
@@ -21704,11 +22831,12 @@ connector_id = "pending-good"
     async fn authz_sources_list_create_clear_round_trip() {
         // Source registry plus list/create routes and the built-in
         // catch-all clear (W2-17, C04-08..C04-10) through the broker:
-        // default list holds only the built-in source, create registers
-        // one stored-only source, duplicates are rejected, and the
-        // catch-all empties the built-in rule table. Before this task
-        // every route here was missing (bare 404).
-        let (server, _state) = TestServer::start().await;
+        // default list holds only the built-in source, an unavailable
+        // fresh kind is refused, an older stored source still lists,
+        // duplicates are rejected, and the catch-all empties the
+        // built-in rule table. Before this task every route here was
+        // missing (bare 404).
+        let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         // Default registry: only the built-in database source, empty
@@ -21722,17 +22850,28 @@ connector_id = "pending-good"
             json!([{"type": "built_in_database", "enable": true}])
         );
 
-        // Register one stored-only source; only the built-in executes,
-        // the new entry is stored and reported without a live claim.
-        let (status, created) = server
+        // A source kind this build does not evaluate is refused before
+        // anything is stored (AZ-02).
+        let (status, refused) = server
             .post_auth(
                 "/api/v5/authorization/sources",
                 json!({"type": "file", "config": {"path": "/etc/authz/rules.conf"}}),
                 &token,
             )
             .await;
-        assert_eq!(status, 204);
-        assert!(created.is_null(), "create returns no body, got: {created}");
+        assert_eq!(status, 400);
+        assert_eq!(refused["code"], json!("BAD_REQUEST"));
+
+        // An older stored source still lists and reports without a live
+        // claim; seed it directly to model the recovered state.
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: json!({"path": "/etc/authz/rules.conf"}),
+            })
+            .expect("seed the stored source");
 
         // List again: the entry is present in stored order.
         let (status, body) = server
@@ -21807,16 +22946,18 @@ connector_id = "pending-good"
         // dir in a fresh server, and read the sources back.
         let dir = unique_data_dir("authz-sources");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
-        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
-        let token = server.login_as_admin().await;
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/authorization/sources",
-                json!({"type": "redis"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 204);
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "redis".to_string(),
+                enable: true,
+                config: Value::Null,
+            })
+            .expect("seed the stored source");
+        // Side effect: login_as_admin persists the admin password change
+        // through the registry so the reload below can authenticate.
+        server.login_as_admin().await;
         drop(server);
         drop(registry);
         let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
@@ -21922,16 +23063,17 @@ connector_id = "pending-good"
         assert_eq!(status, 200);
         assert_eq!(body["rules"].as_array().expect("rules array").len(), 2);
 
-        // Register a second source, then a bad order naming an unknown
-        // type is rejected and the stored order is unchanged.
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/authorization/sources",
-                json!({"type": "file"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 204);
+        // An older stored source is seeded directly, then a bad order
+        // naming an unknown type is rejected and the stored order is
+        // unchanged.
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: Value::Null,
+            })
+            .expect("seed the stored source");
         let (status, body) = server
             .put_auth(
                 "/api/v5/authorization/sources/order",
@@ -21997,6 +23139,332 @@ connector_id = "pending-good"
             .await;
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn mv09b_client_rules_http_round_trip_order_replace_refused() {
+        // Per-client rules through the production router: create, list
+        // with paging, read, replace, delete, order, merge and refusal.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty index reads as an empty page, never an error.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+
+        // Create one rule. Success is 204 with no body.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                json!({"clientid": "mv09b-c1", "topic": "mv09b/c1/#", "permission": "allow", "action": "publish"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // Duplicate scope is rejected, never merged.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                json!({"clientid": "mv09b-c1", "topic": "mv09b/c1/#", "permission": "deny", "action": "publish"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Malformed bodies are rejected and store nothing new.
+        for bad in [
+            json!({"topic": "mv09b/x/#", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "", "topic": "mv09b/x/#", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "*", "topic": "mv09b/x/#", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "mv09b-x", "topic": "", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "mv09b-x", "topic": "mv09b/x/#", "permission": "maybe", "action": "publish"}),
+            json!({"clientid": "mv09b-x", "topic": "mv09b/x/#", "permission": "allow", "action": "forward"}),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/authorization/sources/built_in_database/rules/clients",
+                    bad,
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+
+        // Seed two more clients so paging has three rows.
+        for (id, topic) in [("mv09b-c2", "mv09b/c2/#"), ("mv09b-c3", "mv09b/c3/#")] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/authorization/sources/built_in_database/rules/clients",
+                    json!({"clientid": id, "topic": topic, "permission": "allow", "action": "publish"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 204);
+        }
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients?page=2&limit=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data array").len(), 1);
+        assert_eq!(body["meta"]["count"], json!(3));
+
+        // Detail read carries the key plus the rule set.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-c1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("mv09b-c1"));
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 1);
+
+        // Unknown ids read as 404 with the documented shape.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-missing",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Replace sets order: first match wins. Broad allow first opens
+        // the narrow topic.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/#", "permission": "allow", "action": "publish"},
+                    {"topic": "mv09b/order/secret/#", "permission": "deny", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // Prove at socket: first-match allow admits the publish.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-ord", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        client
+            .send_bin(&mqtt_publish("mv09b/order/secret/x", 1, 1, b"x"))
+            .await;
+        let puback = client.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/mv09b-ord/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("publish"));
+        assert_eq!(entries[0]["topic"], json!("mv09b/order/secret/x"));
+        assert_eq!(entries[0]["result"], json!("allow"));
+
+        // Reversed order denies the same probe.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/secret/#", "permission": "deny", "action": "publish"},
+                    {"topic": "mv09b/order/#", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // Prove at socket: reversed order, first match denies.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-ord", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        client
+            .send_bin(&mqtt_publish("mv09b/order/secret/x", 2, 1, b"x"))
+            .await;
+        let puback = client.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/mv09b-ord/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("publish"));
+        assert_eq!(entries[0]["topic"], json!("mv09b/order/secret/x"));
+        assert_eq!(entries[0]["result"], json!("deny"));
+
+        // Replace drops omitted rules, it never merges.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/kept/#", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 1);
+        assert_eq!(body["rules"][0]["topic"], json!("mv09b/order/kept/#"));
+
+        // A refused replace keeps the active policy.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/ok/#", "permission": "allow", "action": "publish"},
+                    {"topic": "", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 1);
+        // Prove at socket: refused replace keeps the stored allow policy.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-ord", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        client
+            .send_bin(&mqtt_publish("mv09b/order/kept/x", 3, 1, b"x"))
+            .await;
+        let puback = client.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/mv09b-ord/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("publish"));
+        assert_eq!(entries[0]["topic"], json!("mv09b/order/kept/x"));
+        assert_eq!(entries[0]["result"], json!("allow"));
+
+        // Duplicate scope inside one batch is rejected and keeps policy.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/dup/#", "permission": "allow", "action": "publish"},
+                    {"topic": "mv09b/order/dup/#", "permission": "deny", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+
+        // Delete removes every rule for the id. A second delete is 404.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn mv09b_changed_client_rule_applies_without_reconnect() {
+        // A changed client rule steers the next operation on a connected
+        // client. The client stays connected throughout: HTTP changes the
+        // rule, the next subscribe on the same connection follows it.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-noreconn", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+
+        // Empty table is open, so the first subscribe succeeds.
+        client
+            .send_bin(&mqtt_subscribe(7, &[("mv09b/noreconn/#", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+
+        // Deny the same filter over HTTP. The next subscribe on the same
+        // connection is refused without a reconnect.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                json!({"clientid": "mv09b-noreconn", "topic": "mv09b/noreconn/#", "permission": "deny", "action": "subscribe"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        client
+            .send_bin(&mqtt_subscribe(8, &[("mv09b/noreconn/#", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0x87]);
+
+        // Delete the rule over HTTP. The next subscribe on the same
+        // connection succeeds again, still without a reconnect.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-noreconn",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        client
+            .send_bin(&mqtt_subscribe(9, &[("mv09b/noreconn/#", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
     }
 
     #[tokio::test]
@@ -23853,7 +25321,8 @@ connector_id = "pending-good"
         feature = "confluent",
         feature = "gcp_pubsub",
         feature = "bigquery",
-        feature = "kinesis"
+        feature = "kinesis",
+        feature = "opc_ua"
     ))]
     #[tokio::test]
     async fn test_connectors_create_kafka_rabbitmq_logger() {
@@ -26428,14 +27897,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_gateway_routes_return_404() {
+        // MV-15 owns `GET /gateways`, `GET+PUT /gateways/{name}` and
+        // `PUT /gateways/{name}/enable/{enable}` as honest markers: the
+        // list reads `[]`, an unknown name misses with 404, and writes
+        // refuse. The deeper per-gateway sub-resources stay removed.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/gateways",
-            "/api/v5/gateways/stomp",
-            "/api/v5/gateways/stomp/clients/c1",
-            "/api/v5/gateway",
-        ] {
+        let (status, body) = server.get_auth("/api/v5/gateways", &token).await;
+        assert_eq!(status, 200, "honest route GET /gateways must be 200");
+        assert_eq!(body, json!([]));
+        for path in ["/api/v5/gateways/stomp/clients/c1", "/api/v5/gateway"] {
             let (status, _) = server
                 .request_raw(&format!(
                     "GET {path} HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -31149,14 +32620,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn removed_schema_registry_routes_return_404() {
         // W3-37 owns `GET+POST /schema_registry` and
-        // `DELETE /schema_registry/:name`. The validation routes stay
-        // removed until their own task lands.
+        // `DELETE /schema_registry/:name`. MV-15 owns the validation
+        // list, create, replace and detail reads as honest markers; the
+        // per-validation metrics sub-route stays removed.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/schema_validations",
-            "/api/v5/schema_validations/validation/x/metrics",
-        ] {
+        let (status, body) = server.get_auth("/api/v5/schema_validations", &token).await;
+        assert_eq!(
+            status, 200,
+            "honest route GET /schema_validations must be 200"
+        );
+        assert_eq!(body, json!([]));
+        for path in ["/api/v5/schema_validations/validation/x/metrics"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
@@ -31999,14 +33474,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "catalogue must contain {documented}"
             );
         }
-        // The login-only scopes are flagged administrator-only; the
-        // generic scopes are not.
+        // Three login-only scopes are administrator-only. mfa_management
+        // is not: a non-administrator may hold it for self-service.
         for entry in scopes {
             let name = entry["name"].as_str().expect("entry has a name");
             let admin_only = entry["admin_only"].as_bool().expect("flag is a bool");
             let expect_admin_only = matches!(
                 name,
-                "user_management" | "mfa_management" | "sso_management" | "api_key_management"
+                "user_management" | "sso_management" | "api_key_management"
             );
             assert_eq!(
                 admin_only, expect_admin_only,
@@ -32623,7 +34098,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
         assert!(body["message"].is_string());
         let (status, body) = server
             .get_auth(
@@ -32648,7 +34123,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // Malformed batches are client errors with the documented shape
         // and apply nothing.
@@ -36085,7 +37560,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// the handler. A 9 MiB call gets 413. Both go through a socket.
+    /// A 3 MiB call reaches the handler. A call just over 8 MiB gets 413.
+    /// Both go through a socket.
     #[tokio::test]
     async fn mcp_body_cap_is_eight_mebibytes() {
         let (server, _state) = TestServer::start().await;
@@ -36105,8 +37581,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert!(body["result"].is_object(), "ping answers: {body}");
 
-        // A 9 MiB envelope is refused with 413.
-        let huge_pad = "p".repeat(9 * 1024 * 1024);
+        // A body exactly one byte over 8 MiB is refused with 413. The
+        // fixed overhead keeps the serialized body at the boundary so
+        // the socket write finishes before the server refuses it.
+        let empty = json!({"jsonrpc": "2.0", "method": "ping",
+            "params": {"pad": ""}, "id": 2});
+        let overhead = serde_json::to_vec(&empty).expect("encode body").len();
+        let huge_pad = "p".repeat(crate::mcp::MCP_MAX_BODY_BYTES + 1 - overhead);
         let (status, body) = mcp_rpc(
             &server,
             &bearer,

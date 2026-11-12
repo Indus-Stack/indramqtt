@@ -1240,7 +1240,18 @@ impl Sink for CockroachDbSink {
         };
 
         if should_flush {
-            self.flush().await?;
+            // Buffer rows during backoff. The explicit flush still fails fast.
+            if self.backoff.lock().check().is_err() {
+                return Ok(());
+            }
+            // Keep buffered rows when the flush loses the race with backoff.
+            match self.flush().await {
+                Ok(()) => {}
+                Err(ConnectorError::Connection(msg)) if msg == "sink backing off after errors" => {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

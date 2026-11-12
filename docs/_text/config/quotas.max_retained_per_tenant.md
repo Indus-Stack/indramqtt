@@ -1,0 +1,1 @@
+`quotas.max_retained_per_tenant` caps retained topics in one managed tenant. The file value seeds the default for every managed tenant. A namespace `limits` block overrides it for that tenant. Past the cap, new topics drop while delivery continues. The default is 0, which means unlimited.

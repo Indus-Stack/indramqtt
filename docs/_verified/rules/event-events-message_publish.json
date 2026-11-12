@@ -1,0 +1,26 @@
+{
+  "cases": [
+    {
+      "matched": false,
+      "payload": {
+        "reason": "x"
+      },
+      "projected": null,
+      "sql": "SELECT reason FROM \"$events/message_publish\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "reason": "x"
+      },
+      "projected": null,
+      "sql": "SELECT reason FROM \"$events/message_publish\"",
+      "topic": "$events/client_connected"
+    }
+  ],
+  "item": "event-events-message_publish",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

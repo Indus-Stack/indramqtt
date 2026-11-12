@@ -1,0 +1,9 @@
+{
+  "action": "Stop the WebSocket listener and dial its port.",
+  "config": "[listeners.ws]\nenabled = false\nbind = \"127.0.0.1:8083\"\n",
+  "item": "listeners.ws.enabled",
+  "kind": "setting",
+  "output": "refused",
+  "returncode": 0,
+  "verified": true
+}

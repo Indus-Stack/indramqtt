@@ -1,0 +1,8 @@
+{
+  "item": "deleteAcl",
+  "kind": "api",
+  "output": "deleted",
+  "request": "DELETE /api/v1/auth/acls/{id} for the index of the new doc-acl-delete rule",
+  "returncode": 0,
+  "verified": true
+}

@@ -7,7 +7,7 @@
 //! [`TokenInfo`] into request extensions for handlers.
 
 use axum::{
-    extract::{Request, State},
+    extract::{Extension, Request},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -15,8 +15,8 @@ use axum::{
 };
 
 use crate::admin_users::AdminRole;
-use crate::v5::api_keys::{KeyDecision, KeyGrant, KeyRole, ResolvedApiKey};
-use crate::v5::auth::{authenticated_user, TokenInfo};
+use crate::v5::api_keys::{KeyDecision, KeyGrant, KeyRole, PathAccess, ResolvedApiKey};
+use crate::v5::auth::{authenticated_user, effective_user_scopes, TokenInfo};
 use crate::ApiState;
 
 /// Credentials presented on a management API request.
@@ -72,6 +72,10 @@ pub struct ResolvedIdentity {
     /// applies the role and the scopes to the request path. `None` for a
     /// user token and for an operator key from the environment.
     pub key_grant: Option<KeyGrant>,
+    /// True for the token of a dashboard user. The middleware applies the
+    /// effective dashboard scopes to the request path. False for an API
+    /// key and for an operator key from the environment.
+    pub is_login_user: bool,
 }
 
 /// The lifetime of the identity of one API-key request. The key does
@@ -103,6 +107,7 @@ pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<Reso
                 return Some(ResolvedIdentity {
                     info,
                     key_grant: None,
+                    is_login_user: true,
                 });
             }
             if let Some(key) = state.api_keys.resolve(&token) {
@@ -114,6 +119,7 @@ pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<Reso
                 .map(|info| ResolvedIdentity {
                     info,
                     key_grant: None,
+                    is_login_user: false,
                 })
         }
         Credentials::Basic { username, secret } => state
@@ -135,8 +141,10 @@ fn key_identity(key: ResolvedApiKey) -> ResolvedIdentity {
             role,
             expires_at: std::time::Instant::now() + API_KEY_IDENTITY_TTL,
             must_change_password: false,
+            scopes: None,
         },
         key_grant: Some(key.grant),
+        is_login_user: false,
     }
 }
 
@@ -185,6 +193,123 @@ fn scope_forbidden() -> Response {
         })),
     )
         .into_response()
+}
+
+fn login_scope_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "code": "FORBIDDEN",
+            "message": "the scopes of this user do not allow this path"
+        })),
+    )
+        .into_response()
+}
+
+/// Canonical form of a request path for the scope check.
+/// The function removes empty and dot segments, resolves `..` and
+/// percent-decodes each segment. A malformed escape, a NUL or a segment
+/// that decodes to a leading slash returns `None`, and the caller denies
+/// the request. An encoded slash inside a segment stays in that segment.
+fn canonical_scope_path(path: &str) -> Option<String> {
+    let mut segments: Vec<String> = Vec::new();
+    for raw in path.split('/') {
+        if raw.is_empty() {
+            continue;
+        }
+        let decoded = percent_decode(raw)?;
+        if decoded.starts_with('/') || decoded.contains('\0') {
+            return None;
+        }
+        match decoded.as_str() {
+            "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(decoded.replace('/', "%2F")),
+        }
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
+/// True for a management path that any authenticated dashboard user can
+/// call, whatever the explicit scope list. These are the public paths of
+/// the reference scope map plus the public status paths.
+/// Only the caller's own password change is public. Another user's
+/// password change needs `user_management`. The MFA self-service route
+/// stays public for the caller; the handler needs `mfa_management` for
+/// another user.
+fn login_public_path(segments: &[&str], username: &str) -> bool {
+    match segments {
+        ["status"]
+        | ["error_codes"]
+        | ["logout"]
+        | ["user_scopes"]
+        | ["current_user"]
+        | ["current_user", ..]
+        | ["api_key_scopes"]
+        | ["schemas"]
+        | ["schemas", _]
+        | ["sso", "mfa", ..]
+        | ["sso", "running"]
+        | ["sso", "login", _]
+        | ["sso", "oidc", "callback"]
+        | ["sso", "saml", "acs"]
+        | ["sso", "saml", "metadata"]
+        | ["sso", "token_exchange"] => true,
+        ["users", name, "change_pwd"] => *name == username,
+        _ => false,
+    }
+}
+
+/// The login-only scope of a management path, when it has one.
+fn login_scope_for_path(segments: &[&str]) -> Option<&'static str> {
+    match segments {
+        ["api_key"] | ["api_key", _] => Some("api_key_management"),
+        ["users"] | ["users", _] => Some("user_management"),
+        ["users", _, "change_pwd"] => Some("user_management"),
+        ["users", _, "mfa"] => Some("mfa_management"),
+        ["sso"] | ["sso", _] => Some("sso_management"),
+        _ => None,
+    }
+}
+
+/// True when the effective scopes of a dashboard user allow the path.
+/// The function mirrors the API key access table. The login-only scopes
+/// replace the role-only rule of that table.
+fn user_may_call(info: &TokenInfo, path: &str) -> bool {
+    let relative = path.strip_prefix("/api/v5").unwrap_or(path);
+    let segments: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if login_public_path(&segments, &info.username) {
+        return true;
+    }
+    let effective = effective_user_scopes(info.role, &info.scopes);
+    let has_scope = |name: &str| effective.iter().any(|scope| scope == name);
+    if let Some(needed) = login_scope_for_path(&segments) {
+        return has_scope(needed);
+    }
+    if segments == ["features"] {
+        return has_scope("system");
+    }
+    match crate::v5::api_keys::access_for_path(path) {
+        PathAccess::Anonymous => true,
+        PathAccess::AnyKey => match &info.scopes {
+            Some(list) => !list.is_empty(),
+            None => true,
+        },
+        PathAccess::Scope(needed) => has_scope(needed),
+        PathAccess::RoleOnly => match &info.scopes {
+            Some(_) => false,
+            None => info.role == AdminRole::Administrator,
+        },
+        // A dashboard login user holds a bearer token. The public list
+        // and the login-only scopes handle each bearer-only route above.
+        PathAccess::BearerOnly => true,
+        PathAccess::Closed => info.scopes.is_none(),
+    }
 }
 
 /// The answer to a key that calls an operation which the reference lists
@@ -290,7 +415,11 @@ fn is_mfa_self_service(method: &axum::http::Method, path: &str) -> bool {
 /// change while `must_change_password` is set, and GET-only access for
 /// viewers. A viewer can also call the three MFA enrolment routes for
 /// that viewer.
-pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next: Next) -> Response {
+pub async fn require_api_auth(
+    Extension(state): Extension<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
     let Some(identity) = resolve_credentials(&state, req.headers()) else {
         return unauthorized("missing or invalid credentials");
     };
@@ -304,6 +433,14 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
         }
     }
     let info = identity.info;
+    if identity.is_login_user {
+        let Some(path) = canonical_scope_path(&path) else {
+            return login_scope_forbidden();
+        };
+        if !user_may_call(&info, &path) {
+            return login_scope_forbidden();
+        }
+    }
     // `resolve_credentials` already loaded the user fresh from the store
     // (revoking tokens of deleted users), so `info` carries the current
     // role and `must_change_password` with no second `admin_users.get`.
@@ -422,5 +559,35 @@ mod tests {
             "admin"
         ));
         assert!(!is_own_change_pwd(&put, "/api/v5/users/admin", "admin"));
+    }
+
+    #[test]
+    fn canonical_scope_path_removes_trailing_slash_and_dot_segments() {
+        assert_eq!(
+            canonical_scope_path("/api/v5/users/").as_deref(),
+            Some("/api/v5/users")
+        );
+        assert_eq!(
+            canonical_scope_path("/api/v5/metrics/../users").as_deref(),
+            Some("/api/v5/users")
+        );
+        assert_eq!(
+            canonical_scope_path("/api/v5/./users").as_deref(),
+            Some("/api/v5/users")
+        );
+    }
+
+    #[test]
+    fn canonical_scope_path_decodes_and_refuses_encoded_slashes() {
+        assert_eq!(
+            canonical_scope_path("/api/v5/%75sers").as_deref(),
+            Some("/api/v5/users")
+        );
+        assert_eq!(
+            canonical_scope_path("/api/v5/%2e%2e/users").as_deref(),
+            Some("/api/users")
+        );
+        assert_eq!(canonical_scope_path("/api/v5/%2fetc"), None);
+        assert_eq!(canonical_scope_path("/api/v5/%zz"), None);
     }
 }

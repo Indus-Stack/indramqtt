@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-client_check_authz_complete"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT allow FROM "$events/client_check_authz_complete"'
+topic = "$events/client_check_authz_complete"
+payload = '{"allow": true}'
+expect_matched = true
+expect_projected = '{"allow": true}'
+
+[[case]]
+sql = 'SELECT allow FROM "$events/client_check_authz_complete"'
+topic = "sensors/kitchen"
+payload = '{"allow": true}'
+expect_matched = false

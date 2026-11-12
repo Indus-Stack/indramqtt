@@ -1,0 +1,32 @@
+[example]
+area = "rules"
+item = "fn-nth"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT nth(2, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": 20}'
+
+[[case]]
+sql = "SELECT nth(5, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": ""}'
+
+[[case]]
+sql = "SELECT nth(1, 'notalist') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT nth(1) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": null}'

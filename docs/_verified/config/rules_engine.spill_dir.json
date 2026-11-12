@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a spill directory and check that `/healthz` answers OK.",
+  "config": "[rules_engine]\nspill_dir = \"/tmp/docs-spill\"\n",
+  "item": "rules_engine.spill_dir",
+  "kind": "setting",
+  "output": "ok",
+  "returncode": 0,
+  "verified": true
+}

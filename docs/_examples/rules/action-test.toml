@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-test"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-test"
+type = "test"
+expect_status = 201
+expect_type = "test"
+
+[[case]]
+name = "dx2-action-test"
+type = "test"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

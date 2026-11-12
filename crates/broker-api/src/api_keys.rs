@@ -164,6 +164,7 @@ impl ApiKeyStore {
             role: AdminRole::Administrator,
             expires_at: Instant::now() + API_KEY_IDENTITY_TTL,
             must_change_password: false,
+            scopes: None,
         })
     }
 }

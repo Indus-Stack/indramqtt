@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with push intent on and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.push_gateway]\nenable = true\n",
+  "item": "prometheus.push_gateway.enable",
+  "kind": "setting",
+  "output": "push_enable=true",
+  "returncode": 0,
+  "verified": true
+}

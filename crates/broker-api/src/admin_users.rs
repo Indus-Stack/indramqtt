@@ -84,6 +84,19 @@ pub struct AdminUserView {
     pub role: AdminRole,
     pub description: String,
     pub must_change_password: bool,
+    /// Explicit dashboard user scopes. `None` means the role default.
+    pub scopes: Option<Vec<String>>,
+}
+
+/// One write to the explicit scope list of a dashboard user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserScopesUpdate {
+    /// Leave the stored list unchanged.
+    Keep,
+    /// Remove the explicit list; the role default applies.
+    Clear,
+    /// Store this explicit list.
+    Set(Vec<String>),
 }
 
 /// Errors from [`AdminUsers`] mutations.
@@ -138,6 +151,8 @@ struct AdminUser {
     mfa_enabled: bool,
     /// Most recently verified 30 s counter, for single-use rejection.
     mfa_last_step: Option<u64>,
+    /// Explicit dashboard user scopes. `None` means the role default.
+    scopes: Option<Vec<String>>,
 }
 
 /// Per-user MFA verify attempt state (memory-only; resets on restart).
@@ -272,6 +287,7 @@ impl AdminUsers {
                     mfa_secret,
                     mfa_enabled,
                     mfa_last_step,
+                    scopes: entry.scopes.clone(),
                 },
                 None => {
                     // Fail closed: the verifier is unusable, so nobody can
@@ -300,6 +316,7 @@ impl AdminUsers {
                         mfa_secret,
                         mfa_enabled,
                         mfa_last_step,
+                        scopes: entry.scopes.clone(),
                     }
                 }
             };
@@ -375,6 +392,7 @@ impl AdminUsers {
                 },
                 mfa_enabled: user.mfa_enabled,
                 mfa_last_step: user.mfa_last_step,
+                scopes: user.scopes.clone(),
             })
             .collect();
         entries.sort_by(|a, b| a.username.cmp(&b.username));
@@ -406,6 +424,18 @@ impl AdminUsers {
         password: &str,
         role: AdminRole,
         description: &str,
+    ) -> Result<(), AdminUserError> {
+        self.create_with_scopes(username, password, role, description, None)
+    }
+
+    /// Create one user with an explicit scope list.
+    pub fn create_with_scopes(
+        &self,
+        username: &str,
+        password: &str,
+        role: AdminRole,
+        description: &str,
+        scopes: Option<Vec<String>>,
     ) -> Result<(), AdminUserError> {
         if !is_valid_username(username) {
             return Err(AdminUserError::InvalidUsername);
@@ -443,6 +473,7 @@ impl AdminUsers {
                     mfa_secret: Vec::new(),
                     mfa_enabled: false,
                     mfa_last_step: None,
+                    scopes,
                 },
             );
         }
@@ -510,6 +541,18 @@ impl AdminUsers {
         role: Option<AdminRole>,
         description: Option<&str>,
     ) -> Result<(), AdminUserError> {
+        self.update_with_scopes(username, role, description, UserScopesUpdate::Keep)
+    }
+
+    /// Replace `role`, `description` and the explicit scope list of one
+    /// user atomically: one map write lock, one registry persist.
+    pub fn update_with_scopes(
+        &self,
+        username: &str,
+        role: Option<AdminRole>,
+        description: Option<&str>,
+        scopes: UserScopesUpdate,
+    ) -> Result<(), AdminUserError> {
         {
             let mut users = self.users.write().unwrap();
             if !users.contains_key(username) {
@@ -535,6 +578,11 @@ impl AdminUsers {
                 if let Some(description) = description {
                     user.description = description.to_string();
                 }
+                match scopes {
+                    UserScopesUpdate::Keep => {}
+                    UserScopesUpdate::Clear => user.scopes = None,
+                    UserScopesUpdate::Set(list) => user.scopes = Some(list),
+                }
             }
         }
         self.persist()
@@ -548,24 +596,30 @@ impl AdminUsers {
         if !is_strong_password(new_password) {
             return Err(AdminUserError::WeakPassword);
         }
+        // Read the current verifier under a short read lock.
+        // Derive outside the lock so a slow hash never blocks readers.
+        let (salt, iterations, stored_key) = {
+            let users = self.users.read().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            (user.salt.clone(), user.iterations, user.stored_key)
+        };
+        let (candidate_stored, _) = derive_keys(new_password.as_bytes(), &salt, iterations);
+        if constant_time_eq(&candidate_stored, &stored_key) {
+            return Err(AdminUserError::SameAsOld);
+        }
+        // Derive the new verifier outside the lock.
+        // The write lock covers only the map update.
+        let mut new_salt = [0u8; SALT_LEN];
+        rand::rng().fill_bytes(&mut new_salt);
+        let (new_stored, new_server) = derive_keys(new_password.as_bytes(), &new_salt, ITERATIONS);
         {
             let mut users = self.users.write().unwrap();
-            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
-            let (candidate_stored, _) =
-                derive_keys(new_password.as_bytes(), &user.salt, user.iterations);
-            if constant_time_eq(&candidate_stored, &user.stored_key) {
-                return Err(AdminUserError::SameAsOld);
-            }
-            let mut salt = [0u8; SALT_LEN];
-            rand::rng().fill_bytes(&mut salt);
-            let (stored_key, server_key) = derive_keys(new_password.as_bytes(), &salt, ITERATIONS);
-            if let Some(user) = users.get_mut(username) {
-                user.salt = salt.to_vec();
-                user.iterations = ITERATIONS;
-                user.stored_key = stored_key;
-                user.server_key = server_key;
-                user.must_change_password = false;
-            }
+            let user = users.get_mut(username).ok_or(AdminUserError::NotFound)?;
+            user.salt = new_salt.to_vec();
+            user.iterations = ITERATIONS;
+            user.stored_key = new_stored;
+            user.server_key = new_server;
+            user.must_change_password = false;
         }
         self.persist()
     }
@@ -700,6 +754,7 @@ impl AdminUsers {
             role: u.role,
             description: u.description.clone(),
             must_change_password: u.must_change_password,
+            scopes: u.scopes.clone(),
         })
     }
 
@@ -712,6 +767,7 @@ impl AdminUsers {
                 role: u.role,
                 description: u.description.clone(),
                 must_change_password: u.must_change_password,
+                scopes: u.scopes.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.username.cmp(&b.username));
@@ -744,6 +800,7 @@ impl AdminUsers {
                 mfa_secret: Vec::new(),
                 mfa_enabled: false,
                 mfa_last_step: None,
+                scopes: None,
             },
         );
     }
@@ -1109,6 +1166,7 @@ fn default_admin_user() -> AdminUser {
         mfa_secret: Vec::new(),
         mfa_enabled: false,
         mfa_last_step: None,
+        scopes: None,
     }
 }
 

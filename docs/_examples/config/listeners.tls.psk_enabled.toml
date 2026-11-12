@@ -1,0 +1,26 @@
+[example]
+area = "config"
+item = "listeners.tls.psk_enabled"
+kind = "setting"
+expect = "psk-no-cert-boot"
+expected = "The broker boots with no certificate when PSK is on, and the listeners row shows enable true with running true."
+source = "`crates/broker-config/src/schema.rs` skips the certificate check when PSK is on, `crates/broker-node/src/main.rs` boots without certificate files, and `crates/broker-node/src/native.rs` binds the socket."
+action = "Read `GET /api/v5/listeners/ssl:default` and open one TCP connection to the bind."
+config = '''
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+psk_enabled = true
+'''
+script = '''
+from config_probe import *
+import socket
+
+status, row = http("GET", "/api/v5/listeners/ssl:default")
+assert status == 200, (status, row)
+assert row["enable"] is True, row
+assert row["running"] is True, row
+sock = socket.create_connection(("127.0.0.1", 28883), timeout=10)
+sock.close()
+print("psk-no-cert-boot")
+'''

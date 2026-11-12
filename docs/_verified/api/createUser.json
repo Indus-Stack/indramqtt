@@ -1,0 +1,8 @@
+{
+  "item": "createUser",
+  "kind": "api",
+  "output": "created",
+  "request": "POST /api/v1/auth/users with username doc-user-create, a password and quota values",
+  "returncode": 0,
+  "verified": true
+}

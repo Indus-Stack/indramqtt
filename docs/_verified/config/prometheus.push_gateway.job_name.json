@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a custom job name and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.push_gateway]\njob_name = \"docs-push-job\"\n",
+  "item": "prometheus.push_gateway.job_name",
+  "kind": "setting",
+  "output": "push_job=docs-push-job",
+  "returncode": 0,
+  "verified": true
+}

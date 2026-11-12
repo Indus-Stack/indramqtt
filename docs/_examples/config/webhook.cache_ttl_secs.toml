@@ -1,0 +1,37 @@
+[example]
+area = "config"
+item = "webhook.cache_ttl_secs"
+kind = "setting"
+expect = "accepted"
+expected = "A cached verdict stays valid for thirty seconds and a second CONNECT succeeds without a new request."
+source = "`crates/broker-auth/src/webhook.rs` drops cache entries older than `cache_ttl_secs` on read."
+action = "Connect twice with a password while a verdict stays valid for thirty seconds."
+config = '''
+[auth]
+allow_anonymous = true
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+cache_ttl_secs = 30
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def credentialed(client):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    payload = word(client) + word("docs-user") + word("right-password")
+    body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    sock.close()
+    return head, ack
+
+head, ack = credentialed("hook-docs")
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+head, ack = credentialed("hook-docs")
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

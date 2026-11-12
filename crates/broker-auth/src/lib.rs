@@ -192,25 +192,114 @@ impl AclRule {
     /// Whether `filter` (a subscription request) is covered by this rule's
     /// topic pattern: every topic the request could match must also match
     /// the rule pattern. Level-wise: `#` (final) covers anything below,
-    /// `+` covers exactly one level, anything else must equal.
+    /// `+` covers exactly one level but never a `#` request level,
+    /// anything else must equal. A filter that starts with `#` or `+`
+    /// never reaches `$` topics (MQTT 5.0 section 4.7.2). A `$` request
+    /// needs a `$` rule. A plain request needs a plain rule.
     fn filter_covered(&self, filter: &TopicFilter) -> bool {
-        let pattern_levels: Vec<&str> = self.topic_pattern.split('/').collect();
-        let request_levels: Vec<&str> = filter.as_str().split('/').collect();
-        let mut pi = 0;
-        for &req in request_levels.iter() {
-            match pattern_levels.get(pi) {
-                Some(&"#") => return true,
-                Some(&"+") => {
-                    pi += 1;
-                }
-                Some(&pat) if pat == req => {
-                    pi += 1;
-                }
-                _ => return false,
-            }
-        }
-        pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+        filter_covered_by(self.topic_pattern.as_str(), filter.as_str())
     }
+
+    /// Whether `filter` (a subscription request) overlaps this rule's
+    /// topic pattern: at least one topic matches both. A deny rule uses
+    /// this test. It applies when the request could reach a denied topic.
+    /// It does not need to cover the whole request.
+    fn filter_overlaps(&self, filter: &TopicFilter) -> bool {
+        filters_overlap(self.topic_pattern.as_str(), filter.as_str())
+    }
+
+    /// Whether this rule decides one subscribe request. An allow rule
+    /// decides when the rule covers the request. A deny rule decides when
+    /// the rule overlaps the request. The first deciding rule wins.
+    fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
+        if self.allow {
+            self.filter_covered(filter)
+        } else {
+            self.filter_overlaps(filter)
+        }
+    }
+}
+
+/// First level of a `/`-separated filter (empty string for an empty one).
+fn first_level_of(filter: &str) -> &str {
+    filter.split('/').next().unwrap_or("")
+}
+
+/// True when a filter can match a topic that starts with `$`.
+///
+/// Only a filter whose first level names the `$` prefix literally (for
+/// example `$SYS/#`) reaches those topics. A filter that starts with a
+/// wildcard (`#`, `+`) never does (MQTT 5.0 section 4.7.2).
+fn reaches_dollar_topics(first_level: &str) -> bool {
+    first_level.starts_with('$')
+}
+
+/// Cover test for one rule pattern over one request filter: every topic
+/// the request could match is also matched by the rule. Both inputs are
+/// filters; `#` must be final in each (the loaders enforce this).
+pub(crate) fn filter_covered_by(rule: &str, request: &str) -> bool {
+    if reaches_dollar_topics(first_level_of(request)) != reaches_dollar_topics(first_level_of(rule))
+    {
+        return false;
+    }
+    let pattern_levels: Vec<&str> = rule.split('/').collect();
+    let request_levels: Vec<&str> = request.split('/').collect();
+    let mut pi = 0;
+    for &req in request_levels.iter() {
+        match pattern_levels.get(pi) {
+            Some(&"#") => return true,
+            Some(&"+") => {
+                // `+` covers one level, never a `#` request level: the
+                // request `#` always reaches further than one level.
+                if req == "#" {
+                    return false;
+                }
+                pi += 1;
+            }
+            Some(&pat) if pat == req => {
+                pi += 1;
+            }
+            _ => return false,
+        }
+    }
+    pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+}
+
+/// Overlap test for two filters: at least one topic matches both. Both
+/// inputs are filters; `#` must be final in each (the loaders enforce
+/// this). Filters of different `$` reach never overlap.
+pub(crate) fn filters_overlap(first: &str, second: &str) -> bool {
+    if reaches_dollar_topics(first_level_of(first)) != reaches_dollar_topics(first_level_of(second))
+    {
+        return false;
+    }
+    overlap_levels(
+        &first.split('/').collect::<Vec<&str>>(),
+        &second.split('/').collect::<Vec<&str>>(),
+    )
+}
+
+/// Level-wise overlap once both filters share the same `$` reach.
+fn overlap_levels(first: &[&str], second: &[&str]) -> bool {
+    if first.is_empty() && second.is_empty() {
+        return true;
+    }
+    // A trailing `#` also matches its own parent, so an exhausted side
+    // still overlaps when the other side holds only `#`.
+    if first.is_empty() || second.is_empty() {
+        return (first.len() == 1 && first[0] == "#") || (second.len() == 1 && second[0] == "#");
+    }
+    let (head_first, tail_first) = (first[0], &first[1..]);
+    let (head_second, tail_second) = (second[0], &second[1..]);
+    if head_first == "#" || head_second == "#" {
+        // `#` is final, so it covers every level below the match so far.
+        return true;
+    }
+    if head_first == "+" || head_second == "+" {
+        // `+` covers any one level here, literal or `+`.
+        return overlap_levels(tail_first, tail_second);
+    }
+    head_first == head_second && overlap_levels(tail_first, tail_second)
 }
 
 /// In-memory credentials + ACL authorizer.
@@ -330,6 +419,10 @@ pub struct MemoryAuth {
     /// cost). `Arc` so the async migration can hold an owned permit
     /// across the blocking task without borrowing `self`.
     migrate_gate: Arc<tokio::sync::Semaphore>,
+    /// `auth.superusers`: usernames that bypass ACL checks on publish and
+    /// subscribe. Checked before the stored ACL rules in both authorize
+    /// paths. Populated from the config root at boot.
+    superusers: RwLock<Vec<String>>,
 }
 
 impl std::fmt::Debug for MemoryAuth {
@@ -365,6 +458,7 @@ impl Default for MemoryAuth {
             verify_dedup_joins: std::sync::atomic::AtomicU64::new(0),
             verify_runs: std::sync::atomic::AtomicU64::new(0),
             migrate_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MIGRATIONS)),
+            superusers: RwLock::new(Vec::new()),
         }
     }
 }
@@ -856,6 +950,19 @@ impl MemoryAuth {
         self.authz_settings.store(Some(store));
     }
 
+    /// `auth.superusers`: usernames that bypass ACL checks on publish and
+    /// subscribe. Set from the config root at boot. An empty list keeps
+    /// today's behaviour (no superusers).
+    pub fn set_superusers(&self, superusers: Vec<String>) {
+        *self.superusers.write() = superusers;
+    }
+
+    /// True when `identity` is a configured superuser and bypasses ACL
+    /// checks. One short read lock; called only on the authorize path.
+    pub fn is_superuser(&self, identity: &str) -> bool {
+        self.superusers.read().iter().any(|u| u == identity)
+    }
+
     /// True when an unmatched rule scan allows. Unlinked state denies.
     /// One lock-free snapshot load with no clone; called only when no
     /// rule matches, never per matched message.
@@ -890,20 +997,27 @@ impl MemoryAuth {
             .is_none_or(|registry| registry.built_in_available())
     }
 
+    /// True when no enabled source other than the built-in database is in
+    /// the stored chain. Unlinked state counts as the built-in only. This
+    /// gate keeps the empty-default-tenant fast path safe: an unsupported
+    /// source must not be bypassed when the built-in rule table is empty
+    /// (D2). One lock-free snapshot load of at most
+    /// [`broker_config::MAX_AUTHZ_SOURCES`] entries.
+    fn chain_has_no_unsupported_source(&self) -> bool {
+        self.authz_sources.load().as_deref().is_none_or(|registry| {
+            registry
+                .snapshot()
+                .iter()
+                .all(|entry| !entry.enable || entry.source_type == "built_in_database")
+        })
+    }
+
     /// Attribute one built-in verdict to the shared registry counters.
     /// Unlinked state applies nothing. One short read lock to clone the
     /// counter `Arc` plus lock-free atomic adds; unknown types apply
     /// nothing and never accumulate.
     fn record_authz_verdict(&self, allowed: bool) {
         if let Some(registry) = self.authz_sources.load().as_deref() {
-            registry.record_built_in(allowed);
-        }
-    }
-
-    /// Attributes one built-in verdict through an already loaded source
-    /// link. Lock-free: see [`AuthzSourceRegistry::record_built_in`].
-    fn record_verdict(sources: Option<&AuthzSourceRegistry>, allowed: bool) {
-        if let Some(registry) = sources {
             registry.record_built_in(allowed);
         }
     }
@@ -2512,16 +2626,6 @@ impl MemoryAuth {
         self.persist()
             .map_err(|e| ClientRuleError::Persist(e.to_string()))
     }
-
-    fn check(
-        &self,
-        client_id: &str,
-        action: AclAction,
-        matches_rule: impl Fn(&AclRule) -> bool,
-    ) -> bool {
-        let tenants = self.tenants.read();
-        self.check_in_tenant(&tenants, DEFAULT_TENANT_ID, client_id, action, matches_rule)
-    }
 }
 
 #[async_trait]
@@ -2918,56 +3022,90 @@ async fn migrate_legacy_hash_gated_in_tenant(
 #[async_trait]
 impl Authorizer for MemoryAuth {
     async fn authorize_publish(&self, client_id: &str, topic: &Topic) -> Result<()> {
-        // Stored order and enable flags gate the built-in table: a
-        // disabled or removed built-in source denies fail closed and
-        // counts the denial on the shared registry. Otherwise the
-        // verdict attributes to the built-in counters.
-        if !self.built_in_live() {
-            self.record_authz_verdict(false);
-            return Err(AuthError::PublishDenied(format!(
-                "{client_id} cannot publish"
-            )));
-        }
-        // Default-tenant shim through the shared first-match-wins helper
-        // so single-tenant installs behave exactly as before (same
-        // open-when-empty; unmatched follows the stored `no_match`).
-        if self.check(client_id, AclAction::Publish, |rule| {
-            rule.topic_matches(topic)
-        }) {
-            self.record_authz_verdict(true);
-            Ok(())
-        } else {
-            self.record_authz_verdict(false);
-            Err(AuthError::PublishDenied(format!(
-                "{client_id} cannot publish"
-            )))
-        }
+        // Default-tenant shim: the same chain and source order as the
+        // tenant path. Single-tenant installs behave as before.
+        self.authorize_publish_in_tenant(DEFAULT_TENANT_ID, client_id, topic)
+            .await
     }
 
     async fn authorize_subscribe(&self, client_id: &str, filter: &TopicFilter) -> Result<()> {
-        // Same stored order and enable gate as publish (see above).
-        if !self.built_in_live() {
-            self.record_authz_verdict(false);
-            return Err(AuthError::SubscribeDenied(format!(
-                "{client_id} cannot subscribe"
-            )));
-        }
-        // Same default-tenant shim as publish (see above).
-        if self.check(client_id, AclAction::Subscribe, |rule| {
-            rule.filter_covered(filter)
-        }) {
-            self.record_authz_verdict(true);
-            Ok(())
-        } else {
-            self.record_authz_verdict(false);
-            Err(AuthError::SubscribeDenied(format!(
-                "{client_id} cannot subscribe"
-            )))
-        }
+        // Default-tenant shim: the same chain and source order as the
+        // tenant path. Single-tenant installs behave as before.
+        self.authorize_subscribe_in_tenant(DEFAULT_TENANT_ID, client_id, filter)
+            .await
     }
 }
 
 impl MemoryAuth {
+    /// Find the first built-in rule for one decision without fallback.
+    ///
+    /// It returns the matching rule's allow flag, or None when no rule
+    /// matches. It never applies the stored `no_match` setting: a miss
+    /// abstains so a later source in the chain still decides.
+    fn built_in_rule_decision(
+        tenants: &HashMap<String, TenantState>,
+        key: &str,
+        client_id: &str,
+        action: AclAction,
+        matches_rule: &impl Fn(&AclRule) -> bool,
+    ) -> Option<bool> {
+        let state = tenants.get(tenant_key(key))?;
+        for rule in state.rules.iter() {
+            if rule.client_matches(client_id) && rule.action.covers(action) && matches_rule(rule) {
+                return Some(rule.allow);
+            }
+        }
+        None
+    }
+
+    /// Evaluate the stored authorization source order for one decision (D2).
+    ///
+    /// The first enabled source that does not abstain decides.
+    /// A source other than `built_in_database` denies the decision.
+    /// The chain never falls through such a deny.
+    /// The built-in database uses its first matching rule.
+    /// It abstains when no rule matches.
+    /// An abstain leaves the decision to a later source.
+    /// When all abstain, `no_match` decides.
+    /// With no linked registry the caller keeps current behaviour.
+    fn source_chain_verdict(
+        &self,
+        tenants: &HashMap<String, TenantState>,
+        key: &str,
+        client_id: &str,
+        action: AclAction,
+        matches_rule: impl Fn(&AclRule) -> bool,
+    ) -> Option<bool> {
+        let loaded = self.authz_sources.load();
+        let sources = loaded.as_deref()?;
+        let snap = sources.snapshot();
+        let mut built_in_enabled = false;
+        for entry in snap.iter() {
+            if !entry.enable {
+                continue;
+            }
+            if entry.source_type == "built_in_database" {
+                built_in_enabled = true;
+                if let Some(decision) =
+                    Self::built_in_rule_decision(tenants, key, client_id, action, &matches_rule)
+                {
+                    return Some(decision);
+                }
+                // No matching rule: abstain, a later source decides.
+                continue;
+            }
+            // D2: an enabled source this build does not evaluate denies the
+            // decision that reaches it; never fall through to a later allow.
+            sources.record_deny(&entry.source_type);
+            return Some(false);
+        }
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
+            return Some(false);
+        }
+        None
+    }
+
     /// Authorize one publish in one tenant (MT-06): a rule in one tenant
     /// never grants publish in another. The default tenant with no rules
     /// stays open; a non-default tenant with no rules (or an unknown or
@@ -2984,54 +3122,71 @@ impl MemoryAuth {
         client_id: &str,
         topic: &Topic,
     ) -> Result<()> {
+        // Superusers bypass all ACL checks.
+        if self.is_superuser(client_id) {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
         let key = tenant_key(tenant);
         // The allow path avoids locks. It reads the source link
         // and the settings with lock-free loads. It counts verdicts
         // with atomic adds. With no rule in the default tenant it
         // skips the tenant lock as well.
-        let sources = self.authz_sources.load();
-        let sources = sources.as_deref();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_publish");
-            Self::record_verdict(sources, false);
+            self.record_authz_verdict(false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
         }
-        // Stored order and enable gate first: a disabled or removed
-        // built-in source denies fail closed in every tenant and counts
-        // the denial on the shared registry.
-        if !sources.is_none_or(|registry| registry.built_in_available()) {
-            Self::record_verdict(sources, false);
+        // Stored order and enable gate: a disabled or removed built-in
+        // source denies fail closed in every tenant.
+        let built_in_enabled = self.built_in_live();
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
         }
-        // An empty default tenant allows the publish: no lock, no scan.
-        // Otherwise one short guard covers the tenant lookup plus the rule
-        // scan; closed-ness is derived from the same guard so the deny
-        // path takes no second tenant lock. Only an unmatched scan takes
-        // one lock-free settings load for the `no_match` value.
-        let (allowed, closed) = if is_default_tenant(key)
+        // An empty store keeps today's open broker: no lock, no scan.
+        // The fast path also needs a chain with no unsupported source.
+        if is_default_tenant(key)
             && self
                 .default_rules_empty
                 .load(std::sync::atomic::Ordering::Acquire)
+            && self.chain_has_no_unsupported_source()
         {
-            (true, false)
-        } else {
-            let tenants = self.tenants.read();
-            let closed = match tenants.get(key) {
-                None => !is_default_tenant(key),
-                Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
-            };
-            let allowed =
-                self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
-                    rule.topic_matches(topic)
-                });
-            (allowed, closed)
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
+        // One short guard covers the tenant lookup, the rule scan and the
+        // source-order walk; closed-ness is derived from the same guard so
+        // the deny path takes no second tenant lock. Only an unmatched
+        // scan takes one lock-free settings load for the `no_match`
+        // value.
+        let tenants = self.tenants.read();
+        let closed = match tenants.get(key) {
+            None => !is_default_tenant(key),
+            Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
         };
+        // D2: walk the stored source order. An enabled source this build
+        // does not evaluate denies the decision that reaches it; the
+        // built-in database's first matching rule decides; an all-abstain
+        // chain falls to the stored `no_match` setting.
+        let allowed =
+            match self.source_chain_verdict(&tenants, key, client_id, AclAction::Publish, |rule| {
+                rule.topic_matches(topic)
+            }) {
+                Some(decision) => decision,
+                None => {
+                    self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
+                        rule.topic_matches(topic)
+                    })
+                }
+            };
+        drop(tenants);
         if allowed {
-            Self::record_verdict(sources, true);
+            self.record_authz_verdict(true);
             Ok(())
         } else {
             // Count only genuinely closed tenants (unknown or a
@@ -3041,7 +3196,7 @@ impl MemoryAuth {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_publish");
             }
-            Self::record_verdict(sources, false);
+            self.record_authz_verdict(false);
             Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )))
@@ -3056,6 +3211,11 @@ impl MemoryAuth {
         client_id: &str,
         filter: &TopicFilter,
     ) -> Result<()> {
+        // Superusers bypass all ACL checks.
+        if self.is_superuser(client_id) {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
         let key = tenant_key(tenant);
         let filter = filter.clone();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
@@ -3065,27 +3225,53 @@ impl MemoryAuth {
                 "{client_id} cannot subscribe"
             )));
         }
-        // Same stored order and enable gate as the publish path.
-        if !self.built_in_live() {
+        // Stored order and enable gate: a disabled or removed built-in
+        // source denies fail closed in every tenant.
+        let built_in_enabled = self.built_in_live();
+        if !built_in_enabled {
             self.record_authz_verdict(false);
             return Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )));
         }
-        // Same single-guard discipline as the publish path: only an
-        // unmatched scan takes the lock-free settings load.
-        let (allowed, closed) = {
-            let tenants = self.tenants.read();
-            let closed = match tenants.get(key) {
-                None => !is_default_tenant(key),
-                Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
-            };
-            let allowed =
-                self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
-                    rule.filter_covered(&filter)
-                });
-            (allowed, closed)
+        // An empty store keeps today's open broker: no lock, no scan.
+        // The fast path also needs a chain with no unsupported source.
+        if is_default_tenant(key)
+            && self
+                .default_rules_empty
+                .load(std::sync::atomic::Ordering::Acquire)
+            && self.chain_has_no_unsupported_source()
+        {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
+        // One short guard covers the tenant lookup, the rule scan and the
+        // source-order walk; closed-ness is derived from the same guard so
+        // the deny path takes no second tenant lock. Only an unmatched
+        // scan takes one lock-free settings load for the `no_match`
+        // value.
+        let tenants = self.tenants.read();
+        let closed = match tenants.get(key) {
+            None => !is_default_tenant(key),
+            Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
         };
+        // D2: walk the stored source order. An enabled source this build
+        // does not evaluate denies the decision that reaches it; the
+        // built-in database's first matching rule decides; an all-abstain
+        // chain falls to the stored `no_match` setting.
+        let allowed = match self.source_chain_verdict(
+            &tenants,
+            key,
+            client_id,
+            AclAction::Subscribe,
+            |rule| rule.matches_subscribe(&filter),
+        ) {
+            Some(decision) => decision,
+            None => self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
+                rule.matches_subscribe(&filter)
+            }),
+        };
+        drop(tenants);
         if allowed {
             self.record_authz_verdict(true);
             Ok(())
@@ -3886,6 +4072,91 @@ mod tests {
             .await
             .is_err());
         assert!(auth.authorize_subscribe("c", &filter("#")).await.is_err());
+    }
+
+    /// SA-23 cover table through the production entry.
+    ///
+    /// Each row holds a request filter, one rule pattern with its allow
+    /// flag, and the expected subscribe decision. Allow rows run against
+    /// that single allow rule. Deny rows run against the deny rule plus
+    /// a trailing catch-all allow. The catch-all is `#`, or `$SYS/#`
+    /// for a `$` request. A denied row proves the deny overlapped the
+    /// request. An allowed row proves it did not.
+    #[tokio::test]
+    async fn sa23_cover_table_through_production_entry() {
+        // (request, rule, rule allows, expected allow).
+        let rows: &[(&str, &str, bool, bool)] = &[
+            // A wider rule covers a narrower request.
+            ("a/b", "a/b", true, true),
+            ("a/b", "a/+", true, true),
+            ("a/b", "a/#", true, true),
+            ("a/b", "#", true, true),
+            ("a", "a/#", true, true),
+            ("a/b/c", "a/#", true, true),
+            ("a/+", "a/#", true, true),
+            ("+", "#", true, true),
+            ("sport/tennis/player1", "sport/tennis/#", true, true),
+            ("sport/+", "sport/#", true, true),
+            ("a/b", "a/b/#", true, true),
+            ("a", "#", true, true),
+            ("#", "#", true, true),
+            ("a/#", "#", true, true),
+            ("$SYS/broker/uptime", "$SYS/#", true, true),
+            ("$SYS/broker", "$SYS/+", true, true),
+            // A narrower rule never covers a wider request.
+            ("a/#", "a/+", true, false),
+            ("#", "+", true, false),
+            ("a/b/c", "a/+", true, false),
+            ("a", "a/+", true, false),
+            ("sensors/+", "sensors/temp", true, false),
+            ("#", "sensors/#", true, false),
+            ("a/b", "b/+", true, false),
+            ("a/b", "a/b/+", true, false),
+            // `#` and `+` at the first level never reach `$` topics.
+            ("$SYS/broker/uptime", "#", true, false),
+            ("$SYS/#", "#", true, false),
+            ("$SYS/broker", "+", true, false),
+            ("$a", "+", true, false),
+            ("$a", "#", true, false),
+            // A deny rule applies on overlap, not only on cover.
+            ("#", "secret/#", false, false),
+            ("secret/x", "secret/#", false, false),
+            ("secret/#", "secret/#", false, false),
+            ("secret", "secret/#", false, false),
+            ("other/x", "secret/#", false, true),
+            ("other/#", "secret/#", false, true),
+            ("$SYS/broker/uptime", "secret/#", false, true),
+            ("$SYS/other/x", "$SYS/broker/#", false, true),
+            ("$SYS/broker/uptime", "$SYS/#", false, false),
+        ];
+        assert!(rows.len() >= 25, "the table holds at least 25 rows");
+        for (request, pattern, rule_allows, expected) in rows {
+            let auth = MemoryAuth::new();
+            auth.add_rule(AclRule::new(
+                "*",
+                AclAction::Subscribe,
+                (*pattern).to_string(),
+                *rule_allows,
+            ))
+            .expect("memory-only persist cannot fail");
+            if !rule_allows {
+                let catch_all = if request.starts_with('$') {
+                    "$SYS/#"
+                } else {
+                    "#"
+                };
+                auth.add_rule(AclRule::new("*", AclAction::Subscribe, catch_all, true))
+                    .expect("memory-only persist cannot fail");
+            }
+            let decision = auth
+                .authorize_subscribe("probe", &filter(request))
+                .await
+                .is_ok();
+            assert_eq!(
+                decision, *expected,
+                "row (request={request}, rule={pattern}, allows={rule_allows}) must be {expected}"
+            );
+        }
     }
 
     #[tokio::test]

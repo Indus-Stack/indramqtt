@@ -169,6 +169,10 @@
       "tier": "community"
     },
     {
+      "kind": "influx",
+      "tier": "community"
+    },
+    {
       "kind": "influxdb",
       "tier": "community"
     },

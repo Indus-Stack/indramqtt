@@ -71,7 +71,7 @@ allow_anonymous = true
 
 ```sh test
 python3 - <<'PY'
-import json, os, urllib.request
+import json, os, urllib.error, urllib.request
 port = os.environ.get("API_PORT", "18083")
 key = os.environ["API_KEY"]
 body = json.dumps({"type": "opc_ua", "name": "opc-1",
@@ -79,8 +79,11 @@ body = json.dumps({"type": "opc_ua", "name": "opc-1",
 req = urllib.request.Request(
     f"http://127.0.0.1:{port}/api/v5/connectors", data=body, method="POST",
     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-with urllib.request.urlopen(req, timeout=5) as res:
-    status, created = res.status, json.load(res)
+try:
+    with urllib.request.urlopen(req, timeout=5) as res:
+        status, created = res.status, json.load(res)
+except urllib.error.HTTPError as err:
+    status, created = err.code, json.load(err)
 assert status == 201, (status, created)
 assert created["type"] in ("opc_ua", "opcua"), created
 print("ok")

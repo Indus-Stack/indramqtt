@@ -1,0 +1,46 @@
+[example]
+area = "api"
+item = "listAcls"
+kind = "api"
+request = "GET /api/v1/auth/acls after the flow creates two ordered rules"
+expect = "listed"
+expected = "The broker lists both rules in creation order with their action and allow values."
+
+script = '''
+from config_probe import http
+
+for pattern, action in [
+    ("doc-acl-list-a", "publish"),
+    ("doc-acl-list-b", "subscribe"),
+]:
+    status, _ = http(
+        "POST",
+        "/api/v1/auth/acls",
+        {
+            "client_pattern": pattern,
+            "action": action,
+            "topic_pattern": f"sensors/{action}",
+            "allow": action == "publish",
+        },
+    )
+    assert status == 201, status
+status, rules = http("GET", "/api/v1/auth/acls")
+assert status == 200, (status, rules)
+found = {
+    rule.get("client_pattern"): (index, rule)
+    for index, rule in enumerate(rules)
+    if rule.get("client_pattern") in ("doc-acl-list-a", "doc-acl-list-b")
+}
+assert set(found) == {"doc-acl-list-a", "doc-acl-list-b"}, rules
+index_a, rule_a = found["doc-acl-list-a"]
+index_b, rule_b = found["doc-acl-list-b"]
+assert index_a < index_b, found
+assert rule_a.get("action") == "publish", rule_a
+assert rule_b.get("action") == "subscribe", rule_b
+assert rule_a.get("allow") is True, rule_a
+assert rule_b.get("allow") is False, rule_b
+for index in sorted((index_a, index_b), reverse=True):
+    code, _ = http("DELETE", f"/api/v1/auth/acls/{index}")
+    assert code == 204, code
+print("listed")
+'''

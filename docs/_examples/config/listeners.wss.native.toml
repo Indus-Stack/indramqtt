@@ -1,0 +1,39 @@
+[example]
+area = "config"
+item = "listeners.wss.native"
+kind = "setting"
+expect = "native-ignored"
+expected = "The broker boots with the deprecated value, and the plaintext listener still serves clients."
+source = "`crates/broker-config/src/schema.rs` marks the setting deprecated and ignored, and `crates/broker-node/src/main.rs` never reads it."
+action = "Connect one plaintext client and read `GET /api/v5/listeners/wss:default`."
+config = '''
+[listeners.wss]
+native = true
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def connect_bytes(client, username=None, password=None):
+    flags = 0x02 | (0x80 if username else 0) | (0x40 if password else 0)
+    body = word("MQTT") + b"\x04" + bytes([flags]) + struct.pack("!H", 60) + word(client)
+    if username:
+        body += word(username)
+    if password:
+        body += word(password)
+    return frame(0x10, body)
+
+status, _ = http("POST", "/api/v1/auth/users", {"username": "docs-wss", "password": "docs-pw-0001"})
+assert status in (200, 201), status
+sock = socket.create_connection(("127.0.0.1", int(MQTT_PORT)), timeout=10)
+sock.settimeout(10)
+sock.sendall(connect_bytes("wss-native-1", "docs-wss", "docs-pw-0001"))
+head, ack = packet(sock)
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+sock.close()
+status, row = http("GET", "/api/v5/listeners/wss:default")
+assert status == 200, (status, row)
+assert row["enable"] is False, row
+print("native-ignored")
+'''

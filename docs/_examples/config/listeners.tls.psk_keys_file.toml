@@ -1,0 +1,27 @@
+[example]
+area = "config"
+item = "listeners.tls.psk_keys_file"
+kind = "setting"
+expect = "psk-empty-store"
+expected = "The broker boots with an empty PSK path, and the listeners row shows enable true with running true."
+source = "`crates/broker-node/src/main.rs` loads the identity file only when the path is not empty, so an empty path boots with an empty store."
+action = "Read `GET /api/v5/listeners/ssl:default` and open one TCP connection to the bind."
+config = '''
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+psk_enabled = true
+psk_keys_file = ""
+'''
+script = '''
+from config_probe import *
+import socket
+
+status, row = http("GET", "/api/v5/listeners/ssl:default")
+assert status == 200, (status, row)
+assert row["enable"] is True, row
+assert row["running"] is True, row
+sock = socket.create_connection(("127.0.0.1", 28883), timeout=10)
+sock.close()
+print("psk-empty-store")
+'''

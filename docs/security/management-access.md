@@ -35,6 +35,22 @@ flowchart TD
 
 The ten scopes are `connections`, `publish`, `data_integration`, `access_control`, `gateways`, `monitoring`, `cluster_operations`, `system`, `audit` and `license`. The catalogue is fixed. Unknown scopes fail.
 
+## Dashboard user scopes
+
+A dashboard user row carries a `scopes` field. The broker applies the effective scopes on each non-public management request. The role is still a limit. A viewer stays read-only.
+
+| Write value | Stored state | Effect |
+|---|---|---|
+| omitted on create | the role default | The user gets the current role default. |
+| `unset` | no explicit list | The user keeps the current role default. |
+| list equal to the role default | no explicit list | The user keeps the current role default. |
+| `[]` | empty list | Only the public routes stay reachable. |
+| other valid list | the list | Only the named scope groups stay reachable. |
+
+An administrator gets the ten scopes and the four login-only scopes. A viewer gets the ten scopes. The login-only scopes are `user_management`, `mfa_management`, `sso_management` and `api_key_management`. The `user_management`, `sso_management` and `api_key_management` scopes need the administrator role. A non-administrator can hold `mfa_management` for their own MFA.
+
+A user with `[]` keeps only the public routes. The public routes are `/status`, `/error_codes`, `/schemas/:name`, `GET /schemas`, login, logout, `GET /user_scopes`, `GET /api_key_scopes` and `GET /current_user`. The user's own password change and own MFA are public too. Another user's password change needs `user_management`. Another user's MFA needs `mfa_management`. A scope change or a role change applies to a live token on the next request. The scopes survive a restart.
+
 ## Minimal example
 
 This file serves the management API and plain MQTT.

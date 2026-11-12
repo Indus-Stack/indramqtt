@@ -1,0 +1,31 @@
+[example]
+area = "config"
+item = "persistence.stream_dir"
+kind = "setting"
+expect = "journaled"
+expected = "The configured directory holds a journal file with the published payload."
+source = "`crates/broker-node/src/main.rs` opens the journal when the setting is not empty."
+action = "Publish one message and read the journal files in the configured directory."
+config = '''
+[persistence]
+stream_dir = "docs-stream"
+'''
+script = '''
+from config_probe import *
+from pathlib import Path
+pub, ack, props = connect("stream-pub", v5=True)
+publish(pub, "docs/stream", b"journal-payload", v5=True)
+root = Path("docs-stream")
+
+def found():
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*"):
+        if path.is_file() and b"journal-payload" in path.read_bytes():
+            return True
+    return False
+
+assert wait_for(found, timeout=5), "no journal file holds the payload"
+disconnect(pub)
+print("journaled")
+'''

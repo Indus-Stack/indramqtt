@@ -532,10 +532,15 @@ fn parse_rule_actions(
             // MV-01/SB-03: the fire target of a v5 rule action is the
             // action's own dispatch key, so delivery crosses to the
             // action-owned sink registered under that key (one action,
-            // one sink, one key).
-            actions.push(broker_rules::RuleAction::ForwardConnector {
-                connector_id: broker_config::v5_action_sink_key(&found.id),
-            });
+            // one sink, one key). A connector-only row owns no such
+            // sink; its own id names the connector sink.
+            let action_key = broker_config::v5_action_sink_key(&found.id);
+            let connector_id = if state.engine.connectors().get(&action_key).is_some() {
+                action_key
+            } else {
+                found.id.clone()
+            };
+            actions.push(broker_rules::RuleAction::ForwardConnector { connector_id });
             continue;
         }
         let Some(object) = item.as_object() else {
@@ -577,10 +582,15 @@ fn parse_rule_actions(
             return Err(bad(format!("unknown action {conn_id:?} (field `actions`)")));
         };
         // MV-01/SB-03: same action-owned dispatch key as the bare
-        // string form above.
-        actions.push(broker_rules::RuleAction::ForwardConnector {
-            connector_id: broker_config::v5_action_sink_key(&found.id),
-        });
+        // string form above. A connector-only row has no action sink,
+        // so its own id reaches the connector sink.
+        let action_key = broker_config::v5_action_sink_key(&found.id);
+        let connector_id = if state.engine.connectors().get(&action_key).is_some() {
+            action_key
+        } else {
+            found.id.clone()
+        };
+        actions.push(broker_rules::RuleAction::ForwardConnector { connector_id });
     }
     Ok(actions)
 }
@@ -1758,6 +1768,66 @@ fn missing_connector_field(
         false
     }
 
+    // A present target or identity field must carry a value. A blank
+    // string is the same as a missing setting and never selects a default.
+    for key in [
+        "database",
+        "database_name",
+        "table",
+        "table_name",
+        "server",
+        "endpoint",
+        "url",
+        "host",
+        "catalog",
+        "schema",
+        "topic",
+        "bucket",
+        "org",
+        "token",
+        "instance_name",
+        "table_bucket_arn",
+        "stable_name",
+        "filename_prefix",
+        "private_key_pem",
+        "device_path",
+        "device_path_template",
+        "workgroup_name",
+        "connection_string",
+    ] {
+        if body
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Some(key);
+        }
+    }
+    // An identifier is one bare name. A space would become a different
+    // target or an invalid statement, so refuse it here.
+    for key in [
+        "database",
+        "database_name",
+        "table",
+        "table_name",
+        "catalog",
+        "schema",
+        "stable_name",
+        "instance_name",
+        "device_path",
+        "device_path_template",
+        "filename_prefix",
+        "workgroup_name",
+        "topic",
+    ] {
+        if body
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.chars().any(char::is_whitespace))
+        {
+            return Some(key);
+        }
+    }
     match conn_type {
         "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
             // Credential first so a bare body names the credential, not an identity.
@@ -1945,7 +2015,29 @@ fn missing_connector_field(
             if !present(body, &["account_name", "account"]) {
                 return Some("account_name");
             }
-            if !present(body, &["account_key", "accountKey"]) {
+            // The reference form carries the credential in `auth` or
+            // `auth`-style variants. Accept every documented form; the
+            // sink builder resolves the same names.
+            let credential_keys = [
+                "account_key",
+                "accountKey",
+                "sas_token",
+                "sas",
+                "token",
+                "bearer_token",
+            ];
+            let nested_credential = ["auth", "authentication"].iter().any(|parent| {
+                body.get(*parent)
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|auth| {
+                        credential_keys.iter().any(|key| {
+                            auth.get(*key)
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|text| !text.trim().is_empty())
+                        })
+                    })
+            });
+            if !present(body, &credential_keys) && !nested_credential {
                 return Some("account_key");
             }
             None
@@ -1960,8 +2052,11 @@ fn missing_connector_field(
             None
         }
         "bigquery" | "bq" | "gbq" => {
+            // The native form names `authentication`; the reference form
+            // names the same object `auth`. Both carry an operator value.
             if !body
                 .get("authentication")
+                .or_else(|| body.get("auth"))
                 .is_some_and(|value| value.is_object())
             {
                 return Some("authentication");
@@ -1969,6 +2064,18 @@ fn missing_connector_field(
             None
         }
         "disk_log" | "disk" | "disklog" => {
+            // Lane A wrote the file under `directory` with a separate
+            // prefix and extension. That form supplies its own bounds in
+            // the sink builder; only the native `filepath` form needs the
+            // path and rotating-file fields here.
+            let legacy_directory = body
+                .get("directory")
+                .or_else(|| body.get("dir"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            if legacy_directory && !present(body, &["filepath", "file"]) {
+                return None;
+            }
             if !present(body, &["filepath", "file", "path"]) {
                 return Some("filepath");
             }
@@ -2075,6 +2182,13 @@ fn missing_connector_field(
         "mqtt_bridge" | "mqtt" => {
             if !present_nested(body, &["server", "broker_address", "broker", "host"]) {
                 return Some("server");
+            }
+            if body
+                .get("client_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Some("client_id");
             }
             None
         }
@@ -2306,6 +2420,32 @@ fn missing_mv02b_connector_field(
             None
         }
         "influxdb" => {
+            // A present top-level field must still carry a value; the
+            // reference form does not turn an empty top-level override
+            // into a silently ignored setting.
+            for key in ["bucket", "org", "token", "measurement"] {
+                if body
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Some(key);
+                }
+            }
+            // The reference form puts the connection fields in the
+            // connector `parameters` object and lets the sink pick the
+            // measurement. The native form keeps them at the top level.
+            let nested_reference = body
+                .get("parameters")
+                .and_then(|value| value.as_object())
+                .is_some_and(|params| {
+                    ["bucket", "database", "org", "token", "username"]
+                        .iter()
+                        .any(|key| params.get(*key).is_some_and(|value| !value.is_null()))
+                });
+            if nested_reference {
+                return None;
+            }
             if !present(body, &["bucket"]) {
                 return Some("bucket");
             }
@@ -2338,6 +2478,17 @@ fn missing_mv02b_connector_field(
             }
             if !present_any(body, &["measures", "multi_measure_mappings"]) {
                 return Some("measures");
+            }
+            if let Some(endpoint) = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| value.contains("://"))
+            {
+                if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                    return Some("endpoint");
+                }
             }
             None
         }
@@ -2590,6 +2741,8 @@ pub(crate) fn resolve_action_connector(
 /// response: every `file:`/`env:` string leaf renders as its
 /// `<redacted:...>` marker naming the reference, never the value. The
 /// store keeps the reference; only the response is redacted.
+/// A RocketMQ plaintext signing key never renders either: the access
+/// key stays since it names the credential, the secret does not.
 fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
     fn walk(node: &mut serde_json::Value) {
         match node {
@@ -2612,6 +2765,29 @@ fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
         }
     }
     let mut out = value.clone();
+    // Reads must not leak the vendor signing key.
+    // Reason: the secret signs requests, the access key only names them.
+    let is_rocketmq = matches!(
+        out.get("type").and_then(|v| v.as_str()),
+        Some("rocketmq") | Some("rocket_mq") | Some("apache_rocketmq")
+    );
+    if is_rocketmq {
+        if let Some(obj) = out.as_object_mut() {
+            for key in ["secret_key", "security_token"] {
+                let plain = obj
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(|s| !broker_config::secrets::is_secret_ref(s.trim()))
+                    .unwrap_or(false);
+                if plain {
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String(super::sso::REDACTED_SECRET.to_string()),
+                    );
+                }
+            }
+        }
+    }
     walk(&mut out);
     out
 }
@@ -3198,7 +3374,8 @@ fn webhook_http_client() -> reqwest::Client {
 /// skip, never a fallback identity. A sink or transport that fails to
 /// build fails the same way with its own error text. Enabled kinds go
 /// through [`register_live_sink`], the same path `create_connector` uses.
-pub(crate) async fn try_register_live_sink(
+/// Qualification calls this entry directly.
+pub async fn try_register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
     name: &str,
@@ -3231,7 +3408,90 @@ fn refuse_disabled_kind(conn_type: &str, feature: &str) -> String {
     format!("connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)")
 }
 
-pub(crate) async fn register_live_sink(
+/// MQTT bridge keep-alive default. Reason: the connector schema default.
+const MQTT_BRIDGE_KEEPALIVE_SECS: u16 = 60;
+/// MQTT bridge inflight bound. Reason: 1000 rows cap the sink queue
+/// while the runtime drains it.
+const MQTT_BRIDGE_MAX_INFLIGHT: usize = 1_000;
+/// MQTT bridge rows per send. Reason: one row per send keeps the
+/// runtime in charge of batching.
+const MQTT_BRIDGE_BATCH_ROWS: usize = 1;
+/// MQTT bridge linger. Reason: 10 ms lets one row wait for the runtime
+/// batch timer.
+const MQTT_BRIDGE_LINGER_MS: u64 = 10;
+
+/// Read one positive bridge bound. A value below 1 is refused so the
+/// sink never stores an unbounded or zero limit.
+fn parse_bridge_bound(
+    name: &str,
+    value: Option<&serde_json::Value>,
+    default: usize,
+    field: &str,
+) -> Result<usize, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .filter(|bound| *bound >= 1)
+            .and_then(|bound| usize::try_from(bound).ok())
+            .ok_or_else(|| {
+                format!("connector {name:?} field `{field}` must be a positive integer")
+            }),
+    }
+}
+
+/// Read the bridge linger window. The reference form accepts a whole
+/// number of milliseconds; an absent value uses the sink default.
+fn parse_bridge_linger(
+    name: &str,
+    value: Option<&serde_json::Value>,
+    default: u64,
+) -> Result<u64, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            format!("connector {name:?} field `linger_ms` must be a whole number of milliseconds")
+        }),
+    }
+}
+
+/// Parse the connector `keepalive` value. Accept whole seconds or a
+/// duration string such as `60s`, `1m` or `1500ms`. Reason: the
+/// reference connector accepts both shapes.
+fn parse_bridge_keepalive(name: &str, value: &serde_json::Value) -> Result<u16, String> {
+    let bad = || {
+        format!(
+            "connector {name:?} field `keepalive` must be whole seconds or a duration string such as `60s`"
+        )
+    };
+    let seconds = match value {
+        serde_json::Value::Number(number) => number.as_f64().ok_or_else(|| bad())?,
+        serde_json::Value::String(text) => {
+            let text = text.trim().to_ascii_lowercase();
+            let split = text
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .ok_or_else(|| bad())?;
+            let (number, unit) = text.split_at(split);
+            let number: f64 = number.parse().map_err(|_| bad())?;
+            match unit.trim() {
+                "ms" => number / 1_000.0,
+                "s" => number,
+                "m" => number * 60.0,
+                "h" => number * 3_600.0,
+                _ => return Err(bad()),
+            }
+        }
+        _ => return Err(bad()),
+    };
+    if !seconds.is_finite() || seconds < 0.0 || seconds > f64::from(u16::MAX) {
+        return Err(bad());
+    }
+    Ok(seconds.round() as u16)
+}
+
+/// Register one live sink on the engine. Qualification calls this entry.
+/// Qualification covers both this entry and `build_connector`.
+pub async fn register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
     name: &str,
@@ -3429,7 +3689,9 @@ pub(crate) async fn register_live_sink(
             let (host, port) = match server.rsplit_once(':') {
                 Some((host, port)) => match port.parse::<u16>() {
                     Ok(port) => (host.trim().trim_matches(&['[', ']'][..]).to_string(), port),
-                    Err(_) => (server.to_string(), 5432),
+                    Err(_) => {
+                        return Err(format!("postgres bad port in {server:?}"));
+                    }
                 },
                 None => (server.to_string(), 5432),
             };
@@ -3628,61 +3890,199 @@ pub(crate) async fn register_live_sink(
             return Err(refuse_disabled_kind(conn_type, "clickhouse"));
         }
         "mqtt_bridge" | "bridge" => {
-            // The connector carries the remote broker only. The topic,
-            // QoS, retain flag and body belong to the action, so a
-            // connector alone registers no sink and invents no target.
-            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
-        }
-        "influxdb" => {
-            // Fail closed (S1-01): the create and update paths gate
-            // these fields first; the arm repeats the check so boot
-            // replay cannot invent a target either. The server default
-            // is the reference connector default.
-            let raw_server = body
+            // Lane B keeps the target on the action. The reference form
+            // carries bridge controls on the connector and keeps its
+            // connector sink. Detect that form by its bridge fields.
+            // The Rust bridge has no reader for the reference transport,
+            // identity pool and TLS blocks. Refuse them before storage so
+            // the operator never gets a setting that does nothing.
+            for key in [
+                "tcp_opts",
+                "static_clientids",
+                "pool_size",
+                "bridge_mode",
+                "mode",
+                "connect_timeout",
+                "retry_interval",
+                "reconnect_interval",
+                "ssl",
+            ] {
+                if body.get(key).is_some_and(|value| !value.is_null()) {
+                    return Err(format!(
+                        "connector {name:?} field `{key}` is not supported by the MQTT bridge; remove it"
+                    ));
+                }
+            }
+            let reference_form = [
+                "proto_ver",
+                "keepalive",
+                "clean_start",
+                "clientid_prefix",
+                "max_inflight",
+                "batch_size",
+                "max_batch_size",
+                "linger_ms",
+            ]
+            .iter()
+            .any(|key| body.get(*key).is_some());
+            if !reference_form {
+                crate::v5::action_sinks::validate_connector_io_bounds(
+                    body,
+                    name,
+                    "connector config",
+                )?;
+                return Ok(());
+            }
+            // Fail closed when the operator omits the target. No
+            // invented address.
+            let Some(server) = body
                 .get("server")
-                .or_else(|| body.get("url"))
-                .or_else(|| body.get("endpoint"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("127.0.0.1:8086");
-            let endpoint =
-                if raw_server.starts_with("http://") || raw_server.starts_with("https://") {
-                    raw_server.to_string()
-                } else {
-                    format!("http://{raw_server}")
-                };
-            let Some(bucket) = body
-                .get("bucket")
+                .or_else(|| body.get("broker_address"))
+                .or_else(|| body.get("broker"))
+                .or_else(|| body.get("host"))
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
+                return Err(format!(
+                    "connector {name:?} is missing required field: server"
+                ));
+            };
+            let client_id = body
+                .get("client_id")
+                .or_else(|| body.get("clientid_prefix"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(name)
+                .to_string();
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let keep_alive_secs = match body.get("keepalive") {
+                None | Some(serde_json::Value::Null) => MQTT_BRIDGE_KEEPALIVE_SECS,
+                Some(value) => parse_bridge_keepalive(name, value)?,
+            };
+            let clean_start = match body.get("clean_start") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    format!("connector {name:?} field `clean_start` must be a boolean")
+                })?,
+            };
+            let protocol = match body
+                .get("proto_ver")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None | Some("v3") | Some("v4") => broker_connectors::MqttBridgeProtocol::V311,
+                Some("v5") => broker_connectors::MqttBridgeProtocol::V50,
+                Some(other) => {
+                    return Err(format!(
+                        "connector {name:?} field `proto_ver` must be one of v3, v4, v5: {other:?}"
+                    ));
+                }
+            };
+            let max_inflight = parse_bridge_bound(
+                name,
+                body.get("max_inflight"),
+                MQTT_BRIDGE_MAX_INFLIGHT,
+                "max_inflight",
+            )?;
+            let max_batch_size = parse_bridge_bound(
+                name,
+                body.get("batch_size")
+                    .or_else(|| body.get("max_batch_size")),
+                MQTT_BRIDGE_BATCH_ROWS,
+                "batch_size",
+            )?;
+            let linger_ms =
+                parse_bridge_linger(name, body.get("linger_ms"), MQTT_BRIDGE_LINGER_MS)?;
+            let config = broker_connectors::MqttBridgeSinkConfig {
+                broker_address: server.to_string(),
+                client_id,
+                clean_start,
+                username,
+                password,
+                keep_alive_secs,
+                topic_prefix: None,
+                topic_template: None,
+                payload_template: None,
+                qos_override: None,
+                retain_override: None,
+                max_inflight: Some(max_inflight),
+                max_batch_size: Some(max_batch_size),
+                linger_ms: Some(linger_ms),
+                protocol,
+            };
+            if let Some(transport) =
+                record_sink_error!(broker_connectors::RumqttcMqttBridgeTransport::new(&config))
+            {
+                if let Some(sink) = record_sink_error!(broker_connectors::MqttBridgeSink::new(
+                    config,
+                    Arc::new(transport)
+                )) {
+                    let sink = Arc::new(sink);
+                    engine.connectors().register(name, sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("bridge:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("mqtt_bridge:{}", name), sink);
+                }
+            }
+        }
+        "influxdb" | "influx" => {
+            // Documented `endpoint` first (DX2-023): it must already name
+            // `http(s)` or the sink refuses it. Legacy `url` and `server`
+            // carry `host:port` and keep the historic prefix for the
+            // stored canonical parameters.
+            let endpoint = if let Some(explicit) = body.get("endpoint").and_then(|v| v.as_str()) {
+                explicit.to_string()
+            } else {
+                let url = body
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| body.get("server").and_then(|v| v.as_str()))
+                    .unwrap_or("http://127.0.0.1:8086");
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    url.to_string()
+                } else {
+                    format!("http://{url}")
+                }
+            };
+            // The reference form keeps the connection fields in the
+            // connector `parameters` object; the native form names them
+            // at the top level. Read both and fail closed when a value
+            // is absent. Never invent a bucket, org, token or
+            // measurement.
+            let nested = body.get("parameters").and_then(|value| value.as_object());
+            let field = |keys: &[&str]| -> Option<String> {
+                keys.iter().find_map(|key| {
+                    body.get(*key)
+                        .or_else(|| nested.and_then(|params| params.get(*key)))
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+            };
+            let Some(bucket) = field(&["bucket"]) else {
                 return Err("influxdb connector is missing required field: bucket".to_string());
             };
-            let Some(org) = body
-                .get("org")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
+            let Some(org) = field(&["org"]) else {
                 return Err("influxdb connector is missing required field: org".to_string());
             };
-            let Some(token) = body
-                .get("token")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
+            let Some(token) = field(&["token"]) else {
                 return Err("influxdb connector is missing required field: token".to_string());
             };
-            let Some(measurement) = body
-                .get("measurement")
-                .or_else(|| body.get("measurement_template"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
+            let Some(measurement) = field(&["measurement", "measurement_template"]) else {
                 return Err("influxdb connector is missing required field: measurement".to_string());
             };
             // The sink validates the value; an unknown precision fails
@@ -3699,15 +4099,23 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("timeout_ms"))
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            // Documented settings (DX2-023): the sink applies each one.
+            // Missing batch size and linger keep the historic defaults.
+            let batch_size = body.get("batch_size").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let batch_timeout_ms = body
+                .get("batch_timeout_ms")
+                .or_else(|| body.get("linger_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100);
             let config = broker_connectors::InfluxDbSinkConfig {
                 endpoint,
-                bucket: bucket.to_string(),
-                org: org.to_string(),
-                token: token.to_string(),
-                measurement_template: measurement.to_string(),
+                bucket,
+                org,
+                token,
+                measurement_template: measurement,
                 precision,
-                batch_size: 1,
-                batch_timeout_ms: 100,
+                batch_size,
+                batch_timeout_ms,
                 request_timeout_ms,
             };
             if let Some(sink) = record_sink_error!(broker_connectors::InfluxDbSink::new(
@@ -3718,7 +4126,10 @@ pub(crate) async fn register_live_sink(
                 engine.connectors().register(name, sink.clone());
                 engine
                     .connectors()
-                    .register(format!("influxdb:{}", name), sink);
+                    .register(format!("influxdb:{}", name), sink.clone());
+                engine
+                    .connectors()
+                    .register(format!("influx:{}", name), sink);
             }
         }
         #[cfg(feature = "mongodb")]
@@ -4321,7 +4732,9 @@ pub(crate) async fn register_live_sink(
                 .filter(|s| !s.is_empty())
             {
                 None | Some("sql") => broker_connectors::greptimedb::GreptimeFormat::SqlInsert,
-                Some("influx") => broker_connectors::greptimedb::GreptimeFormat::InfluxLineProtocol,
+                Some("influx") | Some("influx_line_protocol") => {
+                    broker_connectors::greptimedb::GreptimeFormat::InfluxLineProtocol
+                }
                 Some(other) => {
                     return Err(format!(
                         "greptimedb connector field `format` must be one of sql, influx: {other:?}"
@@ -4355,10 +4768,10 @@ pub(crate) async fn register_live_sink(
                     .register(format!("greptime:{}", name), sink);
             }
         }
-        "iotdb" => {
-            // Fail closed (S1-01): the create and update paths gate
-            // these fields first; the arm repeats the check so boot
-            // replay cannot invent a target either.
+        "iotdb" | "iot_db" => {
+            // Fail closed (S1-01): the create and update paths gate these
+            // fields first; the arm repeats the check so boot replay cannot
+            // invent a target either.
             let Some(raw_server) = body
                 .get("endpoint")
                 .or_else(|| body.get("server"))
@@ -4382,18 +4795,23 @@ pub(crate) async fn register_live_sink(
             else {
                 return Err("iotdb connector is missing required field: device".to_string());
             };
-            let Some(username) = body
-                .get("username")
-                .or_else(|| body.get("user"))
+            // Documented auth object first (DX2-024). Flat fields stay for
+            // the old entry shape. The value must be non-empty.
+            let nested_auth = body.get("auth");
+            let Some(username) = nested_auth
+                .and_then(|auth| auth.get("username"))
                 .and_then(|v| v.as_str())
+                .or_else(|| body.get("username").and_then(|v| v.as_str()))
+                .or_else(|| body.get("user").and_then(|v| v.as_str()))
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
                 return Err("iotdb connector is missing required field: username".to_string());
             };
-            let Some(password) = body
-                .get("password")
+            let Some(password) = nested_auth
+                .and_then(|auth| auth.get("password"))
                 .and_then(|v| v.as_str())
+                .or_else(|| body.get("password").and_then(|v| v.as_str()))
                 .filter(|s| !s.is_empty())
             else {
                 return Err("iotdb connector is missing required field: password".to_string());
@@ -4404,6 +4822,91 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
+            // One path for each shape (DX2-024). Flat fields and the
+            // documented object share defaults and validation.
+            // Reason: docs default 200 rows per flush.
+            let batch_size = match body.get("batch_size") {
+                None => Some(200),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v as usize),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: batch_size must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 2 MiB per batch.
+            let batch_bytes = match body.get("batch_bytes") {
+                None => Some(2_097_152),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v as usize),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: batch_bytes must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 10 ms linger.
+            let linger_ms = match body.get("linger_ms") {
+                None => Some(10),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: linger_ms must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 3 retries on 305 and 5xx.
+            let max_retries = match body.get("max_retries") {
+                None => Some(3),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v as usize),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: max_retries must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 100 ms first retry delay.
+            let initial_backoff_ms = match body.get("initial_backoff_ms") {
+                None => Some(100),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: initial_backoff_ms must be an integer"
+                                .to_string(),
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 2000 ms retry ceiling.
+            let max_backoff_ms = match body.get("max_backoff_ms") {
+                None => Some(2_000),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: max_backoff_ms must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            let is_aligned = body
+                .get("is_aligned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let config = broker_connectors_enterprise::iotdb::IotDbSinkConfig {
                 endpoint,
                 device_path_template: device_path.to_string(),
@@ -4411,7 +4914,7 @@ pub(crate) async fn register_live_sink(
                     username: username.to_string(),
                     password: password.to_string(),
                 },
-                is_aligned: false,
+                is_aligned,
                 measurements: match body.get("measurements").and_then(|v| v.as_array()) {
                     Some(items)
                         if !items.is_empty()
@@ -4475,12 +4978,12 @@ pub(crate) async fn register_live_sink(
                         return Err("iotdb connector is missing required field: types".to_string());
                     }
                 },
-                batch_size: Some(1),
-                batch_bytes: Some(2_097_152),
-                linger_ms: Some(10),
-                max_retries: Some(3),
-                initial_backoff_ms: Some(100),
-                max_backoff_ms: Some(2_000),
+                batch_size,
+                batch_bytes,
+                linger_ms,
+                max_retries,
+                initial_backoff_ms,
+                max_backoff_ms,
                 timeout_ms,
             };
             let client = reqwest::Client::builder()
@@ -4498,7 +5001,10 @@ pub(crate) async fn register_live_sink(
                     engine.connectors().register(name, sink.clone());
                     engine
                         .connectors()
-                        .register(format!("iotdb:{}", name), sink);
+                        .register(format!("iotdb:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("iot_db:{}", name), sink);
                 }
             }
         }
@@ -4873,10 +5379,101 @@ pub(crate) async fn register_live_sink(
             crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
         }
         "rocketmq" => {
-            // The connector carries the proxy endpoints only. The
-            // topic, tag and keys belong to the action, so a connector
-            // alone registers no sink and invents no target.
-            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
+            // Lane A keeps the connector's own sink. Build it from the
+            // operator's endpoint and topic. Fail closed when either is
+            // absent: never invent a target.
+            let Some(raw_endpoint) = body
+                .get("endpoint")
+                .or_else(|| body.get("endpoints"))
+                .or_else(|| body.get("server"))
+                .or_else(|| body.get("servers"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(());
+            };
+            let endpoints: Vec<String> = raw_endpoint
+                .split(',')
+                .map(|part| {
+                    part.trim()
+                        .trim_start_matches("http://")
+                        .trim_start_matches("tcp://")
+                        .to_string()
+                })
+                .filter(|part| !part.is_empty())
+                .collect();
+            if endpoints.is_empty() {
+                return Ok(());
+            }
+            // The topic is the connector-only target. Without it the
+            // connector stays persist-only; never invent a topic.
+            let Some(topic) = body
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(());
+            };
+            let access_key = body
+                .get("access_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let secret_key = body
+                .get("secret_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let security_token = body
+                .get("security_token")
+                .or_else(|| body.get("securityToken"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let timeout_ms = body
+                .get("timeout_ms")
+                .or_else(|| body.get("timeout"))
+                .or_else(|| body.get("request_timeout_ms"))
+                .and_then(|v| v.as_u64());
+            let config = broker_connectors_enterprise::rocketmq::RocketMqSinkConfig {
+                endpoints,
+                topic: topic.to_string(),
+                tag_template: None,
+                // The lane A connector form keys each row by its MQTT
+                // client id, so the proxy keeps per-client ordering.
+                keys_template: Some("${client_id}".to_string()),
+                // Round-robin is the reference default dispatch.
+                strategy: "roundrobin".to_string(),
+                message_group_template: None,
+                access_key,
+                secret_key,
+                security_token,
+                // One row per send: the runtime owns batching (RO-01).
+                batch_size: Some(1),
+                buffer_capacity: Some(
+                    broker_connectors_enterprise::rocketmq::DEFAULT_BUFFER_CAPACITY,
+                ),
+                // 10 ms lets one row wait for the runtime batch timer.
+                linger_ms: Some(10),
+                timeout_ms,
+            };
+            // The vendor server speaks the remoting protocol only.
+            let transport: Option<
+                Arc<dyn broker_connectors_enterprise::rocketmq::RocketMqTransport>,
+            > = record_sink_error!(
+                broker_connectors_enterprise::rocketmq::RemotingRocketMqTransport::new(&config)
+            )
+            .map(|built| Arc::new(built) as _);
+            if let Some(transport) = transport {
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::rocketmq::RocketMqSink::new(config, transport)
+                ) {
+                    let sink = Arc::new(sink);
+                    engine.connectors().register(name, sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("rocketmq:{}", name), sink);
+                }
+            }
         }
         #[cfg(feature = "confluent")]
         "confluent" => {
@@ -6081,6 +6678,7 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("project"))
                 .or_else(|| {
                     body.get("authentication")
+                        .or_else(|| body.get("auth"))
                         .and_then(|auth| auth.get("gcp_project_id"))
                 })
                 .and_then(|v| v.as_str())
@@ -6152,12 +6750,16 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_u64())
                 .or(Some(2_000));
 
+            // Read the credential from `authentication` or `auth` and
+            // apply it. Never fall back to `GcpAuth::None` when a
+            // credential is present.
+            let (_, auth) = crate::v5::action_sinks::bigquery_auth(body, name, name)?;
             let config = broker_connectors_enterprise::bigquery::BigQuerySinkConfig {
                 project_id: project_id.to_string(),
                 dataset_id: dataset_id.to_string(),
                 table_template: table.to_string(),
                 endpoint,
-                auth: broker_connectors_enterprise::gcp_pubsub::GcpAuth::None,
+                auth,
                 ignore_unknown_values,
                 skip_invalid_rows,
                 template_suffix,
@@ -6907,6 +7509,18 @@ pub async fn create_connector(
         )
             .into_response();
     }
+    // A RocketMQ topic is a bare name. The connector-only form keeps no
+    // sink under lane B, so validate the stored target here instead.
+    if crate::v5::action_sinks::canonical_action_kind(&conn_type) == "rocketmq" {
+        if let Some(topic) = body.get("topic").and_then(|value| value.as_str()) {
+            if topic.trim().is_empty() || topic.chars().any(char::is_whitespace) {
+                return ApiError::BadRequest(format!(
+                    "connector {name:?} field `topic` must be a bare topic name (connector create)"
+                ))
+                .into_response();
+            }
+        }
+    }
     // The official document-store drivers own their pools and TLS. An
     // explicit pool, pipelining or `ssl` value is refused at create,
     // not stored and ignored.
@@ -6918,8 +7532,6 @@ pub async fn create_connector(
             | "kafka"
             | "rabbitmq"
             | "redis"
-            | "mqtt_bridge"
-            | "mqtt"
             | "pulsar"
             | "rocketmq"
     ) {
@@ -7224,6 +7836,33 @@ pub async fn update_connector(
         ))
         .into_response();
     }
+    // A RocketMQ topic is a bare name. The connector-only form keeps no
+    // sink under lane B, so validate the stored target here instead.
+    if crate::v5::action_sinks::canonical_action_kind(&conn_type) == "rocketmq" {
+        if let Some(topic) = body.get("topic").and_then(|value| value.as_str()) {
+            if topic.trim().is_empty() || topic.chars().any(char::is_whitespace) {
+                return ApiError::BadRequest(format!(
+                    "connector {bare:?} field `topic` must be a bare topic name (connector update)"
+                ))
+                .into_response();
+            }
+        }
+    }
+    // The reference password form for PostgreSQL is resolved at create;
+    // an update keeps the old URL form and refuses the reference. Name
+    // the password field; do not invent a port error.
+    if crate::v5::action_sinks::canonical_action_kind(&conn_type) == "pgsql" {
+        let raw_password = body
+            .get("password")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if broker_config::secrets::is_secret_ref(raw_password) {
+            return ApiError::BadRequest(format!(
+                "connector {bare:?} field `password` cannot be a secret reference on update"
+            ))
+            .into_response();
+        }
+    }
     // The official document-store drivers own their pools and TLS. An
     // explicit pool, pipelining or `ssl` value is refused at update.
     if matches!(
@@ -7234,8 +7873,6 @@ pub async fn update_connector(
             | "kafka"
             | "rabbitmq"
             | "redis"
-            | "mqtt_bridge"
-            | "mqtt"
             | "pulsar"
             | "rocketmq"
     ) {
@@ -7299,11 +7936,19 @@ pub async fn update_connector(
     // action dispatch keys below, after the stored update and its
     // persist.
     let mut staged_ids: Vec<String> = Vec::new();
+    let mut reused_ids: Vec<String> = Vec::new();
     for record in state.actions.snapshot() {
         if !crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, &bare) {
             continue;
         }
         if !crate::v5::action_sinks::action_owned_kind(&record.action_type) {
+            continue;
+        }
+        if crate::v5::action_sinks::is_connector_only_action(&record) {
+            // The action uses the connector runtime. It needs no build of
+            // its own; the new connector sink replaces its key below.
+            reused_ids.push(record.id.clone());
+            staged_ids.push(record.id.clone());
             continue;
         }
         let opts = match crate::v5::action_sinks::ActionResourceOpts::parse(
@@ -7425,6 +8070,24 @@ pub async fn update_connector(
         {
             state.engine.connectors().unregister(&registered);
             replaced.push(old);
+        }
+    }
+    for action_id in &reused_ids {
+        let key = broker_config::v5_action_sink_key(action_id);
+        let previous = state.engine.connectors().get(&key);
+        match state.engine.connectors().get(&bare) {
+            Some(sink) => {
+                state.engine.connectors().register(key, sink);
+                if let Some(old) = previous {
+                    replaced.push(old);
+                }
+            }
+            None => {
+                if let Some(old) = previous {
+                    state.engine.connectors().unregister(&key);
+                    replaced.push(old);
+                }
+            }
         }
     }
     for old in replaced {

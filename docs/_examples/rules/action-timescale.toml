@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-timescale"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-timescale"
+type = "timescale"
+expect_status = 201
+expect_type = "timescale"
+
+[[case]]
+name = "dx2-action-timescale"
+type = "timescale"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a data plane bind address and check that `/healthz` answers OK.",
+  "config": "[cluster]\nquic_bind = \"127.0.0.1:9992\"\n",
+  "item": "cluster.quic_bind",
+  "kind": "setting",
+  "output": "ok",
+  "returncode": 0,
+  "verified": true
+}

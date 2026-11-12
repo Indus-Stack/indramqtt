@@ -2274,6 +2274,16 @@ where
                     }
                     Err(reason) => {
                         debug!("Kernel MQTT connection {}: {}", conn_id, reason);
+                        // A v5 client with an accepted CONNECT gets a
+                        // DISCONNECT with code 0x82 before the close.
+                        // Reason: the specification requires the server
+                        // to send that code on a protocol error, and a
+                        // 3.1.1 client gets no packet. The close stays
+                        // abnormal, so the will still fires.
+                        if conn.connected && conn.level == 5 {
+                            wire::encode_disconnect_v5(0x82, &mut sink.out.lock());
+                            let _ = flush(&sink, &mut io).await;
+                        }
                         break Stop::Abnormal;
                     }
                 }
@@ -2580,6 +2590,17 @@ mod tests {
         }
     }
 
+    /// Shared state for tests that bind anonymous clients. Reason:
+    /// `Shared::new()` starts with `allow_anonymous = false` (the
+    /// fail-closed schema default); these tests exercise the bind and
+    /// delivery paths, not the anonymous-refusal policy, so they need
+    /// the flag open.
+    fn test_shared() -> Shared {
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
+        shared
+    }
+
     #[test]
     fn publish_out_metadata_round_trip() {
         let mut meta = vec![0, 3, b'a', b'/', b'b', 0, 9, 1, 1, 0];
@@ -2757,7 +2778,7 @@ mod tests {
     /// connections lands in two tenants.
     #[tokio::test]
     async fn tm01_connect_authenticates_same_username_in_two_tenants() {
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .auth
             .set_policy(broker_auth::PasswordHashPolicy::for_tests());
@@ -2834,7 +2855,7 @@ mod tests {
     #[tokio::test]
     async fn burst_same_credential_binds_share_one_verification() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .auth
             .set_policy(broker_auth::PasswordHashPolicy::for_tests());
@@ -2881,7 +2902,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_in_one_connection_releases_only_that_connection() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let first = NATIVE_CONN_ID_BASE + 900_001;
         let second = NATIVE_CONN_ID_BASE + 900_002;
         let (tx_a, _rx_a, bound_a) = bind_client(&shared, first, "panic-a").await;
@@ -3000,7 +3021,7 @@ mod tests {
     /// Goes through the broker, not the store alone.
     #[tokio::test]
     async fn native_unsubscribe_stops_delivery_with_unsuback() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let conn_id = NATIVE_CONN_ID_BASE + 920_001;
         let (tx, mut rx, mut bound) = bind_client(&shared, conn_id, "native-unsub").await;
         let waker = Arc::new(tokio::sync::Notify::new());
@@ -3227,7 +3248,7 @@ mod tests {
     async fn ws_and_tcp_clients_exchange_publishes_both_ways() {
         use futures::SinkExt as _;
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (tcp_port, ws_port) = ws_test_listeners(shared).await;
 
         // A TCP subscriber waits on the topic.
@@ -3321,7 +3342,7 @@ mod tests {
     async fn ws_split_and_batched_packets_decode() {
         use futures::SinkExt as _;
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (tcp_port, ws_port) = ws_test_listeners(shared).await;
 
         // A TCP subscriber waits on two topics.
@@ -3431,7 +3452,7 @@ mod tests {
     #[tokio::test]
     async fn ws_refusals_and_frame_errors_close_only_that_connection() {
         use futures::{SinkExt as _, StreamExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
 
         let no_protocol = ws_test_raw_status(ws_port, "/mqtt", None).await;
@@ -3522,7 +3543,7 @@ mod tests {
     #[tokio::test]
     async fn ws_oversized_upgrade_head_is_refused() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
             .await
@@ -3558,7 +3579,7 @@ mod tests {
     async fn ws_ping_flood_closes_only_that_connection() {
         use futures::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::protocol::Message;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
         // One ping gets a pong and the connection stays open.
         // The library may answer the ping itself as well, so skip
@@ -3624,7 +3645,7 @@ mod tests {
         use futures::{SinkExt as _, StreamExt as _};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio_tungstenite::tungstenite::protocol::Message;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (tcp_port, ws_port) = ws_test_listeners(shared).await;
         // An oversized head gets no upgrade.
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
@@ -3824,7 +3845,7 @@ mod tests {
     async fn two_rapid_pings_get_pongs_through_broker() {
         use futures::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::protocol::Message;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
         let mut ws = ws_test_dial(ws_port).await;
         ws.send(Message::Ping(b"one".to_vec()))
@@ -3862,7 +3883,7 @@ mod tests {
     #[tokio::test]
     async fn ws_two_tenants_stay_apart() {
         use futures::SinkExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .auth
             .set_policy(broker_auth::PasswordHashPolicy::for_tests());
@@ -4120,7 +4141,7 @@ mod tests {
     async fn wss_and_tcp_clients_exchange_publishes_both_ways() {
         use futures::SinkExt as _;
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (tcp_port, wss_port) = wss_test_listeners(shared).await;
 
         // A TCP subscriber waits on the topic.
@@ -4214,7 +4235,7 @@ mod tests {
     async fn wss_refusals_close_only_that_connection() {
         use futures::SinkExt as _;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
 
         let no_protocol = wss_test_raw_status(wss_port, "/mqtt", None).await;
@@ -4270,7 +4291,7 @@ mod tests {
     async fn wss_idle_tls_handshake_times_out() {
         use futures::SinkExt as _;
         use tokio::io::AsyncReadExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
 
         // A client opens the socket and sends nothing.
@@ -4302,7 +4323,7 @@ mod tests {
     #[tokio::test]
     async fn wss_two_tenants_stay_apart() {
         use futures::SinkExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .auth
             .set_policy(broker_auth::PasswordHashPolicy::for_tests());
@@ -4568,7 +4589,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_require_mode_refuses_client_without_certificate() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = k1_05_listener(shared, k1_05_policy(true)).await;
 
         // No certificate: the handshake fails or the bind refuses.
@@ -4616,7 +4637,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_valid_certificate_maps_common_name_to_username() {
         use tokio::io::AsyncWriteExt as _;
-        let mut shared = Shared::new();
+        let mut shared = test_shared();
         shared.tls_peer_cert_as_username = "cn".to_string();
         let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
 
@@ -4649,7 +4670,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_certificate_client_id_carries_publish() {
         use tokio::io::AsyncWriteExt as _;
-        let mut shared = Shared::new();
+        let mut shared = test_shared();
         shared.tls_peer_cert_as_clientid = "cn".to_string();
         let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
 
@@ -4690,7 +4711,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_wrong_ca_and_expired_certificates_fail() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = k1_05_listener(shared, k1_05_policy(true)).await;
 
         for client in ["wrong-client", "expired-client"] {
@@ -4737,7 +4758,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_no_verification_keeps_today_behavior() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = k1_05_listener(shared, super::TlsClientAuth::default()).await;
 
         let mut plain = k1_05_dial(port, None).await.expect("plain TLS dials");
@@ -4789,7 +4810,7 @@ mod tests {
     #[tokio::test]
     async fn tls_suite_probe_matrix_reports_modern_and_legacy() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = k1_05_listener(shared, super::TlsClientAuth::default()).await;
 
         // Modern client with default suites. This probe must pass.
@@ -4829,7 +4850,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_two_tenants_stay_apart_on_certificate_path() {
         use tokio::io::AsyncWriteExt as _;
-        let mut shared = Shared::new();
+        let mut shared = test_shared();
         shared.tls_peer_cert_as_username = "cn".to_string();
         shared
             .tenant_registry
@@ -4982,7 +5003,7 @@ mod tests {
     #[tokio::test]
     async fn k1_05_wss_require_mode_checks_client_certificate() {
         use futures::SinkExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = k1_05_wss_listener(shared, k1_05_policy(true)).await;
 
         let denied = k1_05_wss_dial(port, None).await;
@@ -5134,7 +5155,7 @@ mod tests {
     #[tokio::test]
     async fn psk_valid_identity_connects_and_exchanges_mqtt() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = psk_test_listener(shared, psk_test_store()).await;
         let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
         client
@@ -5169,7 +5190,7 @@ mod tests {
     /// the library permits.
     #[tokio::test]
     async fn psk_unknown_identity_and_wrong_key_fail_without_leak() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = psk_test_listener(shared, psk_test_store()).await;
         let unknown = psk_test_dial(port, "no-such-device", vec![0x2Au8; 32]).await;
         assert!(unknown.is_err(), "unknown identity fails");
@@ -5210,7 +5231,7 @@ mod tests {
     #[tokio::test]
     async fn psk_verified_identity_reaches_the_bind() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = psk_test_listener(shared.clone(), psk_test_store()).await;
         let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
         client
@@ -5330,7 +5351,7 @@ mod tests {
     #[tokio::test]
     async fn psk_tls13_valid_identity_connects_and_exchanges_mqtt() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = psk_test_listener(shared, psk_test_store()).await;
         let mut client = psk_test_connect_tls13(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
         client
@@ -5381,7 +5402,7 @@ mod tests {
     /// Proves the fail-closed default: no identity connects.
     #[tokio::test]
     async fn psk_empty_store_fails_closed() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let empty = std::sync::Arc::new(broker_auth::PskStore::new());
         let port = psk_test_listener(shared, empty).await;
         let denied = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
@@ -5565,7 +5586,7 @@ mod tests {
     #[tokio::test]
     async fn max_packet_size_connack_advertises_configured_cap() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         assert_eq!(shared.sessions.max_packet_size(), 1_048_576);
         let port = p2_tcp_listener(shared).await;
         let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -5582,7 +5603,7 @@ mod tests {
             "default CONNACK advertises 1 MiB"
         );
 
-        let capped = Shared::new();
+        let capped = test_shared();
         capped.sessions.set_max_packet_size(2048);
         let port = p2_tcp_listener(capped).await;
         let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -5606,7 +5627,7 @@ mod tests {
     #[tokio::test]
     async fn max_packet_size_oversize_publish_closes_with_0x95() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         shared.sessions.set_max_packet_size(2048);
         let port = p2_tcp_listener(shared).await;
 
@@ -5678,7 +5699,7 @@ mod tests {
         let layered = broker_config::load_layered(&dir, &broker_config::CliOverrides::default())
             .expect("config loads");
         assert_eq!(layered.config().session.max_packet_size, 4096);
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .sessions
             .set_max_packet_size(layered.config().session.max_packet_size);
@@ -5711,7 +5732,7 @@ mod tests {
     async fn max_packet_size_large_publish_delivers_over_tcp_and_ws() {
         use futures::SinkExt as _;
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         shared.sessions.set_max_packet_size(4 * 1024 * 1024);
         let (tcp_port, ws_port) = ws_test_listeners(shared).await;
 
@@ -5804,7 +5825,7 @@ mod tests {
             .load_file(path.to_str().expect("path shows"))
             .expect("psk file loads");
         assert_eq!(count, 1, "one identity loads");
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = psk_test_listener(shared, store).await;
         let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
         client
@@ -5842,7 +5863,7 @@ mod tests {
             .load_file(path.to_str().expect("path shows"))
             .expect("psk file loads");
         assert_eq!(count, 1, "one identity loads");
-        let shared = Shared::new();
+        let shared = test_shared();
         let port = psk_test_listener(shared, store).await;
         let unknown = psk_test_dial(port, "no-such-device", vec![0x2Au8; 32]).await;
         assert!(unknown.is_err(), "unknown identity fails");
@@ -5939,7 +5960,7 @@ mod tests {
         conf.wss.cert_file = k1_05_file("server-cert.pem");
         conf.wss.key_file = k1_05_file("server-key.pem");
         conf.wss.verify_client_cert = true;
-        let control = NativeListenerController::new(Shared::new(), conf);
+        let control = NativeListenerController::new(test_shared(), conf);
         for kind in ["ssl", "wss"] {
             let refused = control.start_listener(&record(kind));
             assert!(refused.is_err(), "{kind} must not start without a CA file");
@@ -6020,7 +6041,7 @@ mod tests {
     #[tokio::test]
     async fn denied_publish_with_disconnect_stops_the_rest_of_the_buffer() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let shared = Shared::new();
+        let shared = test_shared();
         acl_deny_secret(&shared, "disconnect");
         let (tcp_port, _ws_port) = ws_test_listeners(shared).await;
 
@@ -6073,7 +6094,7 @@ mod tests {
     #[tokio::test]
     async fn delayed_publish_is_authorized_on_the_inner_topic() {
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         acl_deny_secret(&shared, "ignore");
         shared.spawn_delayed_driver();
         let (tcp_port, _ws_port) = ws_test_listeners(shared).await;
@@ -6238,5 +6259,112 @@ mod tests {
         assert_eq!(run.consumed, 1);
         assert_eq!(run.bytes, 600);
         assert!(run.reads <= 3, "reads for 600 bytes: {}", run.reads);
+    }
+
+    /// MV-09a: built-in credential CONNECTs through a real TCP socket
+    /// for both protocol versions. A correct password connects with
+    /// CONNACK 0x00; a wrong password is refused with a non-zero
+    /// CONNACK code. The socket is the production entry, not the store.
+    #[tokio::test]
+    async fn mv09a_builtin_auth_over_tcp_accepts_and_refuses_v4_and_v5() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = test_shared();
+        shared
+            .auth
+            .add_user("sock-alice", b"sock-secret")
+            .expect("user stores");
+        let port = p2_tcp_listener(shared).await;
+
+        // v4 correct password connects.
+        let mut v4 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v4.write_all(&ws_test_connect_with_auth(
+            "sock-v4-ok",
+            "sock-alice",
+            b"sock-secret",
+        ))
+        .await
+        .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut v4).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "v4 correct password connects"
+        );
+
+        // v4 wrong password is refused with a non-zero code.
+        let mut v4bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v4bad
+            .write_all(&ws_test_connect_with_auth(
+                "sock-v4-bad",
+                "sock-alice",
+                b"nope",
+            ))
+            .await
+            .expect("CONNECT sends");
+        let connack = tcp_test_recv(&mut v4bad).await;
+        assert_eq!(connack.len(), 4, "v4 refusal carries a CONNACK");
+        assert_ne!(connack[3], 0, "v4 wrong password is refused");
+
+        // v5 correct password connects through the same listener.
+        let mut v5 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v5.write_all(&mv09a_v5_connect_with_auth(
+            "sock-v5-ok",
+            "sock-alice",
+            b"sock-secret",
+        ))
+        .await
+        .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut v5).await;
+        assert!(
+            connack.len() >= 4 && connack[0] == 0x20,
+            "v5 refusal or accept carries a CONNACK, got: {connack:?}"
+        );
+        assert_eq!(
+            connack[3], 0x00,
+            "v5 correct password connects, got: {connack:?}"
+        );
+
+        // v5 wrong password is refused with a non-zero reason code.
+        let mut v5bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v5bad
+            .write_all(&mv09a_v5_connect_with_auth(
+                "sock-v5-bad",
+                "sock-alice",
+                b"nope",
+            ))
+            .await
+            .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut v5bad).await;
+        assert!(
+            connack.len() >= 4 && connack[0] == 0x20,
+            "v5 refusal carries a CONNACK, got: {connack:?}"
+        );
+        assert_ne!(connack[3], 0x00, "v5 wrong password is refused");
+    }
+
+    /// Builds an MQTT 5 CONNECT packet with username and password.
+    /// Property length is zero. The socket entry reads the same bytes
+    /// the production listener parses.
+    fn mv09a_v5_connect_with_auth(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![
+            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0xC2, 0x00, 0x3C, 0x00,
+        ];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        body.extend_from_slice(username.as_bytes());
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10];
+        broker_protocol::wire::encode_varint(body.len() as u32, &mut packet);
+        packet.extend_from_slice(&body);
+        packet
     }
 }

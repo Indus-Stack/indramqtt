@@ -1320,6 +1320,7 @@ mod tests {
             mfa_secret: String::new(),
             mfa_enabled: false,
             mfa_last_step: None,
+            scopes: None,
         });
         snapshot
             .connectors

@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-disk_log"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-disk_log"
+type = "disk_log"
+expect_status = 201
+expect_type = "disk_log"
+
+[[case]]
+name = "dx2-action-disk_log"
+type = "disk_log"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

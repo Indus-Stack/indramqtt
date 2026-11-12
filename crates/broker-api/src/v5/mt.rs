@@ -422,6 +422,41 @@ fn validate_ns_config(config: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// External credential backend keys refused in per-tenant configs.
+/// Per-tenant external login is not in the MVP (CEO, 2026-10-18).
+/// Reason: one shared list keeps every config write path refusing the
+/// same keys before storing anything, so no path stores a refused key.
+const EXTERNAL_LOGIN_KEYS: [&str; 7] = [
+    "auth",
+    "authentication",
+    "ldap",
+    "kerberos",
+    "jwks",
+    "dbauth",
+    "webhook",
+];
+
+/// Name the first external backend key in `config`, if any.
+/// Returns `None` for a config with no external backend key.
+fn external_login_key(config: &serde_json::Value) -> Option<&'static str> {
+    let obj = config.as_object()?;
+    EXTERNAL_LOGIN_KEYS
+        .into_iter()
+        .find(|key| obj.contains_key(*key))
+}
+
+/// Refuse a config that carries an external backend key (MV-09a).
+/// A non-default namespace must not carry an external credential
+/// backend. The write is refused with 400 and stores nothing.
+fn refuse_external_login_key(config: &serde_json::Value) -> Option<Response> {
+    external_login_key(config).map(|key| {
+        ApiError::BadRequest(format!(
+            "per-tenant external login via {key:?} is not available in this broker"
+        ))
+        .into_response()
+    })
+}
+
 /// One per-tenant limit override from a namespace config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NsLimitOverride {
@@ -977,6 +1012,14 @@ pub async fn put_ns_config(
             return ApiError::BadRequest(format!("invalid config body: {error}")).into_response();
         }
     };
+    // Per-tenant external login is not in the MVP (CEO, 2026-10-18).
+    // A non-default namespace must not carry an external credential
+    // backend. The write is refused with 400 and stores nothing; the
+    // runtime stays fail-closed for that tenant (its external verdicts
+    // deny inside each authenticator).
+    if let Some(refusal) = refuse_external_login_key(&config) {
+        return refusal;
+    }
     if let Err(message) = state.namespaces.put_config(&ns, config.clone()) {
         if message.contains("not found") {
             return ns_not_found(&ns);
@@ -1145,6 +1188,12 @@ pub async fn bulk_import_configs(State(state): State<ApiState>, body: bytes::Byt
         if let Err(message) = validate_ns_config(&entry.config) {
             return ApiError::BadRequest(message).into_response();
         }
+        // The bulk path refuses the same external keys as the single
+        // write path, before anything applies. A refused bulk stores
+        // nothing, not even its innocent entries.
+        if let Some(refusal) = refuse_external_login_key(&entry.config) {
+            return refusal;
+        }
     }
     let mut fresh = 0;
     for entry in &entries {
@@ -1215,6 +1264,12 @@ pub async fn bulk_import_ns_configs(State(state): State<ApiState>, body: bytes::
         if let Err(message) = validate_ns_config(config) {
             return ApiError::BadRequest(message).into_response();
         }
+        // The map import refuses the same external keys as the single
+        // write path, before anything applies. A refused import stores
+        // nothing, also on a dry run.
+        if let Some(refusal) = refuse_external_login_key(config) {
+            return refusal;
+        }
     }
     if dry_run {
         return (StatusCode::OK, Json(configs)).into_response();
@@ -1262,6 +1317,14 @@ mod mt_tests {
         async fn start() -> (Self, TestState) {
             let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
             let state = ApiState::standalone(engine);
+            Self::start_with_state(state).await
+        }
+
+        /// Serve one ready-made state through the production router.
+        /// Seeds the fast test password policy and the two test admins
+        /// first, as `start` does. Lets restart tests serve a
+        /// registry-backed state on a temp data dir.
+        async fn start_with_state(state: ApiState) -> (Self, TestState) {
             state
                 .auth
                 .set_policy(broker_auth::PasswordHashPolicy::for_tests());
@@ -1877,5 +1940,189 @@ mod mt_tests {
             0,
             "a tenant with the same name starts empty"
         );
+    }
+
+    /// Per-tenant external login is not in the MVP. A namespace config
+    /// that carries an external credential backend is refused with 400
+    /// and stores nothing through the production HTTP entry.
+    #[tokio::test]
+    async fn per_tenant_external_login_config_is_refused() {
+        let (server, state) = TestServer::start().await;
+        let admin = admin_token(&state.inner);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/ns/t-ext",
+                Some(serde_json::json!({})),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 204);
+        for key in ["ldap", "jwks", "dbauth", "webhook", "auth"] {
+            let (status, body) = server
+                .send(
+                    "PUT",
+                    "/api/v5/mt/ns/t-ext/config",
+                    Some(serde_json::json!({ key: { "url": "http://127.0.0.1:9" } })),
+                    Some(&admin),
+                )
+                .await;
+            assert_eq!(status, 400, "external key {key} is refused");
+            assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        }
+        let (status, stored) = server
+            .send("GET", "/api/v5/mt/ns/t-ext/config", None, Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            stored,
+            serde_json::json!({}),
+            "refused writes store nothing"
+        );
+        server.task.abort();
+    }
+
+    /// Both bulk import paths refuse per-tenant external login keys
+    /// with 400 through the production HTTP entry. A refused bulk
+    /// stores nothing, not even its innocent entries.
+    #[tokio::test]
+    async fn bulk_imports_refuse_external_login_keys() {
+        let (server, state) = TestServer::start().await;
+        let admin = admin_token(&state.inner);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/ns/t-bulk-ok",
+                Some(serde_json::json!({})),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 204);
+        // One bad entry fails the whole bulk; the innocent new entry
+        // stays absent.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/mt/bulk_import_configs",
+                Some(serde_json::json!([
+                    {"ns": "t-bulk-ok", "config": {"ldap": {"url": "http://127.0.0.1:9"}}},
+                    {"ns": "t-bulk-new", "config": {"session": {"max_sessions": 3}}}
+                ])),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 400, "bulk with an external key is refused");
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        let (status, stored) = server
+            .send("GET", "/api/v5/mt/ns/t-bulk-ok/config", None, Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(stored, serde_json::json!({}), "refused bulk stores nothing");
+        let (status, _) = server
+            .send("GET", "/api/v5/mt/ns/t-bulk-new/config", None, Some(&admin))
+            .await;
+        assert_eq!(status, 404, "innocent bulk entries stay out too");
+        // The map import refuses the same keys, also on a dry run.
+        for dry_run in [false, true] {
+            let (status, body) = server
+                .send(
+                    "POST",
+                    "/api/v5/mt/bulk_import_ns_configs",
+                    Some(serde_json::json!({
+                        "configs": {
+                            "t-bulk-ok": {"webhook": {"url": "http://127.0.0.1:9"}},
+                            "t-bulk-map-new": {"session": {"max_sessions": 3}}
+                        },
+                        "dry_run": dry_run
+                    })),
+                    Some(&admin),
+                )
+                .await;
+            assert_eq!(status, 400, "map import with an external key is refused");
+            assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        }
+        let (status, _) = server
+            .send(
+                "GET",
+                "/api/v5/mt/ns/t-bulk-map-new/config",
+                None,
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 404, "refused map entries stay out");
+        server.task.abort();
+    }
+
+    /// A refused bulk import stores nothing, also across a restart.
+    /// The reloaded registry holds no refused key and the stored config
+    /// reads back unchanged through the production HTTP entry.
+    #[tokio::test]
+    async fn bulk_import_refusal_stores_nothing_across_restart() {
+        let dir = temp_config_dir("bulk-restart");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("registry loads"));
+        let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
+        let mut state = ApiState::standalone(engine);
+        state.namespaces = Arc::new(NamespaceStore::from_registry(&registry));
+        let (server, live) = TestServer::start_with_state(state).await;
+        let admin = admin_token(&live.inner);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/ns/t-keep",
+                Some(serde_json::json!({})),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 204);
+        // Both bulk paths refuse the external keys.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/bulk_import_configs",
+                Some(serde_json::json!([
+                    {"ns": "t-keep", "config": {"ldap": {"url": "http://127.0.0.1:9"}}}
+                ])),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 400);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/bulk_import_ns_configs",
+                Some(serde_json::json!({
+                    "configs": {"t-keep": {"jwks": {"url": "http://127.0.0.1:9"}}},
+                    "dry_run": false
+                })),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 400);
+        // The stored config is unchanged before the restart.
+        let (status, stored) = server
+            .send("GET", "/api/v5/mt/ns/t-keep/config", None, Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(stored, serde_json::json!({}));
+        // Restart on the same data dir: the refused keys stay out.
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("registry reloads"));
+        let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
+        let mut state = ApiState::standalone(engine);
+        state.namespaces = Arc::new(NamespaceStore::from_registry(&reloaded));
+        let (server, live) = TestServer::start_with_state(state).await;
+        let admin = admin_token(&live.inner);
+        let (status, stored) = server
+            .send("GET", "/api/v5/mt/ns/t-keep/config", None, Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            stored,
+            serde_json::json!({}),
+            "refused keys stay out after a restart"
+        );
+        server.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

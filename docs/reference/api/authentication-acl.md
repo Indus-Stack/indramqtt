@@ -32,6 +32,10 @@ List ordered ACL rules
 
 Operation id: `listAcls`.
 
+`GET /api/v1/auth/acls` lists the ordered ACL rules of a tenant.
+
+The rules keep evaluation order. The first match wins. An absent `tenant` reads the default tenant. A tenant with no rules returns an empty list.
+
 Parameters:
 
 | Name | In | Required | Type | Description |
@@ -83,9 +87,21 @@ Media type `application/json`:
 
 Notes:
 
-- Related calls sit on the same tag page.
+- The rules keep evaluation order. The first match wins.
 
-Not verified: see `../_verification/failures.md`.
+- An absent tenant reads the default tenant.
+
+Verified: the runner ran this call through the management API. See `../../_verified/api/listAcls.json`.
+
+Verified example:
+
+Request: `GET /api/v1/auth/acls after the flow creates two ordered rules`.
+
+Captured output:
+
+```output
+listed
+```
 
 Example:
 
@@ -101,6 +117,10 @@ curl -s -X GET 'http://127.0.0.1:18083/api/v1/auth/acls' \
 Add new ACL rule
 
 Operation id: `createAcl`.
+
+`POST /api/v1/auth/acls` appends one ordered ACL rule to a tenant.
+
+A tenant holds at most 10000 rules. An empty client pattern fails with 400. The action must be `publish`, `subscribe` or `all`. The topic pattern must be a valid MQTT filter. A successful write returns 201 with the stored client pattern, topic pattern and allow value. The write persists and clears cached authorization decisions.
 
 Parameters:
 
@@ -133,13 +153,27 @@ Responses:
 
 Notes:
 
-- Send `client_pattern`, `action`, `topic_pattern`, `allow`. An empty required string fails with 400.
+- Send `client_pattern`, `action`, `topic_pattern` and `allow`.
 
-- Success answers 201 with the stored row.
+- An empty client pattern fails with 400. The action must be `publish`, `subscribe` or `all`.
 
-- Related calls sit on the same tag page.
+- The topic pattern must be a valid MQTT filter.
 
-Not verified: see `../_verification/failures.md`.
+- A tenant holds at most 10000 rules.
+
+- The write persists and clears cached authorization decisions.
+
+Verified: the runner ran this call through the management API. See `../../_verified/api/createAcl.json`.
+
+Verified example:
+
+Request: `POST /api/v1/auth/acls with client_pattern doc-acl-create, action publish, topic_pattern sensors/#, allow true`.
+
+Captured output:
+
+```output
+created
+```
 
 Example:
 
@@ -163,6 +197,10 @@ Delete one ACL rule by index
 
 Operation id: `deleteAcl`.
 
+`DELETE /api/v1/auth/acls/{id}` removes one ACL rule at an index in a tenant.
+
+`id` is the zero-based index in the tenant rule list. A successful delete returns 204 with no body. An index past the end returns 404. The delete persists and clears cached authorization decisions.
+
 Parameters:
 
 | Name | In | Required | Type | Description |
@@ -185,13 +223,25 @@ Responses:
 
 Notes:
 
+- `id` is the zero-based index in the tenant rule list.
+
 - Success answers 204 with no body.
 
-- An unknown id fails with 404.
+- An index past the end fails with 404.
 
-- Related calls sit on the same tag page.
+- The write persists and clears cached authorization decisions.
 
-Not verified: see `../_verification/failures.md`.
+Verified: the runner ran this call through the management API. See `../../_verified/api/deleteAcl.json`.
+
+Verified example:
+
+Request: `DELETE /api/v1/auth/acls/{id} for the index of the new doc-acl-delete rule`.
+
+Captured output:
+
+```output
+deleted
+```
 
 Example:
 
@@ -207,6 +257,10 @@ curl -s -X DELETE 'http://127.0.0.1:18083/api/v1/auth/acls/1' \
 List all configured users and quotas
 
 Operation id: `listUsers`.
+
+`GET /api/v1/auth/users` lists the users and quota objects of a tenant.
+
+The names are sorted. A password never appears in the answer. An absent `tenant` reads the default tenant.
 
 Parameters:
 
@@ -259,9 +313,21 @@ Media type `application/json`:
 
 Notes:
 
-- Related calls sit on the same tag page.
+- Names are sorted. A password never appears in the answer.
 
-Verified: the example flow below runs this call.
+- An absent tenant reads the default tenant.
+
+Verified: the runner ran this call through the management API. See `../../_verified/api/listUsers.json`.
+
+Verified example:
+
+Request: `GET /api/v1/auth/users after the flow creates two users`.
+
+Captured output:
+
+```output
+listed
+```
 
 Example:
 
@@ -277,6 +343,10 @@ curl -s -X GET 'http://127.0.0.1:18083/api/v1/auth/users' \
 Create or update user credentials and quotas
 
 Operation id: `createUser`.
+
+`POST /api/v1/auth/users` stores one username and password in a tenant.
+
+An empty username or password fails with 400. A create for an existing username replaces the stored credential. The password is write-only and never appears in a read. A password longer than 8192 bytes is refused. A successful write returns 201 with the username and quota object. The write persists and clears cached authorization decisions.
 
 Parameters:
 
@@ -308,13 +378,27 @@ Responses:
 
 Notes:
 
-- Send `username`, `password`. An empty required string fails with 400.
+- Send `username` and `password`. An empty value fails with 400.
 
-- Success answers 201 with the stored row.
+- Success answers 201 with the stored row. The password is write-only.
 
-- Related calls sit on the same tag page.
+- A create for an existing username replaces the stored credential.
 
-Verified: the example flow below runs this call.
+- A password longer than 8192 bytes is refused.
+
+- The write persists and clears cached authorization decisions.
+
+Verified: the runner ran this call through the management API. See `../../_verified/api/createUser.json`.
+
+Verified example:
+
+Request: `POST /api/v1/auth/users with username doc-user-create, a password and quota values`.
+
+Captured output:
+
+```output
+created
+```
 
 Example:
 
@@ -336,6 +420,10 @@ curl -s -X POST 'http://127.0.0.1:18083/api/v1/auth/users' \
 Delete one user
 
 Operation id: `deleteUser`.
+
+`DELETE /api/v1/auth/users/{username}` removes one user from a tenant.
+
+A successful delete returns 204 with no body. An unknown username returns 404. The delete persists.
 
 Parameters:
 
@@ -361,11 +449,19 @@ Notes:
 
 - Success answers 204 with no body.
 
-- An unknown id fails with 404.
+- An unknown username fails with 404.
 
-- Related calls sit on the same tag page.
+Verified: the runner ran this call through the management API. See `../../_verified/api/deleteUser.json`.
 
-Verified: the example flow below runs this call.
+Verified example:
+
+Request: `DELETE /api/v1/auth/users/doc-user-delete for a user that the flow creates`.
+
+Captured output:
+
+```output
+deleted
+```
 
 Example:
 
@@ -381,6 +477,10 @@ curl -s -X DELETE 'http://127.0.0.1:18083/api/v1/auth/users/doc-user-1' \
 Show password verification counters
 
 Operation id: `getVerifyStats`.
+
+`GET /api/v1/auth/verify_stats` reads the password verification counters of the process.
+
+`verifications` counts blocking password hashes. `dedup_joins` counts CONNECTs that shared one leader check. The counters live in memory and restart at zero.
 
 Parameters:
 
@@ -417,9 +517,21 @@ Media type `application/json`:
 
 Notes:
 
-- Related calls sit on the same tag page.
+- The counters live in memory and restart at zero.
 
-Not verified: see `../_verification/failures.md`.
+- `verifications` counts blocking password hashes. `dedup_joins` counts CONNECTs that shared one leader check.
+
+Verified: the runner ran this call through the management API. See `../../_verified/api/getVerifyStats.json`.
+
+Verified example:
+
+Request: `GET /api/v1/auth/verify_stats after the flow creates a user and connects it`.
+
+Captured output:
+
+```output
+counted
+```
 
 Example:
 

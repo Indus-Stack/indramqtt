@@ -1,0 +1,1 @@
+`jwks.issuer` names the expected JWT issuer. Empty skips the issuer check. The broker checks the claim after signature verification. Verification needs a cached key from the live endpoint. Without a live endpoint no token verifies.

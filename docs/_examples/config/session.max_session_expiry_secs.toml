@@ -1,0 +1,21 @@
+[example]
+area = "config"
+item = "session.max_session_expiry_secs"
+kind = "setting"
+expect = "expiry_interval=60"
+expected = "A v5 client that asks for 3600 seconds gets the configured cap of 60 seconds."
+source = "`crates/broker-node/src/main.rs` applies the cap, and `crates/broker-api/src/v5/clients.rs` reports the stored value."
+action = "Connect a v5 client with session expiry 3600 and read `GET /api/v5/clients/<id>`."
+config = '''
+[session]
+max_session_expiry_secs = 60
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("expiry-client", v5=True, expiry=3600)
+status, client = http("GET", "/api/v5/clients/expiry-client")
+assert status == 200, (status, client)
+assert client.get("expiry_interval") == 60, client.get("expiry_interval")
+disconnect(sock)
+print("expiry_interval=60")
+'''

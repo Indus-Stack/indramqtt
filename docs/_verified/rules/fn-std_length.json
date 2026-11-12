@@ -1,0 +1,86 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": 3
+      },
+      "sql": "SELECT std_length(nums) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": 5
+      },
+      "sql": "SELECT std_length('hello') AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT std_length(5) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-std_length",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

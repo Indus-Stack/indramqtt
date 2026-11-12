@@ -1,0 +1,27 @@
+[example]
+area = "connectors"
+item = "s3"
+kind = "connector-create"
+
+[[case]]
+name = "s3-normal"
+endpoint = "http://127.0.0.1:9000"
+bucket = "telemetry-cold-store"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+key_template = "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson"
+compression = "gzip"
+batch_size = 100
+batch_bytes = 65536
+batch_timeout_ms = 1000
+timeout_ms = 5000
+expect_status = 201
+expect_type = "s3"
+
+[[case]]
+name = "s3-edge-bad-bucket"
+endpoint = "http://127.0.0.1:9000"
+bucket = "UPPER"
+key_template = "telemetry/${topic}_${seq}.ndjson"
+expect_status = 400

@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "clientid": "sensor-1"
+      },
+      "projected": {
+        "clientid": "sensor-1"
+      },
+      "sql": "SELECT clientid FROM \"$events/client_connected\"",
+      "topic": "$events/client_connected"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "clientid": "sensor-1"
+      },
+      "projected": null,
+      "sql": "SELECT clientid FROM \"$events/client_connected\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-client_connected",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

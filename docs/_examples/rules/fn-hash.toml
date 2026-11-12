@@ -1,0 +1,39 @@
+[example]
+area = "rules"
+item = "fn-hash"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT hash('sha256', 'ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603"}'
+
+[[case]]
+sql = "SELECT hash('md5', 'ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "187ef4436122d1cc2f40dc2b92f0eba0"}'
+
+[[case]]
+sql = "SELECT hash(' Sha256 ', 'ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603"}'
+
+[[case]]
+sql = "SELECT hash('nope', 'ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT hash('sha256') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

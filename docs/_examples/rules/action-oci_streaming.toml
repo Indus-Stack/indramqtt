@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-oci_streaming"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-oci_streaming"
+type = "oci_streaming"
+expect_status = 201
+expect_type = "oci_streaming"
+
+[[case]]
+name = "dx2-action-oci_streaming"
+type = "oci_streaming"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

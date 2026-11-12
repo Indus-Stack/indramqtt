@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "opc_ua"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-opc_ua",
+        "name": "dx2-action-opc_ua",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "opc_ua"
+      },
+      "name": "dx2-action-opc_ua",
+      "status": 201,
+      "type": "opc_ua"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-opc_ua\" already exists"
+      },
+      "name": "dx2-action-opc_ua",
+      "status": 400,
+      "type": "opc_ua"
+    }
+  ],
+  "item": "action-opc_ua",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

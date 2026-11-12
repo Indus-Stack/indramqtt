@@ -1,0 +1,23 @@
+[example]
+area = "config"
+item = "node.data_dir"
+kind = "setting"
+expect = "docs-data"
+expected = "The node reports the configured state directory and the broker creates it."
+source = "`crates/broker-node/src/main.rs` loads the registry and the offline store from the configured directory at boot."
+action = "Read the node list with `GET /api/v5/nodes` and check the directory."
+config = '''
+[node]
+data_dir = "docs-data"
+'''
+script = '''
+from config_probe import *
+from pathlib import Path
+status, nodes = http("GET", "/api/v5/nodes")
+assert status == 200, (status, nodes)
+path = Path(nodes[0]["sys_path"])
+assert path.name == "docs-data", path
+assert path.is_dir(), path
+assert (path / "cluster_identity.json").is_file(), path
+print(path.name)
+'''

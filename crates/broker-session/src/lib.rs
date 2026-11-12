@@ -1483,6 +1483,91 @@ impl Session {
         self.authz_cache.write().clear();
     }
 
+    /// Look up a cached authorization verdict on the authorize path.
+    /// Returns the cached `allow` for a fresh entry. The key is
+    /// `(action, topic, qos, retain)`. `now_ms` stays within `ttl_ms`
+    /// of its write time. An expired match is removed and reads as a
+    /// miss; other expired entries stay until a later lookup, trim or
+    /// clear (the read filters them, the cap bounds them).
+    /// A hit takes only a read lock; only an expired entry takes a
+    /// write lock to remove it. The publish path thus pays no write
+    /// lock on a hit (SA-22 item 7).
+    pub fn cached_authz_verdict(
+        &self,
+        action: &str,
+        topic: &str,
+        qos: u8,
+        retain: bool,
+        ttl_ms: u64,
+    ) -> Option<bool> {
+        let now = now_ms();
+        // Fast path: read lock covers the hit. A fresh entry returns
+        // without ever taking the write lock.
+        {
+            let cache = self.authz_cache.read();
+            let entry = cache.iter().find(|entry| {
+                entry.action == action
+                    && entry.topic == topic
+                    && entry.qos == qos
+                    && entry.retain == retain
+            })?;
+            if now.saturating_sub(entry.updated_ms) <= ttl_ms {
+                return Some(entry.allow);
+            }
+        }
+        // Slow path: the entry exists but is stale. Take the write
+        // lock once to remove it, then report a miss.
+        let mut cache = self.authz_cache.write();
+        if let Some(pos) = cache.iter().position(|entry| {
+            entry.action == action
+                && entry.topic == topic
+                && entry.qos == qos
+                && entry.retain == retain
+        }) {
+            if now.saturating_sub(cache[pos].updated_ms) <= ttl_ms {
+                return Some(cache[pos].allow);
+            }
+            cache.remove(pos);
+        }
+        None
+    }
+
+    /// Trim the per-client decision cache to `max_size` entries.
+    /// Evicts the oldest entries first. One short per-session write
+    /// lock on the authorize event only. The floor is one entry.
+    pub fn trim_authz_cache_to(&self, max_size: usize) {
+        let cap = max_size.max(1);
+        let mut cache = self.authz_cache.write();
+        while cache.len() > cap {
+            cache.pop_front();
+        }
+    }
+
+    /// True when `topic` matches one entry of the `excludes` list.
+    /// Exact match wins; a pattern that ends with `/#` matches the
+    /// prefix; `#` alone matches every topic. Used to skip caching.
+    /// No allocation on the authorize path.
+    pub fn authz_topic_excluded(topic: &str, excludes: &[String]) -> bool {
+        for pattern in excludes {
+            if pattern == "#" {
+                return true;
+            }
+            if pattern == topic {
+                return true;
+            }
+            if let Some(prefix) = pattern.strip_suffix("/#") {
+                if topic == prefix
+                    || (topic.len() > prefix.len()
+                        && topic.starts_with(prefix)
+                        && topic.as_bytes()[prefix.len()] == b'/')
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Buffer one message for later replay, evicting the oldest entry
     /// past [`MAX_OFFLINE_QUEUE`]. Returns whether the entry was queued
     /// (false only when durable persist failed; see

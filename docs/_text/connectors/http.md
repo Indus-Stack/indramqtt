@@ -1,0 +1,1 @@
+`http` posts each result row to a URL as a webhook. It is the inventory name for the `webhook` sink. The v1 route accepts `http` and stores the runtime as `webhook`. The v5 route keeps the name `http`. Both routes use the settings of the webhook sink. The tier is community.

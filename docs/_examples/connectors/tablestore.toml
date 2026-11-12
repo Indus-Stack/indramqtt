@@ -1,0 +1,30 @@
+[example]
+area = "connectors"
+item = "tablestore"
+kind = "connector-create"
+
+[[case]]
+name = "tablestore-normal"
+endpoint = "http://127.0.0.1:4242"
+instance_name = "docs-instance"
+table_name = "telemetry"
+access_key_id = "AKID"
+access_key_secret = "secret"
+primary_keys = [{ name = "device_id", source = "${client_id}", data_type = "string" }]
+attribute_columns = [{ name = "temperature", source = "${payload.temperature}", data_type = "double" }]
+batch_size = 1
+buffer_capacity = 100
+linger_ms = 10
+timeout_ms = 5000
+expect_status = 201
+expect_type = "tablestore"
+
+[[case]]
+name = "tablestore-edge-empty-table"
+endpoint = "http://127.0.0.1:4242"
+instance_name = "docs-instance"
+table_name = ""
+access_key_id = "AKID"
+access_key_secret = "secret"
+primary_keys = [{ name = "device_id", source = "${client_id}", data_type = "string" }]
+expect_status = 400

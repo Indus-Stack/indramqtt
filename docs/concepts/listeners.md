@@ -122,6 +122,8 @@ hello-listeners
 - `listeners.tcp.max_connections` caps concurrent TCP clients. Default is 1000000. One million connections fits a large single-node deployment.
 - `listeners.tcp.backlog` caps pending accepts. Default is 1024. 1024 pending accepts absorb connection bursts.
 - `session.max_packet_size` caps each packet in bytes. Default is 1048576. 1 MiB matches the server limit.
+- An empty client id needs clean start. Without it the broker refuses the CONNECT (3.1.1 code 2, v5 code 0x85).
+- A protocol error after CONNECT ends only that connection. A v5 client gets DISCONNECT 0x82 first.
 - A secure listener without certificate files refuses startup. It logs the missing setting.
 
 ## Next steps

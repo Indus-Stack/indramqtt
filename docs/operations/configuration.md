@@ -88,6 +88,10 @@ lists split on commas. A wrong-typed value stops startup. The error
 names the variable. An unknown `INDRA_*` variable stops startup. A typo
 never boots an unwanted broker.
 
+An explicit non-default `licence.license_file` is refused at load. The
+broker keeps the stored licence and never reads this path. The error
+names the file and the key. The default path keeps booting.
+
 Two names from the shipped container files keep working as aliases:
 `INDRA_LICENSE_KEY` sets `licence.license_key` and `INDRA_API_BIND`
 sets `listeners.api.bind`. The canonical `INDRA_LICENCE__LICENSE_KEY`
@@ -122,6 +126,11 @@ A listener bind must be an IP address and a port. The broker applies
 `listeners.tcp.max_connections` and `listeners.tcp.backlog` at each
 bind. Each kernel WebSocket listener uses the limit of the plaintext
 listener.
+
+`listeners.api.enabled = false` opens no API socket. MQTT still
+serves from the same file. No flag sets `enabled`: a file or variable
+with `enabled = false` wins over a bind value. The kernel then answers
+no HTTP, including `/healthz`.
 
 ## MQTT listeners
 

@@ -119,6 +119,12 @@ curl -sf http://127.0.0.1:18083/api/v5/authentication -H "Authorization: Bearer 
 
 - With zero users the broker is open. The first user closes anonymous access.
 - `auth.enabled` defaults to true. `auth.allow_anonymous` defaults to false.
+- A known local name with a wrong password denies at once. The denial stops the chain. It never falls through to a later backend.
+- An unknown local name ignores to the next enabled backend.
+- A stored non-empty chain decides in its own order. Disabled entries never run.
+- A chain change or a user change evicts the node authentication cache. The next CONNECT checks the new credential.
+- A non-default tenant cannot use a global external backend. The broker denies the CONNECT and logs it.
+- A namespace config with an external backend key is refused with 400. The refused write stores nothing.
 - Usernames hold at most 256 bytes. Passwords hold at most 8192 bytes. Longer values fail closed.
 - The broker holds at most 100000 users. One import batch holds at most 10000 entries. Large fleets import in repeated batches.
 - An unreachable back end denies access. It never grants it.

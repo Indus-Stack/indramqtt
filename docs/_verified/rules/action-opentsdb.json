@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "opentsdb"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-opentsdb",
+        "name": "dx2-action-opentsdb",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "opentsdb"
+      },
+      "name": "dx2-action-opentsdb",
+      "status": 201,
+      "type": "opentsdb"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-opentsdb\" already exists"
+      },
+      "name": "dx2-action-opentsdb",
+      "status": 400,
+      "type": "opentsdb"
+    }
+  ],
+  "item": "action-opentsdb",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,32 @@
+[example]
+area = "rules"
+item = "fn-sha"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT sha('ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "da23614e02469a0d7c7bd1bdab5c9c474b1904dc"}'
+
+[[case]]
+sql = "SELECT sha('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}'
+
+[[case]]
+sql = "SELECT sha(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT sha() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

@@ -6,11 +6,11 @@ use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use rekuiper_core::{RuleCounters, StreamBus, StreamReceiver, StreamSender};
-use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
+use rekuiper_sql::{Evaluator, Expr, SelectStmt, TimeUnit, WindowDef};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -238,6 +238,28 @@ pub enum BackpressurePolicy {
     RejectPublisher,
 }
 
+// Map a policy to a small number for lock-free storage.
+fn backpressure_policy_to_u8(policy: BackpressurePolicy) -> u8 {
+    match policy {
+        BackpressurePolicy::Block => 0,
+        BackpressurePolicy::DropNewest => 1,
+        BackpressurePolicy::DropOldest => 2,
+        BackpressurePolicy::SpillToDisk => 3,
+        BackpressurePolicy::RejectPublisher => 4,
+    }
+}
+
+// Map a stored number back to a policy. Unknown values read as DropOldest.
+fn backpressure_policy_from_u8(value: u8) -> BackpressurePolicy {
+    match value {
+        0 => BackpressurePolicy::Block,
+        1 => BackpressurePolicy::DropNewest,
+        3 => BackpressurePolicy::SpillToDisk,
+        4 => BackpressurePolicy::RejectPublisher,
+        _ => BackpressurePolicy::DropOldest,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushOutcome {
     Enqueued,
@@ -354,10 +376,12 @@ pub fn apply_transform_steps(
                     Ok(next) => cur_topic = next,
                     Err(_) => {
                         // Fail closed: an invalid rewritten topic never
-                        // fans out. `ignore` keeps the previous topic
-                        // and continues; `drop` and `disconnect` shed
-                        // the message.
-                        // TODO(parity): Does disconnect close the connection or shed only the message?
+                        // fans out. `ignore` keeps the previous topic and
+                        // continues; `drop` and `disconnect` shed the
+                        // message. A transform step sheds the message; it
+                        // cannot close the connection itself - the session
+                        // closes a connection on its own bind path, never
+                        // from a transform step.
                         if step.failure_action == "ignore" {
                             continue;
                         }
@@ -417,9 +441,12 @@ pub fn apply_transform_steps_with_metrics(
                     Ok(next) => cur_topic = next,
                     Err(_) => {
                         // Fail closed: an invalid rewritten topic never
-                        // fans out. `ignore` keeps the previous topic
-                        // and continues; `drop` and `disconnect` shed
-                        // the message.
+                        // fans out. `ignore` keeps the previous topic and
+                        // continues; `drop` and `disconnect` shed the
+                        // message. A transform step sheds the message; it
+                        // cannot close the connection itself - the session
+                        // closes a connection on its own bind path, never
+                        // from a transform step.
                         if step.failure_action == "ignore" {
                             continue;
                         }
@@ -646,7 +673,9 @@ pub trait BrokerSink: Send + Sync {
 pub struct BoundedEventInput {
     tx: mpsc::Sender<StreamEvent>,
     rx: Mutex<mpsc::Receiver<StreamEvent>>,
-    policy: BackpressurePolicy,
+    // Live backpressure policy. Reason: boot applies the file value
+    // without a restart. One relaxed load per push, no lock.
+    policy: AtomicU8,
     /// Disk behind `SpillToDisk`, if one was configured. `None` for the
     /// other four policies and for directory-less `SpillToDisk` inputs.
     /// Held across the check-send-spill sequence so concurrent pushes
@@ -686,7 +715,7 @@ impl BoundedEventInput {
         Arc::new(Self {
             tx,
             rx: Mutex::new(rx),
-            policy,
+            policy: AtomicU8::new(backpressure_policy_to_u8(policy)),
             spill: parking_lot::Mutex::new(None),
             spill_enabled: AtomicU64::new(0),
             spill_backlog: AtomicU64::new(0),
@@ -718,6 +747,18 @@ impl BoundedEventInput {
         input.spill_enabled.store(1, Ordering::Relaxed);
         *input.spill.lock() = Some(log);
         Ok(input)
+    }
+
+    /// Live backpressure policy. One relaxed load, no lock.
+    pub fn policy(&self) -> BackpressurePolicy {
+        backpressure_policy_from_u8(self.policy.load(Ordering::Relaxed))
+    }
+
+    /// Apply the file backpressure policy. Boot and management only.
+    /// One relaxed store, no lock on the publish path.
+    pub fn set_policy(&self, policy: BackpressurePolicy) {
+        self.policy
+            .store(backpressure_policy_to_u8(policy), Ordering::Relaxed);
     }
 
     /// Attach the node metrics mirror for the spill counters. The first
@@ -820,7 +861,7 @@ impl BoundedEventInput {
         // joins the disk (memory always predates it), so replay stays
         // memory-then-disk, oldest first. The backlog mirror is lock-free;
         // steady-state (`0`) skips the mutex entirely.
-        if self.policy == BackpressurePolicy::SpillToDisk
+        if self.policy() == BackpressurePolicy::SpillToDisk
             && self.spill_backlog.load(Ordering::Relaxed) != 0
         {
             return self.spill_or_refuse(event);
@@ -835,7 +876,7 @@ impl BoundedEventInput {
     }
 
     fn apply_full_policy(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
-        match self.policy {
+        match self.policy() {
             // Synchronous callers cannot block: use `push().await` for
             // true blocking behaviour under the Block policy.
             BackpressurePolicy::Block => Ok(PushOutcome::Dropped(OverflowReason::BufferFull)),
@@ -1007,7 +1048,7 @@ impl BoundedEventInput {
 #[async_trait]
 impl EventInput for BoundedEventInput {
     async fn push(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
-        match self.policy {
+        match self.policy() {
             BackpressurePolicy::Block => self
                 .tx
                 .send(event)
@@ -1022,11 +1063,11 @@ impl EventInput for BoundedEventInput {
 /// One native stream rule: match ingress by topic filter, run actions.
 ///
 /// Open-core licensing tier of a rule, derived from its SQL at creation:
-/// any `GROUP BY` window clause (`TUMBLINGWINDOW`, `HOPPINGWINDOW`,
-/// `SLIDINGWINDOW`, `COUNTWINDOW`) makes a rule Enterprise; everything
-/// else is Community. Tier labels stay for display but never select the
-/// execution path: every window rule runs on rekuiper's runtime
-/// (see [`runtime`]).
+/// Any window clause makes a rule Enterprise. Plain `GROUP BY` with
+/// no window also runs as a session window, so it is Enterprise.
+/// Everything else is Community. Tier labels stay for display but never
+/// select the execution path: every window rule runs on rekuiper's
+/// runtime (see [`runtime`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleTier {
@@ -1498,7 +1539,9 @@ pub struct RuleEngine {
     /// (the rule task closed mid-admission). Counted with a warning; bus
     /// backpressure awaits capacity instead of dropping on full.
     runtime_feed_dropped: AtomicU64,
-    window_channel_depth: usize,
+    // Live window task feed depth. Reason: boot applies the file value
+    // without a restart. One relaxed load at task spawn, never on publish.
+    window_channel_depth: AtomicUsize,
     forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
     /// Kernel config registry receiving every rule mutation (`None` in
     /// unit tests and standalone state, which stay memory-only).
@@ -1598,7 +1641,7 @@ struct RuleTask {
     feeder: tokio::task::JoinHandle<()>,
     sink_worker: tokio::task::JoinHandle<()>,
     /// Bounded rule-task feed (replacement for the retired worker channel):
-    /// depth is [`DEFAULT_WINDOW_CHANNEL_DEPTH`]. A full feed drops with a
+    /// depth is the live window depth. A full feed drops with a
     /// warning and a counter, never blocks publish.
     feed_tx: mpsc::Sender<TimedRecord>,
     counters: Arc<RuleCounters>,
@@ -1740,6 +1783,17 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
 /// [`RuleEngine::with_window_channel_depth`]. Same value as
 /// [`runtime::RULE_TASK_FEED_DEPTH`]: the rule-task feed bound.
 pub const DEFAULT_WINDOW_CHANNEL_DEPTH: usize = 65_536;
+
+/// Idle gap that closes an implicit plain-`GROUP BY` session (500ms).
+/// Reason: burst publishes arrive microseconds apart, so 500ms groups
+/// each burst into one session while keeping added latency well under
+/// the 10s management-test bound.
+pub const IMPLICIT_GROUP_SESSION_TIMEOUT_MS: u64 = 500;
+
+/// Longest one implicit plain-`GROUP BY` session runs (30s).
+/// Reason: caps the session buffer so a continuous stream flushes
+/// at least every 30s; the bounded feed drops surplus with a counter.
+pub const IMPLICIT_GROUP_SESSION_MAX_MS: u64 = 30_000;
 
 /// True for system-message topics (`$SYS` and `$SYS/...`), which the rule
 /// engine skips while `ignore_sys_message` holds (W3-10). Pure prefix test
@@ -1962,7 +2016,7 @@ impl RuleEngine {
             rule_tasks: RwLock::new(HashMap::new()),
             window_executor: RwLock::new(None),
             runtime_feed_dropped: AtomicU64::new(0),
-            window_channel_depth: window_channel_depth.max(1),
+            window_channel_depth: AtomicUsize::new(window_channel_depth.max(1)),
             forward_throttle,
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
@@ -2017,7 +2071,7 @@ impl RuleEngine {
             rule_tasks: RwLock::new(HashMap::new()),
             window_executor: RwLock::new(None),
             runtime_feed_dropped: AtomicU64::new(0),
-            window_channel_depth: window_channel_depth.max(1),
+            window_channel_depth: AtomicUsize::new(window_channel_depth.max(1)),
             forward_throttle,
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
@@ -2033,14 +2087,34 @@ impl RuleEngine {
 
     /// Override the rule-task feed channel depth after construction
     /// (floors at 1, no ceiling). Applies to tasks spawned from here on.
-    pub fn with_window_channel_depth(mut self, depth: usize) -> Self {
-        self.window_channel_depth = depth.max(1);
+    pub fn with_window_channel_depth(self, depth: usize) -> Self {
+        self.window_channel_depth
+            .store(depth.max(1), Ordering::Relaxed);
         self
     }
 
     /// Configured per-rule task feed channel depth.
     pub fn window_channel_depth(&self) -> usize {
+        self.window_channel_depth.load(Ordering::Relaxed)
+    }
+
+    /// Apply the file window depth. Boot and management only.
+    /// One relaxed store, no lock. Tasks spawned later use it.
+    pub fn set_window_channel_depth(&self, depth: usize) {
         self.window_channel_depth
+            .store(depth.max(1), Ordering::Relaxed);
+    }
+
+    /// Live backpressure policy of the ingress queue.
+    /// One relaxed load, no lock.
+    pub fn backpressure_policy(&self) -> BackpressurePolicy {
+        self.input.policy()
+    }
+
+    /// Apply the file backpressure policy. Boot and management only.
+    /// One relaxed store, no lock on the publish path.
+    pub fn set_backpressure_policy(&self, policy: BackpressurePolicy) {
+        self.input.set_policy(policy);
     }
 
     /// Bounded ingress queue for flood protection at outer boundaries.
@@ -3821,7 +3895,7 @@ impl RuleEngine {
             None => return,
         };
         let bus_rx = self.stream_bus.subscribe(runtime::RULE_INGRESS_STREAM);
-        let (feed_tx, feed_rx) = mpsc::channel(self.window_channel_depth);
+        let (feed_tx, feed_rx) = mpsc::channel(self.window_channel_depth.load(Ordering::Relaxed));
         let (sink_tx, sink_rx) = mpsc::channel(runtime::PER_RULE_SINK_QUEUE_DEPTH);
         let counters = Arc::new(RuleCounters::default());
         let status = Arc::new(RwLock::new("running".to_string()));
@@ -4085,6 +4159,7 @@ impl RuleEngine {
         // Snapshot matching rules so the sink (which may touch the router,
         // never this map) runs without holding the lock.
         // B4-07 live wiring (durability push after match, see below).
+        // The rule path ignores the `$` guard. The flag above gates `$SYS`.
         let matched: Vec<Arc<Rule>> = {
             let rules = self.rules.read();
             rules
@@ -5019,6 +5094,212 @@ fn group_key(
         .join("\x1f")
 }
 
+/// Give plain `GROUP BY` (no window clause) a session window so it
+/// aggregates per group instead of projecting each message alone.
+///
+/// A plain `GROUP BY k` with no window arrives here with `window: None`
+/// and runs per message, so `sum(v)` returns the single row value. The
+/// session groups each burst (gap `IMPLICIT_GROUP_SESSION_TIMEOUT_MS`,
+/// cap `IMPLICIT_GROUP_SESSION_MAX_MS`) into one batch; the flush
+/// partitions by key and evaluates aggregates per group. Skips `FOREACH`
+/// rules: their expansion path never enters the window feed.
+fn apply_implicit_group_window(stmt: &mut SelectStmt) {
+    if stmt.group_by.is_empty() || stmt.window.is_some() {
+        return;
+    }
+    stmt.window = Some(WindowDef::Session {
+        unit: TimeUnit::Ms,
+        max_duration: IMPLICIT_GROUP_SESSION_MAX_MS,
+        timeout: IMPLICIT_GROUP_SESSION_TIMEOUT_MS,
+    });
+}
+
+/// Function names the broker never serves (the deferred schema-registry
+/// family, out of the MVP). A static call fails rule creation with
+/// `InvalidRule` naming the function; the API answers 400.
+const REFUSED_SQL_FUNCTIONS: &[&str] = &["schema_encode", "schema_decode"];
+
+/// True when `expr` is a string literal; returns its text.
+fn literal_text(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(serde_json::Value::String(text)) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// Reject one call that the broker statically knows it cannot serve:
+/// a deferred function name, a D4 hash algorithm literal or a D4 named-zone
+/// literal. Dynamic (non-literal) arguments skip this check and fail closed
+/// at execution instead, where the run counts as failed.
+fn check_one_call(name: &str, args: &[Expr]) -> Result<(), String> {
+    let lower = name.to_ascii_lowercase();
+    if REFUSED_SQL_FUNCTIONS.contains(&lower.as_str()) {
+        return Err(format!("unsupported function {name:?} (field `sql_query`)"));
+    }
+    if lower == "hash" {
+        if let Some(algo) = args.first().and_then(literal_text) {
+            if stdlib::refused_hash_algorithm(algo) {
+                return Err(format!(
+                    "unsupported hash algorithm {algo:?} (field `sql_query`)"
+                ));
+            }
+        }
+    }
+    if lower == "timezone_to_second" || lower == "timezone_to_offset_seconds" {
+        if let Some(zone) = args.first().and_then(literal_text) {
+            if stdlib::is_named_zone(zone) {
+                return Err(format!(
+                    "unsupported time zone {zone:?} (field `sql_query`)"
+                ));
+            }
+        }
+    }
+    if lower == "date_to_unix_ts" && args.len() == 4 {
+        if let Some(zone) = args.get(1).and_then(literal_text) {
+            if stdlib::is_named_zone(zone) {
+                return Err(format!(
+                    "unsupported time zone {zone:?} (field `sql_query`)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk one expression and refuse every statically unsupported call inside
+/// it. Window definitions carry no calls and need no walk.
+fn check_expr_calls(expr: &Expr) -> Result<(), String> {
+    match expr {
+        Expr::Call { name, args } => {
+            check_one_call(name, args)?;
+            for arg in args {
+                check_expr_calls(arg)?;
+            }
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr_calls(left)?;
+            check_expr_calls(right)
+        }
+        Expr::UnaryOp { expr, .. } => check_expr_calls(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            check_expr_calls(expr)?;
+            check_expr_calls(low)?;
+            check_expr_calls(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            check_expr_calls(expr)?;
+            for item in list {
+                check_expr_calls(item)?;
+            }
+            Ok(())
+        }
+        Expr::IsNull { expr, .. } => check_expr_calls(expr),
+        Expr::FieldAccess { parent, .. } => check_expr_calls(parent),
+        Expr::Index { base, index } => {
+            check_expr_calls(base)?;
+            check_expr_calls(index)
+        }
+        Expr::Slice { base, lo, hi } => {
+            check_expr_calls(base)?;
+            if let Some(lo) = lo {
+                check_expr_calls(lo)?;
+            }
+            if let Some(hi) = hi {
+                check_expr_calls(hi)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                check_expr_calls(operand)?;
+            }
+            for (cond, result) in when_clauses {
+                check_expr_calls(cond)?;
+                check_expr_calls(result)?;
+            }
+            if let Some(other) = else_clause {
+                check_expr_calls(other)?;
+            }
+            Ok(())
+        }
+        Expr::Over {
+            call, partition_by, ..
+        } => {
+            check_expr_calls(call)?;
+            if let Some(partition_by) = partition_by {
+                check_expr_calls(partition_by)?;
+            }
+            Ok(())
+        }
+        Expr::Wildcard | Expr::WildcardModified { .. } | Expr::Identifier(_) | Expr::Literal(_) => {
+            Ok(())
+        }
+    }
+}
+
+/// Refuse every statically unsupported call in one parsed rule. The walk
+/// covers the SELECT list, WHERE, GROUP BY, HAVING, ORDER BY, JOIN ON,
+/// window filter, trigger, partition, UNION branches and FOREACH plan. A
+/// refusal names the function, algorithm or zone so the API can answer 400
+/// with it. Dynamic values are not literals and stay for execution, where
+/// they fail closed and count as a failed run.
+fn refuse_unsupported_sql_calls(
+    stmt: &SelectStmt,
+    foreach: Option<&ForeachPlan>,
+) -> Result<(), String> {
+    for field in &stmt.fields {
+        check_expr_calls(field)?;
+    }
+    if let Some(where_clause) = stmt.where_clause.as_ref() {
+        check_expr_calls(where_clause)?;
+    }
+    for item in &stmt.group_by {
+        check_expr_calls(item)?;
+    }
+    if let Some(having) = stmt.having.as_ref() {
+        check_expr_calls(having)?;
+    }
+    for item in &stmt.order_by {
+        check_expr_calls(&item.expr)?;
+    }
+    for join in &stmt.joins {
+        if let Some(on) = join.on.as_ref() {
+            check_expr_calls(on)?;
+        }
+    }
+    if let Some(filter) = stmt.window_filter.as_ref() {
+        check_expr_calls(filter)?;
+    }
+    if let Some(trigger) = stmt.window_trigger_condition.as_ref() {
+        check_expr_calls(trigger)?;
+    }
+    if let Some(partition) = stmt.window_partition_by.as_ref() {
+        check_expr_calls(partition)?;
+    }
+    if let Some((_, next)) = stmt.set_op.as_ref() {
+        refuse_unsupported_sql_calls(next, None)?;
+    }
+    if let Some(plan) = foreach {
+        check_expr_calls(&plan.array)?;
+        if let Some(fields) = plan.fields.as_ref() {
+            for (expr, _) in fields {
+                check_expr_calls(expr)?;
+            }
+        }
+        if let Some(incase) = plan.incase.as_ref() {
+            check_expr_calls(incase)?;
+        }
+    }
+    Ok(())
+}
+
 /// Parse one rule SQL string through the standard front end first, with a
 /// fallback to the streaming parser for rekuiper-only syntax beyond the
 /// standard window extension.
@@ -5038,17 +5319,28 @@ fn group_key(
 fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
     let rewritten = rewrite_colliding_functions(sql);
     match std_sql::parse_std_rule(&rewritten) {
-        Ok(std_rule) => Ok((
-            std_rule.stmt.clone(),
-            std_rule.foreach.clone(),
-            std_rule.sources.clone(),
-            std_rule.has_wildcard,
-            std_rule.explicit_keys.clone(),
-        )),
+        Ok(std_rule) => {
+            let mut stmt = std_rule.stmt.clone();
+            if std_rule.foreach.is_none() {
+                apply_implicit_group_window(&mut stmt);
+            }
+            refuse_unsupported_sql_calls(&stmt, std_rule.foreach.as_ref())
+                .map_err(RuleEngineError::InvalidRule)?;
+            Ok((
+                stmt,
+                std_rule.foreach.clone(),
+                std_rule.sources.clone(),
+                std_rule.has_wildcard,
+                std_rule.explicit_keys.clone(),
+            ))
+        }
         Err(std_err) => {
             let normalized = normalize_from_target(&rewritten);
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
-                Ok(stmt) => {
+                Ok(mut stmt) => {
+                    apply_implicit_group_window(&mut stmt);
+                    refuse_unsupported_sql_calls(&stmt, None)
+                        .map_err(RuleEngineError::InvalidRule)?;
                     let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
                     Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
                 }
@@ -5137,7 +5429,7 @@ fn compile_std_topic_filters(sources: &[StdSource]) -> Vec<Option<TopicFilter>> 
 /// own event topic, so MQTT ingress does not run it. The source check
 /// uses the filters compiled at creation, so it adds no parse.
 fn rule_matches_ingress(rule: &Rule, topic: &Topic) -> bool {
-    rule.topic_filter.matches(topic)
+    rule.topic_filter.matches_for_rule_engine(topic)
         && std_sources_match(&rule.std_sources, &rule.std_topic_filters, topic)
 }
 
@@ -5790,17 +6082,26 @@ pub fn try_evaluate(
 fn parse_rule_sql_for_tester(sql: &str) -> Result<ParsedStdRule, String> {
     let rewritten = rewrite_colliding_functions(sql);
     match std_sql::parse_std_rule(&rewritten) {
-        Ok(std_rule) => Ok((
-            std_rule.stmt.clone(),
-            std_rule.foreach.clone(),
-            std_rule.sources.clone(),
-            std_rule.has_wildcard,
-            std_rule.explicit_keys.clone(),
-        )),
+        Ok(std_rule) => {
+            let mut stmt = std_rule.stmt.clone();
+            if std_rule.foreach.is_none() {
+                apply_implicit_group_window(&mut stmt);
+            }
+            refuse_unsupported_sql_calls(&stmt, std_rule.foreach.as_ref())?;
+            Ok((
+                stmt,
+                std_rule.foreach.clone(),
+                std_rule.sources.clone(),
+                std_rule.has_wildcard,
+                std_rule.explicit_keys.clone(),
+            ))
+        }
         Err(std_err) => {
             let normalized = normalize_from_target(&rewritten);
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
-                Ok(stmt) => {
+                Ok(mut stmt) => {
+                    apply_implicit_group_window(&mut stmt);
+                    refuse_unsupported_sql_calls(&stmt, None)?;
                     let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
                     Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
                 }
@@ -5963,7 +6264,9 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
         None => return vec![payload.clone()],
     };
     if let Some(plan) = rule.std_foreach.as_ref() {
-        // TODO(parity): Does FOREACH WHERE evaluate per element with item bound?
+        // FOREACH WHERE evaluates per element with `item` bound
+        // (expand_foreach_rows applies `stmt.where_clause` to the
+        // extended record carrying `item`).
         let (base, _, _) = build_std_record(topic, payload, qos);
         let rows = expand_foreach_rows(stmt, plan, &base);
         let mut out = Vec::with_capacity(rows.len());
@@ -7518,17 +7821,18 @@ mod tests {
                 .expect("rule creates")
                 .tier
         };
-        // No SQL, plain SELECT, and GROUP BY without a window: Community.
+        // No SQL and plain SELECT: Community.
         assert_eq!(mk(None), RuleTier::Community);
         assert_eq!(
             mk(Some(r#"SELECT temperature FROM "sensors/+""#)),
             RuleTier::Community
         );
+        // Plain GROUP BY runs as an implicit session window: Enterprise.
         assert_eq!(
             mk(Some(
                 r#"SELECT sensor_id, avg(temperature) AS a FROM "sensors/+" GROUP BY sensor_id"#
             )),
-            RuleTier::Community
+            RuleTier::Enterprise
         );
         // Any window clause makes the rule Enterprise — even disabled.
         assert_eq!(
@@ -8898,8 +9202,13 @@ mod tests {
     /// ingress forwards (no SQL projection, bytes verbatim) into the
     /// OPC-UA memory transport as a typed node write. All transports
     /// are in-memory; the RSA key is a fixed test key (never deployed).
-    /// X1-09: needs the `aws_iot`, `azure_iot` and `gcp_iot` features.
-    #[cfg(all(feature = "aws_iot", feature = "azure_iot", feature = "gcp_iot"))]
+    /// X1-09: needs the `aws_iot`, `azure_iot`, `gcp_iot` and `opc_ua` features.
+    #[cfg(all(
+        feature = "aws_iot",
+        feature = "azure_iot",
+        feature = "gcp_iot",
+        feature = "opc_ua"
+    ))]
     #[tokio::test]
     async fn test_into_fans_out_to_iot_industrial_sinks() {
         use broker_connectors_enterprise::{
@@ -10472,6 +10781,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     message_group_template: None,
                     access_key: None,
                     secret_key: None,
+                    security_token: None,
                     batch_size: Some(1),
                     buffer_capacity: None,
                     linger_ms: Some(10),
