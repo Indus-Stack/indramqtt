@@ -351,6 +351,8 @@ matched=2 success=2 reset=0
 - A `forwardconnector` action names a connector id that must exist. A missing id drops the row and logs the miss.
 - Console output truncates at 1024 characters per line.
 - A republish template holds at most 65536 bytes per field.
+- The broker holds at most 1024 actions. A create past the cap answers 400. A stored list above the cap still boots. It keeps all rows, raises `action_limit_exceeded`, and refuses new rows.
+- A delete of a linked action answers 400 with the `rules` array. Each summary row carries `name`, `type`, `enable`, `status`, `node_status`, and `rules`.
 
 ## Next steps
 

@@ -2459,18 +2459,42 @@ impl ActionsConf {
         self.validate_with(false, true)
     }
 
+    /// True when the stored list is above the cap. Boot keeps the
+    /// rows and refuses new writes. Reason: the cap bounds list
+    /// clones per request, but a stored list must stay readable.
+    #[must_use]
+    pub fn is_over_limit(&self) -> bool {
+        self.actions.len() > MAX_ACTIONS
+    }
+
+    /// Boot validation of stored actions. It checks each row but
+    /// skips the length cap. Reason: a stored list above the cap
+    /// must still boot (keep all rows, alarm, refuse new writes).
+    /// New files and new writes use [`Self::validate_stored`].
+    pub fn validate_stored_for_boot(&self) -> Result<(), ConfigError> {
+        self.validate_entries(true, true)
+    }
+
     pub(crate) fn validate_with(
         &self,
         allow_removed: bool,
         allow_refused: bool,
     ) -> Result<(), ConfigError> {
-        if self.actions.len() > MAX_ACTIONS {
+        if self.is_over_limit() {
             return Err(ConfigError::Invalid(format!(
                 "actions.actions holds {} entries, at most {} (field `actions`)",
                 self.actions.len(),
                 MAX_ACTIONS
             )));
         }
+        self.validate_entries(allow_removed, allow_refused)
+    }
+
+    fn validate_entries(
+        &self,
+        allow_removed: bool,
+        allow_refused: bool,
+    ) -> Result<(), ConfigError> {
         let mut seen = HashSet::with_capacity(self.actions.len());
         for (index, entry) in self.actions.iter().enumerate() {
             if entry.id.trim().is_empty() {
@@ -3912,6 +3936,39 @@ impl FullSnapshot {
         self.validate_with(true)
     }
 
+    /// Boot validation of a stored snapshot. It tolerates removed
+    /// kinds and an action list above the cap. Reason: a stored
+    /// list above the cap must still boot (keep all rows, alarm,
+    /// refuse new writes). New files use [`Self::validate`].
+    pub fn validate_stored_for_boot(&self) -> Result<(), ConfigError> {
+        self.validate_with_for_boot()
+    }
+
+    fn validate_with_for_boot(&self) -> Result<(), ConfigError> {
+        self.admin_users.validate()?;
+        self.mqtt_users.validate()?;
+        self.rules.validate()?;
+        self.connectors.validate_stored()?;
+        self.authn_chain.validate()?;
+        self.authn_node_cache.validate()?;
+        self.authn_settings.validate()?;
+        self.authz_node_cache.validate()?;
+        self.authz_settings.validate()?;
+        self.authz_sources.validate()?;
+        self.api_keys.validate()?;
+        self.sso_backends.validate()?;
+        self.actions.validate_stored_for_boot()?;
+        self.sources.validate_stored()?;
+        self.rule_engine.validate()?;
+        self.transformations.validate()?;
+        self.schemas.validate()?;
+        self.cluster_meta.validate()?;
+        self.global_zone.validate()?;
+        self.prometheus.validate()?;
+        self.namespaces.validate()?;
+        Ok(())
+    }
+
     fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
         self.admin_users.validate()?;
         self.mqtt_users.validate()?;
@@ -4047,14 +4104,16 @@ impl ConfigRegistry {
         Self::load_with(dir, false)
     }
 
-    /// Loads the registry for broker boot, accepting records written by an
-    /// older broker whose connector kinds were since removed.
+    /// Loads the registry for broker boot, accepting removed kinds
+    /// and an action list above the cap.
     ///
     /// This is deliberately separate from [`Self::load`]: an operator
     /// configuration or restored file that names a removed kind must still
     /// fail loudly, while an existing `state.toml` must not brick an
     /// upgrade. Removed records are preserved so the operator can read and
-    /// delete them through the API.
+    /// delete them through the API. An action list above the cap also
+    /// loads: the broker keeps all rows, alarms, and refuses new
+    /// writes.
     pub fn load_for_boot(dir: &Path) -> Result<Self, ConfigError> {
         Self::load_with(dir, true)
     }
@@ -4063,7 +4122,7 @@ impl ConfigRegistry {
         let file = state_path(dir);
         let validate = |snapshot: &FullSnapshot| {
             if allow_removed {
-                snapshot.validate_stored()
+                snapshot.validate_stored_for_boot()
             } else {
                 snapshot.validate()
             }
@@ -4549,7 +4608,11 @@ impl ConfigRegistry {
     ///
     /// Every removed or not-ready kind must already sit in the snapshot
     /// with the same id and type. It refuses other kinds with the strict
-    /// error. New writes use [`Self::commit_actions`].
+    /// error. New writes use [`Self::commit_actions`]. The length cap
+    /// is not checked here: a stored list above the cap stays
+    /// writable for non-growing writes (enable, replace, delete). The
+    /// create path refuses growth past the cap, and new files use
+    /// [`ActionsConf::validate`].
     pub fn commit_actions_stored(&self, conf: ActionsConf) -> Result<(), ConfigError> {
         let current = self.snapshot();
         for (index, entry) in conf.actions.iter().enumerate() {
@@ -4567,7 +4630,7 @@ impl ConfigRegistry {
                 }
             }
         }
-        conf.validate_stored()?;
+        conf.validate_stored_for_boot()?;
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.actions = conf.clone();

@@ -484,6 +484,24 @@ impl ApiState {
         // The alarm directory hoisted here so the action-sink boot replay
         // can raise build failures (W1-16 owns the endpoint).
         let alarms = Arc::new(crate::v5::alarms::AlarmStore::new());
+        // MV-07: a stored list above the cap still boots. The broker
+        // keeps all rows, alarms, and refuses new writes. The create
+        // path checks the same cap, so no new row can grow the list.
+        if actions.snapshot().len() > crate::v5::actions::MAX_ACTIONS {
+            alarms.activate(
+                "action_limit_exceeded",
+                &format!(
+                    "action store holds {} entries, at most {} (field `actions`)",
+                    actions.snapshot().len(),
+                    crate::v5::actions::MAX_ACTIONS
+                ),
+                serde_json::json!({
+                    "kind": "action",
+                    "limit": crate::v5::actions::MAX_ACTIONS,
+                    "count": actions.snapshot().len(),
+                }),
+            );
+        }
         // Boot seeding (W3-04): mirror the persisted action enable flags
         // into the engine's lock-free dispatch snapshot so a restart keeps
         // disabled actions skipped from the first publish. MV-01: every
@@ -28545,6 +28563,287 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn sb16_action_limit_create_file_and_boot() {
+        // MV-07 limit test through the production entries.
+        // The file check writes and reloads a state file.
+        // The boot check starts a broker with the stored list.
+        // The API check uses the HTTP router and the alarm list.
+        let over: Vec<broker_config::ActionEntry> = (0..(broker_config::MAX_ACTIONS + 1))
+            .map(|index| broker_config::ActionEntry {
+                id: format!("limit-action-{index:04}"),
+                action_type: "console".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            })
+            .collect();
+        let conf = broker_config::ActionsConf { actions: over };
+        assert!(conf.is_over_limit());
+        assert!(conf.validate().is_err());
+        assert!(conf.validate_stored().is_err());
+        assert!(conf.validate_stored_for_boot().is_ok());
+        let slot = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-sb16-limit-{}-{}",
+            std::process::id(),
+            slot
+        ));
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        registry
+            .commit_actions_stored(conf)
+            .expect("stored rewrite keeps over-limit rows");
+        registry
+            .save()
+            .expect("stored list writes to the state file");
+        assert!(
+            ConfigRegistry::load(&dir).is_err(),
+            "a new file load refuses a list above the cap"
+        );
+        let boot =
+            Arc::new(ConfigRegistry::load_for_boot(&dir).expect("boot loads a list above the cap"));
+        let (mut server, _state) = TestServer::start_with_registry(Arc::clone(&boot)).await;
+        let token = server.login_as_admin().await;
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            actions.as_array().expect("action list").len(),
+            broker_config::MAX_ACTIONS + 1
+        );
+        let (status, alarms) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(names.contains(&"action_limit_exceeded"), "{names:?}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "limit-one-more", "type": "console"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            actions.as_array().expect("action list").len(),
+            broker_config::MAX_ACTIONS + 1
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/limit-action-0000", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, alarms) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"action_limit_exceeded"), "{names:?}");
+        server.task.abort();
+        let _ = (&mut server.task).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn sb16_action_delete_reports_rules_and_summary_lists_links() {
+        // MV-07 shape test through the HTTP router.
+        // Delete of a linked action names every rule.
+        // Summary rows carry status and rule links.
+        let (mut server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sb16-linked", "type": "console"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, first) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "sb16-rule-one",
+                    "sql": "SELECT * FROM \"sb16/linked\"",
+                    "actions": ["sb16-linked"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let first_id = first["id"].as_str().expect("rule id").to_string();
+        let (status, second) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "sb16-rule-two",
+                    "sql": "SELECT * FROM \"sb16/linked\"",
+                    "actions": ["sb16-linked"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let second_id = second["id"].as_str().expect("rule id").to_string();
+        let (status, body) = server
+            .delete_auth("/api/v5/actions/sb16-linked", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let rules = body["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2);
+        let ids: Vec<&str> = rules.iter().filter_map(|row| row.as_str()).collect();
+        assert!(ids.contains(&first_id.as_str()), "{ids:?}");
+        assert!(ids.contains(&second_id.as_str()), "{ids:?}");
+        let (status, summary) = server.get_auth("/api/v5/actions_summary", &token).await;
+        assert_eq!(status, 200);
+        let row = summary
+            .as_array()
+            .expect("summary list")
+            .iter()
+            .find(|row| row["name"] == json!("sb16-linked"))
+            .expect("linked action in summary")
+            .clone();
+        assert_eq!(row["type"], json!("console"));
+        assert_eq!(row["enable"], json!(true));
+        assert!(row["status"].is_string());
+        assert!(row["node_status"].is_array());
+        let linked = row["rules"].as_array().expect("summary rules");
+        assert_eq!(linked.len(), 2);
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{first_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{second_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sb16-linked", &token)
+            .await;
+        assert_eq!(status, 204);
+        server.task.abort();
+        let _ = (&mut server.task).await;
+    }
+
+    #[tokio::test]
+    async fn sb16_action_metrics_report_n_publishes_and_reset() {
+        // MV-07 metrics test through the broker rule path.
+        // Three publishes move the counters, then reset zeroes them.
+        struct CountingSink;
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let (mut server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sb16-metrics", "type": "console"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("sb16-metrics"),
+            std::sync::Arc::new(CountingSink),
+        );
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "sb16-metrics-rule",
+                    "sql": "SELECT * FROM \"sb16/metrics\"",
+                    "actions": ["sb16-metrics"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("sb16/metrics").expect("valid topic");
+        for _ in 0..3 {
+            state
+                .engine
+                .dispatch_ingress(
+                    &topic,
+                    &bytes::Bytes::from_static(b"{\"k\":1}"),
+                    broker_protocol::QoS::AtMostOnce,
+                    &broker_sink,
+                )
+                .await;
+        }
+        let (status, body) = server
+            .get_auth("/api/v5/actions/sb16-metrics/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["total"], json!(3));
+        assert_eq!(body["metrics"]["matched"], json!(3));
+        assert_eq!(body["metrics"]["success"], json!(3));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/sb16-metrics/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/actions/sb16-metrics/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["total"], json!(0));
+        assert_eq!(body["metrics"]["matched"], json!(0));
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sb16-metrics", &token)
+            .await;
+        assert_eq!(status, 204);
+        server.task.abort();
+        let _ = (&mut server.task).await;
+    }
+
+    #[tokio::test]
     async fn actions_single_read_and_replace_round_trip() {
         // W3-03 (C06-05/C06-06) broker-through test: create an action via
         // the W3-02 routes, read it back and expect the documented
@@ -35834,12 +36133,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             "alloydb",
             "cockroachdb",
             "http",
-            "opc_ua",
-            "sparkplug_b",
         ] {
             assert!(
                 kinds.contains(ready),
                 "type list holds the documented ready kind {ready}"
+            );
+        }
+        // New device kinds have no reference schema and stay out of the
+        // documented listing until the contract lands.
+        for unlisted in ["opc_ua", "sparkplug_b"] {
+            assert!(
+                !kinds.contains(unlisted),
+                "type list stays without the unlisted kind {unlisted}"
             );
         }
         for name in &kinds {

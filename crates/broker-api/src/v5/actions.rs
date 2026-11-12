@@ -918,12 +918,14 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     // Rule linkage: an action still referenced by a rule cannot be
     // dropped while the reference stands. Rules name their forward
     // target by the action dispatch key, so both the key form and the
-    // older bare/typed forms count as a reference; the first such rule
-    // is named in the refusal.
-    if let Some(rule_id) = state.engine.list_rules().iter().find_map(|rule| {
-        rule.actions
-            .iter()
-            .any(|action| {
+    // older bare/typed forms count as a reference. The answer carries
+    // the documented `rules` array with every referencing rule id.
+    let referencing: Vec<String> = state
+        .engine
+        .list_rules()
+        .iter()
+        .filter(|rule| {
+            rule.actions.iter().any(|action| {
                 matches!(
                     action,
                     broker_rules::RuleAction::ForwardConnector { connector_id }
@@ -933,9 +935,19 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
                         || connector_id == &broker_config::v5_action_sink_key(&id)
                 )
             })
-            .then(|| rule.id.clone())
-    }) {
-        return ApiError::BadRequest(format!("action {id:?} is referenced by rule {rule_id:?}"))
+        })
+        .map(|rule| rule.id.clone())
+        .collect();
+    if !referencing.is_empty() {
+        let first = referencing.first().cloned().unwrap_or_default();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": format!("action {id:?} is referenced by rule {first:?}"),
+                "rules": referencing,
+            })),
+        )
             .into_response();
     }
     if !state.actions.remove(&bare) {
@@ -947,6 +959,12 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     state
         .alarms
         .deactivate(&format!("action_build_failed:{bare}"));
+    // MV-07: a delete that drops the list back to the cap clears
+    // the boot over-limit alarm. New writes stay refused while the
+    // list is above the cap.
+    if state.actions.snapshot().len() <= MAX_ACTIONS {
+        state.alarms.deactivate("action_limit_exceeded");
+    }
     state.actions.set_wiring(&bare, ActionWiring::None);
     // MV-01: drop the owned sink under its dispatch key so delivery
     // stops with the delete (unknown keys are a no-op). Drain the
@@ -1488,24 +1506,61 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
 /// `GET /api/v5/actions_summary` (W3-08, C06-12): a bare JSON array with
 /// one summary row per action, as the reference API documents.
 ///
-/// Each row carries `name`, `type` and `enable`, read from the live store.
-/// The broker keeps no health state, no creation time and no rule links
-/// for an action, so the rows leave out `status`, `created_at`,
-/// `last_modified_at` and `rules` instead of inventing values. An empty
-/// store reads as `[]`. The query parameters `ns` and `only_global` are
-/// ignored. Management-plane only: one bounded snapshot clone per
-/// request, and publish and deliver never touch this store.
+/// Each row carries `name`, `type`, `enable`, `status`,
+/// `node_status` and `rules`, read from the live store and the
+/// engine. `status` uses the same wiring, kind and health check as
+/// the single read. `rules` lists the ids of rules that forward to
+/// the action. The broker keeps no creation time, so the rows leave
+/// out `created_at` and `last_modified_at` instead of inventing
+/// values. An empty store reads as `[]`. The query parameters `ns`
+/// and `only_global` are ignored. Management-plane only: one bounded
+/// snapshot clone per request, and publish and deliver never touch
+/// this store.
 pub async fn get_actions_summary(State(state): State<ApiState>) -> Response {
+    let rules_snapshot = state.engine.list_rules();
     let rows: Vec<serde_json::Value> = state
         .actions
         .snapshot()
         .iter()
         .map(|record| {
-            serde_json::json!({
-                "name": record.id,
-                "type": record.action_type,
-                "enable": record.enable,
-            })
+            let wiring = state.actions.wiring_of(&record.id);
+            let health = action_health(&state, &record.id);
+            let rendered = record.to_json_with_health(&wiring, health.as_ref());
+            let status = rendered["status"].clone();
+            let node_status = rendered["node_status"].clone();
+            let key = broker_config::v5_action_sink_key(&record.id);
+            let linked: Vec<serde_json::Value> = rules_snapshot
+                .iter()
+                .filter(|rule| {
+                    rule.actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            broker_rules::RuleAction::ForwardConnector { connector_id }
+                            if connector_id == &record.id
+                            || connector_id == &key
+                            || connector_id == &format!("{}:{}", record.action_type, record.id)
+                        )
+                    })
+                })
+                .map(|rule| serde_json::Value::String(rule.id.clone()))
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "name".to_string(),
+                serde_json::Value::String(record.id.clone()),
+            );
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(record.action_type.clone()),
+            );
+            obj.insert("enable".to_string(), serde_json::Value::Bool(record.enable));
+            obj.insert("status".to_string(), status);
+            obj.insert("node_status".to_string(), node_status);
+            obj.insert("rules".to_string(), serde_json::Value::Array(linked));
+            if let Some(reason) = rendered.get("status_reason") {
+                obj.insert("status_reason".to_string(), reason.clone());
+            }
+            serde_json::Value::Object(obj)
         })
         .collect();
     (StatusCode::OK, Json(rows)).into_response()
