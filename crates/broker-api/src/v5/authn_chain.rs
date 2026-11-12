@@ -198,6 +198,12 @@ pub async fn put_authn_entry(
     let Some(existing) = state.authn_chain.get(&id) else {
         return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
     };
+    // A secret sent back as the mask keeps the stored secret.
+    let mut value = value;
+    broker_config::secrets::restore_masked_secrets(&mut value, &existing.config);
+    if let Some(config) = value.get_mut("config") {
+        broker_config::secrets::restore_masked_secrets(config, &existing.config);
+    }
     let entry = match parse_update_request(&value, &id, &existing) {
         Ok(e) => e,
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
@@ -378,7 +384,8 @@ fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
     {
         value["user_id_type"] = serde_json::json!("username");
     }
-    value
+    // A read never shows a secret of the backend.
+    broker_config::secrets::masked_secrets(&value)
 }
 
 /// Render one stored entry for the detail route.
@@ -412,7 +419,8 @@ fn render_detail(entry: &AuthnEntry) -> serde_json::Value {
     {
         value["user_id_type"] = serde_json::json!("username");
     }
-    value
+    // A read never shows a secret of the backend.
+    broker_config::secrets::masked_secrets(&value)
 }
 
 /// Validate a create body into a chain entry.
@@ -934,7 +942,9 @@ mod tests {
                 parts(create_authn_chain(State(state.clone()), Bytes::from(raw)).await).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(stored["mechanism"], sent["mechanism"]);
-            for (key, want) in sent.as_object().expect("case is an object") {
+            // A secret field reads back as the mask; every other field round-trips.
+            let want_all = broker_config::secrets::masked_secrets(sent);
+            for (key, want) in want_all.as_object().expect("case is an object") {
                 assert_eq!(&stored[key], want, "variant field {key} round-trips",);
             }
         }
@@ -985,7 +995,9 @@ mod tests {
                 parts(create_authn_chain(State(state.clone()), Bytes::from(raw)).await).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(stored["mechanism"], sent["mechanism"]);
-            for (key, want) in sent.as_object().expect("case is an object") {
+            // A secret field reads back as the mask; every other field round-trips.
+            let want_all = broker_config::secrets::masked_secrets(sent);
+            for (key, want) in want_all.as_object().expect("case is an object") {
                 assert_eq!(&stored[key], want, "variant field {key} round-trips",);
             }
         }

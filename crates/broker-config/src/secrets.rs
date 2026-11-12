@@ -139,6 +139,105 @@ fn strip_single_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// Marker shown in place of a stored secret on every read. The console
+/// and the reference API use the same six asterisks.
+pub const SECRET_MASK: &str = "******";
+
+/// True when a config field name carries secret material. This is the
+/// one rule for every connector, action and snapshot read. The name is
+/// matched in lower case.
+#[must_use]
+pub fn is_secret_key(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("passphrase")
+        || lower.contains("private_key")
+        || lower.contains("privatekey")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("account_key")
+        || lower.contains("shared_access_key")
+        || lower.contains("service_account")
+        || lower.contains("credentials_json")
+        || lower == "token"
+        || lower.ends_with("_token")
+}
+
+/// Mask every secret in one document, in place. A field with a secret
+/// name shows `******` when its value is a plain string, object or
+/// array. A `file:` or `env:` reference shows its `<redacted:...>`
+/// marker. Other values are not secrets and stay. The walk covers
+/// objects and arrays at any depth.
+pub fn mask_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, member) in map.iter_mut() {
+                if is_secret_key(key) {
+                    match member {
+                        serde_json::Value::String(text) if text.is_empty() => {}
+                        serde_json::Value::String(text) if is_secret_ref(text.trim()) => {
+                            *text = redact_value(text.trim());
+                        }
+                        serde_json::Value::String(_)
+                        | serde_json::Value::Object(_)
+                        | serde_json::Value::Array(_) => {
+                            *member = serde_json::Value::String(SECRET_MASK.to_string());
+                        }
+                        _ => {}
+                    }
+                } else {
+                    mask_secrets(member);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_secrets),
+        serde_json::Value::String(text) if is_secret_ref(text.trim()) => {
+            *text = redact_value(text.trim());
+        }
+        _ => {}
+    }
+}
+
+/// Copy of `value` with every secret masked.
+#[must_use]
+pub fn masked_secrets(value: &serde_json::Value) -> serde_json::Value {
+    let mut out = value.clone();
+    mask_secrets(&mut out);
+    out
+}
+
+/// An update that sends the mask back keeps the stored secret. Every
+/// field of `body` that holds exactly `******` takes the value stored at
+/// the same path. A path with no stored value keeps the mask text.
+pub fn restore_masked_secrets(body: &mut serde_json::Value, stored: &serde_json::Value) {
+    match (body, stored) {
+        (serde_json::Value::Object(new), serde_json::Value::Object(old)) => {
+            for (key, member) in new.iter_mut() {
+                let Some(previous) = old.get(key) else {
+                    continue;
+                };
+                let echoed_ref = matches!(
+                    (member.as_str(), previous.as_str()),
+                    (Some(sent), Some(old)) if is_secret_ref(old.trim()) && sent == redact_value(old.trim())
+                );
+                if member.as_str() == Some(SECRET_MASK) || echoed_ref {
+                    *member = previous.clone();
+                } else {
+                    restore_masked_secrets(member, previous);
+                }
+            }
+        }
+        (serde_json::Value::Array(new), serde_json::Value::Array(old)) => {
+            for (member, previous) in new.iter_mut().zip(old) {
+                restore_masked_secrets(member, previous);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

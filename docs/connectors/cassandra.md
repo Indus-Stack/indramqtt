@@ -458,3 +458,18 @@ ok
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
+
+## Known limits in this release
+
+The broker accepts the fields in this list. The broker does not apply them in this release.
+
+- `batch_bytes` (the batch size in bytes)
+- `batch_size` (the batch size)
+- `initial_backoff_ms` (the first retry wait time)
+- `linger_ms` (the batch wait time)
+- `max_backoff_ms` (the longest retry wait time)
+- `max_retries` (the retry count)
+
+To set batching, use `resource_opts` in the action. The broker applies `resource_opts`.
+
+A later release applies these fields.

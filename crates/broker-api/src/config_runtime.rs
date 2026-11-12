@@ -225,8 +225,13 @@ async fn apply_candidate(
         ))));
     }
     let _sink_guard = state.action_sink_lock.lock().await;
-    let (connector_undo, pending_live) =
-        apply_connectors_live(&state.engine, &previous, candidate).await;
+    let (connector_undo, pending_live) = apply_connectors_live(
+        &state.engine,
+        &previous,
+        candidate,
+        &state.connectors.data_dir(),
+    )
+    .await;
     // Default-zone knobs (AP-03): apply to the live session manager so a
     // reload carrying kept knobs keeps bounding new sessions. The setters
     // never fail; a later commit failure rolls them back below.
@@ -337,8 +342,13 @@ async fn apply_restore(
         ))));
     }
     let _sink_guard = state.action_sink_lock.lock().await;
-    let (connector_undo, pending_live) =
-        apply_connectors_live(&state.engine, &previous, &candidate).await;
+    let (connector_undo, pending_live) = apply_connectors_live(
+        &state.engine,
+        &previous,
+        &candidate,
+        &state.connectors.data_dir(),
+    )
+    .await;
     // Default-zone knobs (AP-03): same live apply as a reload, with the
     // same rollback when the restore fails to commit.
     apply_zone_live(&state.sessions, &candidate.global_zone);
@@ -507,6 +517,7 @@ async fn apply_connectors_live(
     engine: &broker_rules::RuleEngine,
     previous: &Arc<FullSnapshot>,
     candidate: &FullSnapshot,
+    data_dir: &std::path::Path,
 ) -> (ConnectorLiveUndo, Vec<String>) {
     let mut undo = ConnectorLiveUndo {
         removed: Vec::new(),
@@ -587,6 +598,7 @@ async fn apply_connectors_live(
             &entry.connector_type,
             &entry.id,
             &params,
+            data_dir,
         )
         .await
         {
@@ -982,24 +994,7 @@ fn redact_snapshot(snapshot: &FullSnapshot) -> serde_json::Value {
 }
 
 fn redact_json_in_place(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => {
-            if secrets::is_secret_ref(text.trim()) {
-                *text = secrets::redact_value(text.trim());
-            }
-        }
-        serde_json::Value::Array(entries) => {
-            for entry in entries {
-                redact_json_in_place(entry);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (_, entry) in map.iter_mut() {
-                redact_json_in_place(entry);
-            }
-        }
-        _ => {}
-    }
+    secrets::mask_secrets(value);
 }
 
 #[cfg(test)]

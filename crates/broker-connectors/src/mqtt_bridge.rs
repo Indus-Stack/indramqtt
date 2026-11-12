@@ -205,6 +205,13 @@ impl MqttBridgeSinkConfig {
                 "mqtt bridge max_batch_size must be >= 1".to_string(),
             ));
         }
+        // The MQTT 5 driver refuses a keep-alive below five seconds.
+        if self.protocol == MqttBridgeProtocol::V50 && self.keep_alive_secs < 5 {
+            return Err(ConnectorError::Dispatch(format!(
+                "mqtt bridge field `keepalive` must be at least 5 seconds with proto_ver v5, got {}",
+                self.keep_alive_secs
+            )));
+        }
         Ok(())
     }
 

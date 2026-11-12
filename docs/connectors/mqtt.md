@@ -152,3 +152,15 @@ ok
 - Read the sink settings in [MQTT bridge](./mqtt-bridge.md).
 - Feed the sink from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
+
+## Known limits in this release
+
+The broker accepts the fields in this list. The broker does not apply them in this release.
+
+- `linger_ms` (the batch wait time)
+- `max_batch_size` (the batch size)
+- `max_inflight` (the number of requests in flight)
+
+To set batching, use `resource_opts` in the action. The broker applies `resource_opts`.
+
+A later release applies these fields.

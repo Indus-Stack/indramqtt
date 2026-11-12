@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
+    SinkBatchItem,
 };
 
 /// IoTDB authentication (HTTP Basic).
@@ -798,6 +799,33 @@ impl Sink for IotDbSink {
             self.flush().await?;
         }
         Ok(())
+    }
+
+    /// Write the whole batch as one tablet per device. The rows are
+    /// checked first, so a bad row leaves nothing half buffered.
+    async fn send_batch(&self, items: &[SinkBatchItem]) -> Result<()> {
+        let mut built = Vec::with_capacity(items.len());
+        let mut previous = i64::MIN;
+        for item in items {
+            if item.topic.as_str().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "iotdb row requires a non-empty topic".to_string(),
+                ));
+            }
+            // Rows of one device need distinct times, or the server
+            // overwrites the earlier row.
+            let millis = now_millis().max(previous.saturating_add(1));
+            previous = millis;
+            built.push(self.build_row(&item.topic, &item.payload, item.qos, millis)?);
+        }
+        {
+            let mut buffer = self.buffer.lock();
+            for (row, bytes) in built {
+                buffer.queue.push(row);
+                buffer.bytes = buffer.bytes.saturating_add(bytes);
+            }
+        }
+        self.flush().await
     }
 
     fn kind(&self) -> &'static str {

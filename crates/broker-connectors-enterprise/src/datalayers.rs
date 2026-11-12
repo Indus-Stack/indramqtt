@@ -73,6 +73,10 @@ pub struct DatalayersConfig {
     /// Vector of column names to treat as measurement fields.
     #[serde(default)]
     pub field_columns: Vec<String>,
+    /// Write precision: `ns`, `us`, `ms` or `s`. `None` writes
+    /// microseconds, the wire default of this sink.
+    #[serde(default)]
+    pub precision: Option<String>,
     /// Batch flush size (default 500: one HTTP POST carries at most
     /// this many records, so a single flush cannot grow without bound;
     /// 500 keeps the JSON body well under typical proxy limits while
@@ -188,13 +192,19 @@ impl DatalayersConfig {
         self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
-    /// Write URL: `{endpoint}/write?db={database}&precision=us`.
-    /// Precision `us` matches the microsecond timestamps below.
+    /// Write precision label: `us` unless the config names another.
+    pub fn effective_precision(&self) -> &str {
+        self.precision.as_deref().unwrap_or("us")
+    }
+
+    /// Write URL: `{endpoint}/write?db={database}&precision={precision}`.
+    /// The default precision `us` matches the microsecond timestamps below.
     pub fn write_url(&self) -> String {
         format!(
-            "{}/write?db={}&precision=us",
+            "{}/write?db={}&precision={}",
             self.endpoint.trim_end_matches('/'),
-            self.database
+            self.database,
+            self.effective_precision()
         )
     }
 
@@ -426,6 +436,7 @@ pub struct HttpDatalayersTransport {
     sql_url: String,
     sql_url_no_db: String,
     auth_header: Option<String>,
+    precision: String,
 }
 
 impl HttpDatalayersTransport {
@@ -439,6 +450,7 @@ impl HttpDatalayersTransport {
             sql_url: config.sql_url(true),
             sql_url_no_db: config.sql_url(false),
             auth_header: config.auth_header_value(),
+            precision: config.effective_precision().to_string(),
         }
     }
 
@@ -449,6 +461,7 @@ impl HttpDatalayersTransport {
             sql_url: config.sql_url(true),
             sql_url_no_db: config.sql_url(false),
             auth_header: config.auth_header_value(),
+            precision: config.effective_precision().to_string(),
         }
     }
 
@@ -489,7 +502,27 @@ impl HttpDatalayersTransport {
     async fn post_write(&self, request: &DatalayersWriteRequest) -> Result<()> {
         // Render the batch as line protocol. An empty batch fails
         // closed without a request.
-        let body = write_request_to_lines(request);
+        let body = if self.precision == "us" {
+            write_request_to_lines(request)
+        } else {
+            // Record times are microseconds; convert to the precision
+            // named in the write URL.
+            request
+                .records
+                .iter()
+                .filter_map(|record| {
+                    let mut record = record.clone();
+                    record.time = match self.precision.as_str() {
+                        "ns" => record.time.saturating_mul(1_000),
+                        "ms" => record.time / 1_000,
+                        "s" => record.time / 1_000_000,
+                        _ => record.time,
+                    };
+                    format_record_line(&request.table, &record)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         if body.is_empty() {
             return Err(ConnectorError::Dispatch(
                 "datalayers write batch has no fields".into(),
@@ -835,6 +868,7 @@ mod tests {
             timestamp_field: Some("custom_ts".to_string()),
             tag_columns: vec!["line".to_string(), "machine".to_string()],
             field_columns: vec!["pressure".to_string(), "temperature".to_string()],
+            precision: None,
             batch_size: Some(1),
             buffer_capacity: None,
             timeout_ms: None,
@@ -852,6 +886,7 @@ mod tests {
             timestamp_field: Some("custom_ts".to_string()),
             tag_columns: vec!["line".to_string(), "machine".to_string()],
             field_columns: vec!["pressure".to_string(), "temperature".to_string()],
+            precision: None,
             batch_size: Some(1),
             buffer_capacity: None,
             timeout_ms: None,
@@ -1260,6 +1295,7 @@ mod tests {
             timestamp_field: Some("custom_ts".to_string()),
             tag_columns: vec!["line".to_string()],
             field_columns: vec!["pressure".to_string()],
+            precision: None,
             batch_size: Some(50),
             buffer_capacity: None,
             timeout_ms: Some(5_000),
@@ -1277,6 +1313,7 @@ mod tests {
             timestamp_field: Some("custom_ts".to_string()),
             tag_columns: vec!["line".to_string()],
             field_columns: vec!["pressure".to_string()],
+            precision: None,
             batch_size: Some(50),
             buffer_capacity: None,
             timeout_ms: Some(5_000),
@@ -1678,6 +1715,7 @@ mod tests {
             timestamp_field: Some("ts".to_string()),
             tag_columns: vec!["line".to_string()],
             field_columns: vec!["pressure".to_string(), "seq".to_string()],
+            precision: None,
             batch_size: Some(100),
             buffer_capacity: None,
             timeout_ms: Some(30_000),

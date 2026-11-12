@@ -2181,6 +2181,7 @@ mod tests {
             "rocketmq",
             "qual-rocketmq-v5",
             &v5_body,
+            std::path::Path::new("./data"),
         )
         .await
         .expect("qual register_live_sink builds");

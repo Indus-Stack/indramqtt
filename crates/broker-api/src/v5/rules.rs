@@ -534,12 +534,7 @@ fn parse_rule_actions(
             // action-owned sink registered under that key (one action,
             // one sink, one key). A connector-only row owns no such
             // sink; its own id names the connector sink.
-            let action_key = broker_config::v5_action_sink_key(&found.id);
-            let connector_id = if state.engine.connectors().get(&action_key).is_some() {
-                action_key
-            } else {
-                found.id.clone()
-            };
+            let connector_id = rule_action_target(state, &found.id);
             actions.push(broker_rules::RuleAction::ForwardConnector { connector_id });
             continue;
         }
@@ -584,15 +579,16 @@ fn parse_rule_actions(
         // MV-01/SB-03: same action-owned dispatch key as the bare
         // string form above. A connector-only row has no action sink,
         // so its own id reaches the connector sink.
-        let action_key = broker_config::v5_action_sink_key(&found.id);
-        let connector_id = if state.engine.connectors().get(&action_key).is_some() {
-            action_key
-        } else {
-            found.id.clone()
-        };
+        let connector_id = rule_action_target(state, &found.id);
         actions.push(broker_rules::RuleAction::ForwardConnector { connector_id });
     }
     Ok(actions)
+}
+
+/// Dispatch target of a rule action: the action's own key, also when
+/// the action has no sink yet, because its sink registers under that key.
+fn rule_action_target(_state: &ApiState, action_id: &str) -> String {
+    broker_config::v5_action_sink_key(action_id)
 }
 
 /// `POST /api/v5/rules`: compile the rule before storing. A malformed
@@ -1278,8 +1274,14 @@ impl ConnectorStore {
                                 // A refused build fails closed here: the
                                 // entry stays persist-only and the error is
                                 // logged naming the connector and its kind.
-                                if let Err(register_error) =
-                                    try_register_live_sink(engine, &conn_type, &id, &params).await
+                                if let Err(register_error) = try_register_live_sink(
+                                    engine,
+                                    &conn_type,
+                                    &id,
+                                    &params,
+                                    registry.dir(),
+                                )
+                                .await
                                 {
                                     tracing::warn!(
                                         connector = %id,
@@ -2737,59 +2739,12 @@ pub(crate) fn resolve_action_connector(
     Some((connector_bare_name(&doc), doc))
 }
 
-/// Redact secret references in a connector document for any observable
-/// response: every `file:`/`env:` string leaf renders as its
-/// `<redacted:...>` marker naming the reference, never the value. The
-/// store keeps the reference; only the response is redacted.
-/// A RocketMQ plaintext signing key never renders either: the access
-/// key stays since it names the credential, the secret does not.
+/// Mask every secret in a connector document for any observable
+/// response. The one shared rule is `broker_config::secrets::mask_secrets`:
+/// a secret field shows `******` and a `file:`/`env:` reference shows its
+/// `<redacted:...>` marker, never the value. The store keeps the value.
 fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
-    fn walk(node: &mut serde_json::Value) {
-        match node {
-            serde_json::Value::String(text) => {
-                if broker_config::secrets::is_secret_ref(text.trim()) {
-                    *text = broker_config::secrets::redact_value(text.trim());
-                }
-            }
-            serde_json::Value::Array(entries) => {
-                for entry in entries {
-                    walk(entry);
-                }
-            }
-            serde_json::Value::Object(map) => {
-                for (_, entry) in map.iter_mut() {
-                    walk(entry);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = value.clone();
-    // Reads must not leak the vendor signing key.
-    // Reason: the secret signs requests, the access key only names them.
-    let is_rocketmq = matches!(
-        out.get("type").and_then(|v| v.as_str()),
-        Some("rocketmq") | Some("rocket_mq") | Some("apache_rocketmq")
-    );
-    if is_rocketmq {
-        if let Some(obj) = out.as_object_mut() {
-            for key in ["secret_key", "security_token"] {
-                let plain = obj
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .map(|s| !broker_config::secrets::is_secret_ref(s.trim()))
-                    .unwrap_or(false);
-                if plain {
-                    obj.insert(
-                        key.to_string(),
-                        serde_json::Value::String(super::sso::REDACTED_SECRET.to_string()),
-                    );
-                }
-            }
-        }
-    }
-    walk(&mut out);
-    out
+    broker_config::secrets::masked_secrets(value)
 }
 
 /// `GET /api/v5/connectors` (C07-01): every connector as a bare JSON
@@ -3380,6 +3335,7 @@ pub async fn try_register_live_sink(
     conn_type: &str,
     name: &str,
     body: &serde_json::Value,
+    data_dir: &std::path::Path,
 ) -> Result<(), String> {
     // KC-00: only `ready` kinds register. A kind that is not ready is
     // refused with the documented message (naming the feature when that
@@ -3395,7 +3351,7 @@ pub async fn try_register_live_sink(
             "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
         ));
     }
-    register_live_sink(engine, runtime, name, body).await
+    register_live_sink(engine, runtime, name, body, data_dir).await
 }
 
 /// Closed fallback for a kind whose vendor SDK is not compiled in.
@@ -3458,19 +3414,19 @@ fn parse_bridge_linger(
 /// Parse the connector `keepalive` value. Accept whole seconds or a
 /// duration string such as `60s`, `1m` or `1500ms`. Reason: the
 /// reference connector accepts both shapes.
-fn parse_bridge_keepalive(name: &str, value: &serde_json::Value) -> Result<u16, String> {
+pub(crate) fn parse_bridge_keepalive(name: &str, value: &serde_json::Value) -> Result<u16, String> {
     let bad = || {
         format!(
             "connector {name:?} field `keepalive` must be whole seconds or a duration string such as `60s`"
         )
     };
     let seconds = match value {
-        serde_json::Value::Number(number) => number.as_f64().ok_or_else(|| bad())?,
+        serde_json::Value::Number(number) => number.as_f64().ok_or_else(&bad)?,
         serde_json::Value::String(text) => {
             let text = text.trim().to_ascii_lowercase();
             let split = text
                 .find(|c: char| !c.is_ascii_digit() && c != '.')
-                .ok_or_else(|| bad())?;
+                .ok_or_else(&bad)?;
             let (number, unit) = text.split_at(split);
             let number: f64 = number.parse().map_err(|_| bad())?;
             match unit.trim() {
@@ -3496,6 +3452,7 @@ pub async fn register_live_sink(
     conn_type: &str,
     name: &str,
     body: &serde_json::Value,
+    data_dir: &std::path::Path,
 ) -> Result<(), String> {
     // First build error in this call. Each arm records its failure
     // through the macro below instead of dropping it, and the tail of
@@ -3906,6 +3863,8 @@ pub async fn register_live_sink(
                 "retry_interval",
                 "reconnect_interval",
                 "ssl",
+                // The reference names the identity `clientid_prefix`.
+                "client_id",
             ] {
                 if body.get(key).is_some_and(|value| !value.is_null()) {
                     return Err(format!(
@@ -3949,8 +3908,7 @@ pub async fn register_live_sink(
                 ));
             };
             let client_id = body
-                .get("client_id")
-                .or_else(|| body.get("clientid_prefix"))
+                .get("clientid_prefix")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -5287,6 +5245,14 @@ pub async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
+            let (timestamp_field, tag_columns, field_columns) =
+                crate::v5::action_sinks::datalayers_column_settings(body, name)?;
+            let precision = crate::v5::action_sinks::datalayers_precision(
+                body.get("precision")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                &format!("connector {name:?} field `precision`"),
+            )?;
             let config = broker_connectors_enterprise::datalayers::DatalayersConfig {
                 endpoint,
                 database,
@@ -5294,12 +5260,10 @@ pub async fn register_live_sink(
                 auth_token,
                 username,
                 password,
-                // Stamps are always microseconds (the wire requirement);
-                // the default column split keeps the `topic` tag and
-                // measures every payload field.
-                timestamp_field: None,
-                tag_columns: Vec::new(),
-                field_columns: Vec::new(),
+                timestamp_field,
+                tag_columns,
+                field_columns,
+                precision,
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
@@ -5502,12 +5466,81 @@ pub async fn register_live_sink(
             return Err(refuse_disabled_kind(conn_type, "confluent"));
         }
         "disk_log" | "disk" | "disklog" => {
-            let dir = body
-                .get("directory")
-                .or_else(|| body.get("dir"))
-                .or_else(|| body.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("./target/disk_logs");
+            // A given directory is relative to the data directory and
+            // must stay inside it, like the `filepath` form.
+            let dir = match ["directory", "dir", "path"]
+                .into_iter()
+                .find_map(|key| body.get(key).and_then(|v| v.as_str()).map(|v| (key, v)))
+            {
+                Some((key, given)) => {
+                    if !disk_log_path_contained(given, data_dir) {
+                        return Err(format!(
+                            "connector {name:?} field `{key}` must be a relative path inside the data directory"
+                        ));
+                    }
+                    data_dir.join(given).to_string_lossy().into_owned()
+                }
+                None => data_dir.join("disk_logs").to_string_lossy().into_owned(),
+            };
+            let disk_number = |key: &str| -> Result<Option<u64>, String> {
+                match body.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+                        format!("connector {name:?} field `{key}` must be a non-negative integer")
+                    }),
+                }
+            };
+            let disk_text = |key: &str| -> Result<Option<&str>, String> {
+                match body.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(value) => value.as_str().map(Some).ok_or_else(|| {
+                        format!("connector {name:?} field `{key}` must be a string")
+                    }),
+                }
+            };
+            let format = match disk_text("format")? {
+                None | Some("ndjson") => broker_connectors::disk_log::DiskLogFormat::Ndjson,
+                Some("raw") => broker_connectors::disk_log::DiskLogFormat::Raw,
+                Some("csv") => broker_connectors::disk_log::DiskLogFormat::Csv,
+                Some(other) => {
+                    let wanted = "ndjson, raw or csv";
+                    return Err(format!(
+                        "connector {name:?} field `format` must be {wanted}: {other:?}"
+                    ));
+                }
+            };
+            let compression = match disk_text("compression")? {
+                None | Some("none") => broker_connectors::disk_log::DiskLogCompression::None,
+                Some("gzip") => broker_connectors::disk_log::DiskLogCompression::Gzip,
+                Some(other) => {
+                    return Err(format!(
+                        "connector {name:?} field `compression` value {other:?} is not none or gzip"
+                    ))
+                }
+            };
+            let sync_mode = match disk_text("sync_mode")? {
+                None | Some("every_batch") => broker_connectors::disk_log::DiskSyncMode::EveryBatch,
+                Some("os_default") => broker_connectors::disk_log::DiskSyncMode::OsDefault,
+                Some(other) => {
+                    return Err(format!(
+                        "connector {name:?} field `sync_mode` value {other:?} is not every_batch or os_default"
+                    ))
+                }
+            };
+            let max_file_size_bytes = disk_number("max_file_size_bytes")?.or(Some(67_108_864));
+            let max_file_age_secs = disk_number("max_file_age_secs")?;
+            let max_backup_files = match disk_number("max_backup_files")? {
+                Some(count) => Some(usize::try_from(count).map_err(|_| {
+                    format!("connector {name:?} field `max_backup_files` is too large")
+                })?),
+                None => Some(10),
+            };
+            let max_retention_days = match disk_number("max_retention_days")? {
+                Some(days) => Some(u32::try_from(days).map_err(|_| {
+                    format!("connector {name:?} field `max_retention_days` is too large")
+                })?),
+                None => None,
+            };
             let prefix = body
                 .get("filename_prefix")
                 .or_else(|| body.get("prefix"))
@@ -5527,16 +5560,16 @@ pub async fn register_live_sink(
             // scan, 10 retained segments cap total disk (~640 MiB + active)
             // so a forgotten connector cannot fill the disk.
             let config = broker_connectors::disk_log::DiskLogSinkConfig {
-                directory: dir.to_string(),
+                directory: dir,
                 filename_prefix: prefix.to_string(),
                 filename_extension: ext.to_string(),
-                format: broker_connectors::disk_log::DiskLogFormat::Ndjson,
-                max_file_size_bytes: Some(67_108_864),
-                max_file_age_secs: None,
-                compression: broker_connectors::disk_log::DiskLogCompression::None,
-                max_backup_files: Some(10),
-                max_retention_days: None,
-                sync_mode: broker_connectors::disk_log::DiskSyncMode::EveryBatch,
+                format,
+                max_file_size_bytes,
+                max_file_age_secs,
+                compression,
+                max_backup_files,
+                max_retention_days,
+                sync_mode,
                 timeout_ms,
             };
             if let Some(writer) = record_sink_error!(
@@ -6041,10 +6074,14 @@ pub async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
+            // The connector `timeout_ms` bounds every request of the client.
+            let client = reqwest::Client::builder()
+                .timeout(config.timeout())
+                .build()
+                .unwrap_or_default();
             if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::timestream::HttpTimestreamTransport::new(
-                    &config,
-                    reqwest::Client::new(),
+                    &config, client,
                 )
             ) {
                 let transport = Arc::new(transport);
@@ -6065,6 +6102,24 @@ pub async fn register_live_sink(
             }
         }
         "redshift" => {
+            // The reference connector is the Postgres wire form. These
+            // Data API fields are not reference fields and no sink
+            // applies them, so they are refused.
+            for key in [
+                "cluster_identifier",
+                "session_token",
+                "db_user",
+                "sql_template",
+            ] {
+                let present = body
+                    .get(key)
+                    .or_else(|| body.get("parameters").and_then(|params| params.get(key)));
+                if present.is_some_and(|v| !v.is_null()) {
+                    return Err(format!(
+                        "connector {name:?} field `{key}` is not supported; remove it"
+                    ));
+                }
+            }
             let database = body
                 .get("database")
                 .and_then(|v| v.as_str())
@@ -7583,8 +7638,14 @@ pub async fn create_connector(
     // never depends on a point-in-time reachability probe. A kind with
     // no execution path registers nothing, so it honestly reads back
     // `disconnected` (stored config first, no claimed execution).
-    if let Err(register_error) =
-        try_register_live_sink(&state.engine, &conn_type, &name, &body).await
+    if let Err(register_error) = try_register_live_sink(
+        &state.engine,
+        &conn_type,
+        &name,
+        &body,
+        &state.connectors.data_dir(),
+    )
+    .await
     {
         state.engine.connectors().abort_stage();
         return (
@@ -7670,7 +7731,7 @@ pub async fn create_connector(
         crate::v5::action_sinks::action_targets_connector(&state.connectors, record, &name)
     })
     .await;
-    let body = connector_live_view(&body, &state.engine);
+    let body = redact_connector_doc(&connector_live_view(&body, &state.engine));
 
     (StatusCode::CREATED, Json(body)).into_response()
 }
@@ -7829,6 +7890,7 @@ pub async fn update_connector(
     // Fail closed (S1-01): same required-field gate as create; an update
     // that drops a credential or identity is rejected with the field named.
     apply_cloud_reference_fields(&conn_type, &mut body);
+    broker_config::secrets::restore_masked_secrets(&mut body, &stored);
     if let Some(missing) = missing_connector_field(&conn_type, &body, &state.connectors.data_dir())
     {
         return ApiError::BadRequest(format!(
@@ -7914,8 +7976,14 @@ pub async fn update_connector(
     // in under the action dispatch keys below, after the stored update
     // and its persist.
     state.engine.connectors().begin_stage();
-    if let Err(register_error) =
-        try_register_live_sink(&state.engine, &conn_type, &bare, &body).await
+    if let Err(register_error) = try_register_live_sink(
+        &state.engine,
+        &conn_type,
+        &bare,
+        &body,
+        &state.connectors.data_dir(),
+    )
+    .await
     {
         state.engine.connectors().abort_stage();
         return (
@@ -7936,19 +8004,11 @@ pub async fn update_connector(
     // action dispatch keys below, after the stored update and its
     // persist.
     let mut staged_ids: Vec<String> = Vec::new();
-    let mut reused_ids: Vec<String> = Vec::new();
     for record in state.actions.snapshot() {
         if !crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, &bare) {
             continue;
         }
         if !crate::v5::action_sinks::action_owned_kind(&record.action_type) {
-            continue;
-        }
-        if crate::v5::action_sinks::is_connector_only_action(&record) {
-            // The action uses the connector runtime. It needs no build of
-            // its own; the new connector sink replaces its key below.
-            reused_ids.push(record.id.clone());
-            staged_ids.push(record.id.clone());
             continue;
         }
         let opts = match crate::v5::action_sinks::ActionResourceOpts::parse(
@@ -8072,24 +8132,6 @@ pub async fn update_connector(
             replaced.push(old);
         }
     }
-    for action_id in &reused_ids {
-        let key = broker_config::v5_action_sink_key(action_id);
-        let previous = state.engine.connectors().get(&key);
-        match state.engine.connectors().get(&bare) {
-            Some(sink) => {
-                state.engine.connectors().register(key, sink);
-                if let Some(old) = previous {
-                    replaced.push(old);
-                }
-            }
-            None => {
-                if let Some(old) = previous {
-                    state.engine.connectors().unregister(&key);
-                    replaced.push(old);
-                }
-            }
-        }
-    }
     for old in replaced {
         let _ = old.flush().await;
     }
@@ -8111,7 +8153,7 @@ pub async fn update_connector(
         crate::v5::action_sinks::action_targets_connector(&state.connectors, record, &bare)
     })
     .await;
-    let body = connector_live_view(&body, &state.engine);
+    let body = redact_connector_doc(&connector_live_view(&body, &state.engine));
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -9569,9 +9611,15 @@ mod connector_feature_tests {
             "{kind} must map to feature {feature} when disabled"
         );
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
-        let err = try_register_live_sink(&engine, kind, "feat-test", &serde_json::json!({}))
-            .await
-            .expect_err("disabled kind must fail registration");
+        let err = try_register_live_sink(
+            &engine,
+            kind,
+            "feat-test",
+            &serde_json::json!({}),
+            std::path::Path::new("./data"),
+        )
+        .await
+        .expect_err("disabled kind must fail registration");
         assert!(
             err.contains(feature),
             "closed error must name feature '{feature}': {err}"
@@ -9696,6 +9744,7 @@ mod connector_feature_tests {
             "ch",
             "ch-test",
             &serde_json::json!({"url": "http://127.0.0.1:9", "database": "db", "table": "t"}),
+            std::path::Path::new("./data"),
         )
         .await
         .expect("ch must register through the clickhouse arm");
@@ -9870,5 +9919,79 @@ mod connector_feature_tests {
             body.contains("device-42"),
             "projected payload must travel untouched: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_log_connector_applies_format_rotation_and_contains_paths() {
+        use broker_connectors::Sink as _;
+        let data = std::env::temp_dir().join(format!(
+            "disk-log-connector-{}-{}",
+            std::process::id(),
+            now_nanos_for_test()
+        ));
+        let outside = data
+            .join("..")
+            .join(format!("outside-{}", now_nanos_for_test()));
+        std::fs::create_dir_all(&data).expect("data dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::os::unix::fs::symlink(&outside, data.join("link")).expect("symlink");
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let body = |directory: &str| {
+            serde_json::json!({
+                "directory": directory, "filename_prefix": "sel", "filename_extension": "ent",
+                "format": "raw", "max_file_size_bytes": 16, "compression": "gzip",
+                "max_backup_files": 4, "sync_mode": "every_batch"
+            })
+        };
+        // A directory outside the data directory is refused with the field named.
+        for bad in [
+            outside.to_string_lossy().into_owned(),
+            "../x".to_string(),
+            "link".to_string(),
+        ] {
+            let error = register_live_sink(&engine, "disk_log", "d", &body(&bad), &data)
+                .await
+                .expect_err("outside directory is refused");
+            assert!(error.contains("directory"), "{error}");
+        }
+        assert_eq!(std::fs::read_dir(&outside).expect("read").count(), 0);
+        // A bad setting is refused with the field named.
+        let mut bad_format = body("inside");
+        bad_format["format"] = serde_json::json!("xml");
+        let error = register_live_sink(&engine, "disk_log", "d", &bad_format, &data)
+            .await
+            .expect_err("unknown format is refused");
+        assert!(error.contains("format"), "{error}");
+        // A directory inside the data directory takes the format and the size limit.
+        register_live_sink(&engine, "disk_log", "d", &body("inside"), &data)
+            .await
+            .expect("inside directory registers");
+        let sink = engine.connectors().get("d").expect("sink registered");
+        for value in 0..3 {
+            let payload = Bytes::from(format!("{{\"v\":{value}}}"));
+            sink.send(&Topic::new("t/x").unwrap(), &payload, QoS::AtMostOnce)
+                .await
+                .expect("send");
+        }
+        let active = std::fs::read(data.join("inside").join("sel.ent")).expect("active file");
+        assert_eq!(
+            active, b"{\"v\":2}\n",
+            "raw format, one record after rotation"
+        );
+        let rotated = std::fs::read_dir(data.join("inside"))
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".gz"))
+            .count();
+        assert_eq!(rotated, 1, "the size limit rotated one gzip segment");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    fn now_nanos_for_test() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
     }
 }

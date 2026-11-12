@@ -19924,6 +19924,350 @@ connector_id = "pending-good"
     }
 
     #[tokio::test]
+    async fn every_connector_kind_masks_secrets_on_read_and_keeps_them_on_marker_put() {
+        const SECRET: &str = "known-secret-value-7f3a91";
+        let secret_fields = [
+            "password",
+            "token",
+            "secret_key",
+            "secret_access_key",
+            "access_key_secret",
+            "session_token",
+            "private_key",
+            "service_account_json",
+        ];
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let mut created = Vec::new();
+        let mut unreachable_kinds = Vec::new();
+        for row in broker_config::capability::KIND_ROWS {
+            if !row.connector || !broker_config::capability::row_is_ready(row) {
+                continue;
+            }
+            let name = format!("mask-{}", row.name.replace('_', "-"));
+            // Start with every secret field. Follow the refusals: drop a
+            // field the kind refuses, add a field the kind requires.
+            let mut body = json!({"type": row.name, "name": name});
+            for field in secret_fields {
+                body[field] = json!(SECRET);
+            }
+            // Required fields that a generic body cannot guess.
+            let extra = match row.name {
+                "bigquery" => {
+                    json!({"authentication": {"private_key": SECRET, "client_email": "a@b.c"}})
+                }
+                "datalayers" => {
+                    json!({"username": "u", "database": "d", "table": "t", "token": null})
+                }
+                "disk_log" => {
+                    json!({"filepath": "mask/x.log", "max_file_size": "1mb", "max_file_number": 2})
+                }
+                "greptimedb" => json!({"username": "u", "database": "d", "table": "t"}),
+                "iotdb" => {
+                    json!({"username": "u", "measurements": ["m"], "types": ["double"], "device": "root.d"})
+                }
+                "sparkplug_b" => json!({"server": "mqtt://127.0.0.1:1"}),
+                "tdengine" => {
+                    json!({"database": "d", "password": null, "metrics": {"v": "DOUBLE"}, "tags": {"t": "x"}})
+                }
+                "timestream" => json!({"measures": {"v": "DOUBLE"}}),
+                _ => json!({}),
+            };
+            for (key, value) in extra.as_object().unwrap() {
+                if value.is_null() {
+                    body.as_object_mut().unwrap().remove(key);
+                } else {
+                    body[key] = value.clone();
+                }
+            }
+            let mut ok = false;
+            let mut last_message = String::new();
+            for _ in 0..24 {
+                let (status, answer) = server
+                    .post_auth("/api/v5/connectors", body.clone(), &token)
+                    .await;
+                if status == 201 {
+                    ok = true;
+                    break;
+                }
+                let message = answer["message"].as_str().unwrap_or("").to_string();
+                last_message = message.clone();
+                let named = message
+                    .split("field `")
+                    .nth(1)
+                    .and_then(|rest| rest.split('`').next())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        message
+                            .split("missing required field: ")
+                            .nth(1)
+                            .and_then(|rest| rest.split_whitespace().next())
+                            .map(str::to_string)
+                    });
+                let Some(field) = named else { break };
+                if secret_fields.contains(&field.as_str()) && body.get(&field).is_some() {
+                    body.as_object_mut().unwrap().remove(&field);
+                } else if body.get(&field).is_none() {
+                    let value = if field.contains("url") || field.contains("endpoint") {
+                        "http://127.0.0.1:1"
+                    } else if field.contains("server") || field.contains("host") {
+                        "127.0.0.1:1"
+                    } else {
+                        "value"
+                    };
+                    body[field] = json!(value);
+                } else {
+                    break;
+                }
+            }
+            if ok {
+                created.push((name, body));
+            } else {
+                unreachable_kinds.push((row.name, last_message));
+            }
+        }
+        assert!(
+            created.len() >= 20,
+            "too few kinds could be created: {} (not created: {unreachable_kinds:?})",
+            created.len()
+        );
+        let (status, listed) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert!(
+            !listed.to_string().contains(SECRET),
+            "the list shows a secret"
+        );
+        let mut with_secret = 0;
+        for (name, body) in &created {
+            let path = format!("/api/v5/connectors/{name}");
+            let (status, shown) = server.get_auth(&path, &token).await;
+            assert_eq!(status, 200, "{name}");
+            assert!(!shown.to_string().contains(SECRET), "{name} shows a secret");
+            let stored_before = state
+                .config
+                .snapshot()
+                .connectors
+                .connectors
+                .iter()
+                .find(|entry| entry.id == *name)
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .expect("stored connector");
+            let has_secret = stored_before.contains(SECRET);
+            if has_secret {
+                with_secret += 1;
+            }
+            // Send the read answer back: the mask keeps the stored secret.
+            let mut put = shown.clone();
+            for key in ["status", "node_status", "status_reason"] {
+                put.as_object_mut().unwrap().remove(key);
+            }
+            if has_secret {
+                assert!(
+                    put.to_string().contains("******"),
+                    "{name} shows no mask: {put}"
+                );
+            }
+            let (status, answer) = server.put_auth(&path, put, &token).await;
+            assert_eq!(status, 200, "{name}: {answer}");
+            assert!(!answer.to_string().contains(SECRET), "{name} answer");
+            let stored_after = state
+                .config
+                .snapshot()
+                .connectors
+                .connectors
+                .iter()
+                .find(|entry| entry.id == *name)
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .expect("stored connector");
+            assert_eq!(
+                stored_after.contains(SECRET),
+                has_secret,
+                "{name} lost its secret on the marker PUT"
+            );
+            assert!(!body.is_null());
+        }
+        assert!(with_secret >= 15, "only {with_secret} kinds kept a secret");
+        // Only a kind that this build does not compile in may be missing.
+        for (kind, message) in &unreachable_kinds {
+            assert!(
+                message.contains("cargo feature"),
+                "{kind} could not be created: {message}"
+            );
+        }
+        let (_, snapshot) = server.get_auth("/api/v5/configs", &token).await;
+        assert!(
+            !snapshot.to_string().contains(SECRET),
+            "configs show a secret"
+        );
+        println!(
+            "masked kinds: {} created, {} with a stored secret, not created: {:?}",
+            created.len(),
+            with_secret,
+            unreachable_kinds
+        );
+    }
+
+    #[tokio::test]
+    async fn action_reads_mask_secrets_and_marker_put_keeps_them() {
+        const SECRET: &str = "known-action-secret-5c21";
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "mask-action", "type": "console",
+                       "parameters": {"password": SECRET, "headers": {"token": SECRET}}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(!created.to_string().contains(SECRET));
+        let (status, shown) = server.get_auth("/api/v5/actions/mask-action", &token).await;
+        assert_eq!(status, 200);
+        assert!(!shown.to_string().contains(SECRET));
+        assert_eq!(shown["parameters"]["password"], json!("******"));
+        let (_, listed) = server.get_auth("/api/v5/actions", &token).await;
+        assert!(!listed.to_string().contains(SECRET));
+        let mut put = shown.clone();
+        for key in ["status", "node_status", "status_reason"] {
+            put.as_object_mut().unwrap().remove(key);
+        }
+        let (status, answer) = server
+            .put_auth("/api/v5/actions/mask-action", put, &token)
+            .await;
+        assert_eq!(status, 200, "{answer}");
+        assert!(!answer.to_string().contains(SECRET));
+        let stored = serde_json::to_string(&state.config.snapshot().actions).unwrap();
+        assert!(stored.contains(SECRET), "the marker PUT lost the secret");
+        assert!(!stored.contains("******"), "the mask was stored");
+    }
+
+    #[tokio::test]
+    async fn authn_backends_mask_secrets_on_read_and_keep_them_on_marker_put() {
+        const SECRET: &str = "known-authn-secret-91ab";
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let bodies = [
+            json!({"mechanism": "password_based", "backend": "mysql", "server": "127.0.0.1:3306",
+                   "database": "mqtt", "username": "u", "password": SECRET,
+                   "query": "SELECT password_hash FROM users WHERE username = ${username} LIMIT 1"}),
+            json!({"mechanism": "password_based", "backend": "postgresql", "server": "127.0.0.1:5432",
+                   "database": "mqtt", "username": "u", "password": SECRET,
+                   "query": "SELECT password_hash FROM users WHERE username = $1 LIMIT 1"}),
+            json!({"mechanism": "password_based", "backend": "mongodb", "mongo_type": "single",
+                   "server": "127.0.0.1:27017", "database": "example", "collection": "users",
+                   "username": "u", "password": SECRET}),
+            json!({"mechanism": "password_based", "backend": "redis", "redis_type": "single",
+                   "server": "127.0.0.1:6379", "cmd": "HMGET ${username} password_hash salt",
+                   "password": SECRET}),
+            json!({"mechanism": "password_based", "backend": "http", "method": "post",
+                   "url": "http://127.0.0.1:18083", "headers": {"content-type": "application/json"},
+                   "body": {"username": "${username}", "password": "${password}"},
+                   "password": SECRET}),
+            json!({"mechanism": "jwt", "algorithm": "hmac-based", "secret": SECRET,
+                   "secret_base64_encoded": false, "use_jwks": false, "verify_claims": {}}),
+        ];
+        let raw_chain = || serde_json::to_string(&state.config.snapshot().authn_chain).unwrap();
+        for body in bodies {
+            let (status, created) = server
+                .post_auth("/api/v5/authentication", body.clone(), &token)
+                .await;
+            assert_eq!(status, 200, "{body}: {created}");
+            assert!(
+                !created.to_string().contains(SECRET),
+                "create shows a secret"
+            );
+            let id = created["id"].as_str().unwrap().to_string();
+            let path = format!("/api/v5/authentication/{id}");
+            let (status, shown) = server.get_auth(&path, &token).await;
+            assert_eq!(status, 200);
+            assert!(
+                !shown.to_string().contains(SECRET),
+                "{id} single shows a secret"
+            );
+            assert!(shown.to_string().contains("******"), "{id} shows no mask");
+            let (_, listed) = server.get_auth("/api/v5/authentication", &token).await;
+            assert!(!listed.to_string().contains(SECRET), "list shows a secret");
+            let before = raw_chain();
+            assert!(before.contains(SECRET), "{id} did not store the secret");
+            // Send the read answer back: the mask keeps the stored secret.
+            let (status, answer) = server.put_auth(&path, shown.clone(), &token).await;
+            assert_eq!(status, 204, "{id}: {answer}");
+            let after = raw_chain();
+            assert_eq!(
+                after.matches(SECRET).count(),
+                before.matches(SECRET).count(),
+                "{id} lost its secret on the marker PUT"
+            );
+            assert!(!after.contains("******"), "{id} stored the mask");
+        }
+        let (_, snapshot) = server.get_auth("/api/v5/configs", &token).await;
+        assert!(!snapshot.to_string().contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn authz_sources_mask_secrets_on_read_and_keep_them_on_marker_put() {
+        const SECRET: &str = "known-authz-secret-4d70";
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Only the built-in database source can be written through the API
+        // in this build; it carries the secret in its config.
+        let (status, answer) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database",
+                json!({"type": "built_in_database", "enable": true,
+                       "config": {"password": SECRET, "token": SECRET}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204, "{answer}");
+        // A password source from an older file is read through the same API.
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "mysql".to_string(),
+                enable: false,
+                config: json!({"server": "127.0.0.1:3306", "database": "mqtt",
+                               "username": "u", "password": SECRET,
+                               "query": "SELECT 1"}),
+            })
+            .expect("seed mysql source");
+        let (status, listed) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert!(!listed.to_string().contains(SECRET), "list shows a secret");
+        assert!(listed.to_string().contains("******"));
+        for kind in ["built_in_database", "mysql"] {
+            let path = format!("/api/v5/authorization/sources/{kind}");
+            let (status, shown) = server.get_auth(&path, &token).await;
+            assert_eq!(status, 200, "{kind}");
+            assert!(!shown.to_string().contains(SECRET), "{kind} shows a secret");
+        }
+        let raw = || serde_json::to_string(&state.config.snapshot().authz_sources).unwrap();
+        let before = raw();
+        let (_, shown) = server
+            .get_auth("/api/v5/authorization/sources/built_in_database", &token)
+            .await;
+        let mut put = shown.clone();
+        put.as_object_mut().unwrap().remove("metrics");
+        let (status, answer) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database",
+                put,
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204, "{answer}");
+        let after = raw();
+        assert_eq!(
+            after.matches(SECRET).count(),
+            before.matches(SECRET).count()
+        );
+        assert!(!after.contains("******"), "the mask was stored");
+    }
+
+    #[tokio::test]
     async fn rules_list_create_delete_round_trip() {
         // W3-13 (C06-18/C06-19/C06-20) failing test: create a rule, list
         // and expect it with paging metadata; duplicate create expects

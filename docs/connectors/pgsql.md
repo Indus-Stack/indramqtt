@@ -212,3 +212,15 @@ connected
 - Read the full sink settings in [PostgreSQL](./postgres.md).
 - Feed the connector from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
+
+## Known limits in this release
+
+The broker accepts the fields in this list. The broker does not apply them in this release.
+
+- `batch_size` (the batch size)
+- `batch_timeout_ms` (the batch wait time)
+- `pool_size` (the connection pool size)
+
+To set batching, use `resource_opts` in the action. The broker applies `resource_opts`.
+
+A later release applies these fields.

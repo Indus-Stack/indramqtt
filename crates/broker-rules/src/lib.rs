@@ -11305,6 +11305,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     timestamp_field: None,
                     tag_columns: vec!["device_id".to_string()],
                     field_columns: vec!["temp".to_string()],
+                    precision: None,
                     batch_size: Some(1),
                     buffer_capacity: None,
                     timeout_ms: None,

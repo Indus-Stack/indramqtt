@@ -75,7 +75,8 @@ fn render_entry(entry: &AuthzSourceEntry) -> serde_json::Value {
             value["config"] = entry.config.clone();
         }
     }
-    value
+    // A read never shows a secret of the source.
+    broker_config::secrets::masked_secrets(&value)
 }
 
 /// `GET /authorization/sources`: ordered collection under `sources`.
@@ -683,7 +684,8 @@ fn render_detail(
             value["config"] = entry.config.clone();
         }
     }
-    value
+    // A read never shows a secret of the source.
+    broker_config::secrets::masked_secrets(&value)
 }
 
 /// `GET /authorization/sources/{type}`: read one source's config and
@@ -767,6 +769,12 @@ pub async fn put_authz_source(
         return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
             .into_response();
     };
+    // A secret sent back as the mask keeps the stored secret.
+    let mut value = value;
+    broker_config::secrets::restore_masked_secrets(&mut value, &existing.config);
+    if let Some(config) = value.get_mut("config") {
+        broker_config::secrets::restore_masked_secrets(config, &existing.config);
+    }
     let entry = match parse_update_request(&value, &source_type, &existing) {
         Ok(e) => e,
         Err(msg) => return ApiError::BadRequest(msg).into_response(),

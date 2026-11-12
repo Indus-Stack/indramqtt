@@ -318,3 +318,14 @@ ok
 - Use the documented producer name on [Confluent Producer](./confluent_producer.md).
 - Feed the connector from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
+
+## Known limits in this release
+
+The broker accepts the fields in this list. The broker does not apply them in this release.
+
+- `batch_size` (the batch size)
+- `buffer_capacity` (the buffer size)
+
+To set batching, use `resource_opts` in the action. The broker applies `resource_opts`.
+
+A later release applies these fields.

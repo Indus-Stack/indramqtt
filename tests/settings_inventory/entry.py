@@ -461,8 +461,33 @@ class InventoryEntry(unittest.TestCase):
         self.addCleanup(self.scratch.cleanup)
         self.addCleanup(self.broker.stop)
 
-    def assert_fields_kept(self, actual, expected):
+    @staticmethod
+    def is_secret_key(name):
+        lower = name.lower()
+        return (any(part in lower for part in (
+            "secret", "password", "passwd", "passphrase", "private_key", "privatekey", "api_key", "apikey",
+            "account_key", "shared_access_key", "service_account", "credentials_json"))
+            or lower == "token" or lower.endswith("_token"))
+
+    def masked(self, value):
+        # Mirror of the broker rule: a secret field reads back as ******.
+        if isinstance(value, dict):
+            return {key: ("******" if self.is_secret_key(key) and isinstance(member, (str, dict, list)) and member
+                          and not (isinstance(member, str) and member.startswith(("file:", "env:")))
+                          else self.masked(member))
+                    for key, member in value.items()}
+        if isinstance(value, list):
+            return [self.masked(member) for member in value]
+        return value
+
+    def assert_fields_equal(self, actual, expected):
+        # For answers that are not connector or action reads (peer records, authn and authz rows).
         for key, value in expected.items():
+            self.assertTrue(key in actual, key)
+            self.assertTrue(actual[key] == value, key)
+
+    def assert_fields_kept(self, actual, expected):
+        for key, value in self.masked(expected).items():
             self.assertTrue(key in actual, key)
             self.assertTrue(actual[key] == value, key)
 
@@ -497,7 +522,7 @@ class InventoryEntry(unittest.TestCase):
         expected = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
         self.assertTrue(hmac.compare_digest(parts["Signature"], expected), "selected secret did not sign the request")
 
-    def assert_forward_waits_past_configured_deadline(self, broker, connector, rule_id, payload, invalid):
+    def assert_forward_fails_at_configured_deadline(self, broker, connector, rule_id, payload, invalid):
         peer = SilentPeer()
         self.addCleanup(peer.close)
         config = {**connector, "endpoint": "http://127.0.0.1:" + str(peer.port), "timeout_ms": 1}
@@ -537,21 +562,29 @@ class InventoryEntry(unittest.TestCase):
                 if not request:
                     time.sleep(0.02)
             self.assertTrue(request, "no HTTP request reached the silent loopback peer")
-            time.sleep(0.5)
             status, answer = broker.http("GET", "/api/v5/rules/" + rule_id + "/metrics")
             self.assertEqual(status, 200)
-            metrics = answer["metrics"]
-            self.assertEqual(metrics["matched"], 1)
-            for name in ("actions.total", "actions.failed", "actions.success"):
-                self.assertEqual(metrics[name], 0)
+            self.assertEqual(answer["metrics"]["matched"], 1)
+            # The configured timeout ends the request, so the action counts a failure.
+            failed, started = 0, time.monotonic()
+            while time.monotonic() - started < 20 and not failed:
+                status, answer = broker.http("GET", "/api/v5/actions/" + config["name"] + "/metrics")
+                self.assertEqual(status, 200)
+                failed = answer["metrics"]["failed"]
+                time.sleep(0.1)
+            self.assertGreaterEqual(failed, 1, "the request did not fail at the configured timeout")
 
-    def create_forwarding_action_rule(self, broker, connector, rule_id, topic):
+    def create_forwarding_action_rule(self, broker, connector, rule_id, topic, parameters=None, resource_opts=None):
         # Equal names let the current connector-key dispatch reach the sink.
         # The fixture already uses MV-01's connector/action/rule entry shape.
+        # The action holds its own `parameters` and `resource_opts` (reference v5 shape); the kind decides which are required.
         name = connector["name"]
         kind = connector["type"]
-        self.assertEqual(broker.http("POST", "/api/v5/actions", {
-            "type": kind, "name": name, "connector": name, "parameters": {}, "enable": True})[0], 201)
+        body = {"type": kind, "name": name, "connector": name, "parameters": parameters or {}, "enable": True}
+        if resource_opts:
+            body["resource_opts"] = resource_opts
+        status, answer = broker.http("POST", "/api/v5/actions", body)
+        self.assertEqual(status, 201, answer)
         status, rule = broker.http("POST", "/api/v5/rules", {
             "id": rule_id, "sql": 'SELECT * FROM "' + topic + '"', "actions": [kind + ":" + name]})
         self.assertEqual(status, 201)
@@ -1799,7 +1832,8 @@ class InventoryEntry(unittest.TestCase):
         publish(b, pub, "inventory/action", b'{"value":31}')
         status, stats = b.http("GET", "/api/v5/actions/inventoryaction/metrics")
         self.assertEqual(status, 200)
-        self.assertEqual(stats["metrics"], {"total": 1, "success": 1, "failed": 0})
+        # Action metrics also carry matched, dropped, queuing and inflight keys; check the needed ones.
+        self.assert_fields_kept(stats["metrics"], {"total": 1, "success": 1, "failed": 0})
         status, _ = b.http("PUT", "/api/v5/actions/inventoryaction", {**config, "parameters": "invalid"})
         self.assertEqual(status, 400)
         status, kept = b.http("GET", "/api/v5/actions/inventoryaction")
@@ -1811,7 +1845,8 @@ class InventoryEntry(unittest.TestCase):
         publish(b, pub, "inventory/action", b'{"value":32}')
         status, stats = b.http("GET", "/api/v5/actions/inventoryaction/metrics")
         self.assertEqual(status, 200)
-        self.assertEqual(stats["metrics"], {"total": 1, "success": 1, "failed": 0})
+        # Action metrics also carry matched, dropped, queuing and inflight keys; check the needed ones.
+        self.assert_fields_kept(stats["metrics"], {"total": 1, "success": 1, "failed": 0})
         status, kept = b.http("GET", "/api/v5/actions/inventoryaction")
         self.assertEqual(status, 200)
         for key in ["id", "name", "type", "enable", "connector", "parameters", "resource_opts",
@@ -2790,7 +2825,8 @@ class InventoryEntry(unittest.TestCase):
         attempt()
         self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorypg", {**config, "server": "127.0.0.1:notaport"})[0], 400)
         self.assertEqual(b.http("GET", "/api/v5/connectors/inventorypg")[1]["server"], config["server"])
-        time.sleep(1.1)
+        # One failed delivery backs the sink off for 2 s (BackoffState::failure, broker-connectors lib.rs:850).
+        time.sleep(2.2)
         attempt()
         b.stop()
         b.start()
@@ -2809,7 +2845,7 @@ class InventoryEntry(unittest.TestCase):
         self.assertIn("password", error["message"])
         self.assertIn("secret reference", error["message"])
         self.assertTrue(b.http("GET", "/api/v5/connectors/inventorypg") == before)
-        time.sleep(1.1)
+        time.sleep(2.2)
         attempt()
         b.stop()
         b.start()
@@ -2928,7 +2964,7 @@ class InventoryEntry(unittest.TestCase):
         # audit proves no module/deadline hook; this is not a timeout stress test.
 
     # // AZ-01 inventory: current behaviour; owner MV-03a
-    def test_stream_driver_accepts_token_and_admin_url_then_refuses_on_publish(self):
+    def test_stream_driver_accepts_token_refuses_admin_url_and_fails_on_publish(self):
         peer = SilentPeer()
         self.addCleanup(peer.close)
         b = self.boot()
@@ -2940,7 +2976,9 @@ class InventoryEntry(unittest.TestCase):
                   "batch_bytes": 2097152, "linger_ms": 60000, "max_retries": 0,
                   "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorydriverstreaminitial", "inventory/driver/initial")
+        # The pulsar action needs its own topic: action_sinks.rs required_action_parameters, "pulsar" arm (line 2264).
+        self.create_forwarding_action_rule(b, config, "inventorydriverstreaminitial", "inventory/driver/initial",
+                                           {"pulsar_topic": "selected_topic"})
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -2948,14 +2986,23 @@ class InventoryEntry(unittest.TestCase):
             for mode in ("token", "admin"):
                 selected = dict(config)
                 if mode == "admin":
+                    # An http admin URL is refused for a connector with a pulsar action:
+                    # action_sinks.rs pulsar_sink_config (line 7271) needs a pulsar:// service URL.
                     selected.pop("token")
                     selected["service_url"] = "http://127.0.0.1:" + str(peer.port)
-                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydriverstream", selected)[0], 200)
-                status, stored = b.http("GET", "/api/v5/connectors/inventorydriverstream")
-                self.assertEqual(status, 200)
-                self.assert_fields_kept(stored, selected)
-                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydriverstream", {**selected, "tenant": "bad/tenant"})[0], 400)
-                self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydriverstream") == (200, stored))
+                    before = b.http("GET", "/api/v5/connectors/inventorydriverstream")
+                    status, answer = b.http("PUT", "/api/v5/connectors/inventorydriverstream", selected)
+                    self.assertEqual(status, 400, answer)
+                    self.assertIn("pulsar://", answer["message"])
+                    self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydriverstream") == before)
+                else:
+                    status, answer = b.http("PUT", "/api/v5/connectors/inventorydriverstream", selected)
+                    self.assertEqual(status, 200, (mode, answer))
+                    status, stored = b.http("GET", "/api/v5/connectors/inventorydriverstream")
+                    self.assertEqual(status, 200)
+                    self.assert_fields_kept(stored, selected)
+                    self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydriverstream", {**selected, "tenant": "bad/tenant"})[0], 400)
+                    self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydriverstream") == (200, stored))
                 rule_id = "inventorydriverstream" + mode + str(attempt)
                 topic = "inventory/driver/" + mode + str(attempt)
                 self.assertEqual(b.http("POST", "/api/v5/rules", {
@@ -3107,25 +3154,30 @@ class InventoryEntry(unittest.TestCase):
         self.addCleanup(lambda: broker_thread.join(timeout=1))
         b = self.boot()
         access, secret = secrets.token_hex(12), secrets.token_hex(24)
+        session = secrets.token_hex(16)
+        # The vendor path needs a security token (action_sinks.rs build_rocketmq_sink, line 8248).
+        # Tag and key are action parameters `tag`, `strategy`, `key` (rocketmq_sink_config, line 8163).
         config = {"type": "rocketmq", "name": "inventoryqueue",
                   "endpoint": "127.0.0.1:" + str(nameserver_port),
                   "topic": "selected_topic", "access_key": access, "secret_key": secret,
-                  "tag_template": "selected-tag", "keys_template": "selected-key",
-                   "message_group_template": "selected-group", "batch_size": 1,
-                   "buffer_capacity": 1, "linger_ms": 10, "timeout_ms": 1200}
+                  "security_token": session, "batch_size": 1,
+                  "buffer_capacity": 1, "linger_ms": 10, "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventoryqueuerule", "inventory/queue")
+        self.create_forwarding_action_rule(b, config, "inventoryqueuerule", "inventory/queue", {
+            "topic": "selected_topic", "tag": "selected-tag", "strategy": "key_dispatch", "key": "selected-key-${client_id}"})
         for attempt in range(2):
             if attempt:
                 b.stop()
                 b.start()
             status, stored = b.http("GET", "/api/v5/connectors/inventoryqueue")
             self.assertEqual(status, 200)
-            kept = {key: value for key, value in config.items() if key != "secret_key"}
+            kept = {key: value for key, value in config.items() if key not in ("secret_key", "security_token")}
             self.assert_fields_kept(stored, kept)
             self.assertEqual(stored.get("access_key"), access)
             self.assertNotEqual(stored.get("secret_key"), secret)
+            self.assertNotEqual(stored.get("security_token"), session)
             self.assertTrue(secret not in json.dumps(stored), "secret must not render in a read")
+            self.assertTrue(session not in json.dumps(stored), "security token must not render in a read")
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryqueue", {**config, "topic": "bad topic"})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventoryqueue") == (200, stored))
             pub, ack = b.connect("queue-publisher-" + str(attempt))
@@ -3137,7 +3189,10 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(body, payload)
             self.assertEqual(ext.get("AccessKey"), access)
             self.assertTrue("Signature" in ext)
+            self.assertEqual(ext.get("SecurityToken"), session)
             self.assertTrue("payload-client" in ext.get("properties", ""))
+            self.assertTrue("selected-tag" in ext.get("properties", ""))
+            self.assertTrue("selected-key" in ext.get("properties", ""))
             while not captured.empty():
                 captured.get_nowait()
 
@@ -3159,86 +3214,55 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryrsastream")[0], 404)
 
     # // AZ-01 inventory: current behaviour; owner MV-02a
-    def test_data_api_sdk_replaces_cluster_user_sql_and_session_settings(self):
-        statement_id = str(uuid.uuid4())
-        receiver = HttpReceiver(json.dumps({"Id": statement_id, "Status": "FINISHED", "HasResultSet": False}).encode())
-        self.addCleanup(receiver.close)
+    def test_data_api_sdk_refuses_cluster_user_sql_and_session_settings(self):
         b = self.boot()
         access_key, secret_key = secrets.token_hex(12).upper(), secrets.token_hex(24)
         config = {"type": "redshift", "name": "inventorydataapi", "database": "audit_database", "table": "audit_table",
-                  "workgroup_name": "audit_workgroup", "cluster_identifier": "requested_cluster", "db_user": "requested_user",
-                  "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port), "region": "us-west-2",
-                  "access_key_id": access_key, "secret_access_key": secret_key, "session_token": secrets.token_hex(24),
-                  "sql_template": "INSERT INTO $table (payload) VALUES ($5)", "batch_size": 20, "batch_bytes": 2097152,
-                  "linger_ms": 60000, "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
+                  "workgroup_name": "audit_workgroup", "endpoint": "http://127.0.0.1:9", "region": "us-west-2",
+                  "access_key_id": access_key, "secret_access_key": secret_key, "timeout_ms": 1200}
+        # These Data API fields are not reference fields and nothing applies them: refused with the field named.
+        refused = {"cluster_identifier": "requested_cluster", "db_user": "requested_user",
+                   "session_token": secrets.token_hex(24),
+                   "sql_template": "INSERT INTO $table (payload) VALUES ($5)"}
+        for field, value in refused.items():
+            status, error = b.http("POST", "/api/v5/connectors", {**config, field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
+            self.assertEqual(b.http("GET", "/api/v5/connectors/inventorydataapi")[0], 404)
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorydataapirule", "inventory/dataapi")
         for attempt in range(2):
             if attempt:
                 b.stop()
                 b.start()
-                self.assert_fields_kept(b.http("GET", "/api/v5/connectors/inventorydataapi")[1], config)
-            pub, ack = b.connect("data-api-publisher-" + str(attempt))
-            self.assertEqual(ack, "0000")
-            for workgroup in ("audit_workgroup", None):
-                if workgroup:
-                    config["workgroup_name"] = workgroup
-                else:
-                    config.pop("workgroup_name", None)
-                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydataapi", config)[0], 200)
-                status, stored = b.http("GET", "/api/v5/connectors/inventorydataapi")
-                self.assertEqual(status, 200)
-                self.assert_fields_kept(stored, config)
-                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydataapi", {
-                    **config, "database": ""})[0], 400)
+            status, stored = b.http("GET", "/api/v5/connectors/inventorydataapi")
+            self.assertEqual(status, 200)
+            self.assert_fields_kept(stored, config)
+            for field, value in refused.items():
+                status, error = b.http("PUT", "/api/v5/connectors/inventorydataapi", {**config, field: value})
+                self.assertEqual(status, 400, field)
+                self.assertIn(field, error["message"])
                 self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydataapi") == (200, stored))
-                lower = int(time.time() * 1000) - 1000
-                publish(b, pub, "inventory/dataapi", b'{"v":157}')
-                for operation in ("BatchExecuteStatement", "DescribeStatement"):
-                    path, raw = receiver.requests.get(timeout=10)
-                    headers = receiver.request_headers.get(timeout=10)
-                    self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
-                    self.assertEqual(path, "/")
-                    self.assertEqual(headers["x-amz-target"], "RedshiftData." + operation)
-                    self.assertTrue("x-amz-security-token" not in headers, "unexpected request header")
-                    self.assert_sigv4_request("POST", path, headers, raw, access_key, secret_key, "us-west-2", "redshift-data")
-                    body = json.loads(raw)
-                    if operation == "DescribeStatement":
-                        self.assertTrue(body == {"Id": statement_id}, "unexpected status-poll request")
-                        continue
-                    token = body.pop("ClientToken", None)
-                    self.assertTrue(token is None or (isinstance(token, str) and 0 < len(token) <= 64),
-                                    "invalid protocol idempotency metadata")
-                    self.assertEqual(set(body), {"Database", "WorkgroupName", "Sqls"})
-                    self.assertEqual(body["Database"], "audit_database")
-                    if workgroup:
-                        self.assertEqual(body["WorkgroupName"], workgroup)
-                    else:
-                        self.assertTrue(body["WorkgroupName"] and body["WorkgroupName"] != config["cluster_identifier"])
-                    self.assertEqual(len(body["Sqls"]), 1)
-                    sql = body["Sqls"][0]
-                    prefix = "INSERT INTO audit_table (time_ms, topic, client_id, qos, payload) VALUES ("
-                    suffix = ", 'inventory/dataapi', '', 0, '{\"v\":157}')"
-                    self.assertTrue(sql.startswith(prefix))
-                    self.assertTrue(sql.endswith(suffix))
-                    timestamp = sql[len(prefix):-len(suffix)]
-                    self.assertTrue(timestamp.isdigit())
-                    self.assertTrue(lower <= int(timestamp) <= int(time.time() * 1000) + 1000)
+            self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydataapi", {
+                **config, "database": ""})[0], 400)
+            self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydataapi") == (200, stored))
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
-    def test_table_store_replaces_primary_attribute_and_batch_mappings(self):
+    def test_table_store_applies_action_primary_key_attribute_and_measurement(self):
         receiver = HttpReceiver(b'{"tables":[{"rows":[{"is_ok":true}]}]}')
         self.addCleanup(receiver.close)
         b = self.boot()
         access_key, secret_key = secrets.token_hex(12), secrets.token_hex(24)
+        # Table, measurement, primary keys (`tags`) and attribute columns (`fields`) belong to the action:
+        # action_sinks.rs required_action_parameters "tablestore" arm (line 1953) and build_tablestore_sink (line 7383).
         config = {"type": "tablestore", "name": "inventorytablestore", "instance_name": "audit_instance",
-                  "table_name": "audit_table", "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
+                  "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
                   "access_key_id": access_key, "access_key_secret": secret_key,
-                  "primary_keys": [{"name": "requested_pk", "source": "${payload.requested}", "data_type": "integer"}],
-                  "attribute_columns": [{"name": "requested_attr", "source": "${payload.requested}", "data_type": "integer"}],
                   "batch_size": 20, "buffer_capacity": 1, "linger_ms": 60000, "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorytablestorerule", "inventory/tablestore")
+        self.create_forwarding_action_rule(b, config, "inventorytablestorerule", "inventory/tablestore", {
+            "table_name": "audit_table", "measurement": "audit_measurement",
+            "tags": {"requested_pk": "${client_id}"},
+            "fields": [{"column": "requested_attr", "value": "${payload.requested}", "isint": True}]})
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3274,11 +3298,14 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(table["table_name"], "audit_table")
             self.assertEqual(len(table["rows"]), 1)
             row = table["rows"][0]
-            self.assertEqual(len(row["attributes"]), 1)
-            timestamp = row["attributes"][0].pop("timestamp_ms")
-            self.assertTrue(lower <= timestamp <= int(time.time() * 1000) + 1000)
-            self.assertEqual(row, {"operation": "put", "primary_keys": [{"name": "device_id", "type": "string", "value": "audit_device"}],
-                "attributes": [{"name": "temperature", "type": "double", "value": 42.5}]})
+            # Action `tags` become the primary key, `fields` the attributes, and `measurement` is stored on every row.
+            self.assertEqual(len(row["attributes"]), 2)
+            for attribute in row["attributes"]:
+                timestamp = attribute.pop("timestamp_ms")
+                self.assertTrue(lower <= timestamp <= int(time.time() * 1000) + 1000)
+            self.assertEqual(row, {"operation": "put", "primary_keys": [{"name": "requested_pk", "type": "string", "value": "audit_device"}],
+                "attributes": [{"name": "requested_attr", "type": "integer", "value": 163},
+                               {"name": "measurement", "type": "string", "value": "audit_measurement"}]})
 
     # // AZ-01 inventory: current behaviour; owner MV-04
     def test_removed_table_kind_still_writes_and_replaces_codec_partition_and_deadline(self):
@@ -3295,20 +3322,25 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(b.http("GET", "/api/v5/connectors/inventorytableobject")[0], 404)
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_time_series_http_replaces_measure_dimension_time_and_does_not_apply_deadline(self):
+    def test_time_series_http_applies_measure_dimension_precision_session_token_and_timeout(self):
         receiver = HttpReceiver(b'{"RecordsIngested":{"Total":1}}')
         self.addCleanup(receiver.close)
         b = self.boot()
         access_key, secret_key = secrets.token_hex(12).upper(), secrets.token_hex(24)
+        # The connector holds the documented flat fields and the action merges them (build_timestream_sink,
+        # action_sinks.rs line 4665); the session token is applied to the request.
+        session = secrets.token_hex(24)
         config = {"type": "timestream", "name": "inventorytimeseries", "database_name": "audit_database",
                   "table_name": "audit_table", "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
                   "region": "us-west-2", "access_key_id": access_key, "secret_access_key": secret_key,
-                  "session_token": secrets.token_hex(24), "time_unit": "nanoseconds", "measure_name_template": "requested_measure",
+                  "session_token": session, "measure_name_template": "requested_measure",
                   "dimensions": {"requested_dimension": "${payload.site}"}, "multi_measure_mappings": {"requested": "BIGINT"},
                   "batch_size": 20, "batch_bytes": 2097152, "linger_ms": 60000,
                   "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
-        self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorytimeseriesrule", "inventory/timeseries")
+        status, answer = b.http("POST", "/api/v5/connectors", config)
+        self.assertEqual(status, 201, answer)
+        # Time precision is the action parameter `precision` (build_timestream_sink); `time_unit` is not read.
+        self.create_forwarding_action_rule(b, config, "inventorytimeseriesrule", "inventory/timeseries", {"precision": "ns"})
         payload = b'{"client_id":"audit_device","site":"requested_site","temperature":42.5,"requested":151}'
         for attempt in range(2):
             if attempt:
@@ -3329,7 +3361,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
             self.assertEqual(path, "/")
             self.assertEqual(headers["x-amz-target"], "Timestream_20181101.WriteRecords")
-            self.assertTrue("x-amz-security-token" not in headers, "unexpected request header")
+            self.assertEqual(headers.get("x-amz-security-token"), session)
             self.assert_sigv4_request("POST", path, headers, raw, access_key, secret_key, "us-west-2", "timestream")
             body = json.loads(raw)
             self.assertEqual(set(body), {"DatabaseName", "TableName", "Records"})
@@ -3339,12 +3371,13 @@ class InventoryEntry(unittest.TestCase):
             record = body["Records"][0]
             timestamp = record.pop("Time")
             self.assertTrue(timestamp.isdigit())
-            self.assertTrue(lower <= int(timestamp) <= int(time.time() * 1000) + 1000)
-            self.assertEqual(record, {"Dimensions": [{"Name": "device", "Value": "audit_device"},
-                {"Name": "topic", "Value": "inventory/timeseries"}], "MeasureName": "inventory/timeseries",
-                "MeasureValueType": "MULTI", "MeasureValues": [{"Name": "temperature", "Value": "42.5", "Type": "DOUBLE"}],
-                "TimeUnit": "MILLISECONDS"})
-        self.assert_forward_waits_past_configured_deadline(b, config, "inventorytimedeadline", payload,
+            # The nanosecond precision, the dimension, the measure name and the measure mapping are all applied.
+            self.assertTrue(lower * 1000000 <= int(timestamp) <= (int(time.time() * 1000) + 1000) * 1000000)
+            self.assertEqual(record, {"Dimensions": [{"Name": "requested_dimension", "Value": "requested_site"},
+                {"Name": "topic", "Value": "inventory/timeseries"}], "MeasureName": "requested_measure",
+                "MeasureValueType": "MULTI", "MeasureValues": [{"Name": "requested", "Value": "151", "Type": "BIGINT"}],
+                "TimeUnit": "NANOSECONDS"})
+        self.assert_forward_fails_at_configured_deadline(b, config, "inventorytimedeadline", payload,
                                                         {"database_name": ""})
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
@@ -3678,7 +3711,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(document, {"topic": "inventory/search", "qos": 0, "payload": {"v": 113}})
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_rest_sql_connector_replaces_selected_tag_metric_and_batch_templates(self):
+    def test_rest_sql_connector_applies_tag_and_metric_templates(self):
         receiver = HttpReceiver(b'{"code":0,"rows":1}')
         self.addCleanup(receiver.close)
         b = self.boot()
@@ -3714,9 +3747,10 @@ class InventoryEntry(unittest.TestCase):
             expected_auth = "Basic " + base64.b64encode(("audit_user:" + password).encode()).decode()
             self.assertTrue(headers["authorization"] == expected_auth, "selected credentials differ")
             statement = raw.decode()
-            prefix = "INSERT INTO audit_subtable USING audit_stable TAGS ('room1') VALUES ("
-            suffix = ", 109);"
-            self.assertTrue(statement.startswith(prefix))
+            # The tag and metric templates are merged into the action and applied (build_tdengine_sink, action_sinks.rs line 4177).
+            prefix = "INSERT INTO audit_subtable USING audit_stable TAGS ('requested') VALUES ("
+            suffix = ", 99);"
+            self.assertTrue(statement.startswith(prefix), statement)
             self.assertTrue(statement.endswith(suffix))
             timestamp = statement[len(prefix):-len(suffix)]
             self.assertTrue(timestamp.isdigit())
@@ -3761,7 +3795,8 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(headers["authorization"] == expected_auth, "selected credentials differ")
             self.assertEqual(headers["format"], "json")
             self.assertEqual(headers["strip_outer_array"], "true")
-            self.assertEqual(headers["max_filter_ratio"], "0")
+            # The doris action sends no max_filter_ratio header: build_doris_sink sets max_filter_ratio to None (action_sinks.rs line 4526).
+            self.assertTrue("max_filter_ratio" not in headers, "unexpected request header")
             self.assertTrue("jsonpaths" not in headers, "unexpected request header")
             self.assertTrue(headers["label"].startswith("indra-"))
             rows = json.loads(raw)
@@ -3774,7 +3809,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(lower <= row["timestamp"] <= int(time.time() * 1000) + 1000)
 
     # // AZ-01 inventory: current behaviour; owner MV-02a
-    def test_sql_url_keeps_encoded_password_drops_application_option_and_batch_bound(self):
+    def test_sql_connector_keeps_encoded_password_and_refuses_application_name(self):
         fixture = ROOT / "crates/broker-node/tests/k1_05"
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(fixture / "server-cert.pem", fixture / "server-key.pem")
@@ -3785,20 +3820,37 @@ class InventoryEntry(unittest.TestCase):
         b.extra_env["SSL_CERT_FILE"] = str(fixture / "ca-cert.pem")
         b.start()
         encoded_password = secrets.token_hex(24) + "%2B"
-        connection = ("postgresql://audit_user:" + encoded_password + "@127.0.0.1:" + str(peer.port)
-                      + "/audit_database?application_name=audit_application")
-        config = {"type": "cockroachdb", "name": "inventorysqlurl", "connection_string": connection,
+        # Reference connector shape: server, database, username, password and ssl (pg_family_tls and
+        # build_pg_family_sink, action_sinks.rs lines 2813 and 2933). The password is sent as written.
+        config = {"type": "cockroachdb", "name": "inventorysqlurl", "server": "127.0.0.1:" + str(peer.port),
+                  "database": "audit_database", "username": "audit_user", "password": encoded_password,
+                  "ssl": {"enable": True},
                   "table": "audit_rows", "upsert_conflict_columns": ["v"], "batch_size": 20,
                   "max_retry_attempts": 1, "buffer_capacity": 1, "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorysqlurlrule", "inventory/sqlurl")
+        # SQL-family actions need `parameters.sql` (action_sinks.rs required_action_parameters, line 1702).
+        self.create_forwarding_action_rule(b, config, "inventorysqlurlrule", "inventory/sqlurl", {
+            "sql": "INSERT INTO audit_rows (topic, qos, payload) VALUES ($1, $2, $3)"})
         for attempt in range(2):
             if attempt:
                 b.stop()
                 b.start()
             status, stored = b.http("GET", "/api/v5/connectors/inventorysqlurl")
             self.assertEqual(status, 200)
-            self.assert_fields_kept(stored, config)
+            self.assert_fields_kept(stored, {key: value for key, value in config.items() if key != "password"})
+            # A read never returns the password.
+            self.assertNotIn(encoded_password, json.dumps(stored))
+            self.assertEqual(stored["password"], "******")
+            # Sending the marker back keeps the stored password.
+            self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorysqlurl", {
+                **config, "password": "******"})[0], 200)
+            self.assertTrue(b.http("GET", "/api/v5/connectors/inventorysqlurl") == (200, stored))
+            # An explicit application_name is refused: refuse_pg_connector_override (action_sinks.rs line 2769).
+            status, error = b.http("PUT", "/api/v5/connectors/inventorysqlurl", {
+                **config, "application_name": "audit_application"})
+            self.assertEqual(status, 400, error)
+            self.assertIn("application_name", error["message"])
+            self.assertTrue(b.http("GET", "/api/v5/connectors/inventorysqlurl") == (200, stored))
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorysqlurl", {
                 **config, "table": ""})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventorysqlurl") == (200, stored))
@@ -3806,7 +3858,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(ack, "0000")
             publish(b, pub, "inventory/sqlurl", b'{"v":103}')
             record = peer.records.get(timeout=10)
-            self.assert_fields_kept(record, {"user": "audit_user", "database": "audit_database",
+            self.assert_fields_equal(record, {"user": "audit_user", "database": "audit_database",
                 "application_name": None, "password_sha256": hashlib.sha256(encoded_password.encode()).hexdigest()})
             self.assertGreaterEqual(peer.tls_sessions, attempt + 1)
             self.assertTrue(peer.errors.empty(), "TLS database observer protocol error")
@@ -3814,7 +3866,7 @@ class InventoryEntry(unittest.TestCase):
         # saturation are not qualified by this entry case.
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_sql_http_connector_replaces_format_precision_batch_and_nested_auth(self):
+    def test_sql_http_connector_applies_format_precision_and_ignores_nested_auth(self):
         receiver = HttpReceiver(b'{"code":0}')
         self.addCleanup(receiver.close)
         b = self.boot()
@@ -3824,10 +3876,11 @@ class InventoryEntry(unittest.TestCase):
                   "database": "audit_database", "table": "audit_rows",
                   "username": "audit_user", "password": password,
                   "auth": {"username": "nested_user", "password": secrets.token_hex(24)},
-                  "format": "influx_line_protocol", "timestamp_precision": "second",
                   "batch_size": 20, "buffer_capacity": 1, "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorysqlhttprule", "inventory/sqlhttp")
+        # Format and precision are action parameters: build_greptimedb_sink (action_sinks.rs line 3966).
+        self.create_forwarding_action_rule(b, config, "inventorysqlhttprule", "inventory/sqlhttp", {
+            "format": "sql", "precision": "s"})
         for attempt in range(2):
             if attempt:
                 config.pop("username")
@@ -3864,10 +3917,11 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(statement.endswith(suffix))
             timestamp = statement[len(prefix):-len(suffix)]
             self.assertTrue(timestamp.isdigit())
-            self.assertTrue(lower <= int(timestamp) <= int(time.time() * 1000) + 1000)
+            # Precision `s` is applied: the timestamp is in seconds.
+            self.assertTrue(lower // 1000 <= int(timestamp) <= int(time.time()) + 1)
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_tablet_connector_replaces_alignment_measurements_types_and_batching(self):
+    def test_tablet_connector_applies_alignment_and_batches_one_tablet(self):
         receiver = HttpReceiver(b'{"code":200}')
         self.addCleanup(receiver.close)
         b = self.boot()
@@ -3876,10 +3930,11 @@ class InventoryEntry(unittest.TestCase):
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port) + "/rest/v2",
                   "device_path_template": "root.audit.unit", "username": "audit_user", "password": password,
                   "is_aligned": True, "measurements": ["requested"], "data_types": ["INT64"],
-                  "batch_size": 20, "batch_bytes": 1048576, "linger_ms": 60000,
-                  "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
+                  "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorytabletrule", "inventory/tablet")
+        # The action batch size 16 sends 16 rows in one insertTablet request (16 is the default worker pool size).
+        self.create_forwarding_action_rule(b, config, "inventorytabletrule", "inventory/tablet",
+                                           resource_opts={"batch_size": 16, "batch_time": "30s"})
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3893,7 +3948,7 @@ class InventoryEntry(unittest.TestCase):
             pub, ack = b.connect("tablet-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
             lower = int(time.time() * 1000) - 1000
-            for _ in range(20):
+            for _ in range(16):
                 publish(b, pub, "inventory/tablet", b'{"temperature":101.5,"requested":9}')
             path, raw = receiver.requests.get(timeout=10)
             headers = receiver.request_headers.get(timeout=10)
@@ -3903,14 +3958,31 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(headers["authorization"] == expected_auth, "selected credentials differ")
             body = json.loads(raw)
             times = body.pop("timestamps")
-            self.assertEqual(len(times), 20)
+            self.assertEqual(len(times), 16)
             for stamp in times:
                 self.assertTrue(lower <= stamp <= int(time.time() * 1000) + 1000)
             self.assertEqual(body, {"device": "root.audit.unit", "is_aligned": True,
-                "measurements": ["requested"], "data_types": ["INT64"], "values": [[9] * 20]})
+                "measurements": ["requested"], "data_types": ["INT64"], "values": [[9] * 16]})
+            self.assertEqual(len(set(times)), 16, "rows of one tablet need distinct times")
+        # The action parameter `is_aligned` wins over the connector value.
+        other = {**config, "name": "inventorytabletflat"}
+        self.assertEqual(b.http("POST", "/api/v5/connectors", other)[0], 201)
+        self.create_forwarding_action_rule(b, other, "inventorytabletflatrule", "inventory/tabletflat",
+                                           {"is_aligned": False}, {"batch_size": 1})
+        pub, ack = b.connect("tablet-publisher-flat")
+        self.assertEqual(ack, "0000")
+        publish(b, pub, "inventory/tabletflat", b'{"temperature":101.5,"requested":9}')
+        path, raw = receiver.requests.get(timeout=10)
+        self.assertEqual(path, "/rest/v2/insertTablet")
+        self.assertEqual(json.loads(raw)["is_aligned"], False)
+        status, error = b.http("POST", "/api/v5/actions", {
+            "type": "iotdb", "name": "inventorytabletbad", "connector": "inventorytablet", "enable": True,
+            "parameters": {"is_aligned": "yes"}})
+        self.assertEqual(status, 400)
+        self.assertIn("is_aligned", error["message"])
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_layer_connector_replaces_selected_columns_time_and_batching(self):
+    def test_layer_connector_applies_selected_columns_time_and_precision(self):
         receiver = HttpReceiver()
         self.addCleanup(receiver.close)
         b = self.boot()
@@ -3920,7 +3992,7 @@ class InventoryEntry(unittest.TestCase):
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
                   "database": "audit_database", "table": "audit_rows", "auth_token": token,
                   "timestamp_field": "requested_time", "tag_columns": ["requested_tag"],
-                  "field_columns": ["v"], "batch_size": 20, "buffer_capacity": 1, "timeout_ms": 1200}
+                  "field_columns": ["v"], "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
         self.create_forwarding_action_rule(b, config, "inventorylayerrule", "inventory/layer")
         for attempt in range(2):
@@ -3954,7 +4026,29 @@ class InventoryEntry(unittest.TestCase):
                 self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
                 self.assertEqual(path, "/write?db=audit_database&precision=us")
                 self.assertTrue(headers["authorization"] == expected_auth, "selected credentials differ")
-                self.assertEqual(raw, b'audit_rows,sensor=selected_sensor temperature=42i 1700000000000000')
+                # The selected time field, tag column and field column are applied.
+                self.assertEqual(raw, b'audit_rows,requested_tag=ignored v=97i 1800000000000000')
+        # The action parameter `precision` sets the write precision and the time unit.
+        precise = {**config, "name": "inventorylayerms"}
+        self.assertEqual(b.http("POST", "/api/v5/connectors", precise)[0], 201)
+        self.create_forwarding_action_rule(b, precise, "inventorylayermsrule", "inventory/layerms",
+                                           {"precision": "ms"})
+        pub, ack = b.connect("layer-publisher-ms")
+        self.assertEqual(ack, "0000")
+        publish(b, pub, "inventory/layerms", json.dumps(payload).encode())
+        path, raw = receiver.requests.get(timeout=10)
+        self.assertEqual(path, "/write?db=audit_database&precision=ms")
+        self.assertEqual(raw, b'audit_rows,requested_tag=ignored v=97i 1800000000000')
+        # The line-protocol template `write_syntax` is not rendered by this sink: refused.
+        status, error = b.http("POST", "/api/v5/actions", {
+            "type": "datalayers", "name": "inventorylayerws", "connector": "inventorylayer", "enable": True,
+            "parameters": {"write_syntax": "audit_rows v=${payload.v}"}})
+        self.assertEqual(status, 400)
+        self.assertIn("write_syntax", error["message"])
+        self.assertEqual(b.http("GET", "/api/v5/actions/inventorylayerws")[0], 404)
+        status, error = b.http("PUT", "/api/v5/connectors/inventorylayer", {**config, "tag_columns": "requested_tag"})
+        self.assertEqual(status, 400)
+        self.assertIn("tag_columns", error["message"])
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
     def test_metric_connector_forces_http_plain_body_and_single_row_batch(self):
@@ -4016,7 +4110,9 @@ class InventoryEntry(unittest.TestCase):
                   "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9,
                   "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorystreamingrule", "inventory/streaming")
+        # Database, schema and pipe are action parameters: build_snowflake_sink (action_sinks.rs line 6220).
+        self.create_forwarding_action_rule(b, config, "inventorystreamingrule", "inventory/streaming", {
+            "database": "audit_database", "schema": "audit_schema", "pipe": "audit_pipe"})
         for attempt in range(2):
             if attempt:
                 config.update(database="other_database", schema="other_schema", table="other_table")
@@ -4036,7 +4132,8 @@ class InventoryEntry(unittest.TestCase):
             path, raw = receiver.requests.get(timeout=10)
             headers = receiver.request_headers.get(timeout=10)
             self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
-            self.assertEqual(path, "/v1/data/streaming/channels/INDRA_CHANNEL/rows")
+            # The channel is the action pipe (build_snowflake_sink sets channel to pipe).
+            self.assertEqual(path, "/v1/data/streaming/channels/audit_pipe/rows")
             self.assertTrue("x-snowflake-role" not in headers, "unexpected request header")
             self.assertTrue(headers["authorization"].startswith("Bearer "))
             parts = headers["authorization"][7:].split(".")
@@ -4057,56 +4154,64 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(lower <= row["_MQTT_TIMESTAMP"] <= int(time.time() * 1000) + 1000)
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
-    def test_disk_connector_writes_outside_data_and_ignores_format_rotation(self):
+    def test_disk_connector_refuses_outside_data_and_writes_inside(self):
         b = self.boot()
         outside = b.base / "outside-data"
         outside.mkdir()
-        config = {"type": "disk_log", "name": "inventorydisk", "directory": str(outside),
+        (b.data / "outside-link").symlink_to(outside, target_is_directory=True)
+        config = {"type": "disk_log", "name": "inventorydisk", "directory": "inside",
                   "filename_prefix": "selected", "filename_extension": "entry",
-                  "format": "raw", "max_file_size_bytes": 1, "max_file_age_secs": 1,
-                  "compression": "gzip", "max_backup_files": 1, "max_retention_days": 1,
-                  "sync_mode": "os_default", "timeout_ms": 1}
+                  "format": "raw", "max_file_size_bytes": 16, "max_file_age_secs": 3600,
+                  "compression": "gzip", "max_backup_files": 8, "max_retention_days": 1,
+                  "sync_mode": "os_default", "timeout_ms": 1000}
+        # A directory outside the data directory is refused: absolute, parent
+        # component, a symlink, or a path below a symlink.
+        for bad in (str(outside), "../outside-data", "outside-link", "outside-link/deeper"):
+            status, error = b.http("POST", "/api/v5/connectors", {
+                **config, "name": "inventorydiskbad", "directory": bad})
+            self.assertEqual(status, 400, bad)
+            self.assertIn("directory", error["message"])
+            self.assertEqual(b.http("GET", "/api/v5/connectors/inventorydiskbad")[0], 404)
+        self.assertEqual(list(outside.iterdir()), [])
+        for field, value in (("format", "xml"), ("compression", "zip"), ("max_file_size_bytes", "big")):
+            status, error = b.http("POST", "/api/v5/connectors", {
+                **config, "name": "inventorydiskbad", field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
+        # A directory inside the data directory is created there.
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventorydiskrule", "inventory/disk")
-        active = outside / "selected.entry"
-        self.assertFalse(active.resolve().is_relative_to(b.data.resolve()))
-        expected = []
+        self.assertTrue((b.data / "inside").is_dir())
         for attempt in range(2):
             if attempt:
-                link = b.data / "outside-link"
-                link.symlink_to(outside, target_is_directory=True)
-                config["directory"] = str(link)
-                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydisk", config)[0], 200)
                 b.stop()
                 b.start()
             status, stored = b.http("GET", "/api/v5/connectors/inventorydisk")
             self.assertEqual(status, 200)
             self.assert_fields_kept(stored, config)
+            for bad in (str(outside), "outside-link"):
+                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydisk", {
+                    **config, "directory": bad})[0], 400)
+                self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydisk") == (200, stored))
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydisk", {
                 **config, "filename_prefix": "bad/name"})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydisk") == (200, stored))
-            pub, ack = b.connect("disk-publisher-" + str(attempt))
-            self.assertEqual(ack, "0000")
-            for offset in range(2):
-                value = attempt * 2 + offset
-                lower = int(time.time() * 1000) - 1000
-                publish(b, pub, "inventory/disk", json.dumps({"v": value}).encode())
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    lines = active.read_bytes().splitlines()
-                    if len(lines) == len(expected) + 1:
-                        break
-                    time.sleep(0.02)
-                self.assertEqual(len(lines), len(expected) + 1)
-                row = json.loads(lines[-1])
-                self.assertEqual(set(row), {"timestamp", "topic", "qos", "payload"})
-                self.assertEqual(row["topic"], "inventory/disk")
-                self.assertEqual(row["qos"], 0)
-                self.assertEqual(row["payload"], {"v": value})
-                self.assertTrue(lower <= row["timestamp"] <= int(time.time() * 1000) + 1000)
-                expected.append(row)
-                self.assertEqual([json.loads(line) for line in lines], expected)
-                self.assertEqual(sorted(x.name for x in outside.iterdir()), ["selected.entry"])
+        # The format and rotation settings of the connector sink are proved by the
+        # Rust test `disk_log_connector_applies_format_rotation_and_contains_paths`,
+        # because no rule reaches this form. A write through the file form stays in the data directory.
+        native = {"type": "disk_log", "name": "inventorydisknative", "filepath": "native/selected.entry",
+                  "max_file_size": "1mb", "max_file_number": 3}
+        self.assertEqual(b.http("POST", "/api/v5/connectors", native)[0], 201)
+        self.create_forwarding_action_rule(b, native, "inventorydisknativerule", "inventory/disk")
+        pub, ack = b.connect("disk-publisher")
+        self.assertEqual(ack, "0000")
+        payload = b'{"v":1}'
+        publish(b, pub, "inventory/disk", payload)
+        active = b.data / "native" / "selected.entry"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (active.exists() and active.read_bytes()):
+            time.sleep(0.02)
+        self.assertEqual(active.read_bytes().splitlines(), [payload])
+        self.assertEqual(list(outside.iterdir()), [])
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
     def test_statement_connector_drops_warehouse_mapping_and_batch_controls(self):
@@ -4122,7 +4227,7 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(b.http("GET", "/api/v5/connectors/inventorystatement")[0], 404)
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_alloydb_inline_credentials_reach_tls_but_file_password_is_literal(self):
+    def test_alloydb_inline_credentials_reach_tls_and_file_password_is_resolved(self):
         fixture = ROOT / "crates/broker-node/tests/k1_05"
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(fixture / "server-cert.pem", fixture / "server-key.pem")
@@ -4140,22 +4245,27 @@ class InventoryEntry(unittest.TestCase):
         config = {"type": "alloydb", "name": "inventoryalloy",
                   "server": "127.0.0.1:" + str(peer.port), "database": "inventorydb",
                   "table": "inventorytable", "username": "inventoryuser", "password": credential,
+                  "ssl": {"enable": True},
                   "timeout_ms": 1000}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
-        self.create_forwarding_action_rule(b, config, "inventoryalloyrule", "inventory/alloy")
+        # SQL-family actions need `parameters.sql` (action_sinks.rs required_action_parameters, line 1702).
+        self.create_forwarding_action_rule(b, config, "inventoryalloyrule", "inventory/alloy", {
+            "sql": "INSERT INTO inventorytable (topic, qos, payload) VALUES ($1, $2, $3)"})
         for attempt in range(2):
             if attempt:
                 b.stop()
                 b.start()
                 config["password"] = password_file.as_uri()
                 self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryalloy", config)[0], 200)
-            # The constructor currently accepts a malformed port and an
-            # omitted port using its fixed fallback. Do not publish while
-            # either unrequested target is selected.
-            for address in ["127.0.0.1:notaport", "127.0.0.1"]:
-                self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryalloy", {
-                    **config, "server": address})[0], 200)
-                self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryalloy")[1]["server"], address)
+            # A malformed port is refused and an omitted port takes the default 5432
+            # (parse_host_port, action_sinks.rs line 2535). Neither target is published to.
+            status, error = b.http("PUT", "/api/v5/connectors/inventoryalloy", {**config, "server": "127.0.0.1:notaport"})
+            self.assertEqual(status, 400, error)
+            self.assertIn("port", error["message"])
+            self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryalloy")[1]["server"], config["server"])
+            self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryalloy", {
+                **config, "server": "127.0.0.1"})[0], 200)
+            self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryalloy")[1]["server"], "127.0.0.1")
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryalloy", config)[0], 200)
             status, kept = b.http("GET", "/api/v5/connectors/inventoryalloy")
             self.assertEqual(status, 200)
@@ -4167,8 +4277,9 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(ack, "0000")
             publish(b, pub, "inventory/alloy", b'{"v":89}')
             record = peer.records.get(timeout=10)
-            self.assert_fields_kept(record, {"user": "inventoryuser", "database": "inventorydb",
-                                           "password_sha256": hashlib.sha256(config["password"].encode()).hexdigest()})
+            # A file reference password is resolved to the file text (connector_password, action_sinks.rs line 2627).
+            self.assert_fields_equal(record, {"user": "inventoryuser", "database": "inventorydb",
+                                           "password_sha256": hashlib.sha256(credential.encode()).hexdigest()})
             self.assertGreaterEqual(peer.tls_sessions, attempt + 1)
             self.assertTrue(peer.errors.empty(), "TLS database observer protocol error")
         # The peer refuses authentication after recording a digest. It
@@ -4179,16 +4290,38 @@ class InventoryEntry(unittest.TestCase):
         receiver = HttpReceiver()
         self.addCleanup(receiver.close)
         b = self.boot()
-        parameters = {"influxdb_type": "influxdb_api_v2", "bucket": "requested-bucket",
-                      "org": "requested-org", "token": secrets.token_hex(24), "ping_with_auth": True}
+        # The influxdb action reads bucket, org and token from the top level of the connector or from
+        # the nested reference `parameters` object (build_influxdb_sink, action_sinks.rs).
+        parameters = {"bucket": "requested-bucket", "org": "requested-org", "token": secrets.token_hex(24)}
         config = {"type": "influxdb", "name": "inventoryinflux",
                   "server": "127.0.0.1:" + str(receiver.server.server_port),
                   "measurement": "mqtt_events",
-                  "pool_size": 3, "max_inactive": "1ms", "parameters": parameters}
+                  "pool_size": 3, "max_inactive": "1ms", **parameters}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
         self.create_forwarding_action_rule(b, config, "inventoryinfluxrule", "inventory/influx")
+        # The reference nested form: the action is created and delivers with the nested values.
+        nested_token = secrets.token_hex(24)
+        nested = {"type": "influxdb", "name": "inventoryinfluxnested",
+                  "server": "127.0.0.1:" + str(receiver.server.server_port), "measurement": "mqtt_events",
+                  "parameters": {"influxdb_type": "influxdb_api_v2", "bucket": "nested-bucket",
+                                 "org": "nested-org", "token": nested_token}}
+        self.assertEqual(b.http("POST", "/api/v5/connectors", nested)[0], 201)
+        self.create_forwarding_action_rule(b, nested, "inventoryinfluxnestedrule", "inventory/influxnested")
+        pub, ack = b.connect("influx-nested-publisher")
+        self.assertEqual(ack, "0000")
+        publish(b, pub, "inventory/influxnested", b'{"entry":"nested"}')
+        path, body = receiver.requests.get(timeout=10)
+        headers = receiver.request_headers.get(timeout=10)
+        self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        self.assertEqual(query["bucket"], ["nested-bucket"])
+        self.assertEqual(query["org"], ["nested-org"])
+        self.assertEqual(headers["authorization"], "Token " + nested_token)
+        self.assertTrue(body.startswith(b"mqtt_events,topic=inventory/influxnested "))
         # The v1 and v3 reference forms carry no bucket or org. They must
         # fail closed instead of sending an invented v2 request.
+        without_v2 = {key: value for key, value in config.items() if key not in parameters}
+        stored_before = b.http("GET", "/api/v5/connectors/inventoryinflux")
         for legacy in (
             {"influxdb_type": "influxdb_api_v1", "database": "requested-db",
              "username": "requested-user", "password": secrets.token_hex(24)},
@@ -4196,8 +4329,8 @@ class InventoryEntry(unittest.TestCase):
              "token": secrets.token_hex(24)},
         ):
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryinflux", {
-                **config, "parameters": legacy})[0], 400)
-            self.assertTrue(b.http("GET", "/api/v5/connectors/inventoryinflux")[1]["parameters"] == parameters)
+                **without_v2, "parameters": legacy})[0], 400)
+            self.assertTrue(b.http("GET", "/api/v5/connectors/inventoryinflux") == stored_before)
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -4329,11 +4462,17 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(remote.subscribe(receiver, "inventory/bridge"), "00")
         b = self.boot()
         config = {"type": "mqtt", "name": "inventorymqtt", "server": "127.0.0.1:" + str(remote.mqtt),
-                  "client_id": "inventory-bridge", "username": "audituser", "password": remote.password,
-                  "proto_ver": "v5", "keepalive": "1s", "clean_start": False,
-                  "clientid_prefix": "requested-prefix", "max_inflight": 1}
+                  "username": "audituser", "password": remote.password,
+                  "proto_ver": "v5", "keepalive": "5s", "clean_start": False,
+                  "clientid_prefix": "inventory-bridge", "max_inflight": 1}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
+        # The MQTT 5 driver cannot keep a session alive with less than 5 seconds: refused.
+        status, error = b.http("POST", "/api/v5/connectors", {
+            **config, "name": "inventorymqtt-short", "keepalive": "1s"})
+        self.assertEqual(status, 400)
+        self.assertIn("keepalive", error["message"])
         for field, value in [
+            ("client_id", "requested-id"),
             ("pool_size", 2),
             ("connect_timeout", "1s"),
             ("retry_interval", "1s"),
@@ -4349,7 +4488,8 @@ class InventoryEntry(unittest.TestCase):
                 **config, "name": "inventorymqtt-" + field, field: value})
             self.assertEqual(status, 400, field)
             self.assertIn(field, error["message"])
-        self.create_forwarding_action_rule(b, config, "inventorymqttrule", "inventory/bridge")
+        self.create_forwarding_action_rule(b, config, "inventorymqttrule", "inventory/bridge",
+                                           {"topic": "inventory/bridge"})
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -4363,7 +4503,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(actual["username"], "audituser")
             self.assertEqual(actual["proto_ver"], 5)
-            self.assertEqual(actual["keepalive"], 1)
+            self.assertEqual(actual["keepalive"], 5)
             self.assertFalse(actual["clean_start"])
             status, stored = b.http("GET", "/api/v5/connectors/inventorymqtt")
             self.assertEqual(status, 200)

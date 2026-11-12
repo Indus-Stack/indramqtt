@@ -1390,9 +1390,6 @@ pub(crate) struct ActionSinkStage {
     /// secret resolver, so a target behind a secret reference is dialled
     /// too.
     pub probe_on_create: bool,
-    /// The sink is the referenced connector's already built runtime.
-    /// The caller registers it as-is, without a second action wrapper.
-    pub reuse_connector_runtime: bool,
 }
 
 /// Resolve the connector an action references and stage its owned
@@ -1407,20 +1404,8 @@ pub(crate) struct ActionSinkStage {
 ///   reason. Nothing is dialled, no value invented.
 /// - Everything else (missing field, bad parameter) is a build failure:
 ///   the caller refuses with a message that names the action and field.
-#[cfg(test)]
 pub(crate) fn stage_action_sink(
     connectors: &ConnectorStore,
-    record: &ActionRecord,
-) -> Result<ActionSinkStage, String> {
-    stage_action_sink_with_engine(connectors, None, record)
-}
-
-/// Stage one action's sink with the live connector runtimes available.
-/// A connector reference row reuses the connector's built runtime, so the
-/// row delivers through the same sink as the connector it names.
-pub(crate) fn stage_action_sink_with_engine(
-    connectors: &ConnectorStore,
-    engine: Option<&broker_rules::RuleEngine>,
     record: &ActionRecord,
 ) -> Result<ActionSinkStage, String> {
     if let Some(message) = super::rules::kind_refusal(&record.action_type) {
@@ -1443,7 +1428,6 @@ pub(crate) fn stage_action_sink_with_engine(
             resource_opts,
             health_target: None,
             probe_on_create: false,
-            reuse_connector_runtime: false,
         });
     }
     if canonical_action_kind(&record.action_type) == "console"
@@ -1465,7 +1449,6 @@ pub(crate) fn stage_action_sink_with_engine(
             resource_opts,
             health_target: None,
             probe_on_create: false,
-            reuse_connector_runtime: false,
         });
     }
     let reference = action_connector_references(record)
@@ -1489,36 +1472,8 @@ pub(crate) fn stage_action_sink_with_engine(
             resource_opts,
             health_target: None,
             probe_on_create: false,
-            reuse_connector_runtime: false,
         });
     };
-    if is_connector_only_action(record) {
-        // The row keeps its settings on the connector. Use the connector
-        // runtime that the connector builder already registered. The row
-        // then delivers through the same sink as the connector it names.
-        // A connector with no runtime falls through to the normal build.
-        if let Some(sink) = engine.and_then(|engine| connector_runtime(engine, record)) {
-            return Ok(ActionSinkStage {
-                sink: Some(sink),
-                wiring: ActionWiring::Live,
-                resource_opts,
-                health_target: None,
-                probe_on_create: false,
-                reuse_connector_runtime: true,
-            });
-        }
-        // A connector with no live runtime keeps the row persist-only.
-        // Rule delivery falls back to the connector id, as the persisted
-        // lane A form does.
-        return Ok(ActionSinkStage {
-            sink: None,
-            wiring: ActionWiring::None,
-            resource_opts,
-            health_target: None,
-            probe_on_create: false,
-            reuse_connector_runtime: false,
-        });
-    }
     required_action_parameters(record)?;
     let sink = build_action_sink_with_dir(record, &doc, &resource_opts, &connectors.data_dir())?;
     let has_sink = sink.is_some();
@@ -1543,21 +1498,7 @@ pub(crate) fn stage_action_sink_with_engine(
         // target that arrives through a secret reference. The resolver
         // runs first, so the probe dials the real target.
         probe_on_create: has_sink,
-        reuse_connector_runtime: false,
     })
-}
-
-/// Find the live runtime of the connector that a reference row names.
-fn connector_runtime(
-    engine: &broker_rules::RuleEngine,
-    record: &ActionRecord,
-) -> Option<Arc<dyn broker_connectors::Sink>> {
-    let reference = record.connector.trim();
-    let bare = crate::v5::typed::bare_name(reference, &record.action_type);
-    engine
-        .connectors()
-        .get(reference)
-        .or_else(|| engine.connectors().get(&bare))
 }
 
 /// Build (never register) one action's owned sink from the referenced
@@ -1755,26 +1696,9 @@ fn param_string_map(record: &ActionRecord, key: &str) -> std::collections::HashM
         .unwrap_or_default()
 }
 
-/// True when the action uses the persisted lane A connector-only form:
-/// its own id names the connector and it carries no action-owned
-/// settings. Such a row uses the connector runtime for delivery.
-pub(crate) fn is_connector_only_action(record: &ActionRecord) -> bool {
-    !record.connector.trim().is_empty()
-        && crate::v5::typed::bare_name(record.connector.trim(), &record.action_type) == record.id
-        && record
-            .parameters
-            .as_object()
-            .is_some_and(|params| params.is_empty())
-        && record
-            .params
-            .as_object()
-            .is_none_or(|params| params.is_empty())
-}
-
 /// Check the action-owned value shapes before the sink is built.
 /// Presence is checked against the merged view (the action parameter,
-/// else the connector document). A connector-only row skips this
-/// check because it stores no action-owned settings.
+/// else the connector document).
 pub(crate) fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
     if matches!(
         canonical_action_kind(record.action_type.as_str()),
@@ -3983,16 +3907,22 @@ pub(crate) fn build_influxdb_sink(
     let raw_server = first_string(connector_doc, &["server", "url", "endpoint"])
         .map(|value| value.into_owned())
         .unwrap_or_else(|| "127.0.0.1:8086".to_string());
-    let bucket = connector_field(connector_doc, &connector, &record.id, &["bucket"], "bucket")?;
-    let org = connector_field(connector_doc, &connector, &record.id, &["org"], "org")?;
-    let token = connector_field(connector_doc, &connector, &record.id, &["token"], "token")?;
-    let measurement = merged_field(
-        record,
-        connector_doc,
-        "measurement",
-        &["measurement", "measurement_template"],
-        "measurement",
-    )?;
+    // The reference connector keeps the bucket, org and token inside its
+    // `parameters` object; the native form names them at the top level.
+    let bucket =
+        required_nested_field(connector_doc, &connector, &record.id, &["bucket"], "bucket")?;
+    let org = required_nested_field(connector_doc, &connector, &record.id, &["org"], "org")?;
+    let token = required_nested_field(connector_doc, &connector, &record.id, &["token"], "token")?;
+    let measurement = match param_string(record, "measurement") {
+        Some(value) => value,
+        None => required_nested_field(
+            connector_doc,
+            &connector,
+            &record.id,
+            &["measurement", "measurement_template"],
+            "measurement",
+        )?,
+    };
     let precision = param_string(record, "precision").unwrap_or_else(|| "ms".to_string());
     let config = broker_connectors::InfluxDbSinkConfig {
         endpoint: http_endpoint(&raw_server),
@@ -4399,11 +4329,11 @@ pub(crate) fn build_tdengine_sink(
 /// - `types`: the connector's column types, one per measurement
 ///   (`boolean`, `int32`, `int64`, `float`, `double`, `text`),
 ///   required in the merged view.
-/// - Rows are never aligned (`is_aligned` false, the reference
-///   default).
-/// - Batching belongs to the action runtime, not this driver. The
-///   inner sink keeps one row per send with a short linger, so the
-///   runtime owns the batch size and the batch timer.
+/// - `is_aligned`: the action parameter, else the connector value;
+///   default false, the reference default.
+/// - Batching belongs to the action runtime, which hands each batch
+///   to the sink in one `send_batch` call. The sink writes one
+///   `insertTablet` request per device for that batch.
 pub(crate) fn build_iotdb_sink(
     record: &ActionRecord,
     connector_doc: &serde_json::Value,
@@ -4463,11 +4393,24 @@ pub(crate) fn build_iotdb_sink(
             record.id
         ));
     }
+    let is_aligned = match param_value(record, "is_aligned").or_else(|| {
+        connector_doc
+            .get("is_aligned")
+            .filter(|value| !value.is_null())
+    }) {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            format!(
+                "action {:?} field `parameters.is_aligned` must be a boolean",
+                record.id
+            )
+        })?,
+    };
     let config = IotDbSinkConfig {
         endpoint: iotdb_endpoint(&raw_endpoint),
         device_path_template: device,
         auth: IotDbAuth { username, password },
-        is_aligned: false,
+        is_aligned,
         measurements,
         data_types,
         batch_size: Some(1),
@@ -4631,6 +4574,67 @@ pub(crate) fn build_doris_sink(
     Ok(Arc::new(sink))
 }
 
+/// The time field, tag columns and field columns of a datalayers connector.
+type DatalayersColumns = (Option<String>, Vec<String>, Vec<String>);
+
+/// Read the datalayers column selection settings of a connector
+/// document: the time field, the tag columns and the field columns.
+/// A value of the wrong type is refused with the field named.
+pub(crate) fn datalayers_column_settings(
+    doc: &serde_json::Value,
+    connector: &str,
+) -> Result<DatalayersColumns, String> {
+    let timestamp_field = match doc.get("timestamp_field") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => {
+            Some(text.trim().to_string()).filter(|text| !text.is_empty())
+        }
+        Some(_) => {
+            return Err(format!(
+                "connector {connector:?} field `timestamp_field` must be a string"
+            ))
+        }
+    };
+    let columns = |key: &str| -> Result<Vec<String>, String> {
+        match doc.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .filter(|text| !text.trim().is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "connector {connector:?} field `{key}` must hold non-empty strings"
+                            )
+                        })
+                })
+                .collect(),
+            Some(_) => Err(format!(
+                "connector {connector:?} field `{key}` must be a list of strings"
+            )),
+        }
+    };
+    Ok((
+        timestamp_field,
+        columns("tag_columns")?,
+        columns("field_columns")?,
+    ))
+}
+
+/// Check a datalayers write precision: `ns`, `us`, `ms` or `s`.
+pub(crate) fn datalayers_precision(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("ns" | "us" | "ms" | "s") => Ok(value),
+        Some(other) => Err(format!("{field} must be one of ns, us, ms, s: {other:?}")),
+    }
+}
+
 /// Build the action's `datalayers` sink: the server, database and
 /// credentials come from the connector; the action may override the
 /// table.
@@ -4647,9 +4651,13 @@ pub(crate) fn build_doris_sink(
 /// - Stamps are always microseconds (the wire requirement); tag
 ///   columns default to the `topic` tag and every payload field
 ///   becomes a measured field.
-// TODO(parity): should datalayers honor a precision parameter, or is
-// the microsecond wire precision fixed? The current choice always
-// stamps microseconds until the checker pins it.
+/// - `precision`: one of `ns`, `us`, `ms`, `s`; default `us`, the sink
+///   wire default. The action parameter wins; else the connector value
+///   applies.
+/// - `write_syntax` is a line-protocol template that this sink does not
+///   render, so the action refuses it.
+/// - `timestamp_field`, `tag_columns` and `field_columns` come from the
+///   connector and select the time and the columns.
 /// - Batching belongs to the action runtime, not this driver. The
 ///   inner sink keeps one row per send, so the runtime owns the
 ///   batch size.
@@ -4685,6 +4693,20 @@ pub(crate) fn build_datalayers_sink(
         &["table", "measurement"],
         "table",
     )?;
+    if param_value(record, "write_syntax").is_some() {
+        return Err(format!(
+            "action {:?} field `parameters.write_syntax` is not supported; remove it",
+            record.id
+        ));
+    }
+    let precision = datalayers_precision(
+        param_string(record, "precision").or_else(|| {
+            first_string(connector_doc, &["precision"]).map(|value| value.into_owned())
+        }),
+        &format!("action {:?} field `parameters.precision`", record.id),
+    )?;
+    let (timestamp_field, tag_columns, field_columns) =
+        datalayers_column_settings(connector_doc, &connector)?;
     let config = DatalayersConfig {
         endpoint: http_endpoint(&raw_server),
         database,
@@ -4692,9 +4714,10 @@ pub(crate) fn build_datalayers_sink(
         auth_token,
         username,
         password,
-        timestamp_field: None,
-        tag_columns: Vec::new(),
-        field_columns: Vec::new(),
+        timestamp_field,
+        tag_columns,
+        field_columns,
+        precision,
         batch_size: Some(1),
         buffer_capacity: None,
         timeout_ms: connector_timeout_ms(connector_doc),
@@ -4834,13 +4857,17 @@ pub(crate) fn build_timestream_sink(
         max_backoff_ms: Some(2_500),
         timeout_ms: connector_timeout_ms(connector_doc),
     };
-    let transport =
-        HttpTimestreamTransport::new(&config, reqwest::Client::new()).map_err(|error| {
-            format!(
-                "action {:?} cannot build its timestream transport: {error}",
-                record.id
-            )
-        })?;
+    // The connector `timeout_ms` bounds every request of the client.
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpTimestreamTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its timestream transport: {error}",
+            record.id
+        )
+    })?;
     let sink = TimestreamSink::new(config, Arc::new(transport)).map_err(|error| {
         format!(
             "action {:?} cannot build its timestream sink: {error}",
@@ -7170,7 +7197,9 @@ pub(crate) fn build_redis_sink(
 ///   required, no invented default.
 /// - `clientid_prefix`, `username`, `password`: the connector egress
 ///   identity. The client id defaults to the connector id.
-///   Keep-alive defaults to 160 s (the reference default).
+///   `client_id` is not a reference field and is refused.
+/// - `keepalive` (duration, default 160 s, the reference default) and
+///   `clean_start` (default true) apply to the remote session.
 /// - `proto_ver`: the connector version, default `v4`; only `v3`,
 ///   `v4` and `v5` are accepted. `v3` and `v4` use 3.1.1 framing.
 /// - `topic`: the action remote topic, required. Templates are
@@ -7274,16 +7303,40 @@ pub(crate) fn mqtt_bridge_sink_config(
             ));
         }
     };
+    // The connector `keepalive` and `clean_start` are top-level or inside
+    // the reference `parameters` object.
+    let nested_value = |key: &str| {
+        connector_doc
+            .get(key)
+            .or_else(|| connector_doc.get("parameters").and_then(|p| p.get(key)))
+            .filter(|value| !value.is_null())
+    };
+    let keep_alive_secs = match nested_value("keepalive") {
+        None => MV03A_MQTT_KEEPALIVE_SECS,
+        Some(value) => crate::v5::rules::parse_bridge_keepalive(&connector, value)?,
+    };
+    let clean_start = match nested_value("clean_start") {
+        None => true,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            format!("connector {connector:?} field `clean_start` must be a boolean")
+        })?,
+    };
+    if nested_value("client_id").is_some() {
+        return Err(format!(
+            "connector {connector:?} field `client_id` is not supported by the MQTT bridge; use `clientid_prefix` (action {:?})",
+            record.id
+        ));
+    }
     Ok(MqttBridgeSinkConfig {
         broker_address: server,
-        client_id: nested_field(connector_doc, &["clientid_prefix", "client_id"])
+        client_id: nested_field(connector_doc, &["clientid_prefix"])
             .map(|value| value.into_owned())
             .unwrap_or_else(|| connector.clone()),
-        clean_start: true,
+        clean_start,
         username: nested_field(connector_doc, &["username", "user"]).map(|v| v.into_owned()),
         password: nested_field(connector_doc, &["password", "pass"]).map(|v| v.into_owned()),
         // Reference connector_mqtt defaults keepalive to 160 s.
-        keep_alive_secs: MV03A_MQTT_KEEPALIVE_SECS,
+        keep_alive_secs,
         topic_prefix: None,
         topic_template: Some(topic),
         payload_template: param_string(record, "payload"),
@@ -8529,7 +8582,7 @@ fn rebuild_action_sinks(
             alarms.deactivate(&format!("action_build_failed:{}", record.id));
             continue;
         }
-        let stage = match stage_action_sink_with_engine(connectors, Some(engine), &record) {
+        let stage = match stage_action_sink(connectors, &record) {
             Ok(stage) => stage,
             Err(message) => {
                 // Keep the previous sink: a reload or restore that cannot
@@ -8542,17 +8595,13 @@ fn rebuild_action_sinks(
             ActionWiring::Live => {
                 // Live wiring always carries its sink by construction.
                 if let Some(sink) = stage.sink {
-                    let sink = if stage.reuse_connector_runtime {
-                        sink
-                    } else {
-                        wrap_action_runtime(
-                            engine,
-                            &key,
-                            sink,
-                            stage.resource_opts,
-                            stage.health_target,
-                        )
-                    };
+                    let sink = wrap_action_runtime(
+                        engine,
+                        &key,
+                        sink,
+                        stage.resource_opts,
+                        stage.health_target,
+                    );
                     // A console action shares its captured output with
                     // the connector read path. Register the same runtime
                     // under the bare connector name, as create does.
