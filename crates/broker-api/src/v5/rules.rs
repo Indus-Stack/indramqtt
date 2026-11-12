@@ -3421,12 +3421,12 @@ pub(crate) fn parse_bridge_keepalive(name: &str, value: &serde_json::Value) -> R
         )
     };
     let seconds = match value {
-        serde_json::Value::Number(number) => number.as_f64().ok_or_else(&bad)?,
+        serde_json::Value::Number(number) => number.as_f64().ok_or_else(bad)?,
         serde_json::Value::String(text) => {
             let text = text.trim().to_ascii_lowercase();
             let split = text
                 .find(|c: char| !c.is_ascii_digit() && c != '.')
-                .ok_or_else(&bad)?;
+                .ok_or_else(bad)?;
             let (number, unit) = text.split_at(split);
             let number: f64 = number.parse().map_err(|_| bad())?;
             match unit.trim() {
