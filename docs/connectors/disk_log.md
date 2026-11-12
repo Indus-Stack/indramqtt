@@ -44,7 +44,7 @@ Set `kind` to `disk_log` on the v1 API. The v1 route also accepts `disklog` and 
 | `sync_mode` | no | `{"mode":"everybatch"}`, `{"mode":"interval","ms":N}`, or `{"mode":"osdefault"}`. Default every batch. The interval must be at least 1 ms. |
 | `timeout_ms` | no | Write and flush deadline in ms. Default 5000. A value below 1 becomes 1. |
 
-The v5 route reads `directory`, `dir`, or `path` (default `./target/disk_logs`). It also requires the legacy bounds `max_file_size` and `max_file_number`. The path must stay inside the node data directory. It reads `filename_prefix` or `prefix` (default `indra`) and `filename_extension` or `extension` (default `log`). It reads `timeout_ms`, `timeout`, or `request_timeout_ms`. It fixes `format` to `ndjson`, `max_file_size_bytes` to 67108864, `compression` to `none`, `max_backup_files` to 10, and `sync_mode` to every batch. It registers the name and the aliases `disk_log:name` and `disk:name`.
+The v5 route reads `directory`, `dir`, or `path` (default `disk_logs` in the node data directory). The path is relative to the node data directory. A path outside it is refused with 400: an absolute path, a `..` part, or a symlink. It reads `filename_prefix` or `prefix` (default `indra`) and `filename_extension` or `extension` (default `log`). It reads `timeout_ms`, `timeout`, or `request_timeout_ms`. It applies `format`, `max_file_size_bytes`, `max_file_age_secs`, `compression`, `max_backup_files`, `max_retention_days`, and `sync_mode` with the string values `every_batch` or `os_default`. It registers the name and the aliases `disk_log:name` and `disk:name`.
 
 Example:
 
@@ -53,7 +53,7 @@ Example:
   "id": "disk-log-1",
   "kind": "disk_log",
   "config": {
-    "directory": "/var/lib/indra/audit",
+    "directory": "audit",
     "filename_prefix": "audit",
     "filename_extension": "log",
     "format": "ndjson",
@@ -132,7 +132,7 @@ status, created = call("POST", "/api/v1/connectors",
 assert status == 201 and created["kind"] == "disk_log", (status, created)
 status, created = call("POST", "/api/v5/connectors",
                        {"name": "disk-log-2", "type": "disk_log",
-                        "directory": v5_dir, "path": "disk-log-docs",
+                        "directory": "disk-log-docs",
                         "filename_prefix": "audit2",
                         "max_file_size": "64MB", "max_file_number": 10,
                         "timeout_ms": 5000})
@@ -194,7 +194,7 @@ disk_log
 - Retention prunes the oldest rotated segments first.
 - The every-batch mode flushes and syncs each record. The interval mode flushes at most each N ms. The OS-default mode leaves the flush to the operating system.
 - At open the writer truncates a torn tail after the last newline. It compresses a staged segment that a crash left without its gzip step. A repository test proves this path.
-- The v5 route fixes ndjson, 64 MiB size rotation, no age rotation, no compression, 10 backups, and every-batch sync.
+- The v5 route takes the defaults ndjson, 64 MiB size rotation, no age rotation, no compression, 10 backups, and every-batch sync when a setting is absent.
 - The connector runs behind the rule engine bounded queue. A slow disk never stalls publishers.
 - The tier is community. The kind ships in the default build.
 

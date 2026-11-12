@@ -20286,6 +20286,66 @@ connector_id = "pending-good"
     }
 
     #[tokio::test]
+    async fn raw_secrets_in_config_history_need_the_full_administrator_scope() {
+        const SECRET: &str = "known-history-secret-2e8f";
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, answer) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "mqtt", "name": "hist-secret", "server": "127.0.0.1:1",
+                       "password": SECRET}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "{answer}");
+        // A key with one scope only (system) is not a full administrator.
+        let (_, limited) = make_key(
+            &server,
+            &token,
+            json!({"name": "hist-lim", "scopes": ["system"]}),
+        )
+        .await;
+        let (_, versions) = server.get_auth("/api/v1/config/history", &limited).await;
+        let id = versions["versions"][0]["id"]
+            .as_u64()
+            .expect("a version exists");
+        let path = format!("/api/v1/config/history/{id}");
+        // Masked answer: allowed for both.
+        for who in [&token, &limited] {
+            let (status, masked) = server.get_auth(&path, who).await;
+            assert_eq!(status, 200);
+            let text = masked.to_string();
+            let at = text.find(SECRET).unwrap_or(0);
+            assert!(
+                !text.contains(SECRET),
+                "masked answer shows a secret: {}",
+                &text[at.saturating_sub(200)..(at + 100).min(text.len())]
+            );
+        }
+        // Raw answer: the full administrator only.
+        let (status, raw) = server
+            .get_auth(&format!("{path}?secrets=raw"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert!(
+            raw.to_string().contains(SECRET),
+            "the raw snapshot lacks the secret"
+        );
+        let (status, refused) = server
+            .get_auth(&format!("{path}?secrets=raw"), &limited)
+            .await;
+        assert_eq!(status, 403, "{refused}");
+        assert_eq!(refused["code"], json!("FORBIDDEN"));
+        assert!(!refused.to_string().contains(SECRET));
+        // A key with no scope list and the administrator role is a full administrator.
+        let (_, full) = make_key(&server, &token, json!({"name": "hist-full"})).await;
+        let (status, raw) = server.get_auth(&format!("{path}?secrets=raw"), &full).await;
+        assert_eq!(status, 200);
+        assert!(raw.to_string().contains(SECRET));
+    }
+
+    #[tokio::test]
     async fn rules_list_create_delete_round_trip() {
         // W3-13 (C06-18/C06-19/C06-20) failing test: create a rule, list
         // and expect it with paging metadata; duplicate create expects

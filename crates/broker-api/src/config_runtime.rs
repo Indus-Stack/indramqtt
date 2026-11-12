@@ -730,8 +730,28 @@ pub async fn list_history(State(state): State<ApiState>) -> Json<serde_json::Val
     }))
 }
 
-/// Fetch one version with its (redacted) snapshot.
-pub async fn get_history_version(State(state): State<ApiState>, Path(id): Path<u64>) -> Response {
+/// Fetch one version with its (redacted) snapshot. The query
+/// `secrets=raw` returns the stored snapshot with its secrets as stored
+/// (references stay references). Only `backup export` asks for it, so an
+/// import restores the secrets. A caller that is not a full administrator
+/// gets 403.
+pub async fn get_history_version(
+    State(state): State<ApiState>,
+    Path(id): Path<u64>,
+    full_admin: Option<axum::Extension<crate::api_auth::FullAdministrator>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let raw = query.get("secrets").map(String::as_str) == Some("raw");
+    if raw && !full_admin.is_some_and(|flag| flag.0 .0) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "FORBIDDEN",
+                "message": "secrets=raw needs a full administrator: the administrator role with no scope list"
+            })),
+        )
+            .into_response();
+    }
     match state.config.history_get(id) {
         Some(version) => (
             StatusCode::OK,
@@ -741,7 +761,11 @@ pub async fn get_history_version(State(state): State<ApiState>, Path(id): Path<u
                 "timestamp_secs": version.timestamp_secs,
                 "summary": version.summary,
                 "changes": version.changes,
-                "snapshot": redact_snapshot(&version.snapshot),
+                "snapshot": if raw {
+                    serde_json::to_value(&version.snapshot).unwrap_or(serde_json::Value::Null)
+                } else {
+                    redact_snapshot(&version.snapshot)
+                },
             })),
         )
             .into_response(),

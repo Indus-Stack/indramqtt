@@ -33,7 +33,7 @@ Connector settings:
 | Setting | Required | Meaning |
 |---|---|---|
 | `server` | yes | Remote `host:port`. Alias `broker_address`. |
-| `client_id` | no | Egress client id. Alias `clientid_prefix`. Default is the connector id. |
+| `clientid_prefix` | no | Egress client id. Default is the connector id. The field `client_id` is refused with 400. |
 | `username` | no | Remote username. |
 | `password` | no | Remote password. |
 | `proto_ver` | no | `v3`, `v4` (default), or `v5`. `v5` uses MQTT 5.0 framing. |

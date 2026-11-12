@@ -472,8 +472,8 @@ class InventoryEntry(unittest.TestCase):
     def masked(self, value):
         # Mirror of the broker rule: a secret field reads back as ******.
         if isinstance(value, dict):
-            return {key: ("******" if self.is_secret_key(key) and isinstance(member, (str, dict, list)) and member
-                          and not (isinstance(member, str) and member.startswith(("file:", "env:")))
+            return {key: ("******" if self.is_secret_key(key) and isinstance(member, str) and member
+                          and not member.startswith(("file:", "env:"))
                           else self.masked(member))
                     for key, member in value.items()}
         if isinstance(value, list):

@@ -110,8 +110,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/kinesis.md` | 215 | `ok` |
 | `connectors/mongodb.md` | 102 | `ok` |
 | `connectors/mongodb.md` | 236 | `ok` |
-| `connectors/mqtt-bridge.md` | 97 | `ok` |
-| `connectors/mqtt-bridge.md` | 225 | `mqtt_bridge` |
+| `connectors/mqtt-bridge.md` | 99 | `ok` |
+| `connectors/mqtt-bridge.md` | 227 | `mqtt_bridge` |
 | `connectors/mqtt.md` | 97 | `ok` |
 | `connectors/mssql.md` | 90 | `disconnected` |
 | `connectors/mssql.md` | 231 | `mssql` |
@@ -147,7 +147,6 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/s3tables.md` | 69 | `refused` |
 | `connectors/snowflake.md` | 85 | `ok` |
 | `connectors/snowflake.md` | 227 | `delivered` |
-| `connectors/snowflake_streaming.md` | 91 | `snowflake_streaming` |
 | `connectors/sparkplug-b.md` | 71 | `ok` |
 | `connectors/sparkplug_b.md` | 84 | `sparkplug_b` |
 | `connectors/sqlserver.md` | 102 | `mssql` |
@@ -210,9 +209,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/api/cluster-nodes.md` | 144 | `OK` |
 | `reference/api/cluster-nodes.md` | 196 | `OK` |
 | `reference/api/cluster-nodes.md` | 212 | `OK` |
-| `reference/api/configuration.md` | 479 | `OK` |
-| `reference/api/configuration.md` | 531 | `OK` |
-| `reference/api/configuration.md` | 547 | `OK` |
+| `reference/api/configuration.md` | 481 | `OK` |
+| `reference/api/configuration.md` | 533 | `OK` |
+| `reference/api/configuration.md` | 549 | `OK` |
 | `reference/api/data-connectors.md` | 149 | `OK` |
 | `reference/api/data-connectors.md` | 207 | `OK` |
 | `reference/api/data-connectors.md` | 223 | `OK` |
@@ -227,8 +226,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/api/rule-engine.md` | 437 | `OK` |
 | `reference/api/rule-engine.md` | 500 | `OK` |
 | `reference/api/rule-engine.md` | 516 | `OK` |
-| `reference/cli.md` | 2330 | `OK` |
-| `reference/cli.md` | 2346 | `OK` |
+| `reference/cli.md` | 2332 | `OK` |
+| `reference/cli.md` | 2348 | `OK` |
 | `reference/configuration.md` | 3404 | `OK` |
 | `reference/configuration.md` | 3420 | `OK` |
 | `reference/index.md` | 41 | `OK` |
@@ -262,4 +261,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 246 blocks. Each output matches its page.
+The run captured 245 blocks. Each output matches its page.

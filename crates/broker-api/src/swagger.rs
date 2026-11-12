@@ -785,6 +785,13 @@ pub fn openapi_spec_json() -> &'static str {
             "required": true,
             "description": "Version id",
             "schema": { "type": "integer" }
+          },
+          {
+            "name": "secrets",
+            "in": "query",
+            "required": false,
+            "description": "Set to raw to get the snapshot with its secrets as stored. This needs a full administrator: the administrator role with no scope list. Backup export uses it, so the export file holds secrets.",
+            "schema": { "type": "string", "enum": ["raw"] }
           }
         ],
         "responses": {
@@ -809,6 +816,7 @@ pub fn openapi_spec_json() -> &'static str {
               }
             }
           },
+          "403": { "description": "The query secrets=raw needs a full administrator" },
           "404": { "description": "Version does not exist" }
         }
       }

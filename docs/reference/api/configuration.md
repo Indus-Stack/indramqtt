@@ -211,6 +211,7 @@ Parameters:
 | Name | In | Required | Type | Description |
 |---|---|---|---|---|
 | `id` | path | true | integer | Version id |
+| `secrets` | query | false | string | Set to raw to get the snapshot with its secrets as stored. This needs a full administrator: the administrator role with no scope list. Backup export uses it, so the export file holds secrets. |
 
 Request body:
 
@@ -221,6 +222,7 @@ Responses:
 | Status | Description |
 |---|---|
 | 200 | Version with redacted snapshot |
+| 403 | The query secrets=raw needs a full administrator |
 | 404 | Version does not exist |
 
 Response `200` body:

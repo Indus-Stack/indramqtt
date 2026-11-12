@@ -184,6 +184,11 @@ fn password_change_required() -> Response {
         .into_response()
 }
 
+/// Set by the middleware on each request: true when the caller is a full
+/// administrator (the administrator role with no explicit scope list).
+#[derive(Debug, Clone, Copy)]
+pub struct FullAdministrator(pub bool);
+
 fn scope_forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -432,6 +437,16 @@ pub async fn require_api_auth(
             KeyDecision::Forbidden => return scope_forbidden(),
         }
     }
+    // The full administrator may read raw secrets: the administrator role
+    // with no explicit scope list, for a key, a login user or an operator key.
+    let full_admin = FullAdministrator(
+        identity.info.role == AdminRole::Administrator
+            && identity.info.scopes.is_none()
+            && identity
+                .key_grant
+                .as_ref()
+                .is_none_or(|grant| grant.scopes.is_none() && grant.role == KeyRole::Administrator),
+    );
     let info = identity.info;
     if identity.is_login_user {
         let Some(path) = canonical_scope_path(&path) else {
@@ -465,6 +480,7 @@ pub async fn require_api_auth(
     let audited = matches!(method.as_str(), "POST" | "PUT" | "DELETE");
     let mut req = req;
     req.extensions_mut().insert(info.clone());
+    req.extensions_mut().insert(full_admin);
     let started = std::time::Instant::now();
     let response = next.run(req).await;
     // Management audit (W2-28): one fire-and-forget entry per

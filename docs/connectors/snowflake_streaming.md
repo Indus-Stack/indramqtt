@@ -58,80 +58,16 @@ Example:
     "database": "IOT",
     "schema": "PUBLIC",
     "table": "TELEMETRY",
-    "private_key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
-    "timeout_ms": 5000
-  }
-}
-```
-
-> [!NOTE]
-> The docs run proves the action create and both connector refusals. It sends no row. No Snowflake service ran in this task. See the record in [Verification failures](../_verification/failures.md).
-
-## Check that it works
-
-The test sends the name to both connector routes and to the actions route. The connector routes answer 400. The actions route refuses the incomplete action and stores nothing.
-
-```toml test
-[node]
-id = "docs-connector-snowflake-streaming"
-
-[listeners.tcp]
-bind = "0.0.0.0:1883"
-
-[listeners.api]
-bind = "0.0.0.0:18083"
-
-[logging]
-level = "warn"
-
-[auth]
-allow_anonymous = true
-```
-
-```sh test
-python3 - <<'PY'
-import json, os, urllib.request, urllib.error
-port = os.environ.get("API_PORT", "18083")
-key = os.environ["API_KEY"]
-
-def call(method, path, body=None):
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}", data=data, method=method,
-        headers={"Authorization": f"Bearer {key}",
-                 "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=5) as res:
-            raw = res.read().decode()
-            return res.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as err:
-        raw = err.read().decode()
-        try:
-            return err.code, json.loads(raw)
-        except ValueError:
-            return err.code, raw
-
-s1, b1 = call("POST", "/api/v1/connectors",
-              {"id": "ss-v1", "kind": "snowflake_streaming",
-               "config": {"account": "xy12345.us-east-1"}})
-assert s1 == 400, (s1, b1)
-assert "unknown connector kind" in json.dumps(b1).lower(), b1
-
-s2, b2 = call("POST", "/api/v5/connectors",
-              {"name": "ss-v5", "type": "snowflake_streaming",
-               "account": "xy12345.us-east-1"})
-assert s2 == 400, (s2, b2)
-assert "unknown connector type" in json.dumps(b2).lower(), b2
+    "private_key_pem": "docs-key-placeholder",
+                 "server": "127.0.0.1:1"})
+assert s2c == 201, (s2c, b2c)
 
 s3, b3 = call("POST", "/api/v5/actions",
               {"type": "snowflake_streaming", "name": "ss-action",
-               "parameters": {"account": "xy12345.us-east-1",
-                              "user": "indra_loader",
-                              "database": "IOT",
-                              "schema": "PUBLIC",
-                              "table": "TELEMETRY"}})
+               "connector": "ss-account",
+               "parameters": {"database": "IOT", "schema": "PUBLIC"}})
 assert s3 == 400, (s3, b3)
-assert "snowflake" in json.dumps(b3).lower() or "pipe" in json.dumps(b3).lower(), b3
+assert "pipe" in json.dumps(b3).lower(), b3
 
 s4, b4 = call("GET", "/api/v5/actions/ss-action")
 assert s4 == 404, (s4, b4)
@@ -154,7 +90,7 @@ snowflake_streaming
 - The v5 actions route names this type in the action-type list. Create refuses an action that misses its connector, its pipe, or its database and schema fields.
 - The action build reads `account`, `pipe_user`, and `private_key_pem` from the connector and `database`, `schema`, and `pipe` from the action.
 - An incomplete action stores nothing, so the read answers 404.
-- No connector row is created in this check, so a rule forward cannot use this name.
+- The action name is not a connector type. A rule forward uses the action, not a connector row of this name.
 - The tier of the Snowflake runtime is enterprise.
 
 ## Next steps

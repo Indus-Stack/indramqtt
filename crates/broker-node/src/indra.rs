@@ -2137,14 +2137,15 @@ async fn cmd_backup_export(
         .and_then(|versions| versions.first())
         .and_then(|row| row.get("id").and_then(|v| v.as_u64()))
         .ok_or_else(|| CtlError::server("config history has no versions"))?;
-    let path = format!("/api/v1/config/history/{latest}");
+    let path = format!("/api/v1/config/history/{latest}?secrets=raw");
     let (_, version) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
     let snapshot = version
         .get("snapshot")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    // The server redacts secret references in this snapshot; the file
-    // therefore holds references (restorable markers), never values.
+    // The backup route returns the stored snapshot. Secrets stay as
+    // stored (inline values or `file:`/`env:` references), so an import
+    // restores them. Treat the file as a secret.
     let text = if format == "json" {
         serde_json::to_string_pretty(&snapshot)
             .map_err(|e| CtlError::server(format!("cannot encode backup: {e}")))?

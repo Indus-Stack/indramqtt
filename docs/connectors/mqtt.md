@@ -36,7 +36,7 @@ Create the connector with `POST /api/v5/connectors`.
 | `type` | yes | Connector type. Use `mqtt`. |
 | `enable` | no | Enable flag. Default `true`. |
 | `server` or `broker_address` | no | Remote address. Default `127.0.0.1:1883`. A wrong scheme, a bad port, port 0, an empty host, or a `/` is refused. |
-| `client_id` | no | Bridge client id. Default `indra-bridge`. An empty value is refused. |
+| `clientid_prefix` | no | Bridge client id. Default is the connector name. The field `client_id` is not a reference field and is refused with 400. |
 | `username` | no | Remote username. Default is none. |
 | `password` | no | Remote password. Default is none. |
 
@@ -66,7 +66,7 @@ Example:
   "type": "mqtt",
   "enable": true,
   "server": "127.0.0.1:1883",
-  "client_id": "docs-bridge"
+  "clientid_prefix": "docs-bridge"
 }
 ```
 
@@ -121,13 +121,13 @@ assert "unknown connector kind" in json.dumps(b1).lower(), b1
 
 s2, b2 = call("POST", "/api/v5/connectors",
               {"name": "mqtt-1", "type": "mqtt",
-               "server": "127.0.0.1:1883", "client_id": "docs-bridge"})
+               "server": "127.0.0.1:1883", "clientid_prefix": "docs-bridge"})
 assert s2 == 201, (s2, b2)
 assert b2["type"] == "mqtt", b2
 
 s3, b3 = call("POST", "/api/v5/connectors",
               {"name": "mqtt-2", "type": "mqtt",
-               "server": "127.0.0.1:1883", "client_id": ""})
+               "server": "127.0.0.1:1883", "client_id": "x"})
 assert s3 == 400, (s3, b3)
 assert "client_id" in json.dumps(b3).lower(), b3
 print("ok")
@@ -143,7 +143,7 @@ ok
 - The connector id must not be empty and must not exceed 256 bytes. A duplicate id is refused.
 - The v1 connectors route refuses `mqtt`. It accepts `mqtt_bridge`, `mqtt-bridge`, and `bridge`.
 - The v5 route maps the name to the `mqtt_bridge` runtime. It ignores the caller `clean_start`, `keep_alive_secs`, `topic_prefix`, `topic_template`, `qos_override`, `retain_override`, `max_inflight`, `max_batch_size`, `linger_ms`, and `protocol` values. It uses one row per batch and the fixed values in the table above.
-- An empty `client_id` or a malformed `server` value is refused with 400.
+- A `client_id` field or a malformed `server` value is refused with 400.
 - The connector runs behind the rule engine bounded queue. A slow remote broker never stalls publishers.
 - The tier is community. The bridge ships in the default build.
 

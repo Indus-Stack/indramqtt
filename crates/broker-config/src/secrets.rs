@@ -166,8 +166,8 @@ pub fn is_secret_key(name: &str) -> bool {
 }
 
 /// Mask every secret in one document, in place. A field with a secret
-/// name shows `******` when its value is a plain string, object or
-/// array. A `file:` or `env:` reference shows its `<redacted:...>`
+/// name shows `******` when its value is a plain string. An object or
+/// array under such a name is walked, not replaced. A `file:` or `env:` reference shows its `<redacted:...>`
 /// marker. Other values are not secrets and stay. The walk covers
 /// objects and arrays at any depth.
 pub fn mask_secrets(value: &mut serde_json::Value) {
@@ -180,10 +180,13 @@ pub fn mask_secrets(value: &mut serde_json::Value) {
                         serde_json::Value::String(text) if is_secret_ref(text.trim()) => {
                             *text = redact_value(text.trim());
                         }
-                        serde_json::Value::String(_)
-                        | serde_json::Value::Object(_)
-                        | serde_json::Value::Array(_) => {
+                        serde_json::Value::String(_) => {
                             *member = serde_json::Value::String(SECRET_MASK.to_string());
+                        }
+                        // A container under a secret name is not a secret
+                        // value. Walk into it and mask its own secrets.
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            mask_secrets(member);
                         }
                         _ => {}
                     }
@@ -195,6 +198,15 @@ pub fn mask_secrets(value: &mut serde_json::Value) {
         serde_json::Value::Array(items) => items.iter_mut().for_each(mask_secrets),
         serde_json::Value::String(text) if is_secret_ref(text.trim()) => {
             *text = redact_value(text.trim());
+        }
+        // The registry keeps some documents as JSON text. Mask inside it.
+        serde_json::Value::String(text)
+            if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'[')) =>
+        {
+            if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text) {
+                mask_secrets(&mut inner);
+                *text = inner.to_string();
+            }
         }
         _ => {}
     }
@@ -241,6 +253,36 @@ pub fn restore_masked_secrets(body: &mut serde_json::Value, stored: &serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_named_container_is_walked_not_replaced() {
+        let mut doc = serde_json::json!({
+            "api_keys": {"keys": [{"name": "k", "secret": "s3", "enable": true}]},
+            "service_account_json": {"client_email": "a@b", "private_key": "pk"},
+            "password": "pw",
+        });
+        mask_secrets(&mut doc);
+        assert_eq!(doc["api_keys"]["keys"][0]["name"], "k");
+        assert_eq!(doc["api_keys"]["keys"][0]["secret"], SECRET_MASK);
+        assert_eq!(doc["api_keys"]["keys"][0]["enable"], true);
+        assert_eq!(doc["service_account_json"]["client_email"], "a@b");
+        assert_eq!(doc["service_account_json"]["private_key"], SECRET_MASK);
+        assert_eq!(doc["password"], SECRET_MASK);
+    }
+
+    #[test]
+    fn json_text_documents_are_masked_inside() {
+        let mut doc = serde_json::json!({
+            "config": "{\"name\":\"c\",\"password\":\"pw\"}",
+            "note": "{not json",
+        });
+        mask_secrets(&mut doc);
+        let inner: serde_json::Value =
+            serde_json::from_str(doc["config"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["name"], "c");
+        assert_eq!(inner["password"], SECRET_MASK);
+        assert_eq!(doc["note"], "{not json");
+    }
 
     #[test]
     fn parse_accepts_both_forms_and_rejects_plain() {
