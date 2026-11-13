@@ -5320,7 +5320,9 @@ fn azure_blob_auth(
     action_id: &str,
 ) -> Result<broker_connectors_enterprise::azure_blob::AzureBlobAuth, String> {
     use broker_connectors_enterprise::azure_blob::AzureBlobAuth;
-    let nested = connector_doc.get("auth").and_then(|value| value.as_object());
+    let nested = connector_doc
+        .get("auth")
+        .and_then(|value| value.as_object());
     let pick = |keys: &[&str]| -> Option<String> {
         keys.iter().find_map(|key| {
             connector_doc
