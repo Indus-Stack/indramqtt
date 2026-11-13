@@ -4416,7 +4416,7 @@ class InventoryEntry(unittest.TestCase):
         # loopback peer does not qualify any database protocol version.
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
-    def test_clickhouse_request_timeout_is_stored_but_not_applied_to_driver(self):
+    def test_clickhouse_request_timeout_is_applied_to_driver(self):
         peer = SilentPeer()
         self.addCleanup(peer.close)
         b = self.boot()
@@ -4492,11 +4492,12 @@ class InventoryEntry(unittest.TestCase):
             status, metrics = b.http("GET", metrics_path)
             self.assertEqual(status, 200)
             self.assertEqual(metrics["metrics"]["matched"], 1)
-            self.assertEqual(metrics["metrics"]["actions.total"], 0)
-            self.assertEqual(metrics["metrics"]["actions.failed"], 0)
+            # The one-millisecond request timeout is applied: the silent peer
+            # never answers, so the forward fails (connector_timeout_ms in
+            # action_sinks.rs, request_timeout in clickhouse.rs).
+            self.assertEqual(metrics["metrics"]["actions.total"], 1)
+            self.assertEqual(metrics["metrics"]["actions.failed"], 1)
             self.assertEqual(metrics["metrics"]["actions.success"], 0)
-            # A real HTTP request is still waiting after 500 times the
-            # selected one-millisecond timeout. The driver never gets it.
         # The silent observer does not acknowledge inserts or qualify a
         # database. Raw request headers are never printed or retained.
 

@@ -3825,9 +3825,8 @@ pub(crate) fn build_clickhouse_sink(
     let username = first_string(connector_doc, &["username", "user"])
         .map(|value| value.into_owned())
         .unwrap_or_else(|| "default".to_string());
-    let password = first_string(connector_doc, &["password"])
-        .map(|value| value.into_owned())
-        .unwrap_or_default();
+    // A `file:` or `env:` password is resolved here; its text is never sent.
+    let password = connector_password(&record.id, &connector, connector_doc)?;
     let table = merged_field(
         record,
         connector_doc,
@@ -4515,9 +4514,8 @@ pub(crate) fn build_doris_sink(
     let username = first_string(connector_doc, &["username", "user"])
         .map(|value| value.into_owned())
         .unwrap_or_else(|| "root".to_string());
-    let password = first_string(connector_doc, &["password"])
-        .map(|value| value.into_owned())
-        .unwrap_or_default();
+    // A `file:` or `env:` password is resolved here; its text is never sent.
+    let password = connector_password(&record.id, &connector, connector_doc)?;
     let table = merged_field(
         record,
         connector_doc,
