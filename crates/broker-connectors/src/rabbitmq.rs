@@ -278,13 +278,26 @@ impl RabbitMqTransport for MemoryAmqpTransport {
     }
 }
 
+/// The endpoint without its user and password, for messages. An
+/// error text never holds a credential.
+fn endpoint_without_credentials(endpoint: &str) -> String {
+    match endpoint.strip_prefix("amqp://") {
+        Some(rest) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("amqp://{host}"),
+            None => endpoint.to_string(),
+        },
+        None => "amqp endpoint".to_string(),
+    }
+}
+
 /// Parse `amqp://[user[:pass]@]host[:port][/vhost]` (defaults guest /
 /// guest, 5672, `/`; `%2f` decodes to `/` in the vhost) into
 /// `(host, port, username, password, vhost)`.
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String, String, String)> {
     let rest = endpoint.strip_prefix("amqp://").ok_or_else(|| {
         ConnectorError::Dispatch(format!(
-            "rabbitmq endpoint must start with amqp://: {endpoint:?}"
+            "rabbitmq endpoint must start with amqp://: {:?}",
+            endpoint_without_credentials(endpoint)
         ))
     })?;
     let (authority, vhost_raw) = match rest.split_once('/') {
@@ -314,14 +327,18 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String, String, String
         Some((host, port)) => (
             host.to_string(),
             port.parse::<u16>().map_err(|_| {
-                ConnectorError::Dispatch(format!("rabbitmq bad port in {endpoint:?}"))
+                ConnectorError::Dispatch(format!(
+                    "rabbitmq bad port in {:?}",
+                    endpoint_without_credentials(endpoint)
+                ))
             })?,
         ),
         None => (hostport.to_string(), 5672),
     };
     if host.is_empty() {
         return Err(ConnectorError::Dispatch(format!(
-            "rabbitmq endpoint needs a host: {endpoint:?}"
+            "rabbitmq endpoint needs a host: {:?}",
+            endpoint_without_credentials(endpoint)
         )));
     }
     Ok((host, port, username, password, vhost))
@@ -415,7 +432,7 @@ impl LapinRabbitTransport {
         .map_err(|_| {
             ConnectorError::Connection(format!(
                 "rabbitmq driver connect timeout: {}",
-                self.amqp_url
+                endpoint_without_credentials(&self.amqp_url)
             ))
         })?
         .map_err(|e| ConnectorError::Connection(format!("rabbitmq driver connect failed: {e}")))?;
@@ -425,7 +442,7 @@ impl LapinRabbitTransport {
             .map_err(|_| {
                 ConnectorError::Connection(format!(
                     "rabbitmq driver channel timeout: {}",
-                    self.amqp_url
+                    endpoint_without_credentials(&self.amqp_url)
                 ))
             })?
             .map_err(|e| {
@@ -443,7 +460,7 @@ impl LapinRabbitTransport {
         .map_err(|_| {
             ConnectorError::Connection(format!(
                 "rabbitmq driver confirm mode timeout: {}",
-                self.amqp_url
+                endpoint_without_credentials(&self.amqp_url)
             ))
         })?
         .map_err(|e| {

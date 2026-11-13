@@ -40,9 +40,9 @@ Set `kind` to `clickhouse` on the v1 API. The v1 route also accepts `ch`. It sto
 | `batch_timeout_ms` | yes | Linger before a partial batch flushes. |
 | `username` | no | ClickHouse user. Default `default`. It must not be empty. |
 | `password` | no | ClickHouse password. Default empty. |
-| `request_timeout_ms` | no | Per-request deadline. Default 5000. Values below 1 become 1. |
+| `request_timeout_ms` | no | Stored. The broker does not apply it in this release (see Known limits). |
 
-The v5 route reads `url` or `server`. The default is `http://127.0.0.1:8123`; a value without a scheme gets `http://`. It reads `database` (default `default`) and `table` (default `test_mqtt_events`). It reads `username` or `user` (default `default`) and `password`. It reads `request_timeout_ms`, `timeout_ms`, or `timeout`. The v5 route fixes `format` to `JSONEachRow`, `batch_size` to 1, and `batch_timeout_ms` to 10.
+The v5 route reads `url` or `server`. The default is `http://127.0.0.1:8123`; a value without a scheme gets `http://`. It reads `database` (default `default`) and `table` (default `test_mqtt_events`). It reads `username` or `user` (default `default`) and `password`. It stores `request_timeout_ms`, `timeout_ms`, or `timeout` and does not apply them in this release. The v5 route fixes `format` to `JSONEachRow`, `batch_size` to 1, and `batch_timeout_ms` to 10.
 
 Example:
 
@@ -142,6 +142,7 @@ ok
 
 The broker accepts the fields in this list. The broker does not apply them in this release.
 
+- `request_timeout_ms` (the request deadline): the driver uses its own default timeout.
 - `batch_size` (the batch size)
 - `batch_timeout_ms` (the batch wait time)
 

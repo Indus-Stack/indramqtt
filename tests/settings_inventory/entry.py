@@ -3031,16 +3031,14 @@ class InventoryEntry(unittest.TestCase):
         # successful wire proof for topic/property/partition configuration.
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
-    def test_warehouse_sdk_applies_batch_flags_and_access_token(self):
+    def test_warehouse_sdk_applies_action_target_flags_and_access_token(self):
         receiver = HttpReceiver(b'{"kind":"bigquery#tableDataInsertAllResponse"}')
         self.addCleanup(receiver.close)
         b = self.boot()
         token = secrets.token_hex(24)
         config = {"type": "bigquery", "name": "inventorywarehouse", "project_id": "audit-project",
-                  "dataset_id": "audit_dataset", "table": "selected_table", "template_suffix": "selected_suffix",
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
                   "auth": {"type": "access_token", "token": token}, "access_token": token,
-                  "ignore_unknown_values": False, "skip_invalid_rows": True,
                   "batch_size": 2, "batch_bytes": 1048576, "linger_ms": 60000,
                   "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
         status, result = b.http("POST", "/api/v5/connectors", config)
@@ -3054,7 +3052,15 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventorywarehouse")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventorywarehouserule", "inventory/warehouse")
+        # The target and the insert flags belong to the action (build_bigquery_sink).
+        self.create_forwarding_action_rule(b, config, "inventorywarehouserule", "inventory/warehouse", {
+            "dataset": "audit_dataset", "table": "selected_table", "template_suffix": "selected_suffix",
+            "ignore_unknown_values": False, "skip_invalid_rows": True})
+        for field, value in (("dataset_id", "d"), ("table", "t"), ("template_suffix", "s"),
+                             ("ignore_unknown_values", False), ("skip_invalid_rows", True)):
+            status, error = b.http("PUT", "/api/v5/connectors/inventorywarehouse", {**config, field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3066,19 +3072,20 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventorywarehouse") == (200, stored))
             pub, ack = b.connect("warehouse-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
+            # The connector `batch_size` is not applied (MVP-KNOWN-GAPS: bigquery): one request per row.
             for value in (179, 181):
                 publish(b, pub, "inventory/warehouse", json.dumps({"v": value}).encode())
-            path, raw = receiver.requests.get(timeout=10)
-            headers = receiver.request_headers.get(timeout=10)
-            self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
-            self.assertEqual(urllib.parse.unquote(path), "/bigquery/v2/projects/audit-project/datasets/audit_dataset/tables/selected_table$selected_suffix/insertAll")
-            self.assertEqual(headers.get("authorization"), "Bearer " + token)
-            body = json.loads(raw)
-            self.assertTrue(body.get("skipInvalidRows"))
-            self.assertFalse(body.get("ignoreUnknownValues"))
-            self.assertEqual([row["json"] for row in body["rows"]], [{"v": 179}, {"v": 181}])
-            for row in body["rows"]:
-                self.assertEqual(uuid.UUID(row["insertId"]).version, 4)
+                path, raw = receiver.requests.get(timeout=10)
+                headers = receiver.request_headers.get(timeout=10)
+                self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
+                self.assertEqual(urllib.parse.unquote(path), "/bigquery/v2/projects/audit-project/datasets/audit_dataset/tables/selected_table$selected_suffix/insertAll")
+                self.assertEqual(headers.get("authorization"), "Bearer " + token)
+                body = json.loads(raw)
+                self.assertTrue(body.get("skipInvalidRows"))
+                self.assertFalse(body.get("ignoreUnknownValues"))
+                self.assertEqual([row["json"] for row in body["rows"]], [{"v": value}])
+                for row in body["rows"]:
+                    self.assertEqual(uuid.UUID(row["insertId"]).version, 4)
         # Explicit endpoint and static empty auth avoid credential discovery.
 
     # // DR-03 inventory: keyed vendor path; owner DR-03
@@ -3385,16 +3392,15 @@ class InventoryEntry(unittest.TestCase):
                                                         {"database_name": ""})
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
-    def test_document_sdk_drops_payload_mapping_sort_key_ttl_and_typed_partition(self):
+    def test_document_sdk_applies_action_keys_and_session_token_and_refuses_connector_keys(self):
         receiver = HttpReceiver(b'{"UnprocessedItems":{}}')
         self.addCleanup(receiver.close)
         b = self.boot()
         access_key, secret_key = secrets.token_hex(12).upper(), secrets.token_hex(24)
-        config = {"type": "dynamodb", "name": "inventorydocument", "table_name": "audit_table",
+        session = secrets.token_hex(24)
+        config = {"type": "dynamodb", "name": "inventorydocument",
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port), "region": "us-west-2",
-                  "access_key_id": access_key, "secret_access_key": secret_key, "session_token": secrets.token_hex(24),
-                  "partition_key": "selected_pk", "sort_key": {"name": "selected_sk", "template": "selected", "key_type": "S"},
-                  "ttl_attribute": "expires", "ttl_secs": 60, "attributes_mapping": {"requested": "${payload.v}"},
+                  "access_key_id": access_key, "secret_access_key": secret_key, "session_token": session,
                   "batch_size": 20, "batch_bytes": 2097152, "linger_ms": 60000,
                   "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
         status, result = b.http("POST", "/api/v5/connectors", config)
@@ -3408,8 +3414,16 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventorydocument")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventorydocumentrule", "inventory/document")
-        partitions = ["selected_pk", {"name": "requested_pk", "template": "${payload.v}", "key_type": "N"}]
+        # The table and the keys belong to the action (build_dynamodb_action_sink).
+        self.create_forwarding_action_rule(b, config, "inventorydocumentrule", "inventory/document", {
+            "table": "audit_table", "hash_key": "selected_pk", "template": '{"selected_pk": "${timestamp}"}'})
+        for field, value in (("table_name", "audit_table"), ("partition_key", "selected_pk"),
+                             ("sort_key", {"name": "sk"}), ("ttl_attribute", "expires"), ("ttl_secs", 60),
+                             ("attributes_mapping", {"requested": "${payload.v}"})):
+            status, error = b.http("PUT", "/api/v5/connectors/inventorydocument", {**config, field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
+        partitions = ["selected_pk"]
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3418,13 +3432,12 @@ class InventoryEntry(unittest.TestCase):
             pub, ack = b.connect("document-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
             for partition in partitions:
-                config["partition_key"] = partition
                 self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydocument", config)[0], 200)
                 status, stored = b.http("GET", "/api/v5/connectors/inventorydocument")
                 self.assertEqual(status, 200)
                 self.assert_fields_kept(stored, config)
                 self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorydocument", {
-                    **config, "table_name": ""})[0], 400)
+                    **config, "region": ""})[0], 400)
                 self.assertTrue(b.http("GET", "/api/v5/connectors/inventorydocument") == (200, stored))
                 lower = int(time.time() * 1000) - 1000
                 publish(b, pub, "inventory/document", b'{"v":137}')
@@ -3433,7 +3446,7 @@ class InventoryEntry(unittest.TestCase):
                 self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
                 self.assertEqual(path, "/")
                 self.assertEqual(headers["x-amz-target"], "DynamoDB_20120810.BatchWriteItem")
-                self.assertTrue("x-amz-security-token" not in headers, "unexpected request header")
+                self.assertEqual(headers.get("x-amz-security-token"), session)
                 self.assert_sigv4_request("POST", path, headers, raw, access_key, secret_key, "us-west-2", "dynamodb")
                 body = json.loads(raw)
                 self.assertEqual(set(body), {"RequestItems"})
@@ -3450,15 +3463,15 @@ class InventoryEntry(unittest.TestCase):
                 self.assertTrue(lower <= int(item[field]["S"]) <= int(time.time() * 1000) + 1000)
 
     # // AZ-01 inventory: current behaviour; owner MV-03b
-    def test_stream_sdk_applies_signed_data_but_replaces_partition_hash_and_session(self):
+    def test_stream_sdk_applies_signed_data_and_session_token_and_refuses_connector_stream_fields(self):
         receiver = HttpReceiver(b'{"FailedRecordCount":0,"Records":[{"SequenceNumber":"1","ShardId":"audit-shard"}]}')
         self.addCleanup(receiver.close)
         b = self.boot()
         access_key, secret_key = secrets.token_hex(12).upper(), secrets.token_hex(24)
-        config = {"type": "kinesis", "name": "inventorystream", "stream_name": "audit_stream",
+        session = secrets.token_hex(24)
+        config = {"type": "kinesis", "name": "inventorystream",
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port), "region": "us-west-2",
-                  "access_key_id": access_key, "secret_access_key": secret_key, "session_token": secrets.token_hex(24),
-                  "partition_key_template": "requested_partition", "explicit_hash_key": "123",
+                  "access_key_id": access_key, "secret_access_key": secret_key, "session_token": session,
                   "batch_size": 20, "batch_bytes": 2097152, "linger_ms": 60000,
                   "max_retries": 0, "initial_backoff_ms": 7, "max_backoff_ms": 9, "timeout_ms": 1200}
         status, result = b.http("POST", "/api/v5/connectors", config)
@@ -3472,7 +3485,14 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventorystream")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventorystreamrule", "inventory/stream")
+        # The stream and the partition key belong to the action (build_kinesis_sink).
+        self.create_forwarding_action_rule(b, config, "inventorystreamrule", "inventory/stream", {
+            "stream_name": "audit_stream", "partition_key": "${topic}"})
+        for field, value in (("stream_name", "audit_stream"), ("partition_key_template", "p"),
+                             ("explicit_hash_key", "123")):
+            status, error = b.http("PUT", "/api/v5/connectors/inventorystream", {**config, field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3481,7 +3501,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assert_fields_kept(stored, config)
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorystream", {
-                **config, "stream_name": ""})[0], 400)
+                **config, "region": ""})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventorystream") == (200, stored))
             pub, ack = b.connect("stream-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
@@ -3491,14 +3511,14 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
             self.assertEqual(path, "/")
             self.assertEqual(headers["x-amz-target"], "Kinesis_20131202.PutRecords")
-            self.assertTrue("x-amz-security-token" not in headers, "unexpected request header")
+            self.assertEqual(headers.get("x-amz-security-token"), session)
             self.assert_sigv4_request("POST", path, headers, raw, access_key, secret_key, "us-west-2", "kinesis")
             body = json.loads(raw)
             self.assertEqual(body, {"StreamName": "audit_stream", "Records": [{
                 "PartitionKey": "inventory/stream", "Data": base64.b64encode(b'{"v":139}').decode()}]})
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
-    def test_blob_auth_variants_reach_wire_but_compression_and_batch_policy_are_replaced(self):
+    def test_blob_auth_variants_reach_wire_with_gzip_and_refuse_batch_settings(self):
         receiver = HttpReceiver()
         self.addCleanup(receiver.close)
         b = self.boot()
@@ -3517,9 +3537,8 @@ class InventoryEntry(unittest.TestCase):
             ("bearer", {"token": bearer}), ("bearer", {"bearer_token": bearer}),
             ("bearer", {"auth": {"token": bearer}}), ("bearer", {"auth": {"bearer_token": bearer}})]
         base = {"type": "azure_blob", "name": "inventoryblob", "account_name": "auditaccount",
-                "container_name": "audit-container", "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
-                "blob_path_template": "selected.ndjson", "compression": "gzip", "max_records_per_blob": 20,
-                "max_bytes_per_blob": 2097152, "flush_interval_secs": 60, "buffer_capacity": 1, "timeout_ms": 1200}
+                "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
+                "compression": "gzip", "timeout_ms": 1200}
         config = {**base, **variants[0][1]}
         status, result = b.http("POST", "/api/v5/connectors", config)
         expected = os.environ.get("AZ01_AZURE_BLOB_COMPILED")
@@ -3532,7 +3551,15 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryblob")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventoryblobrule", "inventory/blob")
+        # The container and the blob belong to the action (build_azure_blob_sink).
+        self.create_forwarding_action_rule(b, config, "inventoryblobrule", "inventory/blob",
+                                           {"container": "audit-container", "blob": "selected.ndjson"})
+        # Batch settings of the connector have no effect on an action: refused with the field named.
+        for field, value in (("max_records_per_blob", 20), ("max_bytes_per_blob", 2097152),
+                             ("flush_interval_secs", 60), ("buffer_capacity", 1)):
+            status, error = b.http("PUT", "/api/v5/connectors/inventoryblob", {**config, field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3547,7 +3574,7 @@ class InventoryEntry(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assert_fields_kept(stored, config)
                 self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryblob", {
-                    **config, "blob_path_template": "/bad"})[0], 400)
+                    **config, "compression": "zip"})[0], 400)
                 self.assertTrue(b.http("GET", "/api/v5/connectors/inventoryblob") == (200, stored))
                 lower = time.time() - 1
                 publish(b, pub, "inventory/blob", b'{"v":131}')
@@ -3563,8 +3590,8 @@ class InventoryEntry(unittest.TestCase):
                 self.assertEqual(receiver.request_methods.get(timeout=10), "PUT")
                 self.assertEqual(urllib.parse.urlsplit(path).path, "/audit-container/selected.ndjson")
                 self.assertEqual(headers["x-ms-blob-type"], "BlockBlob")
-                self.assertEqual(headers["content-type"], "application/x-ndjson")
-                self.assertTrue("content-encoding" not in headers, "unexpected request header")
+                self.assertEqual(headers["content-type"], "application/octet-stream")  # a gzip body is binary
+                self.assertEqual(headers.get("content-encoding"), "gzip")
                 if mode == "sas":
                     self.assertTrue(urllib.parse.urlsplit(path).query == sas, "selected SAS differs")
                     self.assertTrue(setup_query.get("sig") == [sas.split("sig=", 1)[1]], "setup SAS differs")
@@ -3580,6 +3607,7 @@ class InventoryEntry(unittest.TestCase):
                     signature = base64.b64encode(hmac.new(key_bytes, canonical.encode(), hashlib.sha256).digest()).decode()
                     self.assertTrue(headers["authorization"] == "SharedKey auditaccount:" + signature,
                                     "selected account key did not sign the blob")
+                raw = gzip.decompress(raw)
                 self.assertTrue(raw.endswith(b"\n"))
                 self.assertEqual(len(raw.splitlines()), 1)
                 document = json.loads(raw)
@@ -3588,16 +3616,16 @@ class InventoryEntry(unittest.TestCase):
                 self.assertEqual(document, {"topic": "inventory/blob", "qos": 0, "payload": {"v": 131}})
 
     # // AZ-01 inventory: current behaviour; owner MV-02d
-    def test_object_store_sdk_applies_signed_target_but_drops_compression_and_session_token(self):
+    def test_object_store_sdk_applies_signed_target_and_gzip_and_refuses_session_token(self):
         receiver = HttpReceiver()
         self.addCleanup(receiver.close)
         b = self.boot()
         access_key, secret_key = secrets.token_hex(12).upper(), secrets.token_hex(24)
         config = {"type": "s3", "name": "inventoryobject",
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
-                  "bucket": "audit-bucket", "region": "us-west-2", "access_key_id": access_key,
-                  "secret_access_key": secret_key, "session_token": secrets.token_hex(24),
-                  "key_template": "selected.ndjson", "compression": "gzip", "batch_size": 20,
+                  "region": "us-west-2", "access_key_id": access_key,
+                  "secret_access_key": secret_key,
+                  "compression": "gzip", "batch_size": 20,
                   "batch_bytes": 10485760, "batch_timeout_ms": 60000, "timeout_ms": 1200}
         status, result = b.http("POST", "/api/v5/connectors", config)
         expected = os.environ.get("AZ01_S3_COMPILED")
@@ -3610,7 +3638,14 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryobject")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventoryobjectrule", "inventory/object")
+        # The bucket and the key belong to the action (build_s3_object_sink). The driver
+        # sends no session token, so the connector refuses one.
+        self.create_forwarding_action_rule(b, config, "inventoryobjectrule", "inventory/object",
+                                           {"bucket": "audit-bucket", "key": "selected.ndjson"})
+        for field, value in (("session_token", "token"), ("bucket", "other"), ("key_template", "k")):
+            status, error = b.http("PUT", "/api/v5/connectors/inventoryobject", {**config, field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(field, error["message"])
         for attempt in range(2):
             if attempt:
                 b.stop()
@@ -3619,7 +3654,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assert_fields_kept(stored, config)
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryobject", {
-                **config, "bucket": "invalid bucket"})[0], 400)
+                **config, "compression": "zip"})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventoryobject") == (200, stored))
             pub, ack = b.connect("object-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
@@ -3633,8 +3668,8 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue("x-amz-security-token" not in headers, "unexpected request header")
             self.assert_sigv4_request("PUT", path, headers, raw, access_key, secret_key, "us-west-2", "s3")
             encodings = [value.strip() for value in headers.get("content-encoding", "").split(",") if value.strip()]
-            self.assertTrue(encodings in ([], ["aws-chunked"]), "unexpected object encoding")
-            if encodings:
+            self.assertIn("gzip", encodings, "the gzip setting was not applied")
+            if "aws-chunked" in encodings:
                 decoded, position = bytearray(), 0
                 while True:
                     end = raw.index(b"\r\n", position)
@@ -3648,6 +3683,7 @@ class InventoryEntry(unittest.TestCase):
                     self.assertEqual(raw[position:position + 2], b"\r\n")
                     position += 2
                 raw = bytes(decoded)
+            raw = gzip.decompress(raw)
             self.assertTrue(raw.endswith(b"\n"))
             self.assertEqual(len(raw.splitlines()), 1)
             document = json.loads(raw)
@@ -3656,15 +3692,14 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(document, {"topic": "inventory/object", "qos": 0, "payload": {"v": 127}})
 
     # // AZ-01 inventory: current behaviour; owner MV-02c
-    def test_search_connector_drops_document_id_nested_auth_and_batch_controls(self):
+    def test_search_connector_applies_document_id_and_api_key_and_refuses_both_credentials(self):
         receiver = HttpReceiver(b'{"errors":false,"items":[{"index":{"status":201}}]}')
         self.addCleanup(receiver.close)
         b = self.boot()
         password = secrets.token_hex(24)
         config = {"type": "elasticsearch", "name": "inventorysearch",
                   "endpoint": "http://127.0.0.1:" + str(receiver.server.server_port),
-                  "index_template": "audit_index", "username": "audit_user", "password": password,
-                  "auth": {"type": "apikey", "key": secrets.token_hex(24)},
+                  "username": "audit_user", "password": password,
                   "doc_id_template": "requested_id", "batch_size": 20, "batch_timeout_ms": 60000,
                   "max_retries": 0, "request_timeout_ms": 1200}
         status, result = b.http("POST", "/api/v5/connectors", config)
@@ -3678,11 +3713,20 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventorysearch")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventorysearchrule", "inventory/search")
+        # The write action belongs to the action (elasticsearch_sink_config).
+        self.create_forwarding_action_rule(b, config, "inventorysearchrule", "inventory/search",
+                                           {"action": "create", "index": "audit_index"})
+        api_key = secrets.token_hex(24)
+        # A user and password together with an API key is ambiguous: refused.
+        status, error = b.http("PUT", "/api/v5/connectors/inventorysearch", {
+            **config, "auth": {"type": "apikey", "key": api_key}})
+        self.assertEqual(status, 400)
+        self.assertIn("auth", error["message"])
         for attempt in range(2):
             if attempt:
                 config.pop("username")
                 config.pop("password")
+                config["auth"] = {"type": "apikey", "key": api_key}
                 self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorysearch", config)[0], 200)
                 b.stop()
                 b.start()
@@ -3690,7 +3734,7 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assert_fields_kept(stored, config)
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventorysearch", {
-                **config, "index_template": ""})[0], 400)
+                **config, "endpoint": ""})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventorysearch") == (200, stored))
             pub, ack = b.connect("search-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
@@ -3701,14 +3745,14 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
             self.assertEqual(path, "/_bulk")
             if attempt:
-                self.assertTrue("authorization" not in headers, "unexpected request header")
+                self.assertEqual(headers["authorization"], "ApiKey " + api_key)
             else:
                 credential = "Basic " + base64.b64encode(("audit_user:" + password).encode()).decode()
                 self.assertTrue(headers["authorization"] == credential, "selected credentials differ")
             self.assertTrue(raw.endswith(b"\n"))
             lines = raw.splitlines()
             self.assertEqual(len(lines), 2)
-            self.assertEqual(json.loads(lines[0]), {"index": {"_index": "audit_index"}})
+            self.assertEqual(json.loads(lines[0]), {"index": {"_index": "audit_index", "_id": "requested_id"}})
             document = json.loads(lines[1])
             stamp = datetime.datetime.fromisoformat(document.pop("timestamp").replace("Z", "+00:00")).timestamp()
             self.assertTrue(lower <= stamp <= time.time() + 1)
@@ -4432,11 +4476,18 @@ class InventoryEntry(unittest.TestCase):
                     time.sleep(0.02)
             self.assertTrue(request, "no driver HTTP request reached the loopback peer")
             self.assertTrue(b"inventorydb" in request)
-            self.assertTrue(config["password"].encode() in request,
-                            "configured password text did not reach driver headers")
+            # The driver gets the resolved secret. A file reference is read
+            # (connector_password in action_sinks.rs); its text is never sent.
+            # clickhouse.rs sends HTTP Basic auth. Decode it and compare
+            # the user and the resolved password exactly.
+            basic = [line.split(b" ", 2)[2].strip() for line in request.split(b"\r\n")
+                     if line.lower().startswith(b"authorization: basic ")]
+            self.assertEqual(len(basic), 1, "driver sent no Basic authorization header")
+            self.assertEqual(base64.b64decode(basic[0]), b"inventoryuser:" + credential.encode(),
+                             "configured password did not reach the driver login")
             if attempt:
-                self.assertFalse(credential.encode() in request,
-                                 "file-reference content unexpectedly reached the header")
+                self.assertFalse(config["password"].encode() in request,
+                                 "file-reference text reached the header unresolved")
             time.sleep(0.5)
             status, metrics = b.http("GET", metrics_path)
             self.assertEqual(status, 200)
@@ -4555,7 +4606,7 @@ class InventoryEntry(unittest.TestCase):
         # Enable is ignored on native ingress. Live caps work but reset.
 
     # // AZ-01 inventory: current behaviour; owner MV-03a
-    def test_amqp_timeout_diagnostic_contains_the_configured_password(self):
+    def test_amqp_timeout_diagnostic_does_not_contain_the_configured_password(self):
         b = self.broker
         b.configure()
         config_file = b.cfg / "indra.toml"
@@ -4578,7 +4629,9 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/connectors/inventoryamqp")[0], 404)
             return
         self.assertEqual(status, 201)
-        self.create_forwarding_action_rule(b, config, "inventoryamqprule", "inventory/amqp")
+        # The routing key belongs to the action (action_sinks.rs rabbitmq builder).
+        self.create_forwarding_action_rule(b, config, "inventoryamqprule", "inventory/amqp",
+                                           {"routing_key": "inventory.amqp"})
         pub, _ = b.connect("amqp-timeout-publisher")
         pub.settimeout(20)
         publish(b, pub, "inventory/amqp", b'{"entry":"diagnostic"}')
@@ -4593,9 +4646,9 @@ class InventoryEntry(unittest.TestCase):
         b.stop()
         output = b"".join(b.last_output)
         self.assertTrue(b"rabbitmq driver connect timeout" in output)
-        self.assertTrue(credential.encode() in output,
-                        "timeout diagnostic did not contain the generated credential")
-        # Only presence is asserted; never print or retain the raw log.
+        # No log line may hold the credential. The raw log is never printed or kept.
+        self.assertFalse(credential.encode() in output,
+                         "timeout diagnostic contains the generated credential")
 
     # // AZ-01 inventory: current behaviour; owner MV-12b
     def test_republish_direct_flag_does_not_select_normal_rule_processing(self):

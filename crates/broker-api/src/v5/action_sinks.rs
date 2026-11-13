@@ -5222,6 +5222,24 @@ pub(crate) fn build_s3_object_sink(
         .ok_or_else(|| format!("action {:?} is missing required field: bucket", record.id))?;
     let key = param_string(record, "key")
         .ok_or_else(|| format!("action {:?} is missing required field: key", record.id))?;
+    let compression = match first_string(connector_doc, &["compression"]).as_deref() {
+        None | Some("none") => S3Compression::None,
+        Some("gzip") => S3Compression::Gzip,
+        Some(other) => {
+            return Err(format!(
+                "connector {connector:?} field `compression` must be none or gzip: {other:?} (action {:?})",
+                record.id
+            ));
+        }
+    };
+    // The bucket and key belong to the action. The driver sends no session
+    // token. These connector fields would be ignored, so they are refused.
+    refuse_connector_fields(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["bucket", "key_template", "session_token"],
+    )?;
     let config = S3SinkConfig {
         endpoint,
         bucket,
@@ -5235,7 +5253,7 @@ pub(crate) fn build_s3_object_sink(
             .map(|value| value.into_owned())
             .unwrap_or_default(),
         key_template: key,
-        compression: S3Compression::None,
+        compression,
         // One row per send with no linger: the action runtime owns
         // batching (RO-01). Cap the buffer at 5 MiB (under the 5 GiB
         // single-PUT limit).
@@ -5267,6 +5285,69 @@ pub(crate) fn build_s3_object_sink(
     ))
 }
 
+/// Refuse connector fields that an action sink does not apply. The error
+/// names the field, so no setting is accepted and then ignored.
+#[cfg(any(
+    feature = "azure_blob",
+    feature = "s3",
+    feature = "dynamodb",
+    feature = "kinesis",
+    feature = "bigquery"
+))]
+fn refuse_connector_fields(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+    fields: &[&str],
+) -> Result<(), String> {
+    for field in fields {
+        let present = connector_doc
+            .get(*field)
+            .or_else(|| connector_doc.get("parameters").and_then(|p| p.get(*field)));
+        if present.is_some_and(|value| !value.is_null()) {
+            return Err(format!(
+                "connector {connector:?} field `{field}` is not supported by its actions; remove it (action {action_id:?})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The azure blob credential of a connector: the account key, a SAS token
+/// or a bearer token, at the top level or inside the `auth` object.
+#[cfg(feature = "azure_blob")]
+fn azure_blob_auth(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+) -> Result<broker_connectors_enterprise::azure_blob::AzureBlobAuth, String> {
+    use broker_connectors_enterprise::azure_blob::AzureBlobAuth;
+    let nested = connector_doc.get("auth").and_then(|value| value.as_object());
+    let pick = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|key| {
+            connector_doc
+                .get(*key)
+                .or_else(|| nested.and_then(|object| object.get(*key)))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+    };
+    if let Some(account_key) = pick(&["account_key", "accountKey"]) {
+        return Ok(AzureBlobAuth::SharedKey { account_key });
+    }
+    if let Some(sas_token) = pick(&["sas_token", "sas"]) {
+        return Ok(AzureBlobAuth::SasToken { sas_token });
+    }
+    if let Some(token) = pick(&["token", "bearer_token"]) {
+        return Ok(AzureBlobAuth::BearerToken { token });
+    }
+    Err(format!(
+        "connector {connector:?} is missing required field: account_key (action {action_id:?})"
+    ))
+}
+
 /// Build the action's `azure_blob` sink. The account, key and optional
 /// endpoint come from the connector; the container and blob come from
 /// the action. The driver never invents a container or blob name.
@@ -5280,8 +5361,7 @@ pub(crate) fn build_azure_blob_sink(
     _opts: &ActionResourceOpts,
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     use broker_connectors_enterprise::azure_blob::{
-        AzureBlobAuth, AzureBlobCompression, AzureBlobSink, AzureBlobSinkConfig,
-        HttpAzureBlobTransport,
+        AzureBlobCompression, AzureBlobSink, AzureBlobSinkConfig, HttpAzureBlobTransport,
     };
     let connector = record.connector.trim().to_string();
     let account_name = connector_field(
@@ -5291,12 +5371,29 @@ pub(crate) fn build_azure_blob_sink(
         &["account_name", "account"],
         "account_name",
     )?;
-    let account_key = connector_field(
+    let auth = azure_blob_auth(connector_doc, &connector, &record.id)?;
+    let compression = match first_string(connector_doc, &["compression"]).as_deref() {
+        None | Some("none") => AzureBlobCompression::None,
+        Some("gzip") => AzureBlobCompression::Gzip,
+        Some(other) => {
+            return Err(format!(
+                "connector {connector:?} field `compression` must be none or gzip: {other:?} (action {:?})",
+                record.id
+            ));
+        }
+    };
+    // The action runtime owns batching (`resource_opts`). These connector
+    // settings have no effect on an action, so they are refused.
+    refuse_connector_fields(
         connector_doc,
         &connector,
         &record.id,
-        &["account_key", "accountKey"],
-        "account_key",
+        &[
+            "max_records_per_blob",
+            "max_bytes_per_blob",
+            "flush_interval_secs",
+            "buffer_capacity",
+        ],
     )?;
     let container = param_string(record, "container").ok_or_else(|| {
         format!(
@@ -5318,9 +5415,9 @@ pub(crate) fn build_azure_blob_sink(
         account_name,
         container_name: container,
         endpoint,
-        auth: AzureBlobAuth::SharedKey { account_key },
+        auth,
         blob_path_template: blob,
-        compression: AzureBlobCompression::None,
+        compression,
         // One blob per send: the action runtime owns batching (RO-01).
         // Cap the blob at 10 MiB (under the block-blob staging limit
         // for small rows). Keep one batch buffered to bound memory.
@@ -5526,6 +5623,20 @@ pub(crate) fn build_dynamodb_action_sink(
         "url",
     )?;
     let region = connector_field(connector_doc, &connector, &record.id, &["region"], "region")?;
+    // The table, the keys and the attribute mapping belong to the action.
+    refuse_connector_fields(
+        connector_doc,
+        &connector,
+        &record.id,
+        &[
+            "table_name",
+            "partition_key",
+            "sort_key",
+            "ttl_attribute",
+            "ttl_secs",
+            "attributes_mapping",
+        ],
+    )?;
     let table = param_string(record, "table")
         .ok_or_else(|| format!("action {:?} is missing required field: table", record.id))?;
     let hash_key = param_string(record, "hash_key")
@@ -5724,7 +5835,8 @@ pub(crate) fn elasticsearch_sink_config(
         "index",
     )?;
     let doc_id_template = param_string(record, "id").or_else(|| {
-        first_string_nested(connector_doc, &["id", "doc_id_template"]).map(|v| v.into_owned())
+        // The connector `id` is the connector name, never a document id.
+        first_string_nested(connector_doc, &["doc_id_template"]).map(|v| v.into_owned())
     });
     let action = param_string(record, "action").ok_or_else(|| {
         format!(
@@ -5780,7 +5892,24 @@ pub(crate) fn elasticsearch_sink_config(
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
         });
+    // The reference `auth` object may carry an API key. It is applied when
+    // no user and password are set; both together are refused.
+    let api_key = connector_doc
+        .get("auth")
+        .filter(|auth| auth.get("type").and_then(|t| t.as_str()) == Some("apikey"))
+        .and_then(|auth| auth.get("key"))
+        .and_then(|key| key.as_str())
+        .map(str::to_string);
+    if api_key.is_some() && (username.is_some() || password.is_some()) {
+        return Err(format!(
+            "connector {connector:?} field `auth` cannot be set together with `username` and `password` (action {:?})",
+            record.id
+        ));
+    }
     let auth = match (username, password) {
+        _ if api_key.is_some() => ElasticsearchAuth::ApiKey {
+            key: api_key.unwrap_or_default(),
+        },
         (Some(username), Some(password)) => ElasticsearchAuth::Basic { username, password },
         (None, None) => ElasticsearchAuth::None,
         _ => {
@@ -5865,6 +5994,30 @@ pub(crate) fn build_bigquery_sink(
         .ok_or_else(|| format!("action {:?} is missing required field: table", record.id))?;
     let (project_id, auth) = bigquery_auth(connector_doc, &connector, &record.id)?;
     let project_id = param_string(record, "project_id").unwrap_or(project_id);
+    // The target and the insert flags belong to the action.
+    refuse_connector_fields(
+        connector_doc,
+        &connector,
+        &record.id,
+        &[
+            "dataset_id",
+            "table",
+            "template_suffix",
+            "ignore_unknown_values",
+            "skip_invalid_rows",
+        ],
+    )?;
+    let flag = |key: &str, default: bool| -> Result<bool, String> {
+        match param_value(record, key) {
+            None => Ok(default),
+            Some(value) => value.as_bool().ok_or_else(|| {
+                format!(
+                    "action {:?} field `parameters.{key}` must be a boolean",
+                    record.id
+                )
+            }),
+        }
+    };
     let config = BigQuerySinkConfig {
         project_id,
         dataset_id: dataset,
@@ -5873,9 +6026,9 @@ pub(crate) fn build_bigquery_sink(
             .map(|value| value.into_owned())
             .map(|value| http_endpoint(&value)),
         auth,
-        ignore_unknown_values: true,
-        skip_invalid_rows: false,
-        template_suffix: None,
+        ignore_unknown_values: flag("ignore_unknown_values", true)?,
+        skip_invalid_rows: flag("skip_invalid_rows", false)?,
+        template_suffix: param_string(record, "template_suffix"),
         // One row per send with no linger: the action runtime owns
         // batching (RO-01). Cap the batch at 1 MiB (under the 10 MiB
         // API limit). Retry 3 times with backoff.
@@ -7711,6 +7864,13 @@ pub(crate) fn build_kinesis_sink(
         &record.id,
         &["aws_secret_access_key", "secret_access_key", "sk"],
         "aws_secret_access_key",
+    )?;
+    // The stream and the partition key belong to the action.
+    refuse_connector_fields(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["stream_name", "partition_key_template", "explicit_hash_key"],
     )?;
     let stream_name = param_string(record, "stream_name").ok_or_else(|| {
         format!(
