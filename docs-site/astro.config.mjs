@@ -21,6 +21,9 @@ export default defineConfig({
     starlight({
       title: 'IndraMQTT',
       description: 'The complete MQTT platform in one small binary.',
+      components: {
+        Head: './src/components/overrides/Head.astro',
+      },
       sidebar: [
         {
           label: 'Start here',
