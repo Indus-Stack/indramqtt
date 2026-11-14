@@ -178,3 +178,15 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
+
+      - name: Test the link plugin
+        working-directory: docs-site
+        run: npm test
+
+      - name: Test the link checker
+        run: python3 tools/test_check_site_links.py -v
+
+      # A page can build and still hold links that return 404. This step
+      # follows every link and anchor of the built site.
+      - name: Check every link of the built site
+        run: python3 tools/check_site_links.py docs-site/dist

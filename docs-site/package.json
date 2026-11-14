@@ -6,9 +6,11 @@
   "description": "Static site for the IndraMQTT user documentation in docs/.",
   "license": "MIT",
   "scripts": {
-    "sync-docs": "rm -rf src/content/docs && mkdir -p src/content && cp -r ../docs src/content/docs && rm -rf src/content/docs/_*",
+    "sync-docs": "node scripts/sync-docs.mjs",
     "dev": "npm run sync-docs && astro dev",
-    "build": "npm run sync-docs && astro build"
+    "build": "npm run sync-docs && astro build",
+    "test": "node --test \"test/*.test.mjs\"",
+    "check-links": "python3 ../tools/check_site_links.py dist"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.30.0",
