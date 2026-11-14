@@ -11325,6 +11325,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `logging.level` applies. If the configuration has an error, `main`
     // returns the error and the runtime prints it on stderr.
     broker_observability::init_tracing_with_level(&cfg.logging.level);
+    // One line at debug level records the resolved level and the
+    // configuration directory, so an operator can see which level applies.
+    debug!(
+        level = %cfg.logging.level,
+        config_dir = %args.config_dir,
+        "log output started"
+    );
 
     // Deprecated settings stay valid for one release. The kernel serves
     // every enabled listener. `native` has no effect. A value of
