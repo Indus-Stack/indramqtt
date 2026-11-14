@@ -139,8 +139,8 @@ def render_cli_page():
     commands = [(name, effects[name]) for name in effects]
     out = [
         "---",
-        "title: Command line reference",
-        "description: Generated flags and commands of each binary.",
+        'title: "Command line reference"',
+        'description: "Generated flags and commands of each binary."',
         "---",
         "",
         "# Command line reference",
@@ -692,8 +692,8 @@ def render_rules_page():
     ordered_operators += sorted(o for o in operators if o not in RULES_OPERATOR_ORDER)
     out = [
         "---",
-        "title: Rule clauses and operators",
-        "description: Verified entries for each rule SQL clause and operator.",
+        'title: "Rule clauses and operators"',
+        'description: "Verified entries for each rule SQL clause and operator."',
         "sidebar:",
         "  order: 44",
         "---",
@@ -801,8 +801,8 @@ def render_rules_events_page():
     """Render the rule events page (DX2-018)."""
     out = [
         "---",
-        "title: Rule events",
-        "description: Verified entries for each rule event source.",
+        'title: "Rule events"',
+        'description: "Verified entries for each rule event source."',
         "sidebar:",
         "  order: 57",
         "---",
@@ -1127,8 +1127,8 @@ def render_rules_functions_page():
     """Render the message context function page (DX2-002)."""
     out = [
         "---",
-        "title: Rule functions: message context",
-        "description: Verified entries for the message context accessors.",
+        'title: "Rule functions: message context"',
+        'description: "Verified entries for the message context accessors."',
         "sidebar:",
         "  order: 45",
         "---",
@@ -1202,8 +1202,8 @@ def render_rules_math_bitwise_page():
     """Render the math and bitwise function page (DX2-003)."""
     out = [
         "---",
-        "title: Rule functions: math and bitwise",
-        "description: Verified entries for the math and bitwise functions.",
+        'title: "Rule functions: math and bitwise"',
+        'description: "Verified entries for the math and bitwise functions."',
         "sidebar:",
         "  order: 46",
         "---",
@@ -1275,8 +1275,8 @@ def render_rules_bits_bytes_page():
     """Render the bit and byte function page (DX2-004)."""
     out = [
         "---",
-        "title: Rule functions: bit and byte",
-        "description: Verified entries for the bit and byte functions.",
+        'title: "Rule functions: bit and byte"',
+        'description: "Verified entries for the bit and byte functions."',
         "sidebar:",
         "  order: 47",
         "---",
@@ -1351,8 +1351,8 @@ def render_rules_type_conversion_page():
     """Render the type conversion function page (DX2-005)."""
     out = [
         "---",
-        "title: Rule functions: type conversion",
-        "description: Verified entries for the type conversion functions.",
+        'title: "Rule functions: type conversion"',
+        'description: "Verified entries for the type conversion functions."',
         "sidebar:",
         "  order: 48",
         "---",
@@ -1511,8 +1511,8 @@ def render_rules_type_checks_page():
     """Render the type check function page (DX2-006)."""
     out = [
         "---",
-        "title: Rule functions: type checks",
-        "description: Verified entries for the type check functions.",
+        'title: "Rule functions: type checks"',
+        'description: "Verified entries for the type check functions."',
         "sidebar:",
         "  order: 49",
         "---",
@@ -1643,8 +1643,8 @@ def render_rules_arrays_page():
     """Render the array function page (DX2-009)."""
     out = [
         "---",
-        "title: Rule functions: arrays",
-        "description: Verified entries for the array functions.",
+        'title: "Rule functions: arrays"',
+        'description: "Verified entries for the array functions."',
         "sidebar:",
         "  order: 50",
         "---",
@@ -1757,8 +1757,8 @@ def render_rules_hashing_page():
     """Render the hashing function page (DX2-010)."""
     out = [
         "---",
-        "title: Rule functions: hashing",
-        "description: Verified entries for the hashing functions.",
+        'title: "Rule functions: hashing"',
+        'description: "Verified entries for the hashing functions."',
         "sidebar:",
         "  order: 51",
         "---",
@@ -1892,8 +1892,8 @@ def render_rules_compression_page():
     """Render the compression function page (DX2-011)."""
     out = [
         "---",
-        "title: Rule functions: compression",
-        "description: Verified entries for the compression functions.",
+        'title: "Rule functions: compression"',
+        'description: "Verified entries for the compression functions."',
         "sidebar:",
         "  order: 52",
         "---",
@@ -2020,8 +2020,8 @@ def render_rules_state_page():
     """Render the rule state function page (DX2-014)."""
     out = [
         "---",
-        "title: Rule functions: rule state",
-        "description: Verified entries for the rule state functions.",
+        'title: "Rule functions: rule state"',
+        'description: "Verified entries for the rule state functions."',
         "sidebar:",
         "  order: 53",
         "---",
@@ -2327,8 +2327,8 @@ def render_rules_actions_a_page():
     """Render the rule actions A page (DX2-015)."""
     out = [
         "---",
-        "title: Rule actions A: alloydb to dynamodb",
-        "description: Verified entries for each rule action from alloydb to dynamodb.",
+        'title: "Rule actions A: alloydb to dynamodb"',
+        'description: "Verified entries for each rule action from alloydb to dynamodb."',
         "sidebar:",
         "  order: 54",
         "---",
@@ -2575,8 +2575,8 @@ def render_rules_actions_b_page():
     """Render the rule actions B page (DX2-016)."""
     out = [
         "---",
-        "title: Rule actions B: elasticsearch to opentsdb",
-        "description: Verified entries for each rule action from elasticsearch to opentsdb.",
+        'title: "Rule actions B: elasticsearch to opentsdb"',
+        'description: "Verified entries for each rule action from elasticsearch to opentsdb."',
         "sidebar:",
         "  order: 55",
         "---",
@@ -2822,8 +2822,8 @@ def render_rules_actions_c_page():
     """Render the rule actions C page (DX2-017)."""
     out = [
         "---",
-        "title: Rule actions C: oracle to webhook",
-        "description: Verified entries for each rule action from oracle to webhook.",
+        'title: "Rule actions C: oracle to webhook"',
+        'description: "Verified entries for each rule action from oracle to webhook."',
         "sidebar:",
         "  order: 56",
         "---",

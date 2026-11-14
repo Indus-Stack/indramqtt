@@ -1,6 +1,6 @@
 ---
-title: Rule functions: compression
-description: Verified entries for the compression functions.
+title: "Rule functions: compression"
+description: "Verified entries for the compression functions."
 sidebar:
   order: 52
 ---

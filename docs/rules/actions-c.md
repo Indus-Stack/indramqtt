@@ -1,6 +1,6 @@
 ---
-title: Rule actions C: oracle to webhook
-description: Verified entries for each rule action from oracle to webhook.
+title: "Rule actions C: oracle to webhook"
+description: "Verified entries for each rule action from oracle to webhook."
 sidebar:
   order: 56
 ---

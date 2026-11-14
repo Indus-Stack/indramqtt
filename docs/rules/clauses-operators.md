@@ -1,6 +1,6 @@
 ---
-title: Rule clauses and operators
-description: Verified entries for each rule SQL clause and operator.
+title: "Rule clauses and operators"
+description: "Verified entries for each rule SQL clause and operator."
 sidebar:
   order: 44
 ---

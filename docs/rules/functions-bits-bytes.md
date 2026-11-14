@@ -1,6 +1,6 @@
 ---
-title: Rule functions: bit and byte
-description: Verified entries for the bit and byte functions.
+title: "Rule functions: bit and byte"
+description: "Verified entries for the bit and byte functions."
 sidebar:
   order: 47
 ---

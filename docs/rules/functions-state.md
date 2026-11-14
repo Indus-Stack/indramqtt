@@ -1,6 +1,6 @@
 ---
-title: Rule functions: rule state
-description: Verified entries for the rule state functions.
+title: "Rule functions: rule state"
+description: "Verified entries for the rule state functions."
 sidebar:
   order: 53
 ---

@@ -155,3 +155,26 @@ jobs:
 
       - name: Refuse the removed vulnerable and unmaintained crates
         run: python3 tools/refuse_removed_crates.py
+
+  docs-site:
+    name: Docs Site Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+
+      # The deployed site builds from docs/. A page that the site cannot
+      # read (front matter without a title, YAML that does not parse)
+      # stops the deployment, so it stops the pull request first.
+      - name: Build the docs site
+        working-directory: docs-site
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
