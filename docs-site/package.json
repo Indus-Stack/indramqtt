@@ -6,7 +6,7 @@
   "description": "Static site for the IndraMQTT user documentation in docs/.",
   "license": "MIT",
   "scripts": {
-    "sync-docs": "rm -rf src/content/docs && mkdir -p src/content && cp -r ../docs src/content/docs",
+    "sync-docs": "rm -rf src/content/docs && mkdir -p src/content && cp -r ../docs src/content/docs && rm -rf src/content/docs/_*",
     "dev": "npm run sync-docs && astro dev",
     "build": "npm run sync-docs && astro build"
   },

@@ -1,6 +1,6 @@
 ---
-title: Command line reference
-description: Generated flags and commands of each binary.
+title: "Command line reference"
+description: "Generated flags and commands of each binary."
 ---
 
 # Command line reference

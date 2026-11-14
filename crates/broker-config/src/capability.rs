@@ -1005,6 +1005,14 @@ pub fn kind_feature(name: &str) -> Option<&'static str> {
 #[must_use]
 pub fn render_markdown() -> String {
     let mut out = String::new();
+    let _ = writeln!(out, "---");
+    let _ = writeln!(out, "title: \"Connector, action and source kinds\"");
+    let _ = writeln!(
+        out,
+        "description: \"Every connector, action and source kind, and whether this build serves it.\""
+    );
+    let _ = writeln!(out, "---");
+    let _ = writeln!(out);
     let _ = writeln!(out, "# Connector, action and source kinds");
     let _ = writeln!(out);
     let _ = writeln!(

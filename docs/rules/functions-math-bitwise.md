@@ -1,6 +1,6 @@
 ---
-title: Rule functions: math and bitwise
-description: Verified entries for the math and bitwise functions.
+title: "Rule functions: math and bitwise"
+description: "Verified entries for the math and bitwise functions."
 sidebar:
   order: 46
 ---

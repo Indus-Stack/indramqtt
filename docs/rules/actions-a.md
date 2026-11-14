@@ -1,6 +1,6 @@
 ---
-title: Rule actions A: alloydb to dynamodb
-description: Verified entries for each rule action from alloydb to dynamodb.
+title: "Rule actions A: alloydb to dynamodb"
+description: "Verified entries for each rule action from alloydb to dynamodb."
 sidebar:
   order: 54
 ---
