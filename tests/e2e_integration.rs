@@ -8687,6 +8687,31 @@ async fn mv01_pgsql_special_password_and_database_reach_driver() {
     kernel.finish().await;
 }
 
+/// Waits until the action holds `rows` rows in its buffer. A QoS 0 publish
+/// reaches the buffer after the PUBLISH is sent, so a test that changes the
+/// action at once can race the rule engine.
+async fn mv01_wait_queued(kernel: &Kernel, action: &str, rows: u64) {
+    let deadline = tokio::time::Instant::now() + STEP;
+    loop {
+        let (status, body) = mv00_api(
+            kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{action}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "action metrics: {body}");
+        if body["metrics"]["queuing"].as_u64() == Some(rows) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "action {action} did not buffer {rows} rows in time: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// A buffered batch survives an update, a disable and a delete: each
 /// swap drains the old runtime before it stops it.
 #[tokio::test]
@@ -8748,6 +8773,7 @@ async fn mv01_action_buffer_drains_on_update_disable_and_delete() {
         &sy02_publish311("mv01/in/drain", 0, 0, false, br#"{"d":1}"#),
     )
     .await;
+    mv01_wait_queued(&kernel, "mv01-drain", 1).await;
     let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
     let (status, body) = mv00_api(
         &kernel,
@@ -8779,6 +8805,7 @@ async fn mv01_action_buffer_drains_on_update_disable_and_delete() {
         )
         .await;
     }
+    mv01_wait_queued(&kernel, "mv01-drain", 2).await;
     let second = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
     let (status, body) = mv00_api(
         &kernel,
