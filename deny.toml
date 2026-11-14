@@ -47,7 +47,7 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa: Marvin timing attack, no fixed release. Direct dependency of broker-connectors; replacement queued (DEP-02)." },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1.x: unmaintained. Direct dependency of broker-api and broker-connectors; replacement by rustls-pki-types queued (DEP-02)." },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability. It comes through serde_yaml in the OPC UA client library (async-opcua-core, its configuration-file loader, which IndraMQTT never calls) and on a test-only path of broker-auth. Remove when the OPC UA library makes YAML optional." },
-    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1: fixed in 0.39.0, which no released sqlx version accepts; the rule-engine dependency pins sqlx 0.8. Known debt: remove sqlx's sqlite feature if no production path uses it, or upgrade, before the MVP release (DEP-0459-1109)." },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1: fixed in 0.39.0, which no released sqlx version accepts; the rule-engine dependency pins sqlx 0.8. Known debt: remove sqlx's sqlite feature if no production path uses it, or upgrade, before the 1.0 release." },
     { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro, build time only, no code at run time. Comes through the rule-engine dependency." },
 ]
 

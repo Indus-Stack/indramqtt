@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the manifest if that directory is absent.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 COPY tests ./tests
 
 # The image contains all connector kinds.
