@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "op-between"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature BETWEEN 60 AND 80'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"temperature": 72.5}'
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature BETWEEN 60 AND 80'
+topic = "sensors/kitchen"
+payload = '{"temperature": 80.1}'
+expect_matched = false

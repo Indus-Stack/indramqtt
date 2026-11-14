@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-gcp_iot"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-gcp_iot"
+type = "gcp_iot"
+expect_status = 201
+expect_type = "gcp_iot"
+
+[[case]]
+name = "dx2-action-gcp_iot"
+type = "gcp_iot"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

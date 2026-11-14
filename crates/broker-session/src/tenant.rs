@@ -73,9 +73,7 @@ pub struct ConnectContext {
     /// Peer IP literal the edge saw on the client socket, if forwarded.
     pub peer_host: Option<String>,
     /// Listener scope the connection arrived on (`""` = default).
-    /// TODO(parity): the edge does not report listener names yet, so
-    /// binds carry the default scope and per-listener rules match only
-    /// the default or wildcard scopes until the name is plumbed.
+    /// The edge reports it. Flagged binds carry it.
     pub listener: String,
     /// TLS client-certificate common name, where TLS terminates.
     pub cert_cn: Option<String>,
@@ -150,8 +148,38 @@ impl TenantRule {
                 "field `expression` must not exceed {MAX_TENANT_EXPRESSION_LEN} chars"
             ));
         }
+        if let Some(field) = unknown_cert_field(&self.expression) {
+            return Err(format!(
+                "field `expression` holds unknown certificate field `${{{field}}}` (code BAD_REQUEST)"
+            ));
+        }
         Ok(())
     }
+}
+
+/// Name of an unknown `cert_*` placeholder in the expression, if any.
+/// Known fields are `cert_cn`, `cert_subject` and `cert_sans`.
+/// Other `cert_*` names are rejected at write time with the
+/// documented error shape. Other unknown names still degrade to
+/// the default tenant at render time.
+fn unknown_cert_field(expression: &str) -> Option<String> {
+    let mut rest = expression;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let name = &after[..end];
+        if name.starts_with("cert_")
+            && name != "cert_cn"
+            && name != "cert_subject"
+            && name != "cert_sans"
+        {
+            return Some(name.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    None
 }
 
 /// Bounded in-memory tenant rule list behind one short lock.
@@ -476,6 +504,31 @@ mod tests {
             );
         }
         assert_eq!(registry.len(), 1, "failed writes must not apply");
+    }
+
+    #[test]
+    fn unknown_cert_field_rejected_with_documented_shape() {
+        let registry = TenantRegistry::new();
+        let err = registry
+            .replace(vec![TenantRule::new("", "tenant", "cn-${cert_fp}")])
+            .expect_err("unknown cert field must fail");
+        assert!(
+            err.contains("expression"),
+            "error must name the field, got: {err}"
+        );
+        assert!(
+            err.contains("BAD_REQUEST"),
+            "error must carry the shape, got: {err}"
+        );
+        assert!(registry.is_empty(), "failed write must not apply");
+        // Known cert fields still store.
+        registry
+            .replace(vec![TenantRule::new(
+                "",
+                "tenant",
+                "cn-${cert_cn}-${cert_sans}",
+            )])
+            .expect("known cert fields store");
     }
 
     #[test]

@@ -6,12 +6,6 @@
 **/*.rs.bk
 *.pdb
 
-# Erlang / Rebar3 build artifacts
-_build/
-.rebar/
-.rebar3/
-*.crashdump
-erl_crash.dump
 
 # IDE and OS
 .idea/
@@ -33,3 +27,7 @@ Thumbs.db
 # Dashboard folder (ignored as of now)
 /dashboard/
 __pycache__/
+benchmark/suite/__pycache__/
+
+# Broker runtime state (password hashes, private keys, local snapshots)
+/data/

@@ -1,0 +1,1 @@
+`listeners.tls.enabled` enables the secure MQTT listener. The default `false` keeps the port closed. Set `true` with a certificate and a key. The broker then accepts TLS handshakes on `listeners.tls.bind`. Boot fails when the certificate or the key is missing and PSK is off.

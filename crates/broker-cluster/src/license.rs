@@ -866,11 +866,10 @@ impl ClusterIdentity {
             if scalar.iter().all(|b| *b == 0) {
                 continue;
             }
-            let field =
-                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&scalar);
-            if let Ok(signing) = SigningKey::from_bytes(&field) {
+            let field = SigningKey::from_slice(&scalar);
+            if let Ok(signing) = field {
                 let verifying = VerifyingKey::from(&signing);
-                let compressed = verifying.to_encoded_point(true);
+                let compressed = verifying.to_sec1_point(true);
                 let public_key_hex = encode_hex(compressed.as_bytes());
                 let identity = Self::identity_for_public(compressed.as_bytes());
                 return Self {
@@ -1016,7 +1015,10 @@ fn trial_days_remaining(trial_started_at: u64, now_secs: u64) -> Option<u64> {
     let trial_secs = TRIAL_DAYS.saturating_mul(SECS_PER_DAY);
     let elapsed = now_secs.saturating_sub(trial_started_at);
     if elapsed < trial_secs {
-        Some((trial_secs - elapsed) / SECS_PER_DAY)
+        // Use ceiling division. Truncation drops to 89 after one
+        // second. Ceiling keeps 90 for the first full day.
+        let remaining = trial_secs.saturating_sub(elapsed);
+        Some(remaining.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY)
     } else {
         None
     }
@@ -1053,7 +1055,10 @@ pub fn evaluate_installation(
     match verify_token_at_time(token, &identity.identity, trusted, effective) {
         Ok(payload) => {
             if effective <= payload.expires_at {
-                let days_remaining = payload.expires_at.saturating_sub(effective) / SECS_PER_DAY;
+                // Use ceiling division. Truncation drops one day
+                // after one second. Ceiling keeps the count stable.
+                let remaining = payload.expires_at.saturating_sub(effective);
+                let days_remaining = remaining.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY;
                 InstallationState::Valid {
                     customer: payload.customer,
                     expires_at: payload.expires_at,
@@ -1066,7 +1071,10 @@ pub fn evaluate_installation(
                 let grace_secs = payload.grace_period_days.saturating_mul(SECS_PER_DAY);
                 let elapsed = effective.saturating_sub(payload.expires_at);
                 if elapsed <= grace_secs {
-                    let days_remaining = grace_secs.saturating_sub(elapsed) / SECS_PER_DAY;
+                    // Use ceiling division. Truncation drops one day
+                    // after one second. Ceiling keeps the count stable.
+                    let remaining = grace_secs.saturating_sub(elapsed);
+                    let days_remaining = remaining.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY;
                     InstallationState::Grace {
                         customer: payload.customer,
                         expires_at: payload.expires_at,
@@ -1266,9 +1274,7 @@ mod tests {
         if seed == 0 {
             bytes[31] = 1;
         }
-        let field_bytes =
-            p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-        SigningKey::from_bytes(&field_bytes).expect("test seed is a valid scalar")
+        SigningKey::from_slice(&bytes).expect("test seed is a valid scalar")
     }
 
     fn test_trusted(keys: &[(&str, &SigningKey)]) -> TrustedKeys {
@@ -1593,7 +1599,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         for (name, key, kid) in [("a.json", &a, "key-a"), ("b.json", &b, "key-b")] {
             let verifying = VerifyingKey::from(key);
-            let point = verifying.to_encoded_point(false);
+            let point = verifying.to_sec1_point(false);
             let hex: String = point
                 .as_bytes()
                 .iter()
@@ -1622,8 +1628,7 @@ mod b2_04_tests {
         if seed == 0 {
             bytes[31] = 1;
         }
-        let field = p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-        SigningKey::from_bytes(&field).expect("test seed is a valid scalar")
+        SigningKey::from_slice(&bytes).expect("test seed is a valid scalar")
     }
 
     fn trusted_for(signing: &SigningKey, kid: &str) -> TrustedKeys {
@@ -2066,8 +2071,7 @@ mod b2_04_b {
     fn b2_04_install_during_trial_moves_to_valid() {
         use p256::ecdsa::signature::Signer;
         let bytes = [0xC9u8; 32];
-        let field = p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-        let signing = SigningKey::from_bytes(&field).expect("seed");
+        let signing = SigningKey::from_slice(&bytes).expect("seed");
         let mut trusted = TrustedKeys::new();
         trusted.insert("key-c9".to_string(), VerifyingKey::from(&signing));
         let now = 1_750_000_000u64;

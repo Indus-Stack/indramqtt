@@ -1,0 +1,1 @@
+[{"body": null, "cleanup": [], "expect_status": 200, "operation": "GET /opentelemetry", "path_params": {}, "query": {}, "setup": []}, {"body": {"metrics": {"enable": true}}, "cleanup": [], "expect_status": 400, "operation": "PUT /opentelemetry", "path_params": {}, "query": {}, "setup": []}]

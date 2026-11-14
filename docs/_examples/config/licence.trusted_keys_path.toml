@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "licence.trusted_keys_path"
+kind = "setting"
+expect = "ok"
+expected = "The broker accepts the trusted keys path and starts."
+source = "`crates/broker-config/src/schema.rs` documents `licence.trusted_keys_path` as trusted licence-signing keys: a JSON file or directory of JSON files."
+action = "Start the broker with a trusted keys path and check that `/healthz` answers OK."
+config = '''
+[licence]
+trusted_keys_path = "/tmp/docs-trusted-keys.json"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

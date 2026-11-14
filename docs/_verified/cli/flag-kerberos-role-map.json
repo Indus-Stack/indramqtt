@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-kerberos-role-map",
+  "match": "--kerberos-role-map",
+  "output": "      --kerberos-role-map <KERBEROS_ROLE_MAP>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

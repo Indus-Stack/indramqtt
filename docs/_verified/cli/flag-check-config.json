@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-check-config",
+  "match": "--check-config",
+  "output": "      --check-config",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

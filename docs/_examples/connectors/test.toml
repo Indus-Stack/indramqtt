@@ -1,0 +1,15 @@
+[example]
+area = "connectors"
+item = "test"
+kind = "connector-create"
+
+[[case]]
+name = "test-normal"
+type = "test"
+expect_status = 201
+expect_type = "test"
+
+[[case]]
+name = ""
+type = "test"
+expect_status = 400

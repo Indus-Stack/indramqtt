@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "op-in"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature IN (70, 72.5, 80)'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"temperature": 72.5}'
+
+[[case]]
+sql = "SELECT device FROM \"sensors/+\" WHERE device IN ('a', 'b')"
+topic = "sensors/kitchen"
+payload = '{"device": "kitchen"}'
+expect_matched = false

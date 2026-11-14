@@ -1,0 +1,9 @@
+{
+  "action": "Run a TLS handshake against the secure WebSocket listener and read the served certificate.",
+  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\n",
+  "item": "listeners.wss.cert_file",
+  "kind": "setting",
+  "output": "server-cn=localhost",
+  "returncode": 0,
+  "verified": true
+}

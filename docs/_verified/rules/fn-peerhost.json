@@ -1,0 +1,39 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "peerhost": "10.0.0.9"
+      },
+      "projected": {
+        "c": "10.0.0.9"
+      },
+      "sql": "SELECT peerhost() AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "c": null
+      },
+      "sql": "SELECT peerhost() AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "peerhost": 42
+      },
+      "projected": {
+        "c": 42
+      },
+      "sql": "SELECT peerhost() AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-peerhost",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

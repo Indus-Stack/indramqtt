@@ -1,4 +1,6 @@
 //! MT-07 single-tenant publish-to-deliver load (BENCH gate).
+//! TM-04 reuses this gate: one rule tenant check sits on the
+//! publish path, so this load shows no regression.
 //!
 //! Driven by the pipeline, never by the agent: an `#[ignore]`
 //! integration test using only APIs present on this task's base commit
@@ -104,6 +106,10 @@ fn mt_single_tenant_publish_to_deliver() {
     let rank = ((0.99 * BENCH_ITERATIONS as f64).ceil() as usize).clamp(1, BENCH_ITERATIONS);
     let p99_ms = latencies_ns[rank - 1] as f64 / 1_000_000.0;
 
+    // Leading blank line keeps the first BENCH line at column 0.
+    // Reason: the harness prints the test name with no newline,
+    // so the first BENCH line needs its own line for the grep.
+    println!();
     println!("BENCH throughput {throughput:.1} msg_per_sec");
     println!("BENCH p99 {p99_ms:.4} ms");
 }

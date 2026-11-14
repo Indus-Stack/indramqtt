@@ -1,0 +1,504 @@
+{
+  "actions": [
+    "alloydb",
+    "aws_iot",
+    "aws_kinesis",
+    "aws_timestream",
+    "azure",
+    "azure_blob",
+    "azure_blob_storage",
+    "azure_event_grid",
+    "azure_event_hub_producer",
+    "azure_eventhubs",
+    "azure_iot",
+    "bigquery",
+    "cassandra",
+    "cb",
+    "ch",
+    "clickhouse",
+    "cockroachdb",
+    "confluent",
+    "confluent_producer",
+    "console",
+    "couch",
+    "couchbase",
+    "cql",
+    "databricks",
+    "datalayers",
+    "disk_log",
+    "documentdb",
+    "doris",
+    "dynamo",
+    "dynamodb",
+    "elastic",
+    "elasticsearch",
+    "es",
+    "eventhubs",
+    "gcp",
+    "gcp_iot",
+    "gcp_pubsub",
+    "gcp_pubsub_consumer",
+    "gcp_pubsub_producer",
+    "greptime",
+    "greptimedb",
+    "http",
+    "influx",
+    "influxdb",
+    "iotdb",
+    "kafka",
+    "kafka_consumer",
+    "kafka_producer",
+    "kinesis",
+    "mongo",
+    "mongodb",
+    "mqtt",
+    "mqtt_bridge",
+    "mssql",
+    "mysql",
+    "oci_streaming",
+    "opc_ua",
+    "opensearch",
+    "opents",
+    "opentsdb",
+    "oracle",
+    "pgsql",
+    "postgres",
+    "pubsub",
+    "pulsar",
+    "rabbitmq",
+    "redis",
+    "redshift",
+    "rocketmq",
+    "s3",
+    "scylla",
+    "scylladb",
+    "snowflake",
+    "snowflake_streaming",
+    "sparkplug_b",
+    "sqlserver",
+    "tablestore",
+    "tdengine",
+    "test",
+    "timescale",
+    "timescaledb",
+    "timestream",
+    "webhook"
+  ],
+  "builtin_source": "rekuiper_sql::builtin_function_metadata",
+  "clauses": [
+    "FROM",
+    "GROUP BY",
+    "HAVING",
+    "LIMIT",
+    "SELECT",
+    "WHERE"
+  ],
+  "events": [
+    "$events/client_check_authz_complete",
+    "$events/client_connack",
+    "$events/client_connected",
+    "$events/client_disconnected",
+    "$events/delivery_dropped",
+    "$events/message_acked",
+    "$events/message_delivered",
+    "$events/message_dropped",
+    "$events/message_publish",
+    "$events/no_such_event",
+    "$events/session_subscribed",
+    "$events/session_unsubscribed",
+    "description",
+    "event",
+    "message_publish"
+  ],
+  "functions": [
+    {
+      "name": "acosh"
+    },
+    {
+      "name": "ascii"
+    },
+    {
+      "name": "asinh"
+    },
+    {
+      "name": "atanh"
+    },
+    {
+      "name": "base64_decode"
+    },
+    {
+      "name": "base64_encode"
+    },
+    {
+      "name": "bin2hexstr"
+    },
+    {
+      "name": "bitsize"
+    },
+    {
+      "name": "bitsl"
+    },
+    {
+      "name": "bitsr"
+    },
+    {
+      "name": "bool"
+    },
+    {
+      "name": "bytesize"
+    },
+    {
+      "name": "clientid"
+    },
+    {
+      "name": "clientip"
+    },
+    {
+      "name": "coalesce_ne"
+    },
+    {
+      "name": "concat"
+    },
+    {
+      "name": "contains"
+    },
+    {
+      "name": "contains_topic"
+    },
+    {
+      "name": "contains_topic_match"
+    },
+    {
+      "name": "date_to_unix_ts"
+    },
+    {
+      "name": "div"
+    },
+    {
+      "name": "find"
+    },
+    {
+      "name": "first"
+    },
+    {
+      "name": "flag"
+    },
+    {
+      "name": "flags"
+    },
+    {
+      "name": "float"
+    },
+    {
+      "name": "float2str"
+    },
+    {
+      "name": "fmod"
+    },
+    {
+      "name": "format_date"
+    },
+    {
+      "name": "getenv"
+    },
+    {
+      "name": "gunzip"
+    },
+    {
+      "name": "gzip"
+    },
+    {
+      "name": "hash"
+    },
+    {
+      "name": "hash_to_range"
+    },
+    {
+      "name": "hexstr2bin"
+    },
+    {
+      "name": "int"
+    },
+    {
+      "name": "is_array"
+    },
+    {
+      "name": "is_bool"
+    },
+    {
+      "name": "is_empty"
+    },
+    {
+      "name": "is_float"
+    },
+    {
+      "name": "is_int"
+    },
+    {
+      "name": "is_map"
+    },
+    {
+      "name": "is_not_null"
+    },
+    {
+      "name": "is_not_null_var"
+    },
+    {
+      "name": "is_null"
+    },
+    {
+      "name": "is_null_var"
+    },
+    {
+      "name": "is_num"
+    },
+    {
+      "name": "is_str"
+    },
+    {
+      "name": "join_to_sql_values_string"
+    },
+    {
+      "name": "join_to_string"
+    },
+    {
+      "name": "jq"
+    },
+    {
+      "name": "json_decode"
+    },
+    {
+      "name": "json_encode"
+    },
+    {
+      "name": "kv_store_del"
+    },
+    {
+      "name": "kv_store_get"
+    },
+    {
+      "name": "kv_store_put"
+    },
+    {
+      "name": "last"
+    },
+    {
+      "name": "length"
+    },
+    {
+      "name": "lz4_compress"
+    },
+    {
+      "name": "lz4_uncompress"
+    },
+    {
+      "name": "map"
+    },
+    {
+      "name": "map_get"
+    },
+    {
+      "name": "map_keys"
+    },
+    {
+      "name": "map_new"
+    },
+    {
+      "name": "map_put"
+    },
+    {
+      "name": "map_size"
+    },
+    {
+      "name": "map_to_entries"
+    },
+    {
+      "name": "map_to_range"
+    },
+    {
+      "name": "map_to_redis_hset_args"
+    },
+    {
+      "name": "map_values"
+    },
+    {
+      "name": "mget"
+    },
+    {
+      "name": "mongo_date"
+    },
+    {
+      "name": "mput"
+    },
+    {
+      "name": "msgid"
+    },
+    {
+      "name": "now_rfc3339"
+    },
+    {
+      "name": "now_timestamp"
+    },
+    {
+      "name": "nth"
+    },
+    {
+      "name": "null"
+    },
+    {
+      "name": "pad"
+    },
+    {
+      "name": "payload"
+    },
+    {
+      "name": "peerhost"
+    },
+    {
+      "name": "proc_dict_del"
+    },
+    {
+      "name": "proc_dict_get"
+    },
+    {
+      "name": "proc_dict_put"
+    },
+    {
+      "name": "qos"
+    },
+    {
+      "name": "random"
+    },
+    {
+      "name": "regex_extract"
+    },
+    {
+      "name": "regex_match"
+    },
+    {
+      "name": "regex_replace"
+    },
+    {
+      "name": "replace"
+    },
+    {
+      "name": "rfc3339_to_unix_ts"
+    },
+    {
+      "name": "rm_prefix"
+    },
+    {
+      "name": "rtrim"
+    },
+    {
+      "name": "sha"
+    },
+    {
+      "name": "split"
+    },
+    {
+      "name": "sprintf_s"
+    },
+    {
+      "name": "sqlserver_bin2hexstr"
+    },
+    {
+      "name": "std_base64_decode"
+    },
+    {
+      "name": "std_base64_encode"
+    },
+    {
+      "name": "std_concat"
+    },
+    {
+      "name": "std_length"
+    },
+    {
+      "name": "std_rtrim"
+    },
+    {
+      "name": "std_split"
+    },
+    {
+      "name": "std_substr"
+    },
+    {
+      "name": "str"
+    },
+    {
+      "name": "str_utf16_le"
+    },
+    {
+      "name": "str_utf8"
+    },
+    {
+      "name": "strlen"
+    },
+    {
+      "name": "subbits"
+    },
+    {
+      "name": "sublist"
+    },
+    {
+      "name": "substr"
+    },
+    {
+      "name": "term_decode"
+    },
+    {
+      "name": "term_encode"
+    },
+    {
+      "name": "timezone_to_offset_seconds"
+    },
+    {
+      "name": "timezone_to_second"
+    },
+    {
+      "name": "tokens"
+    },
+    {
+      "name": "topic"
+    },
+    {
+      "name": "topic_match"
+    },
+    {
+      "name": "unescape"
+    },
+    {
+      "name": "unix_ts_to_rfc3339"
+    },
+    {
+      "name": "unzip"
+    },
+    {
+      "name": "username"
+    },
+    {
+      "name": "uuid_v4"
+    },
+    {
+      "name": "uuid_v4_no_hyphen"
+    },
+    {
+      "name": "zip"
+    },
+    {
+      "name": "zip_compress"
+    },
+    {
+      "name": "zip_uncompress"
+    }
+  ],
+  "operators": [
+    "AND",
+    "BETWEEN",
+    "IN",
+    "LIKE",
+    "NOT",
+    "OR"
+  ]
+}

@@ -386,11 +386,8 @@ pub fn render_rows_body(rows: &[SnowflakeRowItem]) -> Vec<u8> {
         if index > 0 {
             body.push(',');
         }
-        let mut columns: Vec<(&String, &serde_json::Value)> =
-            row.fields.iter().map(|(k, v)| (k, v)).collect();
-        columns.sort_by(|a, b| a.0.cmp(b.0));
         body.push('{');
-        for (column_index, (name, value)) in columns.iter().enumerate() {
+        for (column_index, (name, value)) in row.fields.iter().enumerate() {
             if column_index > 0 {
                 body.push(',');
             }
@@ -617,7 +614,7 @@ fn sql_literal(value: &serde_json::Value) -> String {
     }
 }
 
-/// Render one multi-row `INSERT` for a batch: the sorted union of
+/// Render one multi-row `INSERT` for a batch: the first-seen union of
 /// columns across rows (missing cells become NULL), so mixed payloads
 /// sharing a table stay in one statement.
 pub fn render_insert_sql(
@@ -639,7 +636,6 @@ pub fn render_insert_sql(
             }
         }
     }
-    columns.sort();
     if columns.is_empty() {
         return Err(ConnectorError::Dispatch(
             "snowflake driver batch has no columns".to_string(),
@@ -702,7 +698,6 @@ pub fn render_create_table_sql(
             }
         }
     }
-    columns.sort();
     let mut sql = format!(
         "CREATE TABLE IF NOT EXISTS {}.{}.{} (",
         quote_ident(database),
@@ -854,10 +849,8 @@ impl SnowflakeSink {
         if self.config.column_mappings.is_empty() {
             match &value {
                 serde_json::Value::Object(map) => {
-                    let mut keys: Vec<&String> = map.keys().collect();
-                    keys.sort();
-                    for key in keys {
-                        fields.push((key.to_uppercase(), map[key].clone()));
+                    for (key, value) in map {
+                        fields.push((key.to_uppercase(), value.clone()));
                     }
                 }
                 other => fields.push(("VALUE".to_string(), other.clone())),
@@ -921,7 +914,14 @@ impl SnowflakeSink {
         let mut attempt = 0usize;
         loop {
             // Fresh JWT per attempt (tokens may expire mid-backoff).
-            let token = self.fresh_token()?;
+            // A signing failure restores the batch instead of dropping
+            // rows without a counter.
+            let token = match self.fresh_token() {
+                Ok(token) => token,
+                Err(error) => {
+                    return self.restore_err(rows, oldest, taken_bytes, error);
+                }
+            };
             let mut outcome: Result<()> = Ok(());
             for (table, items) in &groups {
                 if let Err(e) = self
@@ -1075,6 +1075,29 @@ mod tests {
     }
 
     #[test]
+    fn mv00_row_and_sql_keep_columns_paired_in_projection_order() {
+        let rows = [
+            SnowflakeRowItem {
+                fields: vec![
+                    ("B".to_string(), serde_json::json!(2)),
+                    ("A".to_string(), serde_json::json!(1)),
+                ],
+            },
+            SnowflakeRowItem {
+                fields: vec![
+                    ("C".to_string(), serde_json::json!(3)),
+                    ("B".to_string(), serde_json::json!(4)),
+                ],
+            },
+        ];
+        assert_eq!(render_rows_body(&rows), br#"[{"B":2,"A":1},{"C":3,"B":4}]"#);
+        assert_eq!(
+            render_insert_sql("D", "S", "T", &rows).expect("ordered INSERT"),
+            "INSERT INTO \"D\".\"S\".\"T\" (\"B\", \"A\", \"C\") VALUES (2, 1, NULL), (4, NULL, 3)"
+        );
+    }
+
+    #[test]
     fn test_config_validation() {
         let mut config = test_config();
         assert!(config.validate().is_ok());
@@ -1196,9 +1219,9 @@ mod tests {
         .unwrap();
         sink.flush().await.unwrap();
         let captured = transport.captured();
-        // Sorted whole-document columns plus metadata.
+        // Whole-document columns keep projection order before metadata.
         let names: Vec<&String> = captured[0].rows[0].fields.iter().map(|(k, _)| k).collect();
-        assert_eq!(names, vec!["A", "B", "_MQTT_TOPIC", "_MQTT_TIMESTAMP"]);
+        assert_eq!(names, vec!["B", "A", "_MQTT_TOPIC", "_MQTT_TIMESTAMP"]);
     }
 
     #[tokio::test]
@@ -1300,13 +1323,13 @@ mod tests {
             },
         ];
         let sql = render_insert_sql("IOT", "PUBLIC", "TELEMETRY", &rows).unwrap();
-        // Sorted union of columns, missing cells NULL, quotes doubled.
+        // First-seen columns, missing cells NULL, quotes doubled.
         assert_eq!(
             sql,
             "INSERT INTO \"IOT\".\"PUBLIC\".\"TELEMETRY\" \
-             (\"ACTIVE\", \"DEVICE_ID\", \"NOTE\", \"TEMPERATURE\") VALUES \
-             (TRUE, 'sensor-1', NULL, 75.2), \
-             (NULL, 'o''brien', '{\"a\":1}', NULL)"
+             (\"DEVICE_ID\", \"TEMPERATURE\", \"ACTIVE\", \"NOTE\") VALUES \
+             ('sensor-1', 75.2, TRUE, NULL), \
+             ('o''brien', NULL, NULL, '{\"a\":1}')"
         );
         assert!(render_insert_sql("IOT", "PUBLIC", "T", &[]).is_err());
     }
@@ -1325,7 +1348,7 @@ mod tests {
         assert_eq!(
             ddl,
             "CREATE TABLE IF NOT EXISTS \"IOT\".\"PUBLIC\".\"TELEMETRY\" \
-             (\"ACTIVE\" BOOLEAN, \"DEVICE_ID\" TEXT, \"EMPTY\" TEXT, \"TEMPERATURE\" DOUBLE)"
+             (\"DEVICE_ID\" TEXT, \"TEMPERATURE\" DOUBLE, \"ACTIVE\" BOOLEAN, \"EMPTY\" TEXT)"
         );
         assert!(render_create_table_sql("IOT", "PUBLIC", "T", &[]).is_err());
     }

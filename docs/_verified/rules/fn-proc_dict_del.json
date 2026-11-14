@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT proc_dict_del('dx2-state-missing-1') AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT proc_dict_del() AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-proc_dict_del",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

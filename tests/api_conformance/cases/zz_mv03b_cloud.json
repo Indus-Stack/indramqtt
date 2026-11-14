@@ -1,0 +1,554 @@
+[
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "kinesis",
+      "name": "mv03b-lc-kinesis",
+      "endpoint": "http://127.0.0.1:4566",
+      "region": "us-east-1",
+      "aws_access_key_id": "AKID",
+      "aws_secret_access_key": "secret"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "kinesis",
+      "name": "mv03b-lc-kinesis-bad"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "gcp_pubsub_producer",
+      "name": "mv03b-lc-gcp",
+      "project_id": "demo-proj",
+      "endpoint": "http://127.0.0.1:8085",
+      "authentication": {
+        "type": "attached_service_account"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-gcp"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "gcp_pubsub",
+      "name": "mv03b-lc-gcp-bad"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "azure_eventhubs",
+      "name": "mv03b-lc-azeh",
+      "namespace": "ns-1",
+      "endpoint": "http://127.0.0.1:5672",
+      "shared_access_key_name": "send",
+      "shared_access_key": "secret"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-azeh"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "azure_eventhubs",
+      "name": "mv03b-lc-azeh-bad"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "gcp_iot",
+      "name": "mv03b-lc-gcpiot",
+      "private_key_pem": "k",
+      "project_id": "p",
+      "cloud_region": "r",
+      "registry_id": "g",
+      "device_id": "d"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "aws_kinesis",
+      "name": "mv03b-lc-kinesis-alias",
+      "endpoint": "http://127.0.0.1:4566",
+      "region": "us-east-1",
+      "aws_access_key_id": "AKID",
+      "aws_secret_access_key": "secret"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis-alias"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /connectors/{id}",
+    "body": {
+      "type": "kinesis",
+      "name": "mv03b-lc-kinesis",
+      "endpoint": "http://127.0.0.1:4567",
+      "region": "us-east-1",
+      "aws_access_key_id": "AKID",
+      "aws_secret_access_key": "secret"
+    },
+    "expect_status": 200,
+    "path_params": {
+      "id": "mv03b-lc-kinesis"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "kinesis",
+            "name": "mv03b-lc-kinesis",
+            "endpoint": "http://127.0.0.1:4566",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /connectors/{id}",
+    "body": {
+      "type": "gcp_iot",
+      "name": "mv03b-lc-gcpiot",
+      "private_key_pem": "k",
+      "project_id": "p",
+      "cloud_region": "r",
+      "registry_id": "g",
+      "device_id": "d"
+    },
+    "expect_status": 400,
+    "path_params": {
+      "id": "mv03b-lc-gcpiot"
+    },
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "kinesis",
+      "name": "p",
+      "endpoint": "http://127.0.0.1:9",
+      "region": "us-east-1",
+      "aws_access_key_id": "AKID",
+      "aws_secret_access_key": "secret"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "gcp_pubsub",
+      "name": "p",
+      "project_id": "demo-proj",
+      "endpoint": "http://127.0.0.1:9"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "azure_eventhubs",
+      "name": "p",
+      "namespace": "ns-1",
+      "endpoint": "http://127.0.0.1:9",
+      "shared_access_key_name": "send",
+      "shared_access_key": "secret"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "gcp_iot",
+      "name": "p"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "kinesis",
+      "name": "mv03b-lc-kinesis-act",
+      "connector": "mv03b-lc-kinesis",
+      "parameters": {
+        "stream_name": "telemetry",
+        "partition_key": "${client_id}"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "kinesis",
+            "name": "mv03b-lc-kinesis",
+            "endpoint": "http://127.0.0.1:4566",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03b-lc-kinesis-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "kinesis",
+      "name": "mv03b-lc-kinesis-act-bad",
+      "connector": "mv03b-lc-kinesis",
+      "parameters": {}
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "kinesis",
+            "name": "mv03b-lc-kinesis",
+            "endpoint": "http://127.0.0.1:4566",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "gcp_pubsub",
+      "name": "mv03b-lc-gcp-act",
+      "connector": "mv03b-lc-gcp",
+      "parameters": {
+        "pubsub_topic": "events"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "gcp_pubsub",
+            "name": "mv03b-lc-gcp",
+            "project_id": "demo-proj",
+            "endpoint": "http://127.0.0.1:8085"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03b-lc-gcp-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-gcp"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "azure_eventhubs",
+      "name": "mv03b-lc-azeh-act",
+      "connector": "mv03b-lc-azeh",
+      "parameters": {
+        "event_hub": "hub-a"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "azure_eventhubs",
+            "name": "mv03b-lc-azeh",
+            "namespace": "ns-1",
+            "endpoint": "http://127.0.0.1:5672",
+            "shared_access_key_name": "send",
+            "shared_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03b-lc-azeh-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-azeh"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "body": {
+      "type": "kinesis",
+      "name": "mv03b-lc-kinesis-act",
+      "connector": "mv03b-lc-kinesis",
+      "parameters": {
+        "stream_name": "updated",
+        "partition_key": "${client_id}"
+      }
+    },
+    "expect_status": 200,
+    "path_params": {
+      "id": "mv03b-lc-kinesis-act"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "kinesis",
+            "name": "mv03b-lc-kinesis",
+            "endpoint": "http://127.0.0.1:4566",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/actions",
+          "body": {
+            "type": "kinesis",
+            "name": "mv03b-lc-kinesis-act",
+            "connector": "mv03b-lc-kinesis",
+            "parameters": {
+              "stream_name": "telemetry",
+              "partition_key": "${client_id}"
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03b-lc-kinesis-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions_probe",
+    "body": {
+      "type": "kinesis",
+      "name": "p",
+      "connector": "mv03b-lc-kinesis",
+      "parameters": {
+        "stream_name": "telemetry"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "kinesis",
+            "name": "mv03b-lc-kinesis",
+            "endpoint": "http://127.0.0.1:9",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03b-lc-kinesis"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "GET /schemas/{name}",
+    "body": null,
+    "expect_status": 200,
+    "path_params": {
+      "name": "bridge_kinesis.post_connector"
+    },
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /schemas/{name}",
+    "body": null,
+    "expect_status": 200,
+    "path_params": {
+      "name": "bridge_kinesis.post_bridge_v2"
+    },
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  }
+]

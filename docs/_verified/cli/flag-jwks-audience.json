@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-jwks-audience",
+  "match": "--jwks-audience",
+  "output": "      --jwks-audience <JWKS_AUDIENCE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

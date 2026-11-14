@@ -1,0 +1,15 @@
+[package]
+name = "matrix-rumqttc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Detached project. It is not part of the product workspace.
+# It checks the broker through sockets only.
+[workspace]
+
+[dependencies]
+# Pure Rust client. No system library is needed.
+anyhow = "1"
+rumqttc = "0.25"
+tokio = { version = "1", features = ["full"] }

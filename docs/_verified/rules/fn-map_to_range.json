@@ -1,0 +1,74 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": 5
+      },
+      "sql": "SELECT map_to_range(5, 0, 99) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": 6
+      },
+      "sql": "SELECT map_to_range('AB', 0, 99) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": 0
+      },
+      "sql": "SELECT map_to_range(300, 0, 99) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT map_to_range('', 0, 99) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT map_to_range(5, 99, 0) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT map_to_range(5, 0) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-map_to_range",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

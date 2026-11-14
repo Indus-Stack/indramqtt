@@ -5,17 +5,20 @@
 //! partition routing, monotonic sequence ids, event-time stamps and
 //! custom properties (`mqtt_topic` / `mqtt_qos` always injected).
 //!
-//! Wire framing is a clean-room subset of the Pulsar binary protocol:
+//! The production write path runs on the maintained `pulsar` driver
+//! ([`DriverPulsarTransport`] below): binary protocol through the
+//! driver client (no auth against standalone; token auth stays
+//! unqualified, see below).
+//!
+//! The codec is a clean-room subset of the Pulsar binary protocol:
 //! `[totalSize u32][commandSize u32][Command][0x0E01][CRC32C][metaSize
 //! u32][MessageMetadata][payload]`, where Command and MessageMetadata
-//! use Protobuf-style varint/LEN fields. Command subset: Connect(2) /
-//! Connected(3) / Producer(11) / ProducerSuccess(13) / Send(19) /
-//! SendReceipt(20). Metadata subset: producer_name = 1,
+//! use Protobuf-style varint/LEN fields. The codec encodes the
+//! Connected(3) and Send(19) commands. Metadata subset: producer_name = 1,
 //! sequence_id = 2, publish_time = 3, properties = 4
 //! (`KeyValue{key = 1, value = 2}`), partition_key = 5,
-//! event_time = 6. The TCP transport handshakes Connect/Producer once
-//! per topic and awaits one SendReceipt per message (5s); the memory
-//! transport captures everything in-process for tests.
+//! event_time = 6. The memory transport captures everything in-process
+//! for tests.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -25,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
@@ -35,12 +37,8 @@ use broker_connectors::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum PulsarCommand {
-    Connect = 2,
     Connected = 3,
-    Producer = 11,
-    ProducerSuccess = 13,
     Send = 19,
-    SendReceipt = 20,
 }
 
 /// Pulsar authentication.
@@ -85,6 +83,14 @@ fn default_initial_backoff_ms() -> Option<u64> {
 fn default_max_backoff_ms() -> Option<u64> {
     Some(2_000)
 }
+
+fn default_strategy() -> String {
+    "random".to_string()
+}
+
+/// One short TCP handshake per publish bounds the down check to 1 s.
+// A closed listener fails closed even when an old connection still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn is_tenant_segment(value: &str) -> bool {
     !value.is_empty()
@@ -167,8 +173,14 @@ pub struct PulsarSinkConfig {
     #[serde(default)]
     pub auth: PulsarAuth,
     /// Partition key template (`${client_id}`, `${topic}`, ...).
+    /// Absent for `random` and `roundrobin` routing.
     #[serde(default)]
     pub partition_key_template: Option<String>,
+    /// Routing strategy: `random` (default), `roundrobin` or
+    /// `key_dispatch`. `key_dispatch` hashes the key. The other two
+    /// send with no key so the broker spreads rows.
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
     /// Custom properties with template substitution.
     #[serde(default)]
     pub properties: HashMap<String, String>,
@@ -218,6 +230,12 @@ impl PulsarSinkConfig {
             return Err(ConnectorError::Dispatch(
                 "pulsar topic must not be empty".to_string(),
             ));
+        }
+        if !["random", "roundrobin", "key_dispatch"].contains(&self.strategy.as_str()) {
+            return Err(ConnectorError::Dispatch(format!(
+                "pulsar strategy must be one of random, roundrobin, key_dispatch: {:?}",
+                self.strategy
+            )));
         }
         // Strict template checks with dummy values.
         self.resolve_topic("dummy/topic", QoS::AtMostOnce, 0)?;
@@ -385,12 +403,6 @@ fn encode_varint_field(field: u32, value: u64, out: &mut Vec<u8>) {
     encode_varint(value, out);
 }
 
-fn encode_bytes_field(field: u32, value: &[u8], out: &mut Vec<u8>) {
-    encode_tag(field, 2, out);
-    encode_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
 /// CRC32C (Castagnoli, polynomial 0x1EDC6F41) over metadata+payload.
 pub fn crc32c(data: &[u8]) -> u32 {
     const TABLE: [u32; 256] = crc32c_table();
@@ -424,13 +436,8 @@ const fn crc32c_table() -> [u32; 256] {
 /// Command envelope field numbers used by the subset.
 mod fields {
     pub const TYPE: u32 = 1;
-    pub const TOPIC: u32 = 1;
     pub const PRODUCER_ID: u32 = 2;
-    pub const CLIENT_VERSION: u32 = 2;
     pub const SEQUENCE_ID: u32 = 2;
-    pub const PRODUCER_NAME: u32 = 4;
-    pub const AUTH_METHOD_NAME: u32 = 5;
-    pub const AUTH_DATA: u32 = 6;
     pub const PRODUCER_NAME_META: u32 = 1;
     pub const SEQUENCE_ID_META: u32 = 2;
     pub const PUBLISH_TIME: u32 = 3;
@@ -441,18 +448,6 @@ mod fields {
     pub const KV_VALUE: u32 = 2;
 }
 
-/// Encode a `Connect` command body.
-pub fn encode_connect(client_version: &str, auth: &PulsarAuth) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(fields::TYPE, PulsarCommand::Connect as u64, &mut out);
-    encode_string_field(fields::CLIENT_VERSION, client_version, &mut out);
-    if let PulsarAuth::Token { token } = auth {
-        encode_string_field(fields::AUTH_METHOD_NAME, "token", &mut out);
-        encode_bytes_field(fields::AUTH_DATA, token.as_bytes(), &mut out);
-    }
-    out
-}
-
 /// Encode a `Connected` command body (fake brokers + tests).
 pub fn encode_connected() -> Vec<u8> {
     let mut out = Vec::new();
@@ -460,41 +455,10 @@ pub fn encode_connected() -> Vec<u8> {
     out
 }
 
-/// Encode a `Producer` command body.
-pub fn encode_producer(topic_path: &str, producer_id: u64, producer_name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(fields::TYPE, PulsarCommand::Producer as u64, &mut out);
-    encode_string_field(fields::TOPIC, topic_path, &mut out);
-    encode_varint_field(fields::PRODUCER_ID, producer_id, &mut out);
-    encode_string_field(fields::PRODUCER_NAME, producer_name, &mut out);
-    out
-}
-
-/// Encode a `ProducerSuccess` command body.
-pub fn encode_producer_success(producer_name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(
-        fields::TYPE,
-        PulsarCommand::ProducerSuccess as u64,
-        &mut out,
-    );
-    encode_string_field(fields::PRODUCER_NAME, producer_name, &mut out);
-    out
-}
-
 /// Encode a `Send` command body.
 pub fn encode_send(producer_id: u64, sequence_id: u64) -> Vec<u8> {
     let mut out = Vec::new();
     encode_varint_field(fields::TYPE, PulsarCommand::Send as u64, &mut out);
-    encode_varint_field(fields::PRODUCER_ID, producer_id, &mut out);
-    encode_varint_field(fields::SEQUENCE_ID, sequence_id, &mut out);
-    out
-}
-
-/// Encode a `SendReceipt` command body.
-pub fn encode_send_receipt(producer_id: u64, sequence_id: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(fields::TYPE, PulsarCommand::SendReceipt as u64, &mut out);
     encode_varint_field(fields::PRODUCER_ID, producer_id, &mut out);
     encode_varint_field(fields::SEQUENCE_ID, sequence_id, &mut out);
     out
@@ -845,136 +809,175 @@ impl PulsarTransport for MemoryPulsarTransport {
     }
 }
 
-/// TCP transport: Connect/Connected once, Producer per topic (cached),
-/// one Send frame plus receipt per message.
-pub struct TcpPulsarTransport {
-    endpoint: PulsarEndpoint,
-    auth: PulsarAuth,
-    timeout: Duration,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
-    producers: parking_lot::Mutex<HashMap<String, (u64, String)>>,
-    next_producer_id: AtomicU64,
+// ---------------------------------------------------------------------------
+// Maintained-driver transport (production write path).
+// ---------------------------------------------------------------------------
+
+/// One driver message: payload plus routing metadata.
+struct QualSend {
+    payload: Vec<u8>,
+    properties: HashMap<String, String>,
+    partition_key: Option<String>,
+    event_time: Option<u64>,
 }
 
-impl TcpPulsarTransport {
+impl pulsar::SerializeMessage for QualSend {
+    fn serialize_message(
+        input: Self,
+    ) -> std::result::Result<pulsar::producer::Message, pulsar::Error> {
+        Ok(pulsar::producer::Message {
+            payload: input.payload,
+            properties: input.properties,
+            partition_key: input.partition_key,
+            event_time: input.event_time,
+            ..Default::default()
+        })
+    }
+}
+
+/// Map a driver failure into the sink contract. Every driver error
+/// becomes `Connection` (restore the batch, back off, retry):
+/// the standalone qualification uses no auth, so no driver error
+/// is known-terminal here.
+///
+/// TODO(parity): which driver errors must be terminal versus
+/// retryable once authenticated tenants are qualified?
+fn map_driver_error(context: &str, error: pulsar::Error) -> ConnectorError {
+    ConnectorError::Connection(format!("pulsar driver {context} failed: {error:?}"))
+}
+
+/// Production transport on the maintained `pulsar` driver.
+///
+/// The client is created lazily on first publish and cached; the
+/// driver dials on first use. Creation validates our config only,
+/// so management-plane validation stays offline-safe: creating the
+/// sink never touches the network. Each `produce` call builds one
+/// producer for its topic and drops it after the batch, so the
+/// transport caches one client and no per-topic state: nothing
+/// accumulates on the publish path.
+pub struct DriverPulsarTransport {
+    config: PulsarSinkConfig,
+    client: tokio::sync::Mutex<Option<pulsar::Pulsar<pulsar::TokioExecutor>>>,
+    probe_target: String,
+}
+
+impl DriverPulsarTransport {
     pub fn new(config: &PulsarSinkConfig) -> Result<Self> {
         config.validate()?;
+        let endpoint = parse_service_url(&config.service_url)?;
         Ok(Self {
-            endpoint: parse_service_url(&config.service_url)?,
-            auth: config.auth.clone(),
-            timeout: config.timeout(),
-            stream: tokio::sync::Mutex::new(None),
-            producers: parking_lot::Mutex::new(HashMap::new()),
-            next_producer_id: AtomicU64::new(1),
+            config: config.clone(),
+            client: tokio::sync::Mutex::new(None),
+            probe_target: format!("{}:{}", endpoint.host, endpoint.port),
         })
     }
 
-    async fn ensure_connected(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("pulsar connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("pulsar connect failed: {e}")))?;
-        let connect = encode_command_frame(&encode_connect("IndraMQTT-0.1.0", &self.auth));
-        stream
-            .write_all(&connect)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("pulsar connect write failed: {e}")))?;
-        let reply = read_frame(&mut stream, self.timeout).await?;
-        let (command, _, _) = decode_frame(&reply)?;
-        if decode_command_type(&command)? != PulsarCommand::Connected as u32 {
-            return Err(ConnectorError::Connection(
-                "pulsar expected Connected".to_string(),
-            ));
-        }
-        *self.stream.lock().await = Some(stream);
-        Ok(())
+    pub fn config(&self) -> &PulsarSinkConfig {
+        &self.config
     }
 
-    async fn ensure_producer(&self, topic_path: &str) -> Result<(u64, String)> {
-        if let Some(entry) = self.producers.lock().get(topic_path) {
-            return Ok(entry.clone());
+    async fn client(&self) -> Result<pulsar::Pulsar<pulsar::TokioExecutor>> {
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.clone() {
+            // Probe the listener before reusing the cached client. A
+            // refused port clears the cache and fails closed, so the
+            // action counts one failed forward.
+            let reachable = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect(&self.probe_target),
+            )
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .is_some();
+            if !reachable {
+                *guard = None;
+                return Err(ConnectorError::Connection(format!(
+                    "pulsar server unreachable: {}",
+                    self.probe_target
+                )));
+            }
+            return Ok(client);
         }
-        let producer_id = self.next_producer_id.fetch_add(1, Ordering::SeqCst);
-        let producer_name = format!("indra-pulsar-{producer_id}");
-        let frame = encode_command_frame(&encode_producer(topic_path, producer_id, &producer_name));
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("pulsar not connected".to_string()))?;
-        stream.write_all(&frame).await.map_err(|e| {
-            ConnectorError::Connection(format!("pulsar producer write failed: {e}"))
-        })?;
-        let reply = read_frame(stream, self.timeout).await?;
-        let (command, _, _) = decode_frame(&reply)?;
-        if decode_command_type(&command)? != PulsarCommand::ProducerSuccess as u32 {
-            return Err(ConnectorError::Connection(
-                "pulsar expected ProducerSuccess".to_string(),
+        // Reason: the driver speaks `pulsar://` only. An `http(s)://`
+        // address names the admin entry, not the binary entry, so it
+        // fails closed here instead of dialing the wrong port.
+        let url = self.config.service_url.clone();
+        if !url.starts_with("pulsar://") && !url.starts_with("pulsar+ssl://") {
+            return Err(ConnectorError::Dispatch(format!(
+                "pulsar driver needs a pulsar:// service_url, got {url:?}"
+            )));
+        }
+        let builder = pulsar::Pulsar::builder(url.as_str(), pulsar::TokioExecutor);
+        // Reason: token auth against a secured server stays
+        // unqualified (see the test docs), so the driver refuses a
+        // token here instead of sending a token the server may
+        // ignore. TODO(parity): wire the driver token
+        // authenticator once a secured server is available.
+        if let PulsarAuth::Token { .. } = &self.config.auth {
+            return Err(ConnectorError::Dispatch(
+                "pulsar driver token auth is not qualified yet; use no auth".to_string(),
             ));
         }
-        self.producers
-            .lock()
-            .insert(topic_path.to_string(), (producer_id, producer_name.clone()));
-        Ok((producer_id, producer_name))
+        // Bound the broker handshake with the configured timeout, so a
+        // downed server fails closed instead of hanging the send path.
+        let build_timeout = self.config.timeout();
+        let client = tokio::time::timeout(build_timeout, builder.build())
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "pulsar driver connect timed out after {build_timeout:?}"
+                ))
+            })?
+            .map_err(|e| map_driver_error("connect", e))?;
+        *guard = Some(client.clone());
+        Ok(client)
     }
-}
 
-async fn read_frame(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<Vec<u8>> {
-    let mut head = [0u8; 4];
-    tokio::time::timeout(timeout, stream.read_exact(&mut head))
-        .await
-        .map_err(|_| ConnectorError::Connection("pulsar read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("pulsar read failed: {e}")))?;
-    let total = u32::from_be_bytes(head) as usize;
-    if total > 16 * 1024 * 1024 {
-        return Err(ConnectorError::Connection(
-            "pulsar frame too large".to_string(),
-        ));
+    /// Drop the cached driver client so the next publish redials
+    /// with the current configuration.
+    pub async fn reconnect(&self) -> Result<()> {
+        *self.client.lock().await = None;
+        self.client().await.map(|_| ())
     }
-    let mut body = vec![0u8; total];
-    tokio::time::timeout(timeout, stream.read_exact(&mut body))
-        .await
-        .map_err(|_| ConnectorError::Connection("pulsar read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("pulsar read failed: {e}")))?;
-    let mut frame = head.to_vec();
-    frame.extend_from_slice(&body);
-    Ok(frame)
 }
 
 #[async_trait]
-impl PulsarTransport for TcpPulsarTransport {
+impl PulsarTransport for DriverPulsarTransport {
     async fn produce(&self, topic_path: &str, batch: Vec<PulsarMessage>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        self.ensure_connected().await?;
-        let (producer_id, producer_name) = self.ensure_producer(topic_path).await?;
-        let now = now_millis().max(0) as u64;
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("pulsar not connected".to_string()))?;
-        for message in &batch {
-            let metadata = encode_metadata(&producer_name, message, now);
-            let frame = encode_message_frame(
-                &encode_send(producer_id, message.sequence_id),
-                &metadata,
-                &message.payload,
-            );
-            stream
-                .write_all(&frame)
+        let client = self.client().await?;
+        let timeout = self.config.timeout();
+        // Bound the producer handshake with the send timeout, so a
+        // downed server fails closed instead of hanging the send path.
+        let mut producer =
+            tokio::time::timeout(timeout, client.producer().with_topic(topic_path).build())
                 .await
-                .map_err(|e| ConnectorError::Connection(format!("pulsar send failed: {e}")))?;
-            let reply = read_frame(stream, self.timeout).await?;
-            let (command, _, _) = decode_frame(&reply)?;
-            if decode_command_type(&command)? != PulsarCommand::SendReceipt as u32 {
-                return Err(ConnectorError::Connection(
-                    "pulsar expected SendReceipt".to_string(),
-                ));
-            }
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "pulsar driver producer timed out after {timeout:?}"
+                    ))
+                })?
+                .map_err(|e| map_driver_error("producer", e))?;
+        for message in &batch {
+            let send = async {
+                producer
+                    .send_non_blocking(QualSend {
+                        payload: message.payload.clone(),
+                        properties: message.properties.iter().cloned().collect(),
+                        partition_key: message.partition_key.clone(),
+                        event_time: Some(message.event_time_ms),
+                    })
+                    .await
+                    .map_err(|e| map_driver_error("send", e))?
+                    .await
+                    .map_err(|e| map_driver_error("send", e))
+            };
+            tokio::time::timeout(timeout, send).await.map_err(|_| {
+                ConnectorError::Connection("pulsar driver send timed out".to_string())
+            })??;
         }
         Ok(())
     }
@@ -1253,6 +1256,7 @@ mod tests {
             topic: "${topic}".to_string(),
             auth: PulsarAuth::None,
             partition_key_template: Some("${client_id}".to_string()),
+            strategy: "key_dispatch".to_string(),
             properties: HashMap::from([("source".to_string(), "indramqtt".to_string())]),
             batch_size: Some(200),
             batch_bytes: Some(2_097_152),
@@ -1488,76 +1492,319 @@ mod tests {
         assert_eq!(sink.sent_batches(), 0);
     }
 
-    #[tokio::test]
-    async fn test_tcp_loopback_handshake_and_send() {
-        use tokio::net::TcpListener;
+    /// It fails closed when the environment lacks the named address.
+    fn qual_required(name: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| panic!("{name} must name a real server for qualification"))
+    }
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // Connect: command-only frame with type 2 + token auth data.
-            let connect = read_frame(&mut stream, Duration::from_secs(5))
-                .await
-                .expect("connect");
-            let (command, _, _) = decode_frame(&connect).expect("connect frame");
-            assert_eq!(
-                decode_command_type(&command).expect("type"),
-                PulsarCommand::Connect as u32
-            );
-            assert!(command.windows(3).any(|w| w == b"jwt"));
-            stream
-                .write_all(&encode_command_frame(&encode_connected()))
-                .await
-                .expect("connected");
-            // Producer: command-only frame with type 11.
-            let producer = read_frame(&mut stream, Duration::from_secs(5))
-                .await
-                .expect("producer");
-            let (command, _, _) = decode_frame(&producer).expect("producer frame");
-            assert_eq!(
-                decode_command_type(&command).expect("type"),
-                PulsarCommand::Producer as u32
-            );
-            stream
-                .write_all(&encode_command_frame(&encode_producer_success("p")))
-                .await
-                .expect("producer success");
-            // Send: message frame with type 19; answer one receipt.
-            let send = read_frame(&mut stream, Duration::from_secs(5))
-                .await
-                .expect("send");
-            let (command, metadata, payload) = decode_frame(&send).expect("send frame");
-            assert_eq!(
-                decode_command_type(&command).expect("type"),
-                PulsarCommand::Send as u32
-            );
-            assert_eq!(decode_metadata(&metadata).expect("meta").sequence_id, 0);
-            assert_eq!(payload, b"{\"v\":1}");
-            stream
-                .write_all(&encode_command_frame(&encode_send_receipt(1, 0)))
-                .await
-                .expect("receipt");
-        });
+    /// Raw consumer payload: the driver delivers bytes unchanged.
+    #[derive(Debug, Clone)]
+    struct QualBytes(Vec<u8>);
 
-        let mut config = test_config(&format!("pulsar://127.0.0.1:{port}"));
-        config.auth = PulsarAuth::Token {
-            token: "jwt".to_string(),
-        };
-        config.batch_size = Some(1);
-        let transport = Arc::new(TcpPulsarTransport::new(&config).unwrap());
-        let sink = PulsarSink::new(config, transport).unwrap();
-        sink.send(
-            &Topic::new("sensors/t1").unwrap(),
-            &Bytes::from_static(b"{\"v\":1}"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sink.sent_records(), 1);
-        tokio::time::timeout(Duration::from_secs(5), server)
+    impl pulsar::DeserializeMessage for QualBytes {
+        type Output = Self;
+
+        fn deserialize_message(payload: &pulsar::message::Payload) -> Self::Output {
+            QualBytes(payload.data.clone())
+        }
+    }
+
+    /// Read the server version from Prometheus text. Comment lines
+    /// (starting with `#`) never carry a version, so skip them.
+    /// Return the `version="..."` label of the first version sample.
+    fn qual_pulsar_version(text: &str) -> Option<String> {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !(line.contains("pulsar_version") || line.contains("broker_version")) {
+                continue;
+            }
+            if let Some(start) = line.find("version=\"") {
+                let rest = &line[start + "version=\"".len()..];
+                if let Some(end) = rest.find('"') {
+                    let version = rest[..end].trim();
+                    if !version.is_empty() {
+                        return Some(version.to_string());
+                    }
+                }
+            }
+            return Some(line.to_string());
+        }
+        None
+    }
+
+    /// Remove one topic through the admin entry. A missing topic is
+    /// fine: the next produce recreates it.
+    async fn qual_delete_topic(client: &reqwest::Client, http_url: &str, short: &str) {
+        let url = format!("{http_url}/admin/v2/persistent/public/default/{short}?force=true");
+        match client
+            .delete(url)
+            .timeout(Duration::from_secs(30))
+            .send()
             .await
-            .expect("server done")
-            .expect("server task");
+        {
+            Ok(response) => eprintln!("qual delete {short}: status={}", response.status()),
+            Err(error) => eprintln!("qual delete {short} note: {error}"),
+        }
+    }
+
+    /// Flush with retry on transport failures. Terminal failures
+    /// panic at once (fail closed).
+    async fn qual_flush(sink: &PulsarSink, what: &str) {
+        for attempt in 1..=10 {
+            match sink.flush().await {
+                Ok(()) => return,
+                Err(ConnectorError::Connection(message)) if attempt < 10 => {
+                    eprintln!("qual flush {what} retryable (attempt {attempt}): {message}");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(error) => panic!("qual flush {what} terminal: {error:?}"),
+            }
+        }
+        panic!("qual flush {what} never recovered");
+    }
+
+    /// Qualification against a real server through the maintained
+    /// driver ([`DriverPulsarTransport`]).
+    ///
+    /// Run with e.g.:
+    /// `PULSAR_URL=pulsar://127.0.0.1:6650 \
+    ///  PULSAR_HTTP_URL=http://127.0.0.1:8080 \
+    ///  PULSAR_TOPIC=qual-b335 PULSAR_SUBSCRIPTION=qual-sub \
+    ///  cargo test -p broker-connectors-enterprise --all-features --lib pulsar::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// It proves the health entry answers. It streams 500 rows
+    /// through the sink on the driver transport. It reads all 500
+    /// back through an independent driver consumer. It asserts the
+    /// exact count plus the first and the last payload. It proves a
+    /// wrong node fails closed with the node text. It removes the
+    /// topic. Panics when its environment is missing (fail closed,
+    /// never skips).
+    ///
+    /// TODO(parity): the standalone server uses no auth, so token
+    /// auth against a secured server stays unqualified. Which
+    /// driver errors must be terminal for billed tenants is open
+    /// (see [`map_driver_error`]).
+    #[tokio::test]
+    #[ignore = "needs a real Pulsar server (see PULSAR_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use futures::TryStreamExt as _;
+        use pulsar::message::proto::command_subscribe::SubType;
+
+        const ROWS: usize = 500;
+
+        let url = qual_required("PULSAR_URL");
+        let http_url = qual_required("PULSAR_HTTP_URL");
+        let short = qual_required("PULSAR_TOPIC");
+        let sub_base = qual_required("PULSAR_SUBSCRIPTION");
+        assert!(
+            url.starts_with("pulsar://") || url.starts_with("pulsar+ssl://"),
+            "qual url must use pulsar://, got {url:?}"
+        );
+
+        let http = reqwest::Client::new();
+        // The health entry proves the real product answers.
+        let health = http
+            .get(format!("{http_url}/admin/v2/brokers/health"))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual health probe failed: {e}"));
+        assert_eq!(health.status().as_u16(), 200, "qual health status");
+        let body = health.text().await.unwrap_or_default();
+        assert!(
+            body.to_lowercase().contains("ok"),
+            "qual health body: {body:?}"
+        );
+        eprintln!("qual server: health={body:?} url={url}");
+
+        // Best-effort version line for the report. The run omits it
+        // when the server reports none (never a constant instead).
+        match http
+            .get(format!("{http_url}/metrics"))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let text = response.text().await.unwrap_or_default();
+                if let Some(version) = qual_pulsar_version(&text) {
+                    eprintln!("qual version: {version}");
+                }
+            }
+            Err(error) => eprintln!("qual version probe note: {error}"),
+        }
+
+        // Fresh topic for the exact-count assertion.
+        qual_delete_topic(&http, &http_url, &short).await;
+        let full_topic = format!("persistent://public/default/{short}");
+
+        // The consumer subscribes before the first produce, so no
+        // row passes it by. The subscription is unique per run, so
+        // an older run never leaks rows into this count.
+        let subscription = format!("{sub_base}-{}-{}", now_millis(), std::process::id());
+        let driver: pulsar::Pulsar<_> =
+            pulsar::Pulsar::builder(url.as_str(), pulsar::TokioExecutor)
+                .build()
+                .await
+                .unwrap_or_else(|e| panic!("qual driver connects: {e:?}"));
+        let mut consumer: pulsar::Consumer<QualBytes, _> = driver
+            .consumer()
+            .with_topic(full_topic.as_str())
+            .with_subscription(subscription.as_str())
+            .with_subscription_type(SubType::Exclusive)
+            .build()
+            .await
+            .unwrap_or_else(|e| panic!("qual consumer subscribes: {e:?}"));
+
+        // The sink under test rides the production transport.
+        let config = PulsarSinkConfig {
+            service_url: url.clone(),
+            tenant: "public".to_string(),
+            namespace: "default".to_string(),
+            topic: short.clone(),
+            auth: PulsarAuth::None,
+            partition_key_template: None,
+            strategy: "random".to_string(),
+            properties: HashMap::new(),
+            batch_size: Some(1000),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(10),
+            max_retries: Some(3),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(2_000),
+            timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport =
+            Arc::new(DriverPulsarTransport::new(&config).expect("qual transport builds"));
+        // Exercise the production accessors. The config stays attached
+        // to the transport. Reconnect redials with current config.
+        assert_eq!(transport.config().topic, short);
+        transport.reconnect().await.expect("qual reconnect redials");
+        let sink = Arc::new(PulsarSink::new(config, transport).expect("qual sink builds"));
+        assert_eq!(sink.kind(), "pulsar");
+
+        // One batch holds all rows: a single flush sends them.
+        // Reason: 1000 exceeds 500, so no send flushes early.
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(r#"{{"seq":{seq},"client_id":"dev-{seq:04}"}}"#));
+            sink.send(
+                &Topic::new(format!("qual/pulsar/dev-{seq:04}")).expect("qual topic builds"),
+                &payload,
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual send buffers");
+        }
+        qual_flush(&sink, "rows").await;
+        assert_eq!(sink.sent_records(), ROWS as u64, "qual row count");
+        assert_eq!(sink.buffered_rows(), 0, "qual buffer drains");
+
+        // Read back through the independent consumer. At-least-once
+        // permits duplicates, never loss: every key must appear.
+        let mut seen: HashMap<i64, String> = HashMap::new();
+        let mut total = 0usize;
+        let mut duplicates = 0usize;
+        while seen.len() < ROWS {
+            let next = tokio::time::timeout(Duration::from_secs(180), consumer.try_next())
+                .await
+                .expect("qual recv timeout")
+                .unwrap_or_else(|e| panic!("qual recv: {e:?}"));
+            let message = next.expect("qual message");
+            consumer
+                .ack(&message)
+                .await
+                .unwrap_or_else(|e| panic!("qual ack: {e:?}"));
+            let QualBytes(raw) = message.deserialize();
+            total += 1;
+            let text = String::from_utf8(raw).expect("qual payload is UTF-8");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("qual payload is JSON");
+            let seq = parsed
+                .get("seq")
+                .and_then(|v| v.as_i64())
+                .expect("qual payload carries seq");
+            if seen.insert(seq, text).is_some() {
+                duplicates += 1;
+            } else if seen.len().is_multiple_of(100) || seen.len() == ROWS {
+                eprintln!(
+                    "qual progress: distinct={} total={total} duplicates={duplicates}",
+                    seen.len()
+                );
+            }
+        }
+        for seq in 0..ROWS as i64 {
+            assert!(seen.contains_key(&seq), "qual missing seq {seq}");
+        }
+        let first = seen.get(&0).expect("qual first row");
+        let last = seen.get(&(ROWS as i64 - 1)).expect("qual last row");
+        assert!(first.contains("\"seq\":0"), "qual first row: {first}");
+        assert!(
+            last.contains(&format!("\"seq\":{}", ROWS - 1)),
+            "qual last row: {last}"
+        );
+        eprintln!("qual delivery: distinct={ROWS} total={total} duplicates={duplicates}");
+        eprintln!("qual rows asserted: count={ROWS} first={first} last={last}");
+
+        // Fault: a wrong node fails closed with the node text. The
+        // probe proves the port refuses; the sink must report it.
+        let probe = tokio::net::TcpStream::connect("127.0.0.1:1")
+            .await
+            .expect_err("qual probe: port 1 must refuse");
+        let probe_text = probe.to_string().to_lowercase();
+        assert!(
+            probe_text.contains("refus"),
+            "qual probe text: {probe_text}"
+        );
+        let bad_config = PulsarSinkConfig {
+            service_url: "pulsar://127.0.0.1:1".to_string(),
+            tenant: "public".to_string(),
+            namespace: "default".to_string(),
+            topic: short.clone(),
+            auth: PulsarAuth::None,
+            partition_key_template: None,
+            strategy: "random".to_string(),
+            properties: HashMap::new(),
+            batch_size: Some(1000),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(10),
+            max_retries: Some(0),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(10_000),
+        };
+        let bad_transport =
+            Arc::new(DriverPulsarTransport::new(&bad_config).expect("qual bad transport builds"));
+        let bad_sink =
+            Arc::new(PulsarSink::new(bad_config, bad_transport).expect("qual bad sink builds"));
+        bad_sink
+            .send(
+                &Topic::new("qual/pulsar/bad").expect("qual bad topic builds"),
+                &Bytes::from_static(b"{\"seq\":-1}"),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual bad send buffers");
+        let error = bad_sink.flush().await.expect_err("wrong node must fail");
+        match &error {
+            ConnectorError::Connection(message)
+            | ConnectorError::Dispatch(message)
+            | ConnectorError::UnknownConnector(message) => assert!(
+                message.to_lowercase().contains("refus"),
+                "qual fault must carry the node text, got {message:?}"
+            ),
+        }
+        eprintln!("qual fault asserted: wrong node fails closed");
+
+        // Cleanup: remove the topic. A failure is tolerated and
+        // reported: the next run deletes stale state first.
+        qual_delete_topic(&http, &http_url, &short).await;
+        eprintln!("qual done: rows={ROWS} topic={short} cleaned");
     }
 }

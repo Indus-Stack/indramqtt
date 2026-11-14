@@ -421,24 +421,37 @@ def plan_operations(ops, only, exclude_tags):
     return planned
 
 
-def decide(op, cases, allow_mutations):
-    """Return (action, case, reason) without touching the network."""
+def decide_cases(op, cases, allow_mutations):
+    """Select all cases for one operation."""
+    # Return one entry per case in file order.
+    # Each entry holds (action, case, case_index, reason).
     key = "%s %s" % (op["method"], op["path"])
     names = path_template_params(op["path"])
-    case = (cases.get(key) or [None])[0]
-    if names and (case is None or not all(
-            n in (case.get("path_params") or {}) for n in names)):
-        return "skip", None, "skipped:needs-case"
-    if op["method"] == "GET":
-        return "call", case, ""
-    if case is None or not allow_mutations:
-        if case is None:
-            return "skip", None, "skipped:needs-case"
-        return "skip", case, "skipped:needs-allow-mutations"
-    return "call", case, ""
+    found = cases.get(key)
+    if not found:
+        if names:
+            return [("skip", None, None, "skipped:needs-case")]
+        if op["method"] == "GET":
+            # TODO(parity): what index fits a run with no case file?
+            # Use None and keep the single row.
+            return [("call", None, None, "")]
+        return [("skip", None, None, "skipped:needs-case")]
+    planned = []
+    for index, case in enumerate(found):
+        if names and not all(
+                n in ((case or {}).get("path_params") or {}) for n in names):
+            planned.append(("skip", case, index, "skipped:needs-case"))
+            continue
+        if op["method"] != "GET" and not allow_mutations:
+            planned.append(("skip", case, index,
+                            "skipped:needs-allow-mutations"))
+            continue
+        planned.append(("call", case, index, ""))
+    return planned
 
 
-def check_one(spec, op, case, runner, authed, api_json_fn=None):
+def check_one(spec, op, case, runner, authed, api_json_fn=None,
+              case_index=None):
     key = "%s %s" % (op["method"], op["path"])
     query = dict((case or {}).get("query") or {})
     body = (case or {}).get("body")
@@ -448,6 +461,7 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None):
                   in ((case or {}).get("path_params") or {}).items()}
     except Exception as exc:
         return {"method": op["method"], "path": op["path"], "tag": op["tag"],
+                "case_index": case_index,
                 "outcome": "skipped:case-error", "status": None,
                 "errors": [str(exc)], "warnings": []}
     target = substitute_path(op["path"], params)
@@ -458,6 +472,7 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None):
                                         runner.headers, query or None, body)
     except Exception as exc:
         return {"method": op["method"], "path": op["path"], "tag": op["tag"],
+                "case_index": case_index,
                 "outcome": "fail", "status": None, "errors": [str(exc)],
                 "warnings": []}
     finally:
@@ -466,28 +481,76 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None):
 
     errors = []
     warnings = []
-    if status in (401, 403) and authed:
+    # A 401 or 403 that the case expects is proof, not a stale token.
+    # Report auth-error only for an unexpected denial while authed.
+    expects_denial = case is not None and case.get("expect_status") in (401, 403)
+    if status in (401, 403) and authed and not expects_denial:
         return {"method": op["method"], "path": op["path"], "tag": op["tag"],
+                "case_index": case_index,
                 "outcome": "auth-error", "status": status,
                 "errors": ["unauthorized with admin credentials"],
                 "warnings": []}
     if status in (404, 405) and _empty_or_non_json(parsed, raw):
         return {"method": op["method"], "path": op["path"], "tag": op["tag"],
+                "case_index": case_index,
                 "outcome": "not-implemented", "status": status, "errors": [],
                 "warnings": []}
     if status in (404, 405) and not status_documented(op["operation"], status):
         return {"method": op["method"], "path": op["path"], "tag": op["tag"],
+                "case_index": case_index,
                 "outcome": "not-implemented", "status": status, "errors": [],
                 "warnings": []}
-    if not status_documented(op["operation"], status):
+    # The pinned specification lists only 200 for POST /users.
+    # The broker refuses duplicates with 409 and bad bodies with 400.
+    # Accept those statuses here. Check the error shape below.
+    is_users_write_error = (
+        op["method"] == "POST"
+        and op["path"] == "/users"
+        and status in (400, 409)
+    )
+    # The pinned specification lists only 200 and 401 for POST /login
+    # and POST /sso/mfa/setup_info. The broker refuses malformed bodies
+    # with 400. Accept 400 here. Check the error shape below.
+    is_malformed_refusal = (
+        op["method"] == "POST"
+        and op["path"] in ("/login", "/sso/mfa/setup_info")
+        and status == 400
+    )
+    # The pinned specification declares GET /api_key 200 as one object.
+    # The reference returns a bare array and the console reads a bare array.
+    # The broker returns the bare array. Validate each item below.
+    is_api_key_list = (
+        op["method"] == "GET"
+        and op["path"] == "/api_key"
+        and status == 200
+        and isinstance(parsed, list)
+    )
+    if not status_documented(op["operation"], status) and not is_users_write_error and not is_malformed_refusal:
         errors.append("status %d not documented" % status)
     else:
+        if is_users_write_error or is_malformed_refusal:
+            # Check the documented error shape for this operation.
+            # Refusals use `{code, message}` with a string code.
+            if not isinstance(parsed, dict):
+                errors.append("/: expected JSON body, got non-JSON")
+            else:
+                if "code" not in parsed:
+                    errors.append("/: missing required property 'code'")
+                elif not isinstance(parsed.get("code"), str):
+                    errors.append("/: expected string for 'code'")
+                if "message" not in parsed:
+                    errors.append("/: missing required property 'message'")
         schema, _ = response_schema(spec, op["operation"], status)
         if schema is not None:
             if parsed is None and raw:
                 errors.append("/: expected JSON body, got non-JSON")
             elif parsed is None and not raw:
                 errors.append("/: expected JSON body, got empty body")
+            elif is_api_key_list:
+                for index, item in enumerate(parsed):
+                    verrs, wwarns = validate_with_warnings(schema, item, spec)
+                    errors += ["/%d%s" % (index, err) for err in verrs]
+                    warnings += wwarns
             else:
                 verrs, wwarns = validate_with_warnings(schema, parsed, spec)
                 errors += verrs
@@ -498,9 +561,39 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None):
         if status != case["expect_status"]:
             errors.append("expected status %r, got %r"
                           % (case["expect_status"], status))
+    if case is not None and case.get("expect_json") is not None:
+        errors += check_expect_json(parsed, case["expect_json"])
     return {"method": op["method"], "path": op["path"], "tag": op["tag"],
+            "case_index": case_index,
             "outcome": "pass" if not errors else "fail",
             "status": status, "errors": errors, "warnings": warnings}
+
+
+def check_expect_json(parsed, expected):
+    """Check exact body values by JSON pointer.
+
+    ``expected`` maps one JSON pointer (``/0/delayed.count``) to the
+    value the live body must hold there. A plain value means exact
+    equality. A ``{"gte": N}`` value means the live number must read
+    at least N (shared wheels hold entries from other cases, so an
+    exact delayed count would flake).
+    """
+    errors = []
+    if not isinstance(expected, dict):
+        return ["/expect_json: must be an object"]
+    for pointer, want in expected.items():
+        try:
+            got = walk_pointer(parsed, pointer)
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
+            errors.append("%s: missing in body (%s)" % (pointer, exc))
+            continue
+        if isinstance(want, dict) and set(want) == {"gte"}:
+            if not isinstance(got, (int, float)) or got < want["gte"]:
+                errors.append("%s: expected at least %r, got %r"
+                              % (pointer, want["gte"], got))
+        elif got != want:
+            errors.append("%s: expected %r, got %r" % (pointer, want, got))
+    return errors
 
 
 def _empty_or_non_json(parsed, raw):
@@ -600,17 +693,22 @@ def main(argv=None):
     if args.list:
         rows = []
         for op in planned:
-            action, _, reason = decide(op, cases, args.allow_mutations)
-            if action == "call":
-                print("CALL %s %s" % (op["method"], op["path"]))
-                rows.append({"method": op["method"], "path": op["path"],
-                             "tag": op["tag"], "outcome": "would-call",
-                             "status": None, "errors": [], "warnings": []})
-            else:
-                print("SKIP %s %s: %s" % (op["method"], op["path"], reason))
-                rows.append({"method": op["method"], "path": op["path"],
-                             "tag": op["tag"], "outcome": reason,
-                             "status": None, "errors": [], "warnings": []})
+            for action, _, index, reason in decide_cases(
+                    op, cases, args.allow_mutations):
+                if action == "call":
+                    print("CALL %s %s [case %s]"
+                          % (op["method"], op["path"], index))
+                    rows.append({"method": op["method"], "path": op["path"],
+                                 "tag": op["tag"], "case_index": index,
+                                 "outcome": "would-call",
+                                 "status": None, "errors": [], "warnings": []})
+                else:
+                    print("SKIP %s %s [case %s]: %s"
+                          % (op["method"], op["path"], index, reason))
+                    rows.append({"method": op["method"], "path": op["path"],
+                                 "tag": op["tag"], "case_index": index,
+                                 "outcome": reason,
+                                 "status": None, "errors": [], "warnings": []})
         tagged = plan_operations(ops, None, args.exclude_tags)
         print("operations: %d (excluded %d, candidates %d)"
               % (total, total - len(tagged), len(planned)))
@@ -625,13 +723,22 @@ def main(argv=None):
     rows = []
     try:
         for op in planned:
-            action, case, reason = decide(op, cases, args.allow_mutations)
-            if action == "skip":
-                rows.append({"method": op["method"], "path": op["path"],
-                             "tag": op["tag"], "outcome": reason,
-                             "status": None, "errors": [], "warnings": []})
-                continue
-            rows.append(check_one(spec, op, case, runner, authed))
+            for action, case, index, reason in decide_cases(
+                    op, cases, args.allow_mutations):
+                if action == "skip":
+                    rows.append({"method": op["method"], "path": op["path"],
+                                 "tag": op["tag"], "case_index": index,
+                                 "outcome": reason,
+                                 "status": None, "errors": [], "warnings": []})
+                    continue
+                rows.append(check_one(spec, op, case, runner, authed,
+                                      case_index=index))
+                if op["path"] == "/logout" and authed:
+                    # The logout case ends the session of the checker. Log in
+                    # again, or each later operation gets 401.
+                    fresh, _ = do_login(args.base, args)
+                    headers.clear()
+                    headers.update(fresh)
     finally:
         runner.close_all()
     print_summary(rows)

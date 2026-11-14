@@ -66,7 +66,7 @@ impl GreptimePrecision {
     pub fn as_influx_param(&self) -> &'static str {
         match self {
             Self::Nanosecond => "ns",
-            Self::Microsecond => "u",
+            Self::Microsecond => "us",
             Self::Millisecond => "ms",
             Self::Second => "s",
         }
@@ -326,7 +326,10 @@ pub fn build_greptime_sql_insert(table: &str, records: &[GreptimeRecord]) -> Res
 
 /// Escape an InfluxDB line protocol measurement (` ,` and space).
 fn escape_influx_measurement(s: &str) -> String {
-    s.replace(',', "\\,").replace(' ', "\\ ")
+    s.replace(',', "\\,")
+        .replace(' ', "\\ ")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Escape an InfluxDB line protocol field key (`,`, `=` and space).
@@ -819,6 +822,11 @@ impl Sink for GreptimeDbSink {
         };
 
         if should_flush {
+            // Buffer rows during backoff. Keep rows and skip flush.
+            // Flush fails fast while backing off.
+            if self.backoff.lock().check().is_err() {
+                return Ok(());
+            }
             self.flush().await?;
         }
         Ok(())
@@ -1958,7 +1966,7 @@ mod tests {
             1_700_000_000_123_000_000
         );
         assert_eq!(GreptimePrecision::Nanosecond.as_influx_param(), "ns");
-        assert_eq!(GreptimePrecision::Microsecond.as_influx_param(), "u");
+        assert_eq!(GreptimePrecision::Microsecond.as_influx_param(), "us");
         assert_eq!(GreptimePrecision::Millisecond.as_influx_param(), "ms");
         assert_eq!(GreptimePrecision::Second.as_influx_param(), "s");
 

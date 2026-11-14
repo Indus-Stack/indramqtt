@@ -10,11 +10,45 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 
+/// Bound on the named dashboard-object registry (C05-10): at most eight
+/// objects. Reason: only three canonical names exist (`hotconf`,
+/// `actions`, `connectors`) plus the one `hot-config` alias; eight is a
+/// finite cap that leaves headroom without an unbounded map. The registry
+/// is code-defined, so the cap is enforced by construction and each
+/// request clones at most one bounded object.
+const MAX_DASHBOARD_OBJECTS: usize = 8;
+
+// Compile-time guard that the bound above covers the served names
+// (three canonical plus the one alias).
+const DASHBOARD_OBJECT_NAMES: [&str; 3] = ["hotconf", "actions", "connectors"];
+
+const _: () = assert!(DASHBOARD_OBJECT_NAMES.len() < MAX_DASHBOARD_OBJECTS);
+
 fn str_prop(default: &str) -> Value {
     json!({
         "type": "string",
         "default": default
     })
+}
+
+/// KC-00: keep only `ready` schemas in the served object, so a pending or
+/// refused kind is never offered as a dashboard form. The kind is read
+/// from each schema's `type` default.
+fn ready_kind_schemas(schemas: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(map) = schemas.as_object() {
+        for (name, schema) in map {
+            let kind = schema
+                .get("properties")
+                .and_then(|properties| properties.get("type"))
+                .and_then(|type_prop| type_prop.get("default"))
+                .and_then(|default| default.as_str());
+            if kind.is_some_and(broker_config::is_kind_ready) {
+                out.insert(name.clone(), schema.clone());
+            }
+        }
+    }
+    Value::Object(out)
 }
 
 fn pwd_prop() -> Value {
@@ -84,10 +118,6 @@ fn obj_schema_with_type(conn_type: &str, properties: Value, required: &[&str]) -
     })
 }
 
-fn obj_schema(properties: Value, required: &[&str]) -> Value {
-    obj_schema_with_type("http", properties, required)
-}
-
 static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     let mut schemas = serde_json::Map::new();
 
@@ -99,6 +129,7 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             json!({
                 "redis_type": enum_prop(&["single", "sentinel", "cluster"], "single"),
                 "servers": str_prop("127.0.0.1:6379"),
+                "username": str_prop(""),
                 "password": pwd_prop(),
                 "database": int_prop(0),
                 "pool_size": int_prop(8),
@@ -128,7 +159,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 3. Kafka Consumer
     schemas.insert(
         "kafka_consumer.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "kafka_consumer",
             json!({
                 "bootstrap_hosts": str_prop("127.0.0.1:9092"),
                 "topic": str_prop("mqtt_ingress"),
@@ -193,20 +225,45 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         ),
     );
 
+    // 6b. Webhook alias (canonical runtime name; same shape as `http`).
+    schemas.insert(
+        "bridge_webhook.post_connector".to_string(),
+        obj_schema_with_type(
+            "webhook",
+            json!({
+                "url": str_prop("http://127.0.0.1:8080"),
+                "headers": json!({
+                    "type": "object",
+                    "default": { "content-type": "application/json" }
+                }),
+                "connect_timeout": str_prop("5s"),
+                "enable_pipelining": bool_prop(true),
+                "pool_size": int_prop(8),
+                "ssl": ssl_prop()
+            }),
+            &["name", "url"],
+        ),
+    );
+
+    // 6c. Console logger (no target; the broker log is the target).
+    schemas.insert(
+        "connector_console.post_connector".to_string(),
+        obj_schema_with_type("console", json!({}), &["name"]),
+    );
+
     // 7. ClickHouse
     schemas.insert(
         "bridge_clickhouse.post_connector".to_string(),
         obj_schema_with_type(
             "clickhouse",
             json!({
-                "url": str_prop("http://127.0.0.1:8123"),
-                "database": str_prop("default"),
+                "url": str_prop(""),
+                "database": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop("default"),
-                "password": pwd_prop(),
-                "pool_size": int_prop(8),
-                "ssl": ssl_prop()
+                "password": pwd_prop()
             }),
-            &["name", "url", "database"],
+            &["name", "url", "database", "table"],
         ),
     );
 
@@ -221,7 +278,7 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "username": str_prop(""),
                 "password": pwd_prop(),
                 "keepalive": int_prop(60),
-                "proto_ver": enum_prop(&["v3.1.1", "v5.0"], "v5.0"),
+                "proto_ver": enum_prop(&["v3", "v4", "v5"], "v4"),
                 "clean_start": bool_prop(true),
                 "ssl": ssl_prop()
             }),
@@ -236,37 +293,51 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "mongodb",
             json!({
                 "mongo_type": enum_prop(&["single", "rs", "sharded"], "single"),
-                "server": str_prop("127.0.0.1:27017"),
-                "database": str_prop("test"),
+                "server": str_prop(""),
+                "servers": str_prop(""),
+                "database": str_prop(""),
                 "username": str_prop(""),
                 "password": pwd_prop(),
-                "auth_source": str_prop("admin"),
-                "pool_size": int_prop(8),
-                "ssl": ssl_prop()
+                "auth_source": str_prop(""),
+                "parameters": json!({
+                    "type": "object",
+                    "description": "Reference-shaped parameters: single needs server, rs and sharded need servers.",
+                    "properties": {
+                        "mongo_type": {"type": "string", "enum": ["single", "rs", "sharded"], "default": "single"},
+                        "server": {"type": "string", "default": ""},
+                        "servers": {"type": "string", "default": ""},
+                        "replica_set_name": {"type": "string", "default": ""},
+                        "database": {"type": "string", "default": ""},
+                        "w_mode": {"type": "string", "enum": ["unsafe", "safe"], "default": "unsafe"},
+                        "r_mode": {"type": "string", "enum": ["master", "slave_ok"], "default": "master"}
+                    }
+                })
             }),
-            &["name", "server", "database"],
+            &["name", "database", "parameters"],
         ),
     );
 
     // 10. Cassandra
     schemas.insert(
         "bridge_cassa.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "cassandra",
             json!({
-                "servers": str_prop("127.0.0.1:9042"),
-                "keyspace": str_prop("test"),
+                "servers": str_prop(""),
+                "keyspace": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop(""),
-                "password": pwd_prop(),
-                "ssl": ssl_prop()
+                "password": pwd_prop()
             }),
-            &["name", "servers", "keyspace"],
+            &["name", "servers", "keyspace", "table"],
         ),
     );
 
     // 11. RabbitMQ
     schemas.insert(
         "rabbitmq.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "rabbitmq",
             json!({
                 "server": str_prop("127.0.0.1:5672"),
                 "virtual_host": str_prop("/"),
@@ -274,16 +345,19 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "password": pwd_prop(),
                 "ssl": ssl_prop()
             }),
-            &["name", "server"],
+            &["name", "server", "username", "password"],
         ),
     );
 
     // 12. Pulsar
     schemas.insert(
         "pulsar.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "pulsar",
             json!({
                 "servers": str_prop("pulsar://127.0.0.1:6650"),
+                "tenant": str_prop("public"),
+                "namespace": str_prop("default"),
                 "ssl": ssl_prop()
             }),
             &["name", "servers"],
@@ -293,7 +367,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 13. Amazon S3
     schemas.insert(
         "bridge_s3.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "s3",
             json!({
                 "endpoint": str_prop("https://s3.amazonaws.com"),
                 "bucket": str_prop("my-bucket"),
@@ -308,7 +383,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 14. Azure Blob Storage
     schemas.insert(
         "connector_azure_blob_storage.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "azure_blob_storage",
             json!({
                 "account_name": str_prop(""),
                 "account_key": pwd_prop(),
@@ -321,22 +397,24 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 15. InfluxDB
     schemas.insert(
         "bridge_influxdb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "influxdb",
             json!({
-                "server": str_prop("http://127.0.0.1:8086"),
-                "version": enum_prop(&["v1", "v2"], "v2"),
-                "org": str_prop(""),
+                "server": str_prop("127.0.0.1:8086"),
                 "bucket": str_prop(""),
-                "token": pwd_prop()
+                "org": str_prop(""),
+                "token": pwd_prop(),
+                "measurement": str_prop("")
             }),
-            &["name", "server"],
+            &["name", "server", "bucket", "org", "token", "measurement"],
         ),
     );
 
     // 16. TimescaleDB
     schemas.insert(
         "bridge_timescale.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "timescaledb",
             json!({
                 "server": str_prop("127.0.0.1:5432"),
                 "database": str_prop("timeseries"),
@@ -352,44 +430,71 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 17. TDengine
     schemas.insert(
         "tdengine_connector.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "tdengine",
             json!({
-                "server": str_prop("127.0.0.1:6041"),
-                "database": str_prop("db"),
+                "server": str_prop(""),
+                "database": str_prop(""),
+                "stable": str_prop(""),
+                "subtable": str_prop(""),
                 "username": str_prop("root"),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "metrics": json!({"type": "object"}),
+                "tags": json!({"type": "object"})
             }),
-            &["name", "server", "database"],
+            &[
+                "name", "server", "database", "stable", "subtable", "metrics", "tags",
+            ],
         ),
     );
 
     // 18. OpenTSDB
     schemas.insert(
         "opents_connector.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "opentsdb",
             json!({
-                "server": str_prop("http://127.0.0.1:4242"),
-                "summary": str_prop("")
+                "server": str_prop(""),
+                "metric": str_prop(""),
+                "value": str_prop("")
             }),
-            &["name", "server"],
+            &["name", "server", "metric", "value"],
         ),
     );
 
     // 19. IoTDB
     schemas.insert(
         "iotdb.post_restapi".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "iotdb",
             json!({
-                "base_url": str_prop("http://127.0.0.1:18080"),
+                "endpoint": str_prop(""),
                 "username": str_prop("root"),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "device": str_prop(""),
+                "measurements": json!({"type": "array", "items": {"type": "string"}}),
+                "types": json!({"type": "array", "items": {"type": "string"}})
             }),
-            &["name", "base_url"],
+            &[
+                "name",
+                "endpoint",
+                "username",
+                "password",
+                "device",
+                "measurements",
+                "types",
+            ],
         ),
     );
+    // The driver speaks the REST API only; the thrift forms
+    // below document the reference shape. A thrift-shaped
+    // connector body is refused naming its fields: the builder
+    // needs the REST `endpoint`, `device`, `measurements` and
+    // `types`, which thrift bodies do not carry.
     schemas.insert(
         "iotdb.post_thrift".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "iotdb",
             json!({
                 "server": str_prop("127.0.0.1:6667"),
                 "username": str_prop("root"),
@@ -398,30 +503,51 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             &["name", "server"],
         ),
     );
+    schemas.insert(
+        "iotdb.put_thrift".to_string(),
+        obj_schema_with_type(
+            "iotdb",
+            json!({
+                "server": str_prop("127.0.0.1:6667"),
+                "username": str_prop("root"),
+                "password": pwd_prop()
+            }),
+            &["server"],
+        ),
+    );
 
     // 20. GreptimeDB
     schemas.insert(
         "bridge_greptimedb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "greptimedb",
             json!({
-                "server": str_prop("127.0.0.1:4002"),
-                "dbname": str_prop("public"),
+                "server": str_prop("127.0.0.1:4001"),
+                "database": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop(""),
                 "password": pwd_prop()
             }),
-            &["name", "server", "dbname"],
+            &["name", "database", "table"],
         ),
     );
 
     // 21. Elasticsearch
     schemas.insert(
         "elasticsearch.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "elasticsearch",
             json!({
-                "server": str_prop("http://127.0.0.1:9200"),
-                "username": str_prop("elastic"),
+                "server": str_prop("127.0.0.1:9200"),
+                "username": str_prop(""),
                 "password": pwd_prop(),
-                "ssl": ssl_prop()
+                "authentication": json!({
+                    "type": "object",
+                    "properties": {
+                        "username": str_prop(""),
+                        "password": pwd_prop()
+                    }
+                })
             }),
             &["name", "server"],
         ),
@@ -430,7 +556,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 22. DynamoDB
     schemas.insert(
         "bridge_dynamodb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "dynamodb",
             json!({
                 "url": str_prop("https://dynamodb.us-east-1.amazonaws.com"),
                 "region": str_prop("us-east-1"),
@@ -444,7 +571,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 23. Kinesis
     schemas.insert(
         "bridge_kinesis.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "kinesis",
             json!({
                 "endpoint": str_prop("https://kinesis.us-east-1.amazonaws.com"),
                 "region": str_prop("us-east-1"),
@@ -458,24 +586,29 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 24. Confluent
     schemas.insert(
         "confluent.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "confluent",
             json!({
                 "bootstrap_hosts": str_prop(""),
+                "api_key": str_prop(""),
+                "api_secret": pwd_prop(),
                 "ssl": ssl_prop()
             }),
-            &["name", "bootstrap_hosts"],
+            &["name", "bootstrap_hosts", "api_key", "api_secret"],
         ),
     );
 
     // 25. Redshift
     schemas.insert(
         "connector_redshift.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "redshift",
             json!({
                 "server": str_prop("127.0.0.1:5439"),
                 "database": str_prop("dev"),
                 "username": str_prop("awsuser"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -485,7 +618,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 26. BigQuery
     schemas.insert(
         "connector_bigquery.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "bigquery",
             json!({
                 "gcp_project_id": str_prop(""),
                 "service_account_json": pwd_prop()
@@ -497,21 +631,24 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 27. Couchbase
     schemas.insert(
         "connector_couchbase.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "couchbase",
             json!({
-                "servers": str_prop("127.0.0.1:11210"),
-                "bucket": str_prop("default"),
+                "server": str_prop(""),
+                "servers": str_prop(""),
                 "username": str_prop(""),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "connect_timeout": str_prop("15s")
             }),
-            &["name", "servers", "bucket"],
+            &["name", "server", "username"],
         ),
     );
 
     // 28. RocketMQ
     schemas.insert(
         "rocketmq.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "rocketmq",
             json!({
                 "servers": str_prop("127.0.0.1:9876"),
                 "access_key": str_prop(""),
@@ -524,12 +661,15 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 29. Oracle
     schemas.insert(
         "bridge_oracle.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "oracle",
             json!({
                 "server": str_prop("127.0.0.1:1521"),
                 "service_name": str_prop("XE"),
+                "sid": str_prop(""),
                 "username": str_prop("system"),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "pool_size": int_prop(8)
             }),
             &["name", "server", "service_name"],
         ),
@@ -538,12 +678,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 30. Microsoft SQL Server
     schemas.insert(
         "bridge_mssql.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "mssql",
             json!({
                 "server": str_prop("127.0.0.1:1433"),
                 "database": str_prop("master"),
                 "username": str_prop("sa"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -551,12 +693,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "bridge_sqlserver.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "sqlserver",
             json!({
                 "server": str_prop("127.0.0.1:1433"),
                 "database": str_prop("master"),
                 "username": str_prop("sa"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -566,12 +710,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 31. CockroachDB
     schemas.insert(
         "connector_cockroachdb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "cockroachdb",
             json!({
                 "server": str_prop("127.0.0.1:26257"),
                 "database": str_prop("defaultdb"),
                 "username": str_prop("root"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -581,21 +727,24 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 32. Doris
     schemas.insert(
         "connector_doris.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "doris",
             json!({
-                "server": str_prop("127.0.0.1:9030"),
-                "database": str_prop("doris_db"),
+                "server": str_prop(""),
+                "database": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop("root"),
                 "password": pwd_prop()
             }),
-            &["name", "server", "database"],
+            &["name", "server", "database", "table"],
         ),
     );
 
     // 33. Tablestore
     schemas.insert(
         "bridge_tablestore.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "tablestore",
             json!({
                 "endpoint": str_prop(""),
                 "instance_name": str_prop(""),
@@ -609,21 +758,33 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 34. Amazon Timestream
     schemas.insert(
         "connector_aws_timestream.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "timestream",
             json!({
-                "region": str_prop("us-east-1"),
                 "database": str_prop(""),
+                "table": str_prop(""),
+                "region": str_prop(""),
                 "access_key_id": str_prop(""),
-                "secret_access_key": pwd_prop()
+                "secret_access_key": pwd_prop(),
+                "measures": json!({"type": "object"})
             }),
-            &["name", "database"],
+            &[
+                "name",
+                "database",
+                "table",
+                "region",
+                "access_key_id",
+                "secret_access_key",
+                "measures",
+            ],
         ),
     );
 
     // 35. GCP Pub/Sub
     schemas.insert(
         "gcp_pubsub_producer.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "gcp_pubsub",
             json!({
                 "gcp_project_id": str_prop(""),
                 "service_account_json": pwd_prop()
@@ -633,7 +794,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "gcp_pubsub_consumer.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "gcp_pubsub",
             json!({
                 "gcp_project_id": str_prop(""),
                 "service_account_json": pwd_prop()
@@ -645,18 +807,19 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 36. Azure Event Hubs
     schemas.insert(
         "bridge_azure_event_hub.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "azure_eventhubs",
             json!({
                 "connection_string": pwd_prop()
             }),
             &["name", "connection_string"],
         ),
     );
-
     // 37. Snowflake
     schemas.insert(
         "connector_snowflake_aggregated.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "snowflake",
             json!({
                 "account": str_prop(""),
                 "database": str_prop(""),
@@ -669,7 +832,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "connector_snowflake_streaming.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "snowflake",
             json!({
                 "account": str_prop(""),
                 "database": str_prop(""),
@@ -684,12 +848,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 38. AlloyDB
     schemas.insert(
         "connector_alloydb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "alloydb",
             json!({
                 "server": str_prop("127.0.0.1:5432"),
                 "database": str_prop("postgres"),
                 "username": str_prop("postgres"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -699,7 +865,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 39. Disk Log
     schemas.insert(
         "connector_disk_log.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "disk_log",
             json!({
                 "file": str_prop("data/disk_log.txt")
             }),
@@ -707,38 +874,50 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         ),
     );
 
-    // 40. S3 Tables
-    schemas.insert(
-        "connector_s3tables.post_connector".to_string(),
-        obj_schema(
-            json!({
-                "table_bucket_arn": str_prop(""),
-                "namespace": str_prop("default"),
-                "access_key_id": str_prop(""),
-                "secret_access_key": pwd_prop()
-            }),
-            &["name", "table_bucket_arn"],
-        ),
-    );
-
     // 41. Datalayers
     schemas.insert(
         "bridge_datalayers.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "datalayers",
             json!({
-                "server": str_prop("127.0.0.1:8360"),
-                "database": str_prop("iot"),
-                "username": str_prop("root"),
-                "password": pwd_prop()
+                "server": str_prop("127.0.0.1:8361"),
+                "database": str_prop(""),
+                "table": str_prop("")
             }),
-            &["name", "server", "database"],
+            &["name", "database", "table"],
+        ),
+    );
+
+    // 42a. OPC-UA device
+    schemas.insert(
+        "opc_ua.post_connector".to_string(),
+        obj_schema_with_type(
+            "opc_ua",
+            json!({
+                "endpoint_url": str_prop("opc.tcp://127.0.0.1:4840")
+            }),
+            &["name", "endpoint_url"],
+        ),
+    );
+
+    // 42b. Sparkplug B device
+    schemas.insert(
+        "sparkplug_b.post_connector".to_string(),
+        obj_schema_with_type(
+            "sparkplug_b",
+            json!({
+                "mqtt_url": str_prop("mqtt://127.0.0.1:1883"),
+                "client_id": str_prop("")
+            }),
+            &["name", "mqtt_url"],
         ),
     );
 
     // 42. SysKeeper
     schemas.insert(
         "syskeeper_forwarder.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "syskeeper_forwarder",
             json!({
                 "server": str_prop("127.0.0.1:9000")
             }),
@@ -747,7 +926,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "connector_syskeeper_proxy.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "syskeeper_proxy",
             json!({
                 "listen": str_prop("0.0.0.0:9000"),
                 "acceptors": int_prop(16),
@@ -776,13 +956,13 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "redis",
             json!({
                 "connector": str_prop(""),
-                "command": json!({
+                "command_template": json!({
                     "type": "array",
                     "items": { "type": "string" },
                     "default": ["HSET", "${clientid}", "${payload.key}", "${payload.value}"]
                 })
             }),
-            &["name", "connector"],
+            &["name", "connector", "command_template"],
         ),
     );
 
@@ -793,10 +973,23 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "kafka",
             json!({
                 "connector": str_prop(""),
-                "kafka_topic": str_prop("iot_telemetry"),
-                "payload": str_prop("${payload}")
+                "topic": str_prop(""),
+                "message": json!({
+                    "type": "object",
+                    "properties": {
+                        "key": str_prop("${.clientid}"),
+                        "value": str_prop("${.}"),
+                        "timestamp": str_prop("${.timestamp}")
+                    }
+                }),
+                "partition_strategy": enum_prop(&["random", "key_dispatch"], "random"),
+                "required_acks": enum_prop(&["all_isr", "leader_only", "none"], "all_isr"),
+                "kafka_headers": str_prop(""),
+                "kafka_ext_headers": json!({"type": "array"}),
+                "kafka_header_value_encode_mode": enum_prop(&["none", "json"], "none"),
+                "query_mode": enum_prop(&["async", "sync"], "async")
             }),
-            &["name", "connector", "kafka_topic"],
+            &["name", "connector", "topic"],
         ),
     );
 
@@ -826,11 +1019,266 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "sql": str_prop("INSERT INTO telemetry(clientid, topic, payload, timestamp) VALUES (${clientid}, ${topic}, ${payload}, ${timestamp})")
     }), &["name", "connector", "sql"]));
 
+    // SQL Server action: the statement binds $1 (event time), $2
+    // (topic), $3 (client id), $4 (QoS) and $5 (payload JSON).
+    schemas.insert(
+        "bridge_sqlserver.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "mssql",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($2, $4, $5)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // Oracle action: the statement binds :1 (topic), :2 (QoS) and :3
+    // (payload).
+    schemas.insert(
+        "bridge_oracle.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "oracle",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES (:1, :2, :3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // AlloyDB action: PostgreSQL markers $1 (topic), $2 (QoS), $3 (payload).
+    schemas.insert(
+        "action_alloydb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "alloydb",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($1, $2, $3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // CockroachDB action: PostgreSQL markers $1 (topic), $2 (QoS), $3 (payload).
+    schemas.insert(
+        "action_cockroachdb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "cockroachdb",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($1, $2, $3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // Redshift action: PostgreSQL markers $1 (topic), $2 (QoS), $3 (payload).
+    schemas.insert(
+        "action_redshift.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "redshift",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($1, $2, $3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
     // ClickHouse action
-    schemas.insert("bridge_clickhouse.post_bridge_v2".to_string(), obj_schema_with_type("clickhouse", json!({
-        "connector": str_prop(""),
-        "sql": str_prop("INSERT INTO telemetry VALUES (${clientid}, ${topic}, ${payload}, now())")
-    }), &["name", "connector", "sql"]));
+    schemas.insert(
+        "bridge_clickhouse.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "clickhouse",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Cassandra action
+    schemas.insert(
+        "bridge_cassa.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "cassandra",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // InfluxDB action
+    schemas.insert(
+        "bridge_influxdb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "influxdb",
+            json!({
+                "connector": str_prop(""),
+                "measurement": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // GreptimeDB action
+    schemas.insert(
+        "bridge_greptimedb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "greptimedb",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop(""),
+                "precision": str_prop("ms"),
+                "format": str_prop("sql")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // TDengine action
+    schemas.insert(
+        "bridge_tdengine.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "tdengine",
+            json!({
+                "connector": str_prop(""),
+                "stable": str_prop(""),
+                "subtable": str_prop(""),
+                "metrics": json!({"type": "object"}),
+                "tags": json!({"type": "object"})
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // IoTDB action
+    schemas.insert(
+        "bridge_iotdb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "iotdb",
+            json!({
+                "connector": str_prop(""),
+                "device": str_prop(""),
+                "measurements": json!({"type": "array", "items": {"type": "string"}}),
+                "types": json!({"type": "array", "items": {"type": "string"}})
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // OpenTSDB action
+    schemas.insert(
+        "bridge_opents.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "opents",
+            json!({
+                "connector": str_prop(""),
+                "metric": str_prop(""),
+                "value": str_prop(""),
+                "tags": json!({"type": "object"}),
+                "summary": bool_prop(true)
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Doris action
+    schemas.insert(
+        "action_doris.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "doris",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop(""),
+                "format": str_prop("json")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Datalayers action
+    schemas.insert(
+        "bridge_datalayers.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "datalayers",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Timestream action
+    schemas.insert(
+        "action_aws_timestream.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "aws_timestream",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop(""),
+                "measures": json!({"type": "object"}),
+                "measure": str_prop("metrics"),
+                "precision": str_prop("ms"),
+                "dimensions": json!({"type": "object"})
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // MongoDB action
+    schemas.insert(
+        "bridge_mongodb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "mongodb",
+            json!({
+                "connector": str_prop(""),
+                "collection": str_prop("mqtt"),
+                "payload_template": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Couchbase action
+    schemas.insert(
+        "action_couchbase.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "couchbase",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop(""),
+                "max_retries": int_prop(3)
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // Elasticsearch action
+    schemas.insert(
+        "bridge_elasticsearch.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "elasticsearch",
+            json!({
+                "connector": str_prop(""),
+                "action": enum_prop(&["create", "update", "delete"], "create"),
+                "index": str_prop(""),
+                "id": str_prop(""),
+                "doc": str_prop(""),
+                "overwrite": bool_prop(true),
+                "doc_as_upsert": bool_prop(false),
+                "require_alias": bool_prop(false),
+                "routing": str_prop(""),
+                "max_retries": int_prop(2)
+            }),
+            &["name", "connector", "action", "index"],
+        ),
+    );
 
     // MQTT action
     schemas.insert(
@@ -841,9 +1289,154 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "connector": str_prop(""),
                 "topic": str_prop("forward/${topic}"),
                 "payload": str_prop("${payload}"),
-                "qos": int_prop(1)
+                "qos": int_prop(1),
+                "retain": bool_prop(false)
             }),
             &["name", "connector", "topic"],
+        ),
+    );
+
+    // RabbitMQ action
+    schemas.insert(
+        "bridge_rabbitmq.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "rabbitmq",
+            json!({
+                "connector": str_prop(""),
+                "routing_key": str_prop(""),
+                "exchange": str_prop(""),
+                "delivery_mode": enum_prop(&["non_persistent", "persistent"], "non_persistent"),
+                "headers_template": json!({"type": "array"}),
+                "properties_template": json!({"type": "array"}),
+                "payload_template": str_prop("")
+            }),
+            &["name", "connector", "routing_key"],
+        ),
+    );
+
+    // Pulsar action
+    schemas.insert(
+        "pulsar.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "pulsar",
+            json!({
+                "connector": str_prop(""),
+                "pulsar_topic": str_prop(""),
+                "message": json!({
+                    "type": "object",
+                    "properties": {
+                        "key": str_prop("${.clientid}"),
+                        "value": str_prop("${.}")
+                    }
+                }),
+                "strategy": enum_prop(&["random", "roundrobin", "key_dispatch"], "random")
+            }),
+            &["name", "connector", "pulsar_topic"],
+        ),
+    );
+
+    // RocketMQ action
+    schemas.insert(
+        "rocketmq.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "rocketmq",
+            json!({
+                "connector": str_prop(""),
+                "topic": str_prop("TopicTest"),
+                "tag": str_prop(""),
+                "key": str_prop(""),
+                "template": str_prop(""),
+                "strategy": enum_prop(&["roundrobin", "key_dispatch"], "roundrobin")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Confluent action
+    schemas.insert(
+        "confluent.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "confluent",
+            json!({
+                "connector": str_prop(""),
+                "topic": str_prop(""),
+                "message": json!({
+                    "type": "object",
+                    "properties": {
+                        "key": str_prop("${.clientid}"),
+                        "value": str_prop("${.}")
+                    }
+                }),
+                "partition_strategy": enum_prop(&["random", "key_dispatch"], "random"),
+                "required_acks": enum_prop(&["all_isr", "leader_only", "none"], "all_isr"),
+                "kafka_headers": str_prop(""),
+                "kafka_ext_headers": json!({"type": "array"}),
+                "kafka_header_value_encode_mode": enum_prop(&["none", "json"], "none"),
+                "query_mode": enum_prop(&["async", "sync"], "async")
+            }),
+            &["name", "connector", "topic"],
+        ),
+    );
+
+    // OPC-UA action
+    schemas.insert(
+        "opc_ua.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "opc_ua",
+            json!({
+                "connector": str_prop(""),
+                "node_id": str_prop("ns=1;i=1001")
+            }),
+            &["name", "connector", "node_id"],
+        ),
+    );
+
+    // Sparkplug B action
+    schemas.insert(
+        "sparkplug_b.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "sparkplug_b",
+            json!({
+                "connector": str_prop(""),
+                "topic_prefix": str_prop("spBv1.0/plant1")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // MV-03b cloud messaging actions
+    schemas.insert(
+        "bridge_kinesis.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "kinesis",
+            json!({
+                "connector": str_prop(""),
+                "stream_name": str_prop(""),
+                "partition_key": str_prop("${client_id}")
+            }),
+            &["name", "connector", "stream_name", "partition_key"],
+        ),
+    );
+    schemas.insert(
+        "gcp_pubsub_producer.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "gcp_pubsub",
+            json!({
+                "connector": str_prop(""),
+                "pubsub_topic": str_prop("")
+            }),
+            &["name", "connector", "pubsub_topic"],
+        ),
+    );
+    schemas.insert(
+        "bridge_azure_event_hub.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "azure_eventhubs",
+            json!({
+                "connector": str_prop(""),
+                "event_hub": str_prop("")
+            }),
+            &["name", "connector", "event_hub"],
         ),
     );
 
@@ -857,14 +1450,53 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 });
 
 pub async fn get_schema(Path(name): Path<String>) -> Response {
-    let body = match name.as_str() {
-        "connectors" => CONNECTORS_SCHEMA.clone(),
-        "actions" => ACTIONS_SCHEMA.clone(),
-        _ => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "code": "NOT_FOUND" }))).into_response();
+    // Named dashboard object (C05-10).
+    //
+    // The reference documents a 200 body of type string. The string holds
+    // the JSON schema value, not an envelope.
+    //
+    // `hotconf` is canonical; `hot-config` resolves to the same value.
+    // A ready connector or action schema name returns that schema.
+    // Any other name is 404.
+    //
+    // Bound: the registry is code-defined. `MAX_DASHBOARD_OBJECTS` is
+    // finite and each request clones at most one bounded object. The
+    // route is read-only.
+    //
+    // Management-plane only: reads a `LazyLock` static, takes no lock,
+    // and publish/deliver never touch it.
+    let canonical = match name.as_str() {
+        "hotconf" | "hot-config" => Some("hotconf"),
+        "actions" => Some("actions"),
+        "connectors" => Some("connectors"),
+        _ => None,
+    };
+    let schema = match canonical {
+        Some("hotconf") => {
+            // The broker does not track hot-config sections as live state.
+            // It reports only the served-name list from this registry.
+            json!({ "sections": ["actions", "connectors", "hotconf"] })
+        }
+        Some("actions") => ready_kind_schemas(&ACTIONS_SCHEMA["components"]["schemas"]),
+        Some(_) => ready_kind_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]),
+        None => {
+            let connectors = ready_kind_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]);
+            let actions = ready_kind_schemas(&ACTIONS_SCHEMA["components"]["schemas"]);
+            if let Some(schema) = connectors.get(&name).or_else(|| actions.get(&name)) {
+                schema.clone()
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "code": "NOT_FOUND",
+                        "message": format!("schema '{}' not found", name),
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
-
+    let body = serde_json::to_string(&schema).expect("schema value serializes");
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -874,12 +1506,18 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
 }
 
 pub async fn list_schemas() -> Response {
-    (StatusCode::OK, Json(json!(["actions", "connectors"]))).into_response()
+    // Keep the bound live on the non-test path: the registry is fixed-size
+    // (see `DASHBOARD_OBJECT_NAMES`) and each response clones at most one
+    // bounded object, so management memory cannot grow from this route.
+    let mut names = Vec::with_capacity(MAX_DASHBOARD_OBJECTS);
+    names.extend(DASHBOARD_OBJECT_NAMES);
+    (StatusCode::OK, Json(json!(names))).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CONNECTORS_SCHEMA;
+    use super::{get_schema, list_schemas, CONNECTORS_SCHEMA, MAX_DASHBOARD_OBJECTS};
+    use axum::response::Response;
 
     #[test]
     fn kafka_health_check_topic_defaults_to_indramqtt() {
@@ -891,5 +1529,100 @@ mod tests {
             default, "indramqtt_health_check",
             "kafka health-check topic default must stay branded for this repository"
         );
+    }
+
+    /// Read a handler response back into status + JSON body.
+    async fn response_parts(response: Response) -> (axum::http::StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("schema body is small and readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("schema body is JSON");
+        (status, body)
+    }
+
+    fn schema_value(body: &serde_json::Value) -> serde_json::Value {
+        let text = body.as_str().expect("schema body is a JSON string");
+        serde_json::from_str(text).expect("schema string holds JSON")
+    }
+
+    #[tokio::test]
+    async fn known_name_returns_schema_json_string() {
+        // Through the handler (not only the store): known names return the
+        // documented JSON string that holds the schema value.
+        for name in ["connectors", "actions", "hotconf"] {
+            let (status, body) =
+                response_parts(get_schema(axum::extract::Path(name.to_string())).await).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "known name {name}");
+            assert!(
+                body.is_string(),
+                "reference requires a JSON string for {name}, got: {body}"
+            );
+            assert!(
+                schema_value(&body).is_object(),
+                "schema value is an object for {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_body_is_not_the_old_object_envelope() {
+        // Negative test: the old `{name, title, version, schema}` object
+        // must not return.
+        let (status, body) =
+            response_parts(get_schema(axum::extract::Path("connectors".to_string())).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            body.is_string(),
+            "reference requires a JSON string, got: {body}"
+        );
+        assert!(
+            body.get("schema").is_none(),
+            "the old object envelope must not return"
+        );
+        assert!(schema_value(&body).is_object());
+    }
+
+    #[tokio::test]
+    async fn hot_config_alias_resolves_to_hotconf() {
+        let (status, alias) =
+            response_parts(get_schema(axum::extract::Path("hot-config".to_string())).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, canonical) =
+            response_parts(get_schema(axum::extract::Path("hotconf".to_string())).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(alias, canonical, "alias must serve the canonical schema");
+    }
+
+    #[tokio::test]
+    async fn unknown_name_is_not_found_with_code_and_message() {
+        let (status, body) =
+            response_parts(get_schema(axum::extract::Path("no-such-schema".to_string())).await)
+                .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+        assert!(
+            body["message"].is_string(),
+            "unknown name must carry {{code, message}}, got: {body}"
+        );
+        assert_eq!(body.as_object().map(|o| o.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn schema_list_names_canonical_objects() {
+        let (status, body) = response_parts(list_schemas().await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!(["hotconf", "actions", "connectors"])
+        );
+    }
+
+    #[test]
+    fn object_count_cap_covers_served_names() {
+        // Three canonical names plus the one alias fit the bound.
+        const {
+            assert!(4 <= MAX_DASHBOARD_OBJECTS);
+        }
     }
 }

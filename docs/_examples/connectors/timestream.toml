@@ -1,0 +1,34 @@
+[example]
+area = "connectors"
+item = "timestream"
+kind = "connector-create"
+
+[[case]]
+name = "timestream-normal"
+database_name = "iot_database"
+table_name = "telemetry"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+dimensions = { device = "${client_id}" }
+time_unit = "milliseconds"
+measure_name_template = "${topic}"
+multi_measure_mappings = { temperature = "DOUBLE", humidity = "BIGINT" }
+batch_size = 1
+batch_bytes = 65536
+linger_ms = 10
+max_retries = 2
+initial_backoff_ms = 10
+max_backoff_ms = 100
+timeout_ms = 5000
+expect_status = 201
+expect_type = "timestream"
+
+[[case]]
+name = "timestream-edge-empty-database"
+database_name = ""
+table_name = "telemetry"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+expect_status = 400

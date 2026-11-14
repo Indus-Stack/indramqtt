@@ -1,0 +1,1 @@
+[{"body": null, "cleanup": [], "expect_status": 204, "operation": "POST /logout", "path_params": {}, "query": {}, "setup": []}]

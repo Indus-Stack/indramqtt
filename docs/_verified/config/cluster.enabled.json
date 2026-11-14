@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker and check that `/healthz` answers OK.",
+  "config": "[cluster]\nenabled = false\n",
+  "item": "cluster.enabled",
+  "kind": "setting",
+  "output": "ok",
+  "returncode": 0,
+  "verified": true
+}

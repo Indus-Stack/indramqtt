@@ -26,9 +26,9 @@ end-to-end latency on the same 15 scenarios and parameters.
 
 ## Re-running
 
-1. Start a stack (kernel + edge) per `team/perf/remote host-STACK.md`, e.g. in a
-   container `broker-bench` with MQTT on 11883 (host port 13486),
-   API on 28083 (host port 13487), BrokerLink on 28883. The kernel needs
+1. Start a kernel per `team/perf/remote host-STACK.md`, e.g. in a
+   container `broker-bench` with MQTT on 11883 (host port 13486)
+   and API on 28083 (host port 13487). The kernel needs
    `--allow-anonymous` (the generator connects without credentials).
 2. From the repo root, with `python` (3.12) on the load host:
    ```bash
@@ -78,9 +78,9 @@ end-to-end latency on the same 15 scenarios and parameters.
   v5 quantities are `out/in` = `delivery_pct * fanout / 100`... stated
   per-row in the T-29 report. Direct `delivery_pct` comparison is only
   valid for the fanout-1 rows.
-* Resource fields: `rust_*` = `indramqtt` process, `beam_*` = `beam.smp`
-  process, sampled every 2 s via a `/proc` scan loop inside the stack
-  container. CPU is percent of one core (100 = one core saturated);
+* Resource fields: `rust_*` = `indramqtt` process, sampled every 2 s via a `/proc` scan loop inside the stack
+  container. Historic result files also have `beam_*` = `beam.smp`
+  process, `combined_*`, `cores_utilized` and `combined_ram_mb` from runs with the old two-process stack. CPU is percent of one core (100 = one core saturated);
   `cores_utilized = combined_cpu_pct / 100`;
   `tps_per_core_allocated = total_tps / <stack container CPUs>`;
   `tps_per_core_utilized = total_tps / cores_utilized`.

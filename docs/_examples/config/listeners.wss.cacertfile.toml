@@ -1,0 +1,53 @@
+[example]
+area = "config"
+item = "listeners.wss.cacertfile"
+kind = "setting"
+expect = "ca-anchors-ok"
+expected = "A client with a certificate from the configured CA upgrades, and a client with a certificate from another CA fails."
+source = "`crates/broker-node/src/native.rs` loads the trust anchors from the setting and checks the client chain against them."
+action = "Run one secure upgrade with a valid certificate and one with a foreign certificate."
+config = '''
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+verify = "verify_peer"
+cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+'''
+script = '''
+from config_probe import *
+import base64
+import os
+import socket
+import ssl
+
+CERT = "/work/tree/crates/broker-node/tests/k1_05"
+
+def upgrade(cert=None, key=None):
+    try:
+        raw = socket.create_connection(("127.0.0.1", 28884), timeout=10)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if cert:
+            ctx.load_cert_chain(cert, key)
+        tls = ctx.wrap_socket(raw, server_hostname="localhost")
+        tls.settimeout(10)
+        wskey = base64.b64encode(os.urandom(16)).decode()
+        tls.sendall(("GET /mqtt HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wskey + "\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n").encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = tls.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        tls.close()
+        return resp.startswith(b"HTTP/1.1 101")
+    except Exception:
+        return False
+
+assert upgrade(CERT + "/client-a-cert.pem", CERT + "/client-a-key.pem") is True
+assert upgrade(CERT + "/wrong-client-cert.pem", CERT + "/wrong-client-key.pem") is False
+print("ca-anchors-ok")
+'''

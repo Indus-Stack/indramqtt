@@ -8,19 +8,28 @@ repository.workspace = true
 [dependencies]
 broker-rules = { workspace = true }
 broker-protocol = { workspace = true }
+broker-connectors = { workspace = true, optional = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git" }
+# The same revision as broker-rules. Two revisions make two copies of the types.
+rekuiper-sql = { git = "https://github.com/Indus-Stack/rekuiper.git", rev = "afffe8c4154d458410940307c2b96f0495d5c031" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Default build: light sinks only (no vendor SDK). Each heavy SDK is off
+# unless its feature is enabled (X1-09 `s3` plus the X1-10 community
+# sinks); a feature build (or `--all-features`) restores the full set.
+# The forwarding features enable the optional community dependency for
+# tests that go through the gated community sinks.
+default = []
+s3 = ["broker-connectors/s3"]
+clickhouse = ["broker-connectors/clickhouse"]
+kafka = ["broker-connectors/kafka"]
+elasticsearch = ["broker-connectors/elasticsearch"]
+rabbitmq = ["broker-connectors/rabbitmq"]
+
 [dev-dependencies]
 async-trait = { workspace = true }
 broker-connectors = { workspace = true }
-
-[features]
-# X1-09: mirrors the community `s3` gate so the S3 e2e below builds both
-# with default features (test absent) and with `--features s3` (test runs).
-default = []
-s3 = ["broker-connectors/s3"]

@@ -5,8 +5,11 @@ Usage:
 python -m tests.api_conformance --spec <openapi.json> --base http://127.0.0.1:18083/api/v5 --user admin --password <pw>
 python -m tests.api_conformance --spec <openapi.json> --base URL --list [--exclude-tags "Plugins,AI Completion,A2A Registry"]
 python -m tests.api_conformance --spec <openapi.json> --base URL --allow-mutations --cases tests/api_conformance/cases --report out.json
+The checker runs every case of each operation in file order.
+Each case uses its own setup and cleanup.
 Cases live in tests/api_conformance/cases/*.json; `$from:METHOD path#/ptr` reuses a live response.
+A case can also hold `expect_json`: one JSON pointer per body value to check (`{"gte": N}` means at least N).
 Login uses POST /login (Bearer); `--api-key/--api-secret` uses Basic instead.
-Summary groups by spec tag; JSON report rows hold method, path, tag, outcome, status, errors.
+Summary groups by spec tag; JSON report rows hold method, path, tag, case index, outcome, status, errors.
 Only GETs without path params run unaided; the rest need cases.
 Unit tests: python -m unittest tests.api_conformance.test_openapi_validate -v

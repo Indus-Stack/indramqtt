@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-licence-install-file"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--licence-install-file"

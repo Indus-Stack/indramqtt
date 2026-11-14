@@ -8,11 +8,8 @@
 //! The write path runs on the maintained `aws-sdk-kinesis` driver
 //! ([`SdkKinesisTransport`] below): `PutRecords` with driver-owned
 //! SigV4 (static access-key credentials, session token when
-//! configured, endpoint override for local servers). The legacy
-//! hand-written [`HttpKinesisTransport`] (shared signer in `super`,
-//! temp-session `x-amz-security-token` included when configured) is
-//! retained for offline unit tests only; production wiring uses the
-//! driver transport.
+//! configured, endpoint override for local servers). Production wiring
+//! uses the driver transport.
 //!
 //! Partial failures retry per record: a response with
 //! `FailedRecordCount > 0` requeues only the entries carrying an
@@ -519,91 +516,6 @@ impl KinesisTransport for MockKinesisTransport {
                 })
             }
         }
-    }
-}
-
-/// Production transport: signed `POST {endpoint}/` with the JSON body.
-pub struct HttpKinesisTransport {
-    endpoint: String,
-    host: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    client: reqwest::Client,
-}
-
-impl HttpKinesisTransport {
-    pub fn new(config: &KinesisSinkConfig, client: reqwest::Client) -> Result<Self> {
-        config.validate()?;
-        let endpoint = config.endpoint_url();
-        let host = endpoint
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        Ok(Self {
-            endpoint,
-            host,
-            region: config.region.clone(),
-            access_key_id: config.access_key_id.clone(),
-            secret_access_key: config.secret_access_key.clone(),
-            session_token: config.session_token.clone(),
-            client,
-        })
-    }
-}
-
-#[async_trait]
-impl KinesisTransport for HttpKinesisTransport {
-    async fn put_records(
-        &self,
-        req: &KinesisPutRecordsRequest,
-    ) -> Result<KinesisPutRecordsResponse> {
-        let body = render_put_records_body(&req.stream_name, &req.records);
-        let millis = now_millis();
-        let (auth, date) = sign_put_records(
-            &self.access_key_id,
-            &self.secret_access_key,
-            self.session_token.as_deref(),
-            &self.region,
-            &self.host,
-            &body,
-            millis,
-        );
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header(reqwest::header::CONTENT_TYPE, KINESIS_CONTENT_TYPE)
-            .header("X-Amz-Target", KINESIS_TARGET)
-            .header("X-Amz-Date", date)
-            .header(reqwest::header::AUTHORIZATION, auth)
-            .body(body);
-        if let Some(token) = &self.session_token {
-            request = request.header("X-Amz-Security-Token", token.as_str());
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("kinesis put_records failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || (500..=504).contains(&status) {
-            return Err(ConnectorError::Connection(format!(
-                "kinesis throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "kinesis put_records failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("kinesis read failed: {e}")))?;
-        parse_put_records_response(&bytes)
     }
 }
 

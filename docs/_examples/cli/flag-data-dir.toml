@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-data-dir"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--data-dir"

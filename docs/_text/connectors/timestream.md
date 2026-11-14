@@ -1,0 +1,3 @@
+`timestream` is the documented short name for the Amazon Timestream sink. The v1 route accepts `timestream`, `ts`, and `aws_timestream`, and stores the runtime as `timestream`. The v5 route accepts `type` `timestream` and registers the live sink. The tier is enterprise. The service is closed to new customers.
+
+The sink writes each result as one multi-measure record. It signs `WriteRecords` calls with AWS Signature Version 4. It buffers records and flushes full or stale batches. The v1 route reads the full sink settings. The v5 route reads the identity and endpoint fields and fixes the dimensions, the measure mapping, and the batch policy.

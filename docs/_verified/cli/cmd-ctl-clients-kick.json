@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "clients",
+    "--help"
+  ],
+  "item": "cmd-ctl-clients-kick",
+  "match": "kick",
+  "output": "Client sessions: list, show, kick\n  kick  Disconnect one client through the kernel-to-edge close path",
+  "output_bytes": 313,
+  "returncode": 0,
+  "verified": true
+}

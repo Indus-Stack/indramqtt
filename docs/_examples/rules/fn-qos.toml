@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-qos"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT qos() AS q FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"qos": 1}'
+expect_matched = true
+expect_projected = '{"q": 1}'
+
+[[case]]
+sql = 'SELECT qos() AS q FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"q": null}'

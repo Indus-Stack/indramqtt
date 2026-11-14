@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-ldap-bind-dn",
+  "match": "--ldap-bind-dn",
+  "output": "      --ldap-bind-dn <LDAP_BIND_DN>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

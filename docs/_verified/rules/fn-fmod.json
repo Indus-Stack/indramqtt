@@ -1,0 +1,35 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "v": 1.5
+      },
+      "sql": "SELECT fmod(7.5, 2) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT fmod(1.0, 0) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "v": 1.0
+      },
+      "sql": "SELECT fmod(true, 2) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-fmod",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

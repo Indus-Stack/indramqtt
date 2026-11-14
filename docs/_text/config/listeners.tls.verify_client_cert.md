@@ -1,0 +1,1 @@
+`listeners.tls.verify_client_cert` asks clients for a certificate. The default `false` keeps handshakes unchanged. With `true`, the listener needs `cacertfile`. A missing certificate is refused at the bind. A client with a valid certificate still connects.

@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "msg_id": 7
+      },
+      "projected": {
+        "msg_id": 7
+      },
+      "sql": "SELECT msg_id FROM \"$events/message_acked\"",
+      "topic": "$events/message_acked"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "msg_id": 7
+      },
+      "projected": null,
+      "sql": "SELECT msg_id FROM \"$events/message_acked\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-message_acked",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

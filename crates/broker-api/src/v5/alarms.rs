@@ -3,8 +3,9 @@
 //! Covers `GET /alarms` (paged list of active alarms),
 //! `DELETE /alarms` (clear all alarms) and `POST /alarms/force_deactivate`
 //! (deactivate one named alarm, or all when no name is given).
-//! Single-node, management-plane
-//! only: nothing here runs on the per-message path, so delivery never
+//! The kernel raises entries on CONNECT
+//! (`crates/broker-node/src/main.rs`, ban refusal path).
+//! Nothing here runs on the per-message path, so delivery never
 //! takes a management lock and no new buffering is added to fan-out or
 //! fan-in.
 //!
@@ -28,6 +29,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
@@ -40,31 +42,33 @@ const MAX_NAME_LEN: usize = 256;
 /// Longest accepted alarm `message`.
 const MAX_MESSAGE_LEN: usize = 1024;
 
-/// Node name rendered on every alarm row (single node).
-const NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
-/// One active alarm: identifier (`name`), human detail (`message`),
-/// structured detail (`details`, always an object) and activation time
-/// (`activate_at_us`, microseconds since the Unix epoch).
+/// One active alarm: owning tenant (`tenant`), identifier (`name`),
+/// human detail (`message`), structured detail (`details`, always an
+/// object) and activation time (`activate_at_us`, microseconds since
+/// the Unix epoch). The tenant marks which bind raised the alarm, so
+/// one tenant never reads another tenant's alarm as its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlarmEntry {
     pub name: String,
     pub message: String,
     pub details: serde_json::Value,
     pub activate_at_us: u64,
+    pub tenant: String,
 }
 
 impl AlarmEntry {
     fn to_json(&self, now_us: u64) -> serde_json::Value {
         let duration = now_us.saturating_sub(self.activate_at_us);
         serde_json::json!({
-            "node": NODE_NAME,
+            "node": local_node_name(),
             "name": self.name,
             "message": self.message,
             "details": self.details,
             "duration": duration,
             "activate_at": micros_to_rfc3339(self.activate_at_us),
-            "deactivate_at": "infinity",
+            "tenant": self.tenant,
         })
     }
 }
@@ -79,19 +83,21 @@ pub struct DeactivatedAlarm {
     pub details: serde_json::Value,
     pub activate_at_us: u64,
     pub deactivate_at_us: u64,
+    pub tenant: String,
 }
 
 impl DeactivatedAlarm {
     fn to_json(&self) -> serde_json::Value {
         let duration = self.deactivate_at_us.saturating_sub(self.activate_at_us);
         serde_json::json!({
-            "node": NODE_NAME,
+            "node": local_node_name(),
             "name": self.name,
             "message": self.message,
             "details": self.details,
             "duration": duration,
             "activate_at": micros_to_rfc3339(self.activate_at_us),
             "deactivate_at": micros_to_rfc3339(self.deactivate_at_us),
+            "tenant": self.tenant,
         })
     }
 }
@@ -101,8 +107,8 @@ impl DeactivatedAlarm {
 /// Single node behind two short locks; every method finishes quickly and
 /// no delivery path touches it, so management reads never block messaging.
 pub struct AlarmStore {
-    active: RwLock<HashMap<String, AlarmEntry>>,
-    deactivated: RwLock<HashMap<String, DeactivatedAlarm>>,
+    active: RwLock<HashMap<(String, String), AlarmEntry>>,
+    deactivated: RwLock<HashMap<(String, String), DeactivatedAlarm>>,
 }
 
 impl AlarmStore {
@@ -114,52 +120,105 @@ impl AlarmStore {
         }
     }
 
-    /// Raise (or return) the named active alarm. Idempotent: an already
-    /// active name returns its stored entry without moving its activation
-    /// time. A name with a deactivated record re-activates with a fresh
-    /// activation time. Past [`MAX_ALARMS`] active entries the oldest
-    /// entry is evicted first.
+    /// Raise (or return) the named active alarm in the default tenant.
+    /// Idempotent per (`tenant`, `name`). Past [`MAX_ALARMS`] entries
+    /// the oldest entry is evicted first.
     pub fn activate(&self, name: &str, message: &str, details: serde_json::Value) -> AlarmEntry {
+        self.activate_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            name,
+            message,
+            details,
+        )
+    }
+
+    /// Raise (or return) the named active alarm in `tenant`. Idempotent:
+    /// an already active pair returns its stored entry without moving
+    /// its activation time. A pair with a deactivated record re-activates
+    /// with a fresh activation time. Past [`MAX_ALARMS`] active entries
+    /// the oldest entry is evicted first.
+    pub fn activate_in_tenant(
+        &self,
+        tenant: &str,
+        name: &str,
+        message: &str,
+        details: serde_json::Value,
+    ) -> AlarmEntry {
+        let tenant = tenant.trim().to_string();
+        let tenant = if tenant.is_empty() {
+            broker_session::tenant::DEFAULT_TENANT_ID.to_string()
+        } else {
+            tenant
+        };
         let name = truncate(name.trim(), MAX_NAME_LEN).to_string();
         let message = truncate(message, MAX_MESSAGE_LEN).to_string();
         let details = normalise_details(details);
         let now = now_micros();
-        let mut active = self.active.write().expect("alarm store lock");
-        if let Some(existing) = active.get(&name) {
+        let key = (tenant.clone(), name.clone());
+        let mut active = self
+            .active
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = active.get(&key) {
             return existing.clone();
         }
         if active.len() >= MAX_ALARMS {
             evict_oldest_active(&mut active);
         }
         // A fresh activation clears any stale deactivated record first so
-        // the same name never sits in both tables at once.
+        // the same pair never sits in both tables at once.
         self.deactivated
             .write()
-            .expect("alarm store lock")
-            .remove(&name);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
         let entry = AlarmEntry {
             name: name.clone(),
             message,
             details,
             activate_at_us: now,
+            tenant,
         };
-        active.insert(name, entry.clone());
+        active.insert(key, entry.clone());
         entry
     }
 
-    /// Snapshot of active alarms sorted by `name` for stable pages.
+    /// Snapshot of active alarms sorted by (`tenant`, `name`) for
+    /// stable pages. Each entry carries its tenant, so one tenant never
+    /// reads another tenant's alarm as its own.
     pub fn list_active(&self) -> Vec<AlarmEntry> {
-        let map = self.active.read().expect("alarm store lock");
+        let map = self
+            .active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<AlarmEntry> = map.values().cloned().collect();
+        out.sort_by(|a, b| (&a.tenant, &a.name).cmp(&(&b.tenant, &b.name)));
+        out
+    }
+
+    /// Snapshot of active alarms in one tenant, sorted by `name`.
+    pub fn list_active_in_tenant(&self, tenant: &str) -> Vec<AlarmEntry> {
+        let map = self
+            .active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<AlarmEntry> = map
+            .values()
+            .filter(|e| e.tenant == tenant)
+            .cloned()
+            .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// Snapshot of deactivated alarms sorted by `name` for stable pages.
+    /// Snapshot of deactivated alarms sorted by (`tenant`, `name`) for
+    /// stable pages.
     pub fn list_deactivated(&self) -> Vec<DeactivatedAlarm> {
-        let map = self.deactivated.read().expect("alarm store lock");
+        let map = self
+            .deactivated
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<DeactivatedAlarm> = map.values().cloned().collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| (&a.tenant, &a.name).cmp(&(&b.tenant, &b.name)));
         out
     }
 
@@ -168,8 +227,14 @@ impl AlarmStore {
     /// `DELETE /alarms` route calls [`Self::deactivate_all`] so cleared
     /// alarms remain visible under `?activated=false`.
     pub fn clear(&self) {
-        self.active.write().expect("alarm store lock").clear();
-        self.deactivated.write().expect("alarm store lock").clear();
+        self.active
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Deactivate every active alarm into the deactivated history.
@@ -181,53 +246,109 @@ impl AlarmStore {
     pub fn deactivate_all(&self) -> usize {
         let now = now_micros();
         let entries: Vec<AlarmEntry> = {
-            let mut active = self.active.write().expect("alarm store lock");
+            let mut active = self
+                .active
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             active.drain().map(|(_, entry)| entry).collect()
         };
         let moved = entries.len();
         if moved == 0 {
             return 0;
         }
-        let mut history = self.deactivated.write().expect("alarm store lock");
+        let mut history = self
+            .deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for entry in entries {
+            let key = (entry.tenant.clone(), entry.name.clone());
             let record = DeactivatedAlarm {
                 name: entry.name.clone(),
                 message: entry.message,
                 details: entry.details,
                 activate_at_us: entry.activate_at_us,
                 deactivate_at_us: now.max(entry.activate_at_us),
+                tenant: entry.tenant,
             };
-            if history.len() >= MAX_ALARMS && !history.contains_key(&record.name) {
+            if history.len() >= MAX_ALARMS && !history.contains_key(&key) {
                 evict_oldest_deactivated(&mut history);
             }
-            history.insert(record.name.clone(), record);
+            history.insert(key, record);
         }
         moved
     }
 
-    /// Move one active alarm to the deactivated history. Returns true when
-    /// a live entry was moved, false when nothing was stored under `name`.
-    /// Past [`MAX_ALARMS`] deactivated records the oldest is evicted first.
-    /// Used by the force-deactivate route for a named alarm.
+    /// Move active alarms named `name` in every tenant to the deactivated
+    /// history. Returns true when a live entry was moved, false when
+    /// nothing was stored under `name`. Past [`MAX_ALARMS`] deactivated
+    /// records the oldest is evicted first. Used by the force-deactivate
+    /// route for a named alarm.
     pub fn deactivate(&self, name: &str) -> bool {
         let now = now_micros();
-        let mut active = self.active.write().expect("alarm store lock");
-        let Some(entry) = active.remove(name) else {
+        let entries: Vec<AlarmEntry> = {
+            let mut active = self
+                .active
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let keys: Vec<(String, String)> =
+                active.keys().filter(|(_, n)| n == name).cloned().collect();
+            if keys.is_empty() {
+                return false;
+            }
+            keys.into_iter().filter_map(|k| active.remove(&k)).collect()
+        };
+        let mut history = self
+            .deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in entries {
+            let key = (entry.tenant.clone(), entry.name.clone());
+            let record = DeactivatedAlarm {
+                name: entry.name,
+                message: entry.message,
+                details: entry.details,
+                activate_at_us: entry.activate_at_us,
+                deactivate_at_us: now.max(entry.activate_at_us),
+                tenant: entry.tenant,
+            };
+            if history.len() >= MAX_ALARMS && !history.contains_key(&key) {
+                evict_oldest_deactivated(&mut history);
+            }
+            history.insert(key, record);
+        }
+        true
+    }
+
+    /// Move one active (`tenant`, `name`) alarm to the deactivated
+    /// history. Returns true when a live entry was moved, false when
+    /// nothing was stored under the pair.
+    pub fn deactivate_in_tenant(&self, tenant: &str, name: &str) -> bool {
+        let now = now_micros();
+        let mut active = self
+            .active
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = active.remove(&(tenant.to_string(), name.to_string())) else {
             return false;
         };
         drop(active);
+        let key = (entry.tenant.clone(), entry.name.clone());
         let record = DeactivatedAlarm {
             name: entry.name,
             message: entry.message,
             details: entry.details,
             activate_at_us: entry.activate_at_us,
             deactivate_at_us: now.max(entry.activate_at_us),
+            tenant: entry.tenant,
         };
-        let mut history = self.deactivated.write().expect("alarm store lock");
-        if history.len() >= MAX_ALARMS && !history.contains_key(&record.name) {
+        let mut history = self
+            .deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if history.len() >= MAX_ALARMS && !history.contains_key(&key) {
             evict_oldest_deactivated(&mut history);
         }
-        history.insert(record.name.clone(), record);
+        history.insert(key, record);
         true
     }
 }
@@ -238,7 +359,7 @@ impl Default for AlarmStore {
     }
 }
 
-fn evict_oldest_active(map: &mut HashMap<String, AlarmEntry>) {
+fn evict_oldest_active(map: &mut HashMap<(String, String), AlarmEntry>) {
     let oldest = map
         .iter()
         .min_by_key(|(_, e)| e.activate_at_us)
@@ -248,7 +369,7 @@ fn evict_oldest_active(map: &mut HashMap<String, AlarmEntry>) {
     }
 }
 
-fn evict_oldest_deactivated(map: &mut HashMap<String, DeactivatedAlarm>) {
+fn evict_oldest_deactivated(map: &mut HashMap<(String, String), DeactivatedAlarm>) {
     let oldest = map
         .iter()
         .min_by_key(|(_, e)| e.deactivate_at_us)
@@ -346,28 +467,36 @@ pub async fn clear_alarms(State(state): State<ApiState>) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `POST /alarms/force_deactivate`: deactivate alarms unconditionally and
-/// report success with 204, even when nothing is stored.
+/// `POST /alarms/force_deactivate`: deactivate one named active alarm.
 ///
-/// A JSON body holding a non-empty `name` deactivates just that alarm;
-/// any other body (missing, empty, or without a usable `name`) deactivates
-/// everything, mirroring `DELETE /alarms`. A named alarm that is absent or
-/// already deactivated still reports success, so the call is idempotent.
-/// Active entries move to the deactivated history, so a follow-up
-/// `GET /alarms` reads empty while `GET /alarms?activated=false` keeps
-/// what was cleared. Management-plane only: one short store lock, no work
-/// on the per-message path and no new buffering.
+/// A JSON body holding a non-empty `name` deactivates just that alarm.
+/// A missing, empty, or unusable `name` fails with 400 `BAD_REQUEST`.
+/// A named alarm that is absent or already deactivated also fails with
+/// 400, as the documented shape requires. Active entries move to the
+/// deactivated history, so a follow-up `GET /alarms` reads empty while
+/// `GET /alarms?activated=false` keeps what was cleared.
+/// Management-plane only: one short store lock, no work on the
+/// per-message path and no new buffering.
 pub async fn force_deactivate(State(state): State<ApiState>, body: Bytes) -> Response {
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-        if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-            let name = name.trim();
-            if !name.is_empty() {
-                state.alarms.deactivate(name);
-                return StatusCode::NO_CONTENT.into_response();
-            }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid force_deactivate body: {error}"))
+                .into_response();
         }
+    };
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty() {
+        return ApiError::BadRequest("field `name` is required".to_string()).into_response();
     }
-    state.alarms.deactivate_all();
+    if !state.alarms.deactivate(name) {
+        return ApiError::BadRequest("alarm does not exist or is already deactivated".to_string())
+            .into_response();
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -484,6 +613,20 @@ mod tests {
     }
 
     #[test]
+    fn alarms_stay_in_their_own_tenant() {
+        let store = AlarmStore::new();
+        store.activate_in_tenant("default", "shared", "d", serde_json::json!({}));
+        store.activate_in_tenant("tenant-b", "shared", "b", serde_json::json!({}));
+        assert_eq!(store.list_active().len(), 2);
+        let scoped = store.list_active_in_tenant("tenant-b");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].tenant, "tenant-b");
+        assert!(store.deactivate_in_tenant("tenant-b", "shared"));
+        assert_eq!(store.list_active().len(), 1);
+        assert_eq!(store.list_active()[0].tenant, "default");
+    }
+
+    #[test]
     fn active_json_has_documented_shape() {
         let store = AlarmStore::new();
         let entry = store.activate(
@@ -492,7 +635,7 @@ mod tests {
             serde_json::json!({"high_watermark": 70}),
         );
         let rendered = entry.to_json(entry.activate_at_us + 10);
-        assert_eq!(rendered["node"], serde_json::json!(NODE_NAME));
+        assert_eq!(rendered["node"], serde_json::json!(local_node_name()));
         assert_eq!(rendered["name"], serde_json::json!("shape-alarm"));
         assert_eq!(rendered["message"], serde_json::json!("shape message"));
         assert_eq!(
@@ -501,6 +644,22 @@ mod tests {
         );
         assert_eq!(rendered["duration"], serde_json::json!(10));
         assert!(rendered["activate_at"].is_string());
-        assert_eq!(rendered["deactivate_at"], serde_json::json!("infinity"));
+        assert!(rendered.get("deactivate_at").is_none());
+    }
+
+    #[test]
+    fn serves_after_lock_poison() {
+        // A poisoned lock must not stop the store. Reads recover the lock.
+        let store = AlarmStore::new();
+        store.activate("before", "msg", serde_json::json!({}));
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _guard = store.active.write().unwrap();
+                panic!("poison the alarm lock");
+            });
+            let _ = h.join();
+        });
+        store.activate("after", "msg", serde_json::json!({}));
+        assert_eq!(store.list_active().len(), 2);
     }
 }

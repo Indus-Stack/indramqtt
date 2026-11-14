@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "tenants",
+    "--help"
+  ],
+  "item": "cmd-ctl-tenants-show",
+  "match": "show",
+  "output": "Tenant namespaces: list, show, create, delete\n  show    Show one tenant namespace (its stored config)",
+  "output_bytes": 520,
+  "returncode": 0,
+  "verified": true
+}

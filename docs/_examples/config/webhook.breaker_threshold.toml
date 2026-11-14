@@ -1,0 +1,41 @@
+[example]
+area = "config"
+item = "webhook.breaker_threshold"
+kind = "setting"
+expect = "breaker-open credential-denied"
+expected = "Three straight failures open the circuit, and the broker logs the open breaker while it refuses."
+source = "`crates/broker-auth/src/webhook.rs` opens the breaker after `breaker_threshold` consecutive failures, and `crates/broker-node/src/main.rs` refuses the CONNECT."
+action = "Deny three CONNECTs with a password and read the circuit-open line in the boot log."
+config = '''
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+breaker_threshold = 3
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def credentialed(client):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    payload = word(client) + word("docs-user") + word("wrong-password")
+    body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    sock.close()
+    return head, ack
+
+for n in range(3):
+    head, ack = credentialed(f"hook-docs-{n}")
+    assert head == 0x20 and ack == b"\x00\x04", (head, ack.hex())
+entry = wait_for(lambda: "circuit open" in log_text())
+assert entry, log_text()[-1000:]
+print("breaker-open credential-denied")
+'''

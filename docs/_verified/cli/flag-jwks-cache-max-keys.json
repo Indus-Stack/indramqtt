@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-jwks-cache-max-keys",
+  "match": "--jwks-cache-max-keys",
+  "output": "      --jwks-cache-max-keys <JWKS_CACHE_MAX_KEYS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

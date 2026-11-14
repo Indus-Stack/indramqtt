@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-acls-delete"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "acls"]
+match = "delete"

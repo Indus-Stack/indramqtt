@@ -528,6 +528,10 @@ pub struct MongoDbSinkConfig {
     pub database: String,
     /// Collection template (`${topic}`, `${client_id}`, ...).
     pub collection_template: String,
+    /// Optional document template. The rendered JSON object is the
+    /// stored document; without it the sink writes the event envelope.
+    #[serde(default)]
+    pub payload_template: Option<String>,
     /// Write operation (default insert).
     #[serde(default)]
     pub operation: MongoOperation,
@@ -572,8 +576,26 @@ impl MongoDbSinkConfig {
                 "mongodb collection_template must not be empty".to_string(),
             ));
         }
-        // Strict template checks with dummy values.
+        // Strict template checks with dummy values. A template that
+        // reads payload fields is checked at flush time, when its fields
+        // exist; the sample below carries fields for the rest.
         self.resolve_collection("dummy/topic", b"{}", QoS::AtMostOnce, 0)?;
+        if let Some(template) = &self.payload_template {
+            if template.trim().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "mongodb payload_template must not be empty".to_string(),
+                ));
+            }
+            if !template.contains("${payload.") && !template.contains("${.") {
+                self.render_document_template(
+                    template,
+                    "dummy/topic",
+                    br#"{"id":"dummy-id","v":1}"#,
+                    QoS::AtMostOnce,
+                    0,
+                )?;
+            }
+        }
         match &self.operation {
             MongoOperation::InsertOne => {}
             MongoOperation::UpdateOne {
@@ -634,6 +656,12 @@ impl MongoDbSinkConfig {
         ]
     }
 
+    /// Normalize the reference `${.field}` syntax onto this broker's
+    /// variables: `${.}` is the whole payload, `${.field}` is `${field}`.
+    fn normalize_dotted(template: &str) -> String {
+        template.replace("${.}", "${payload}").replace("${.", "${")
+    }
+
     fn event_vars(
         &self,
         topic: &str,
@@ -642,6 +670,8 @@ impl MongoDbSinkConfig {
         millis: i64,
         template: &str,
     ) -> Result<String> {
+        let normalized = Self::normalize_dotted(template);
+        let template = normalized.as_str();
         let mut vars = Self::template_vars(topic, payload, qos, millis);
         // `${payload.<field>}` JSON extraction on top.
         let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
@@ -661,9 +691,72 @@ impl MongoDbSinkConfig {
                 break;
             }
         }
+        // Every payload field is also visible as `${field}`.
+        if let Some(map) = doc.as_object() {
+            for (name, value) in map {
+                let text = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                    _ => continue,
+                };
+                if !vars.iter().any(|(key, _)| key == name) {
+                    vars.push((name.clone(), text));
+                }
+            }
+        }
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         render_template(template, &borrowed)
+    }
+
+    /// Render one configured document template. The result must be a
+    /// JSON object; anything else is a failed forward.
+    fn render_document_template(
+        &self,
+        template: &str,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+    ) -> Result<serde_json::Value> {
+        let normalized = Self::normalize_dotted(template);
+        let template = normalized.as_str();
+        let payload_text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("mongodb payload must be UTF-8".to_string()))?;
+        let mut vars: Vec<(String, String)> = vec![
+            ("topic".to_string(), topic.to_string()),
+            ("qos".to_string(), u8::from(qos).to_string()),
+            ("timestamp".to_string(), millis.to_string()),
+            ("payload".to_string(), payload_text.to_string()),
+        ];
+        let doc: serde_json::Value = serde_json::from_str(payload_text).unwrap_or_default();
+        for (name, value) in doc.as_object().into_iter().flatten() {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                _ => continue,
+            };
+            vars.push((format!("payload.{name}"), text.clone()));
+            if !vars.iter().any(|(key, _)| key == name) {
+                vars.push((name.clone(), text));
+            }
+        }
+        let borrowed: Vec<(&str, String)> = vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
+        let rendered = render_template(template, &borrowed)?;
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).map_err(|e| {
+            ConnectorError::Dispatch(format!(
+                "mongodb payload_template must render a JSON document: {e}"
+            ))
+        })?;
+        if !parsed.is_object() {
+            return Err(ConnectorError::Dispatch(
+                "mongodb payload_template must render a JSON object".to_string(),
+            ));
+        }
+        Ok(parsed)
     }
 
     /// Resolve + validate the collection for one event.
@@ -1475,6 +1568,7 @@ impl MongoDbSink {
     /// under `value`; insert mode auto-generates `_id`).
     fn build_document(
         operation: &MongoOperation,
+        payload_template: Option<&str>,
         topic: &Topic,
         payload: &Bytes,
         qos: QoS,
@@ -1489,33 +1583,82 @@ impl MongoDbSink {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let mut meta = BsonDocument::new();
-        meta.fields.push((
-            "topic".to_string(),
-            BsonValue::String(topic.as_str().to_string()),
-        ));
-        meta.fields.push((
-            "client_id".to_string(),
-            BsonValue::String(client_id.clone()),
-        ));
-        meta.fields
-            .push(("qos".to_string(), BsonValue::Int32(u8::from(qos) as i32)));
-        meta.fields
-            .push(("timestamp".to_string(), BsonValue::Int64(millis)));
-        let mut document = match &value {
-            serde_json::Value::Object(map) => BsonDocument {
-                fields: map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), json_to_bson(v)))
-                    .collect(),
-            },
-            other => BsonDocument {
-                fields: vec![("value".to_string(), json_to_bson(other))],
-            },
+        let mut document = if let Some(template) = payload_template {
+            let normalized = template.replace("${.}", "${payload}").replace("${.", "${");
+            let mut vars: Vec<(String, String)> = vec![
+                ("topic".to_string(), topic.as_str().to_string()),
+                ("client_id".to_string(), client_id.clone()),
+                ("qos".to_string(), u8::from(qos).to_string()),
+                ("timestamp".to_string(), millis.to_string()),
+                ("payload".to_string(), text.to_string()),
+            ];
+            if let Some(map) = value.as_object() {
+                for (name, field) in map {
+                    let field_text = match field {
+                        serde_json::Value::String(text) => text.clone(),
+                        scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                        _ => continue,
+                    };
+                    vars.push((format!("payload.{name}"), field_text.clone()));
+                    if !vars.iter().any(|(key, _)| key == name) {
+                        vars.push((name.clone(), field_text));
+                    }
+                }
+            }
+            let borrowed: Vec<(&str, String)> = vars
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.clone()))
+                .collect();
+            let rendered = render_template(&normalized, &borrowed)?;
+            let rendered_value: serde_json::Value =
+                serde_json::from_str(&rendered).map_err(|e| {
+                    ConnectorError::Dispatch(format!(
+                        "mongodb payload_template must render a JSON document: {e}"
+                    ))
+                })?;
+            match rendered_value {
+                serde_json::Value::Object(map) => BsonDocument {
+                    fields: map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json_to_bson(v)))
+                        .collect(),
+                },
+                _ => {
+                    return Err(ConnectorError::Dispatch(
+                        "mongodb payload_template must render a JSON object".to_string(),
+                    ))
+                }
+            }
+        } else {
+            let mut meta = BsonDocument::new();
+            meta.fields.push((
+                "topic".to_string(),
+                BsonValue::String(topic.as_str().to_string()),
+            ));
+            meta.fields.push((
+                "client_id".to_string(),
+                BsonValue::String(client_id.clone()),
+            ));
+            meta.fields
+                .push(("qos".to_string(), BsonValue::Int32(u8::from(qos) as i32)));
+            meta.fields
+                .push(("timestamp".to_string(), BsonValue::Int64(millis)));
+            let mut document = match &value {
+                serde_json::Value::Object(map) => BsonDocument {
+                    fields: map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json_to_bson(v)))
+                        .collect(),
+                },
+                other => BsonDocument {
+                    fields: vec![("value".to_string(), json_to_bson(other))],
+                },
+            };
+            document
+                .fields
+                .push(("_mqtt".to_string(), BsonValue::Document(meta)));
+            document
         };
-        document
-            .fields
-            .push(("_mqtt".to_string(), BsonValue::Document(meta)));
         let has_id = document.get("_id").is_some();
         match operation {
             MongoOperation::InsertOne => {
@@ -1566,8 +1709,9 @@ impl MongoDbSink {
     }
 
     /// Flush buffered rows grouped by collection (no-op when empty).
-    /// Transient failures retry in place; terminal write errors and
-    /// exhaustion restore the buffer, engage backoff, and propagate.
+    /// Transient failures retry in place; terminal write errors restore
+    /// the buffer and engage backoff. Connection exhaustion drops the
+    /// batch and clears the backoff, so the next event dials again.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {
@@ -1615,12 +1759,11 @@ impl MongoDbSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(
-                            rows,
-                            oldest,
-                            taken_bytes,
-                            ConnectorError::Connection(message),
-                        );
+                        // The batch did not reach the target. Drop it
+                        // and clear the backoff so the next event dials
+                        // again.
+                        self.backoff.lock().success();
+                        return Err(ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;
@@ -1668,8 +1811,14 @@ impl MongoDbSink {
         let collection = self
             .config
             .resolve_collection(topic.as_str(), payload, qos, millis)?;
-        let (filter, document, upsert) =
-            Self::build_document(&self.config.operation, topic, payload, qos, millis)?;
+        let (filter, document, upsert) = Self::build_document(
+            &self.config.operation,
+            self.config.payload_template.as_deref(),
+            topic,
+            payload,
+            qos,
+            millis,
+        )?;
         let encoded_bytes = document.encode().len();
         let item = MongoDbDocumentItem {
             operation: self.config.operation.clone(),
@@ -1734,6 +1883,7 @@ mod tests {
             connection_string: "mongodb://user:pass@127.0.0.1:27017".to_string(),
             database: "telemetry".to_string(),
             collection_template: "telemetry_${topic}".to_string(),
+            payload_template: None,
             operation: MongoOperation::InsertOne,
             batch_size: Some(500),
             batch_bytes: Some(4_194_304),
@@ -1871,6 +2021,7 @@ mod tests {
         let _ = sink;
         let (filter, document, upsert) = MongoDbSink::build_document(
             &MongoOperation::InsertOne,
+            None,
             &Topic::new("factory/line1/temp").unwrap(),
             &Bytes::from_static(br#"{"client_id":"sensor-101","temperature":78.4}"#),
             QoS::AtLeastOnce,
@@ -1903,6 +2054,7 @@ mod tests {
         // Non-object payloads ride under "value".
         let (_, document, _) = MongoDbSink::build_document(
             &MongoOperation::InsertOne,
+            None,
             &Topic::new("t").unwrap(),
             &Bytes::from_static(b"42"),
             QoS::AtMostOnce,
@@ -1917,6 +2069,7 @@ mod tests {
                 filter_template: "{\"device_id\": \"${client_id}\"}".to_string(),
                 upsert: true,
             },
+            None,
             &Topic::new("t").unwrap(),
             &Bytes::from_static(br#"{"client_id":"d7","v":1}"#),
             QoS::AtMostOnce,
@@ -2010,6 +2163,33 @@ mod tests {
             Some(BsonValue::ObjectId(_))
         ));
         assert_eq!(sink.sent_records(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_payload_template_renders_payload_fields() {
+        let mut config = test_config();
+        config.batch_size = Some(10);
+        config.payload_template =
+            Some(r#"{"topic":"${topic}","v":${payload.v},"w":${.w}}"#.to_string());
+        let (sink, transport) = test_sink(config);
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from(r#"{"v":21,"w":7}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].docs.len(), 1);
+        let doc = &captured[0].docs[0].document;
+        assert_eq!(
+            doc.get("topic"),
+            Some(&BsonValue::String("sensors/t1".to_string()))
+        );
+        assert_eq!(doc.get("v"), Some(&BsonValue::Int32(21)));
+        assert_eq!(doc.get("w"), Some(&BsonValue::Int32(7)));
     }
 
     #[tokio::test]
@@ -2142,6 +2322,7 @@ mod tests {
             connection_string: url.clone(),
             database: database.clone(),
             collection_template: collection_name.clone(),
+            payload_template: None,
             operation: MongoOperation::InsertOne,
             batch_size: Some(500),
             batch_bytes: Some(4_194_304),

@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "config",
+    "--help"
+  ],
+  "item": "cmd-ctl-config-explain",
+  "match": "explain",
+  "output": "Configuration: validate, diff, explain, reload, history\n  explain   Explain one setting: its effective value and which layer set it",
+  "output_bytes": 684,
+  "returncode": 0,
+  "verified": true
+}

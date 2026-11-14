@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-jwks-cache-max-keys"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--jwks-cache-max-keys"

@@ -1,0 +1,1 @@
+`jwks.url` names the JWKS endpoint for JWT authentication. Empty disables JWT authentication. The broker enables the JWT path only for `https://` URLs. JWT-shaped passwords verify against this endpoint. An unreachable endpoint denies access and never grants it.

@@ -1,0 +1,9 @@
+{
+  "action": "Connect anonymously and with a password while the MongoDB source stays unreachable.",
+  "config": "[auth]\nallow_anonymous = true\n\n[dbauth]\nmongodb_url = \"mongodb://127.0.0.1:9/docs\"\n",
+  "item": "dbauth.mongodb_url",
+  "kind": "setting",
+  "output": "anonymous-refused credential-denied",
+  "returncode": 0,
+  "verified": true
+}

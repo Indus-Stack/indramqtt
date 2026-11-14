@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-ldap-ca-cert",
+  "match": "--ldap-ca-cert",
+  "output": "          Directory server URL for LDAP authentication (B2-01). Empty (the default) disables LDAP: CONNECT falls back to the local user store only. Set to `ldap://host:port` or `ldaps://host:port` to enable directory-backed authentication at CONNECT (service bind, search, then bind as the entry DN). TLS verification is on by default for `ldaps://`; point `--ldap-ca-cert` at a PEM CA file for private directories [default: \"\"]\n      --ldap-ca-cert <LDAP_CA_CERT>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

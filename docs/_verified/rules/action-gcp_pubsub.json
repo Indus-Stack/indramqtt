@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "gcp_pubsub"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-gcp_pubsub",
+        "name": "dx2-action-gcp_pubsub",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "gcp_pubsub"
+      },
+      "name": "dx2-action-gcp_pubsub",
+      "status": 201,
+      "type": "gcp_pubsub"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-gcp_pubsub\" already exists"
+      },
+      "name": "dx2-action-gcp_pubsub",
+      "status": 400,
+      "type": "gcp_pubsub"
+    }
+  ],
+  "item": "action-gcp_pubsub",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

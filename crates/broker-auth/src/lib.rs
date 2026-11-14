@@ -1,3 +1,6 @@
+pub mod authz_node_cache;
+pub mod authz_settings;
+pub mod authz_sources;
 pub mod chain;
 pub mod db;
 pub mod jwks;
@@ -11,11 +14,21 @@ pub mod jwks_test_support;
 pub mod kerberos;
 pub mod ldap;
 pub mod node_cache;
+pub mod psk;
 pub mod settings;
+#[cfg(test)]
+pub mod test_directory_server;
 pub mod webhook;
 
+pub use authz_node_cache::{AuthzCacheUpdateError, AuthzNodeCache};
+pub use authz_settings::{AuthzSettingsStore, AuthzSettingsUpdateError};
+pub use authz_sources::{
+    AuthzSourceCounterSnapshot, AuthzSourceEntry, AuthzSourceRegistry, SourceInsertError,
+    SourceMoveError, SourceRemoveError, SourceReorderError, SourceUpdateError,
+};
 pub use chain::{
-    AuthnChain, AuthnEntry, ChainInsertError, ChainRemoveError, ChainReorderError, ChainUpdateError,
+    AuthnChain, AuthnCounterSnapshot, AuthnEntry, ChainInsertError, ChainMoveError,
+    ChainRemoveError, ChainReorderError, ChainUpdateError,
 };
 pub use db::{
     DbAuthSet, DbAuthSetConfig, DbSourceSettings, MongoAuth, MongoAuthConfig, MysqlAuth,
@@ -29,6 +42,8 @@ pub use jwks::{
 pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
+pub use psk::{PskInsertError, PskStore};
+pub use psk::{MAX_PSK_ENTRIES, MAX_PSK_IDENTITY_BYTES, MAX_PSK_KEY_BYTES, MIN_PSK_KEY_BYTES};
 pub use settings::{AuthnSettingsStore, SettingsSubscriber, SettingsUpdateError};
 pub use webhook::{
     WebhookAuth, WebhookConfig, WEBHOOK_BREAKER_RESET_MS, WEBHOOK_BREAKER_THRESHOLD,
@@ -177,25 +192,114 @@ impl AclRule {
     /// Whether `filter` (a subscription request) is covered by this rule's
     /// topic pattern: every topic the request could match must also match
     /// the rule pattern. Level-wise: `#` (final) covers anything below,
-    /// `+` covers exactly one level, anything else must equal.
+    /// `+` covers exactly one level but never a `#` request level,
+    /// anything else must equal. A filter that starts with `#` or `+`
+    /// never reaches `$` topics (MQTT 5.0 section 4.7.2). A `$` request
+    /// needs a `$` rule. A plain request needs a plain rule.
     fn filter_covered(&self, filter: &TopicFilter) -> bool {
-        let pattern_levels: Vec<&str> = self.topic_pattern.split('/').collect();
-        let request_levels: Vec<&str> = filter.as_str().split('/').collect();
-        let mut pi = 0;
-        for &req in request_levels.iter() {
-            match pattern_levels.get(pi) {
-                Some(&"#") => return true,
-                Some(&"+") => {
-                    pi += 1;
-                }
-                Some(&pat) if pat == req => {
-                    pi += 1;
-                }
-                _ => return false,
-            }
-        }
-        pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+        filter_covered_by(self.topic_pattern.as_str(), filter.as_str())
     }
+
+    /// Whether `filter` (a subscription request) overlaps this rule's
+    /// topic pattern: at least one topic matches both. A deny rule uses
+    /// this test. It applies when the request could reach a denied topic.
+    /// It does not need to cover the whole request.
+    fn filter_overlaps(&self, filter: &TopicFilter) -> bool {
+        filters_overlap(self.topic_pattern.as_str(), filter.as_str())
+    }
+
+    /// Whether this rule decides one subscribe request. An allow rule
+    /// decides when the rule covers the request. A deny rule decides when
+    /// the rule overlaps the request. The first deciding rule wins.
+    fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
+        if self.allow {
+            self.filter_covered(filter)
+        } else {
+            self.filter_overlaps(filter)
+        }
+    }
+}
+
+/// First level of a `/`-separated filter (empty string for an empty one).
+fn first_level_of(filter: &str) -> &str {
+    filter.split('/').next().unwrap_or("")
+}
+
+/// True when a filter can match a topic that starts with `$`.
+///
+/// Only a filter whose first level names the `$` prefix literally (for
+/// example `$SYS/#`) reaches those topics. A filter that starts with a
+/// wildcard (`#`, `+`) never does (MQTT 5.0 section 4.7.2).
+fn reaches_dollar_topics(first_level: &str) -> bool {
+    first_level.starts_with('$')
+}
+
+/// Cover test for one rule pattern over one request filter: every topic
+/// the request could match is also matched by the rule. Both inputs are
+/// filters; `#` must be final in each (the loaders enforce this).
+pub(crate) fn filter_covered_by(rule: &str, request: &str) -> bool {
+    if reaches_dollar_topics(first_level_of(request)) != reaches_dollar_topics(first_level_of(rule))
+    {
+        return false;
+    }
+    let pattern_levels: Vec<&str> = rule.split('/').collect();
+    let request_levels: Vec<&str> = request.split('/').collect();
+    let mut pi = 0;
+    for &req in request_levels.iter() {
+        match pattern_levels.get(pi) {
+            Some(&"#") => return true,
+            Some(&"+") => {
+                // `+` covers one level, never a `#` request level: the
+                // request `#` always reaches further than one level.
+                if req == "#" {
+                    return false;
+                }
+                pi += 1;
+            }
+            Some(&pat) if pat == req => {
+                pi += 1;
+            }
+            _ => return false,
+        }
+    }
+    pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+}
+
+/// Overlap test for two filters: at least one topic matches both. Both
+/// inputs are filters; `#` must be final in each (the loaders enforce
+/// this). Filters of different `$` reach never overlap.
+pub(crate) fn filters_overlap(first: &str, second: &str) -> bool {
+    if reaches_dollar_topics(first_level_of(first)) != reaches_dollar_topics(first_level_of(second))
+    {
+        return false;
+    }
+    overlap_levels(
+        &first.split('/').collect::<Vec<&str>>(),
+        &second.split('/').collect::<Vec<&str>>(),
+    )
+}
+
+/// Level-wise overlap once both filters share the same `$` reach.
+fn overlap_levels(first: &[&str], second: &[&str]) -> bool {
+    if first.is_empty() && second.is_empty() {
+        return true;
+    }
+    // A trailing `#` also matches its own parent, so an exhausted side
+    // still overlaps when the other side holds only `#`.
+    if first.is_empty() || second.is_empty() {
+        return (first.len() == 1 && first[0] == "#") || (second.len() == 1 && second[0] == "#");
+    }
+    let (head_first, tail_first) = (first[0], &first[1..]);
+    let (head_second, tail_second) = (second[0], &second[1..]);
+    if head_first == "#" || head_second == "#" {
+        // `#` is final, so it covers every level below the match so far.
+        return true;
+    }
+    if head_first == "+" || head_second == "+" {
+        // `+` covers any one level here, literal or `+`.
+        return overlap_levels(tail_first, tail_second);
+    }
+    head_first == head_second && overlap_levels(tail_first, tail_second)
 }
 
 /// In-memory credentials + ACL authorizer.
@@ -204,7 +308,8 @@ impl AclRule {
 /// bcrypt, PBKDF2-SHA256 and Argon2id (B5-01). With zero users configured
 /// the broker is open; once users exist, unknown names and bad passwords
 /// fail. With zero ACL rules everything is allowed; once rules exist the
-/// first matching rule decides and anything unmatched is denied.
+/// first matching rule decides and anything unmatched follows the stored
+/// `no_match` setting (`deny` when no settings store is linked).
 ///
 /// There is no network credential store behind this type, so every
 /// failure mode denies access and never grants it: unknown users, locked
@@ -216,7 +321,13 @@ impl AclRule {
 /// Expensive verifiers run in `tokio::task::spawn_blocking` off the
 /// accept path while CONNECT still awaits the verdict, gated by a
 /// semaphore with [`MAX_CONCURRENT_VERIFICATIONS`] permits; exhaustion
-/// fails closed instead of queueing unboundedly. Legacy SHA-256 verifies
+/// fails closed instead of queueing unboundedly. Concurrent CONNECTs
+/// with the same credential share one check through
+/// [`MAX_VERIFY_DEDUP_INFLIGHT`]; past the cap they verify directly.
+/// The sharing absorbs a reconnect burst: one hash serves many waiters.
+/// [`MemoryAuth::verify_run_count`] reports the hashes run, so a burst
+/// test proves the cost stays within the credential count.
+/// Legacy SHA-256 verifies
 /// inline: a single hash over at most [`MAX_PASSWORD_BYTES`] bytes with no
 /// tunable cost, so off-thread dispatch would add overhead without benefit.
 /// A successful legacy login migrates to the configured default off the
@@ -239,14 +350,22 @@ pub struct MemoryAuth {
     /// authorisation reads state the check already holds (no new lock:
     /// one guard covers the tenant map plus the tenant's rule scan).
     tenants: RwLock<HashMap<String, TenantState>>,
+    /// True while the default tenant holds no ACL rule. The publish check
+    /// reads it with one atomic load and skips the tenant lock then: an
+    /// empty default tenant allows every publish. Every change of the
+    /// tenant tables goes through [`MemoryAuth::tenants_mut`] (or the
+    /// default rule guard), which refreshes this flag before it releases
+    /// the write lock.
+    default_rules_empty: std::sync::atomic::AtomicBool,
     /// Closed-tenant denials (unknown/invalid tenant, or a non-default
     /// tenant with no users/rules): counted exactly where the denial
     /// happens, fail closed and logged there.
     tenant_denials: std::sync::atomic::AtomicU64,
-    /// Kernel config registry receiving every default-tenant user/ACL
-    /// mutation (`None` in unit tests and standalone state, which stay
-    /// memory-only). Only the default tenant persists (per-tenant config
-    /// is MT-07); non-default tenants are memory-only.
+    /// Kernel config registry receiving every user/ACL mutation (`None`
+    /// in unit tests and standalone state, which stay memory-only).
+    /// Every tenant persists through it: each mutation commits the
+    /// exported root (all tenants) and saves it atomically, so a restart
+    /// and a reload keep all tenants.
     registry: RwLock<Option<Arc<ConfigRegistry>>>,
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
@@ -255,14 +374,55 @@ pub struct MemoryAuth {
     /// [`PasswordHashPolicy`]). Replaced atomically; reads take a short
     /// read lock on the management plane only, never on delivery.
     policy: RwLock<PasswordHashPolicy>,
+    /// Ordered authorization source registry driving the stored
+    /// evaluation order and the live allow/deny counters
+    /// (`AuthzSourceRegistry` in `crate::authz_sources`, shared with the
+    /// management API). `None` in unit tests and standalone state, which
+    /// stay memory-only with today's open behaviour. `Some` on the kernel
+    /// and the management plane after boot links the same instance the
+    /// API serves, so publish/subscribe verdicts attribute to the
+    /// built-in source and honour its stored enable flag and order.
+    /// Bound: at most [`broker_config::MAX_AUTHZ_SOURCES`] counter
+    /// records (8: one per source type, each exactly three atomics, no
+    /// list or history ever accumulates); linking is one `Arc` clone at
+    /// boot, verdicts take one short read lock to clone the counter
+    /// `Arc` plus lock-free atomic adds, and order consults load one
+    /// lock-free snapshot of at most the capped entries.
+    authz_sources: arc_swap::ArcSwapOption<AuthzSourceRegistry>,
+    /// Global authorization settings served by the management API
+    /// (`AuthzSettingsStore` in `crate::authz_settings`, shared with the
+    /// management API). `None` in unit tests and standalone state, which
+    /// keep today's behaviour (unmatched denied, denied ignored). `Some`
+    /// on the kernel after boot links the same instance the API serves,
+    /// so publish/subscribe verdicts honour the stored `no_match` and
+    /// `deny_action` values. Linking is one `Arc` clone at boot. The
+    /// authorize path reads the two bools with one lock-free snapshot
+    /// load each. It loads only on the unmatched or denied path, never
+    /// a snapshot clone per message.
+    authz_settings: arc_swap::ArcSwapOption<AuthzSettingsStore>,
     /// Bounds concurrent expensive verifications (bcrypt/PBKDF2/Argon2).
     /// `Arc` so the async verifier can hold an owned permit across the
     /// blocking task without borrowing `self`.
     verify_gate: Arc<tokio::sync::Semaphore>,
+    /// In-flight dedup for concurrent same-credential expensive checks.
+    /// `Arc` so CONNECT tasks share entries without borrowing `self`.
+    /// Bound: at most [`MAX_VERIFY_DEDUP_INFLIGHT`] keys; past the cap
+    /// new CONNECTs verify directly without sharing.
+    verify_inflight: Arc<tokio::sync::Mutex<HashMap<VerifyDedupKey, Arc<VerifyInflight>>>>,
+    /// Waiters that joined a leader check instead of hashing again. One
+    /// atomic; the storm test reads it to prove sharing happened.
+    verify_dedup_joins: std::sync::atomic::AtomicU64,
+    /// Expensive verifications that ran the blocking hash. One atomic;
+    /// the storm test reads it to prove the burst cost stays bounded.
+    verify_runs: std::sync::atomic::AtomicU64,
     /// Bounds concurrent legacy-hash migrations (re-hashes at production
     /// cost). `Arc` so the async migration can hold an owned permit
     /// across the blocking task without borrowing `self`.
     migrate_gate: Arc<tokio::sync::Semaphore>,
+    /// `auth.superusers`: usernames that bypass ACL checks on publish and
+    /// subscribe. Checked before the stored ACL rules in both authorize
+    /// paths. Populated from the config root at boot.
+    superusers: RwLock<Vec<String>>,
 }
 
 impl std::fmt::Debug for MemoryAuth {
@@ -290,8 +450,15 @@ impl Default for MemoryAuth {
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
             policy: RwLock::new(PasswordHashPolicy::default()),
+            authz_sources: arc_swap::ArcSwapOption::empty(),
+            authz_settings: arc_swap::ArcSwapOption::empty(),
+            default_rules_empty: std::sync::atomic::AtomicBool::new(true),
             verify_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
+            verify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            verify_dedup_joins: std::sync::atomic::AtomicU64::new(0),
+            verify_runs: std::sync::atomic::AtomicU64::new(0),
             migrate_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MIGRATIONS)),
+            superusers: RwLock::new(Vec::new()),
         }
     }
 }
@@ -339,16 +506,87 @@ pub const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 /// Default Argon2 output length in bytes. Reason: 256-bit tags match the
 /// other schemes and fit the PHC string in one line.
 pub const DEFAULT_ARGON2_KEY_LEN: usize = 32;
-/// Bound on concurrent expensive verifications. Reason: caps the aggregate
-/// memory and CPU oversubscribe from concurrent memory-hard verifications;
-/// excess CONNECTs fail closed instead of queueing unboundedly on the
-/// accept path.
+/// Bound on concurrent expensive verifications. Reason: verifications
+/// use memory-hard hashes on the accept path;
+/// excess CONNECTs fail closed instead of queueing unboundedly there.
 pub const MAX_CONCURRENT_VERIFICATIONS: usize = 32;
+/// Bound on concurrent same-credential dedup entries. Reason: one entry
+/// per verification permit in [`MAX_CONCURRENT_VERIFICATIONS`]; a burst
+/// holds at most one shared check per permit. Past the cap new CONNECTs
+/// verify directly.
+pub const MAX_VERIFY_DEDUP_INFLIGHT: usize = MAX_CONCURRENT_VERIFICATIONS;
+/// Key for concurrent same-credential verification sharing.
+/// The password hash is SHA-256 of the presented password.
+/// The verifier is the stored encoding the lookup found.
+/// Same inputs share one expensive check with the same result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VerifyDedupKey {
+    tenant: String,
+    username: String,
+    pwd_hash: [u8; 32],
+    verifier: String,
+}
+/// In-flight expensive verification shared by concurrent CONNECTs.
+/// One leader runs the blocking check; waiters await the result.
+/// The result is atomic so the cancel path sets it without a lock.
+/// Values: 0 means pending, 1 means success, 2 means refusal.
+struct VerifyInflight {
+    notify: tokio::sync::Notify,
+    result: std::sync::atomic::AtomicU8,
+}
+impl VerifyInflight {
+    /// Pending leader check.
+    const PENDING: u8 = 0;
+    /// Successful leader check.
+    const OK: u8 = 1;
+    /// Failed or cancelled leader check.
+    const REFUSED: u8 = 2;
+}
+/// Guard that fails waiters closed and removes the entry on early exit.
+/// The leader sets `completed` on the normal path; early drop (cancel)
+/// records refusal, wakes waiters and removes the key when it still
+/// points at this entry.
+struct VerifyLeaderGuard {
+    map: Arc<tokio::sync::Mutex<HashMap<VerifyDedupKey, Arc<VerifyInflight>>>>,
+    key: Option<VerifyDedupKey>,
+    entry: Arc<VerifyInflight>,
+    completed: bool,
+}
+impl Drop for VerifyLeaderGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Fail waiters closed. A stored outcome stays.
+        let _ = self.entry.result.compare_exchange(
+            VerifyInflight::PENDING,
+            VerifyInflight::REFUSED,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.entry.notify.notify_waiters();
+        if let Some(key) = self.key.take() {
+            if let Ok(mut table) = self.map.try_lock() {
+                let same = table
+                    .get(&key)
+                    .map(|current| Arc::ptr_eq(current, &self.entry))
+                    .unwrap_or(false);
+                if same {
+                    table.remove(&key);
+                }
+            } else {
+                // The lock is busy and Drop cannot await. The entry
+                // keeps its stored refusal and the next lookup for
+                // this key reclaims it. Log the miss, never stay silent.
+                tracing::warn!("mqtt authentication dedup entry reclaimed on next lookup");
+            }
+        }
+    }
+}
 /// Bound on concurrent legacy-hash migrations. Reason: a burst of legacy
-/// logins must not re-hash unboundedly at production cost (Argon2id
-/// 19 MiB, bcrypt cost 12, PBKDF2 600k iterations); at most this many
+/// logins must not re-hash unboundedly; at most this many
 /// migrations hash concurrently, excess CONNECTs keep the legacy verifier
-/// (still verifiable) and retry on the next login instead of queueing
+/// and retry on the next login instead of queueing
 /// unbounded blocking work behind the connect path.
 pub const MAX_CONCURRENT_MIGRATIONS: usize = 4;
 /// Bound on password bytes copied per attempt. Reason: 8 KiB covers human
@@ -381,6 +619,67 @@ pub const MAX_IMPORT_BATCH: usize = 10_000;
 /// cannot balloon either; 256 bytes cover service names with headroom
 /// while bounding map and file growth.
 pub const MAX_AUTHN_USERNAME_LEN: usize = 256;
+/// Bound on catch-all authorization rules (the built-in rule table behind
+/// `GET/POST/DELETE /authorization/sources/built_in_database/rules/all`).
+/// Reason: the management plane snapshots the whole list per request and
+/// the publish/subscribe decision scans it linearly under a short read
+/// lock, so the list must stay small and bounded.
+/// Writes past the cap are rejected instead of growing without
+/// limit. Default is the empty list (deny unless a rule allows, per
+/// documented semantics: with zero rules everything is allowed until the
+/// first rule is written, then first-match-wins with unmatched denied).
+// The table holds at most 128 rules.
+// Each rule carries topic, permission and action.
+pub const MAX_AUTHZ_CATCH_ALL_RULES: usize = 128;
+/// Bound on per-client authorization rules (the built-in rule table behind
+/// `GET/POST /authorization/sources/built_in_database/rules/clients`,
+/// `GET/PUT/DELETE .../rules/clients/{clientid}` and
+/// `GET .../rules/users`, filtered to client-scoped
+/// entries). Reason: the management plane snapshots the whole rule list
+/// per request and the publish/subscribe decision scans it linearly under
+/// a short read lock, so the list must stay bounded.
+/// Writes past the cap are rejected instead of
+/// growing without limit. Default is the empty list (with zero rules
+/// everything is allowed until the first rule is written, then
+/// first-match-wins with unmatched denied).
+// The table holds at most 100000 rules.
+// Each rule carries clientid, topic, permission and action.
+pub const MAX_AUTHZ_CLIENT_RULES: usize = 100_000;
+/// Longest accepted per-client rule `clientid`. Reason: ids ride the
+/// per-decision scan and the persisted snapshot, so one entry cannot
+/// balloon either; 256 bytes cover service names with headroom while
+/// bounding map and file growth.
+pub const MAX_AUTHZ_CLIENTID_LEN: usize = 256;
+/// Bound on per-user authorization rules (the built-in rule table behind
+/// `POST /authorization/sources/built_in_database/rules/users` and
+/// `GET/DELETE .../rules/users/{username}`, read through the same shared
+/// table as the per-client index). Reason: the management plane snapshots
+/// the whole rule list per request and the publish/subscribe decision
+/// scans it linearly under a short read lock, so the list must stay
+/// bounded. Writes past the
+/// cap are rejected instead of growing without limit. Default is the empty
+/// index.
+// The shared table holds at most 100000 user rules.
+// Every stored rule stays live on the publish decision path.
+pub const MAX_AUTHZ_USER_RULES: usize = 100_000;
+/// Longest accepted per-user rule `username`. Reason: ids ride the
+/// per-decision scan and the persisted snapshot, so one entry cannot
+/// balloon either; 256 bytes cover service names with headroom while
+/// bounding map and file growth.
+pub const MAX_AUTHZ_USERNAME_LEN: usize = 256;
+
+/// Why [`MemoryAuth::add_client_rule`] refused an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRuleError {
+    /// A rule for the same client id and topic scope is already stored.
+    Duplicate,
+    /// The table holds [`MAX_AUTHZ_CLIENT_RULES`] entries.
+    Full,
+    /// The entry failed validation (message names the field).
+    Invalid(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
 /// Tenant id for clients with no tenant attribute (MT-06). Reason: mirrors
 /// the session tenant default (`broker-session::tenant::DEFAULT_TENANT_ID`)
 /// without adding a dependency; the same literal keeps the default-tenant
@@ -491,11 +790,9 @@ fn is_default_tenant(tenant: &str) -> bool {
 /// most [`MAX_TENANT_ID_LEN`] chars and free of control characters.
 /// Mirrors the MT-01 session bound; invalid ids fail closed (deny, count,
 /// log), never route into another tenant's space.
-// TODO(parity): should overlong/control ids fall back to the default
-// tenant (as MT-01 assignment does) or deny outright here? The rulebook
-// does not decide the lookup policy; current choice denies outright as
-// the conservative fail-closed answer until the checker pins it.
-fn is_valid_tenant_id(id: &str) -> bool {
+// Overlong and control ids deny outright.
+// The broker never routes them into another tenant.
+pub fn is_valid_tenant_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_TENANT_ID_LEN && !id.chars().any(|c| c.is_control())
 }
 
@@ -507,6 +804,64 @@ fn tenant_key(tenant: &str) -> &str {
         DEFAULT_TENANT_ID
     } else {
         tenant
+    }
+}
+
+/// Write guard of the tenant tables. On release it refreshes the flag
+/// that tells the publish check whether the default tenant holds rules.
+struct TenantsGuard<'a> {
+    map: parking_lot::RwLockWriteGuard<'a, HashMap<String, TenantState>>,
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for TenantsGuard<'_> {
+    type Target = HashMap<String, TenantState>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for TenantsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for TenantsGuard<'_> {
+    fn drop(&mut self) {
+        let empty = self
+            .map
+            .get(DEFAULT_TENANT_ID)
+            .is_none_or(|state| state.rules.is_empty());
+        self.flag.store(empty, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Write guard of the rule list of the default tenant. On release it
+/// refreshes the flag that tells the publish check whether that list is
+/// empty.
+struct DefaultRulesGuard<'a> {
+    rules: parking_lot::MappedRwLockWriteGuard<'a, Vec<AclRule>>,
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for DefaultRulesGuard<'_> {
+    type Target = Vec<AclRule>;
+    fn deref(&self) -> &Self::Target {
+        &self.rules
+    }
+}
+
+impl std::ops::DerefMut for DefaultRulesGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rules
+    }
+}
+
+impl Drop for DefaultRulesGuard<'_> {
+    fn drop(&mut self) {
+        self.flag
+            .store(self.rules.is_empty(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -576,6 +931,97 @@ impl MemoryAuth {
         *self.policy.read()
     }
 
+    /// Link the shared authorization source registry serving the
+    /// management API. Boot and management plane only: one `Arc` clone.
+    /// After linking, every publish/subscribe verdict attributes to the
+    /// built-in source counters and honours its stored enable flag and
+    /// order. Unlinked state keeps today's behaviour (open when empty).
+    pub fn set_authz_sources(&self, registry: Arc<AuthzSourceRegistry>) {
+        self.authz_sources.store(Some(registry));
+    }
+
+    /// Link the shared authorization settings store serving the
+    /// management API. Boot and management plane only: one `Arc` clone.
+    /// After linking, an unmatched rule scan follows the stored
+    /// `no_match` value and denials report the stored `deny_action`
+    /// value. Unlinked state keeps today's behaviour (unmatched denied,
+    /// denied ignored).
+    pub fn set_authz_settings(&self, store: Arc<AuthzSettingsStore>) {
+        self.authz_settings.store(Some(store));
+    }
+
+    /// `auth.superusers`: usernames that bypass ACL checks on publish and
+    /// subscribe. Set from the config root at boot. An empty list keeps
+    /// today's behaviour (no superusers).
+    pub fn set_superusers(&self, superusers: Vec<String>) {
+        *self.superusers.write() = superusers;
+    }
+
+    /// True when `identity` is a configured superuser and bypasses ACL
+    /// checks. One short read lock; called only on the authorize path.
+    pub fn is_superuser(&self, identity: &str) -> bool {
+        self.superusers.read().iter().any(|u| u == identity)
+    }
+
+    /// True when an unmatched rule scan allows. Unlinked state denies.
+    /// One lock-free snapshot load with no clone; called only when no
+    /// rule matches, never per matched message.
+    fn no_match_allows(&self) -> bool {
+        self.authz_settings
+            .load()
+            .as_deref()
+            .is_some_and(|store| store.no_match_is_allow())
+    }
+
+    /// True when a denied publish or subscribe disconnects. Unlinked
+    /// state ignores. One lock-free snapshot load with no clone; called
+    /// only on the denial path, never per allowed message.
+    pub fn authz_deny_disconnects(&self) -> bool {
+        self.authz_settings
+            .load()
+            .as_deref()
+            .is_some_and(|store| store.deny_action_is_disconnect())
+    }
+
+    /// True when the built-in database source may execute: unlinked
+    /// state keeps today's behaviour (true), linked state follows the
+    /// stored registry order and enable flags via
+    /// [`AuthzSourceRegistry::built_in_available`]. One lock-free
+    /// snapshot load of at most [`broker_config::MAX_AUTHZ_SOURCES`]
+    /// entries; stored-only sources never execute and are skipped in
+    /// stored order, so the check consults both order and enable.
+    fn built_in_live(&self) -> bool {
+        self.authz_sources
+            .load()
+            .as_deref()
+            .is_none_or(|registry| registry.built_in_available())
+    }
+
+    /// True when no enabled source other than the built-in database is in
+    /// the stored chain. Unlinked state counts as the built-in only. This
+    /// gate keeps the empty-default-tenant fast path safe: an unsupported
+    /// source must not be bypassed when the built-in rule table is empty
+    /// (D2). One lock-free snapshot load of at most
+    /// [`broker_config::MAX_AUTHZ_SOURCES`] entries.
+    fn chain_has_no_unsupported_source(&self) -> bool {
+        self.authz_sources.load().as_deref().is_none_or(|registry| {
+            registry
+                .snapshot()
+                .iter()
+                .all(|entry| !entry.enable || entry.source_type == "built_in_database")
+        })
+    }
+
+    /// Attribute one built-in verdict to the shared registry counters.
+    /// Unlinked state applies nothing. One short read lock to clone the
+    /// counter `Arc` plus lock-free atomic adds; unknown types apply
+    /// nothing and never accumulate.
+    fn record_authz_verdict(&self, allowed: bool) {
+        if let Some(registry) = self.authz_sources.load().as_deref() {
+            registry.record_built_in(allowed);
+        }
+    }
+
     fn digest(password: &[u8]) -> [u8; 32] {
         Sha256::digest(password).into()
     }
@@ -584,10 +1030,14 @@ impl MemoryAuth {
     /// today's empty behaviour (open broker, everything allowed).
     /// Memory-only: mutations are not persisted. A missing/unreadable
     /// secret fails with an error naming the reference, never the value.
+    /// An invalid snapshot fails closed: the call logs the error and
+    /// returns a closed store. The closed store denies every
+    /// authentication and every publish or subscribe.
     pub fn from_snapshot(conf: &MqttUsersConf) -> Self {
         let auth = Self::new();
         if let Err(err) = auth.seed_from_snapshot(conf) {
-            panic!("invalid stored mqtt_users snapshot: {err}");
+            tracing::error!("invalid stored mqtt_users snapshot: {err}");
+            return Self::closed();
         }
         auth
     }
@@ -596,12 +1046,39 @@ impl MemoryAuth {
     /// user/ACL mutation back through it. This is the kernel boot path:
     /// an empty snapshot yields today's empty behaviour. A
     /// missing/unreadable secret fails loudly naming the reference.
+    /// An invalid snapshot fails closed: the call logs the error and
+    /// returns a closed store. The closed store denies every
+    /// authentication and every publish or subscribe.
     pub fn from_registry(registry: &Arc<ConfigRegistry>) -> Self {
         let auth = Self::new();
         if let Err(err) = auth.seed_from_snapshot(&registry.snapshot().mqtt_users) {
-            panic!("invalid stored mqtt_users snapshot: {err}");
+            tracing::error!("invalid stored mqtt_users snapshot: {err}");
+            return Self::closed();
         }
         *auth.registry.write() = Some(Arc::clone(registry));
+        auth
+    }
+
+    /// Closed store for a failed load. It holds one locked account and
+    /// one deny rule. The open-when-empty path stays off, so every
+    /// authentication and every publish or subscribe denies. The caller
+    /// logs the load error.
+    fn closed() -> Self {
+        let auth = Self::new();
+        {
+            let mut tenants = auth.tenants_mut();
+            let state = tenants.entry(DEFAULT_TENANT_ID.to_string()).or_default();
+            state.users.insert(
+                "__closed__".to_string(),
+                UserEntry {
+                    verifier: PasswordVerifier::Locked,
+                    quotas: UserQuotas::default(),
+                },
+            );
+            state
+                .rules
+                .push(AclRule::new("*", AclAction::All, "#", false));
+        }
         auth
     }
 
@@ -655,7 +1132,56 @@ impl MemoryAuth {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Same-credential verifications shared so far. Each count is one
+    /// CONNECT that awaited a leader check instead of hashing again.
+    pub fn verify_dedup_join_count(&self) -> u64 {
+        self.verify_dedup_joins
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Expensive verifications run so far. Each count is one blocking
+    /// hash for a non-legacy verifier. Shared bursts add one run per
+    /// different credential; waiters add none.
+    pub fn verify_run_count(&self) -> u64 {
+        self.verify_runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Total users across all tenants (drives the global open-mode gate).
+    /// The rule list of the default tenant, for a change. The rule
+    /// tables of the management API are the rules of the default tenant.
+    /// Management writes only: the publish path does not call this.
+    fn default_rules_mut(&self) -> DefaultRulesGuard<'_> {
+        let rules = parking_lot::RwLockWriteGuard::map(self.tenants.write(), |tenants| {
+            &mut tenants
+                .entry(DEFAULT_TENANT_ID.to_string())
+                .or_default()
+                .rules
+        });
+        DefaultRulesGuard {
+            rules,
+            flag: &self.default_rules_empty,
+        }
+    }
+
+    /// Write access to the tenant tables. The guard refreshes the
+    /// `default_rules_empty` flag before it releases the lock.
+    fn tenants_mut(&self) -> TenantsGuard<'_> {
+        TenantsGuard {
+            map: self.tenants.write(),
+            flag: &self.default_rules_empty,
+        }
+    }
+
+    /// A copy of the rule list of the default tenant. Management reads
+    /// only: the publish path does not call this.
+    fn default_rules(&self) -> Vec<AclRule> {
+        self.tenants
+            .read()
+            .get(DEFAULT_TENANT_ID)
+            .map(|state| state.rules.clone())
+            .unwrap_or_default()
+    }
+
     fn total_user_count(&self) -> usize {
         self.tenants.read().values().map(|s| s.users.len()).sum()
     }
@@ -684,8 +1210,87 @@ impl MemoryAuth {
         &self,
         conf: &MqttUsersConf,
     ) -> std::result::Result<(), broker_config::ConfigError> {
-        let mut users = HashMap::with_capacity(conf.users.len());
-        for entry in &conf.users {
+        // Build every table before swapping, so a bad write leaves the
+        // running state unchanged. The default tenant comes from the root
+        // fields (pre-change files carry only these and load as the
+        // default tenant with the same passwords and rules); each
+        // `tenants` entry becomes one non-default table.
+        let default_state = self.build_tenant_state(&conf.users, &conf.acls)?;
+        if conf.tenants.len() + 1 > MAX_AUTH_TENANTS {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users holds {} tenants, at most {MAX_AUTH_TENANTS} (field `tenants`)",
+                conf.tenants.len() + 1,
+            )));
+        }
+        let mut total_users = default_state.users.len();
+        let mut next: HashMap<String, TenantState> = HashMap::with_capacity(conf.tenants.len() + 1);
+        for (index, table) in conf.tenants.iter().enumerate() {
+            if !is_valid_tenant_id(&table.tenant) {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} is not a valid tenant id (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            if is_default_tenant(&table.tenant) {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} must live in the root users/acls fields (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            if next.contains_key(&table.tenant) {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} is duplicated (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            let state = self.build_tenant_state(&table.users, &table.acls)?;
+            if state.rules.len() > MAX_ACL_RULES_PER_TENANT {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].acls holds {} entries, at most {MAX_ACL_RULES_PER_TENANT} (field `acls`)",
+                    state.rules.len(),
+                )));
+            }
+            total_users += state.users.len();
+            next.insert(table.tenant.clone(), state);
+        }
+        if default_state.rules.len() > MAX_ACL_RULES_PER_TENANT {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users.acls holds {} entries, at most {MAX_ACL_RULES_PER_TENANT} (field `acls`)",
+                default_state.rules.len(),
+            )));
+        }
+        if total_users > MAX_AUTHN_USERS {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users holds {total_users} users, at most {MAX_AUTHN_USERS} (field `users`)"
+            )));
+        }
+        // Replace every tenant at once: the snapshot is the full truth,
+        // so a reload keeps exactly the tenants it carries (a restart
+        // reads the same file and lands in the same state). A table that
+        // is empty on both sides stays absent: unknown and empty tenants
+        // both deny (closed, counted, logged).
+        // A reload prunes tenants absent from disk.
+        // The snapshot is the full truth.
+        next.insert(DEFAULT_TENANT_ID.to_string(), default_state);
+        *self.tenants_mut() = next;
+        Ok(())
+    }
+
+    /// Build one tenant table from its snapshot rows. Secret references
+    /// resolve at use time (a missing secret fails closed with an error
+    /// naming the reference, never the value); undecodable verifiers lock
+    /// the account (fail closed, still listed). Unknown ACL actions are
+    /// skipped (deny-safe: no rule means denied) rather than widened.
+    fn build_tenant_state(
+        &self,
+        users: &[broker_config::MqttUser],
+        acls: &[broker_config::AclConf],
+    ) -> std::result::Result<TenantState, broker_config::ConfigError> {
+        let mut state = TenantState {
+            users: HashMap::with_capacity(users.len()),
+            rules: Vec::with_capacity(acls.len()),
+        };
+        for entry in users {
             let trimmed = entry.password_hash.trim();
             let verifier = if broker_config::secrets::is_secret_ref(trimmed) {
                 // Fail closed: propagate the resolve error (it names the
@@ -713,7 +1318,7 @@ impl MemoryAuth {
                     }
                 }
             };
-            users.insert(
+            state.users.insert(
                 entry.username.clone(),
                 UserEntry {
                     verifier,
@@ -731,8 +1336,7 @@ impl MemoryAuth {
         // so `parse` succeeds on every round-trip. An unvalidated caller
         // passing an unknown action gets that entry skipped (deny-safe:
         // no rule means denied) rather than widened into `All`.
-        let rules = conf
-            .acls
+        state.rules = acls
             .iter()
             .filter_map(|entry| {
                 AclAction::parse(&entry.action).map(|action| {
@@ -745,31 +1349,19 @@ impl MemoryAuth {
                 })
             })
             .collect();
-        // The persisted snapshot is the default tenant's state: seeding
-        // replaces the default tenant in place and leaves every other
-        // tenant untouched, so a reload never drops a live tenant's
-        // credentials. Boot seeds from an empty snapshot into the same
-        // default tenant, preserving today's open behaviour exactly.
-        // TODO(parity): per-tenant persisted config (including whether a
-        // reload should prune tenants absent from disk) is MT-07; until
-        // then non-default tenants are memory-only and survive reloads.
-        let mut tenants = self.tenants.write();
-        let state = tenants.entry(DEFAULT_TENANT_ID.to_string()).or_default();
-        state.users = users;
-        state.rules = rules;
-        Ok(())
+        Ok(state)
     }
 
-    /// Export the current contents as a validated config root: users
-    /// sorted by username so the persisted file is deterministic, rules
-    /// in evaluation order (first match wins, so order is significant).
-    /// Passwords export in their stored verifier encoding (legacy SHA-256
-    /// hex round-trips until migration, then the new PHC-style encoding;
-    /// never plaintext); quota bounds export alongside the user record
-    /// they belong to.
+    /// Export the current contents as a validated config root: the
+    /// default tenant in the root fields plus one table per non-default
+    /// tenant, users sorted by username so the persisted file is
+    /// deterministic, tables sorted by tenant id, rules in evaluation order
+    /// (first match wins, so order is significant). Passwords export in
+    /// their stored verifier encoding (legacy SHA-256 hex round-trips
+    /// until migration, then the new PHC-style encoding; never plaintext);
+    /// quota bounds export alongside the user record they belong to. Every
+    /// table persists, so a restart and a reload keep all tenants.
     fn export_conf(&self) -> MqttUsersConf {
-        // Only the default tenant persists (per-tenant config is MT-07);
-        // non-default tenants are memory-only and never reach disk.
         let tenants = self.tenants.read();
         let state = tenants.get(DEFAULT_TENANT_ID);
         let mut entries: Vec<MqttUser> = state
@@ -800,9 +1392,49 @@ impl MemoryAuth {
                     .collect()
             })
             .unwrap_or_default();
+        // One table per non-default tenant with users or rules. Tables
+        // that are empty on both sides stay absent: unknown and empty
+        // tenants both deny (closed, counted, logged).
+        let mut tables: Vec<broker_config::TenantMqttConf> = tenants
+            .iter()
+            .filter(|(id, state)| {
+                *id != DEFAULT_TENANT_ID && (!state.users.is_empty() || !state.rules.is_empty())
+            })
+            .map(|(id, state)| {
+                let mut users: Vec<MqttUser> = state
+                    .users
+                    .iter()
+                    .map(|(username, entry)| MqttUser {
+                        username: username.clone(),
+                        password_hash: encode_stored_verifier(&entry.verifier),
+                        max_connections: entry.quotas.max_connections,
+                        max_publish_rate: entry.quotas.max_publish_rate,
+                        max_publish_burst: entry.quotas.max_publish_burst,
+                    })
+                    .collect();
+                users.sort_by(|a, b| a.username.cmp(&b.username));
+                let acls: Vec<AclConf> = state
+                    .rules
+                    .iter()
+                    .map(|rule| AclConf {
+                        username: rule.client_pattern.clone(),
+                        topic: rule.topic_pattern.clone(),
+                        action: action_to_conf(rule.action).to_string(),
+                        allow: rule.allow,
+                    })
+                    .collect();
+                broker_config::TenantMqttConf {
+                    tenant: id.clone(),
+                    users,
+                    acls,
+                }
+            })
+            .collect();
+        tables.sort_by(|a, b| a.tenant.cmp(&b.tenant));
         MqttUsersConf {
             users: entries,
             acls,
+            tenants: tables,
         }
     }
 
@@ -846,15 +1478,9 @@ impl MemoryAuth {
     }
 
     /// Store (or replace) a username in one tenant (MT-06). The default
-    /// tenant behaves exactly like [`MemoryAuth::add_user`] and persists;
-    /// non-default tenants are memory-only (per-tenant config is MT-07)
-    /// and start closed until this call creates them. Creating a new
-    /// tenant past [`MAX_AUTH_TENANTS`] is rejected instead of growing
-    /// without limit.
-    // TODO(parity): should non-default tenants persist alongside the
-    // default snapshot, and in which file/shape? The rulebook does not
-    // decide per-tenant persistence; current choice keeps them
-    // memory-only (fail safe: a restart closes them) until MT-07 pins it.
+    /// tenant behaves exactly like [`MemoryAuth::add_user`]; every tenant
+    /// persists (TM-01) through the registry. Creating a new tenant past
+    /// [`MAX_AUTH_TENANTS`] is rejected instead of growing without limit.
     pub fn add_user_in_tenant(
         &self,
         tenant: &str,
@@ -900,7 +1526,7 @@ impl MemoryAuth {
             ))
         })?;
         {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             if !tenants.contains_key(key) {
                 if tenants.len() >= MAX_AUTH_TENANTS {
                     return Err(broker_config::ConfigError::Invalid(format!(
@@ -936,9 +1562,9 @@ impl MemoryAuth {
             state.users.insert(username, UserEntry { verifier, quotas });
         }
         zero_bytes(&mut password);
-        if is_default_tenant(key) {
-            self.persist()?;
-        }
+        // Every tenant persists (TM-01): the exported root carries all
+        // tenants, so each mutation commits and saves.
+        self.persist()?;
         Ok(())
     }
 
@@ -1082,7 +1708,7 @@ impl MemoryAuth {
         // and the cap so concurrent imports cannot interleave into a
         // partial apply, then insert all and persist once.
         {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             let total = self.total_user_count_locked(&tenants);
             let state = tenants.entry(DEFAULT_TENANT_ID.to_string()).or_default();
             for (username, _) in &hashed {
@@ -1160,8 +1786,8 @@ impl MemoryAuth {
         self.remove_user_in_tenant(DEFAULT_TENANT_ID, username)
     }
 
-    /// Remove a user in one tenant (MT-06). Only the default tenant
-    /// persists; other tenants are memory-only.
+    /// Remove a user in one tenant (MT-06). Every tenant persists
+    /// (TM-01) through the registry.
     pub fn remove_user_in_tenant(
         &self,
         tenant: &str,
@@ -1173,7 +1799,7 @@ impl MemoryAuth {
             .write()
             .get_mut(key)
             .is_some_and(|state| state.users.remove(username).is_some());
-        if removed && is_default_tenant(key) {
+        if removed {
             self.persist()?;
         }
         Ok(removed)
@@ -1217,7 +1843,7 @@ impl MemoryAuth {
     }
 
     /// Attach quota bounds to an existing user in one tenant (MT-06).
-    /// Only the default tenant persists; other tenants are memory-only.
+    /// Every tenant persists (TM-01) through the registry.
     pub fn set_quotas_in_tenant(
         &self,
         tenant: &str,
@@ -1236,9 +1862,7 @@ impl MemoryAuth {
             }
             None => return Ok(false),
         }
-        if is_default_tenant(key) {
-            self.persist()?;
-        }
+        self.persist()?;
         Ok(true)
     }
 
@@ -1277,6 +1901,48 @@ impl MemoryAuth {
         names
     }
 
+    /// Every live user as `(tenant, username)` (TM-01): tenants sorted,
+    /// then names sorted. Management-plane export only: clones at most
+    /// the capped user set under one short read lock; the CONNECT path
+    /// keeps reading under its own short locks and publish/deliver never
+    /// touch this store.
+    pub fn all_users_with_tenants(&self) -> Vec<(String, String)> {
+        let tenants = self.tenants.read();
+        let mut ids: Vec<&String> = tenants.keys().collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for id in ids {
+            let mut names: Vec<&String> = tenants
+                .get(id)
+                .map(|state| state.users.keys().collect())
+                .unwrap_or_default();
+            names.sort();
+            for name in names {
+                out.push((id.clone(), name.clone()));
+            }
+        }
+        out
+    }
+
+    /// Every live ACL rule as `(tenant, rule)` (TM-01): tenants sorted,
+    /// rules in evaluation order (first match wins, so order is
+    /// significant). Management-plane export only: same lock discipline
+    /// as [`MemoryAuth::all_users_with_tenants`].
+    pub fn all_rules_with_tenants(&self) -> Vec<(String, AclRule)> {
+        let tenants = self.tenants.read();
+        let mut ids: Vec<&String> = tenants.keys().collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(state) = tenants.get(id) {
+                for rule in state.rules.iter() {
+                    out.push((id.clone(), rule.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Append an ACL rule (first match wins). Persists through the
     /// registry when one is attached.
     pub fn add_rule(&self, rule: AclRule) -> std::result::Result<(), broker_config::ConfigError> {
@@ -1284,14 +1950,10 @@ impl MemoryAuth {
     }
 
     /// Append an ACL rule in one tenant (MT-06): first match wins within
-    /// the tenant; a rule in one tenant never grants in another. The
-    /// default tenant persists; other tenants are memory-only. Writes
-    /// past [`MAX_ACL_RULES_PER_TENANT`] are rejected instead of growing
-    /// the per-check scan without limit.
-    // TODO(parity): should non-default tenants persist alongside the
-    // default snapshot, and in which file/shape? The rulebook does not
-    // decide per-tenant persistence; current choice keeps them
-    // memory-only (fail safe: a restart closes them) until MT-07 pins it.
+    /// the tenant; a rule in one tenant never grants in another. Every
+    /// tenant persists (TM-01) through the registry. Writes past
+    /// [`MAX_ACL_RULES_PER_TENANT`] are rejected instead of growing the
+    /// per-check scan without limit.
     pub fn add_rule_in_tenant(
         &self,
         tenant: &str,
@@ -1309,7 +1971,7 @@ impl MemoryAuth {
             )));
         }
         {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             if !tenants.contains_key(key) {
                 if tenants.len() >= MAX_AUTH_TENANTS {
                     return Err(broker_config::ConfigError::Invalid(format!(
@@ -1328,9 +1990,9 @@ impl MemoryAuth {
             }
             state.rules.push(rule);
         }
-        if is_default_tenant(key) {
-            self.persist()?;
-        }
+        // Every tenant persists (TM-01): the exported root carries all
+        // tenants, so each mutation commits and saves.
+        self.persist()?;
         Ok(())
     }
 
@@ -1349,20 +2011,68 @@ impl MemoryAuth {
             .unwrap_or_default()
     }
 
+    /// Replace the whole catch-all rule table (first match wins).
+    ///
+    /// Validate-all-before-apply: the length cap and every entry are
+    /// checked before anything becomes visible, so a bad batch applies
+    /// nothing. Entries must carry a non-empty client pattern and a
+    /// non-empty topic filter that parses as an MQTT filter; unknown
+    /// shapes fail closed instead of widening into an allow. Persists
+    /// through the registry when one is attached, so the list survives a
+    /// kernel restart.
+    ///
+    /// Management-plane only: one short write lock per request (plus the
+    /// registry save lock on persist); the publish and subscribe
+    /// authorization consults keep reading under short read locks and
+    /// never take this lock beyond their check.
+    pub fn replace_rules(
+        &self,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), broker_config::ConfigError> {
+        if rules.len() > MAX_AUTHZ_CATCH_ALL_RULES {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users.acls holds {} entries, at most {} (field `rules`)",
+                rules.len(),
+                MAX_AUTHZ_CATCH_ALL_RULES
+            )));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern.trim().is_empty() {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.acls[{index}].username must not be empty (field `username`)"
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.acls[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.acls[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        *self.default_rules_mut() = rules;
+        self.persist()
+    }
+
     /// Drop every ACL rule. Persists through the registry when one is
     /// attached (a no-op on an already-empty list persists nothing).
     pub fn clear_rules(&self) -> std::result::Result<(), broker_config::ConfigError> {
         self.clear_rules_in_tenant(DEFAULT_TENANT_ID)
     }
 
-    /// Drop every ACL rule in one tenant (MT-06).
+    /// Drop every ACL rule in one tenant (MT-06). Every tenant persists
+    /// (TM-01) through the registry.
     pub fn clear_rules_in_tenant(
         &self,
         tenant: &str,
     ) -> std::result::Result<(), broker_config::ConfigError> {
         let key = tenant_key(tenant);
         let was_nonempty = {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             let Some(state) = tenants.get_mut(key) else {
                 return Ok(());
             };
@@ -1372,7 +2082,7 @@ impl MemoryAuth {
             state.rules.clear();
             true
         };
-        if was_nonempty && is_default_tenant(key) {
+        if was_nonempty {
             self.persist()?;
         }
         Ok(())
@@ -1388,7 +2098,8 @@ impl MemoryAuth {
         self.remove_rule_in_tenant(DEFAULT_TENANT_ID, index)
     }
 
-    /// Remove the rule at `index` in one tenant (MT-06).
+    /// Remove the rule at `index` in one tenant (MT-06). Every tenant
+    /// persists (TM-01) through the registry.
     pub fn remove_rule_in_tenant(
         &self,
         tenant: &str,
@@ -1396,7 +2107,7 @@ impl MemoryAuth {
     ) -> std::result::Result<bool, broker_config::ConfigError> {
         let key = tenant_key(tenant);
         let removed = {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             let Some(state) = tenants.get_mut(key) else {
                 return Ok(false);
             };
@@ -1407,7 +2118,7 @@ impl MemoryAuth {
                 return Ok(false);
             }
         };
-        if removed && is_default_tenant(key) {
+        if removed {
             self.persist()?;
         }
         Ok(removed)
@@ -1416,12 +2127,15 @@ impl MemoryAuth {
     /// Per-tenant first-match-wins check (MT-06): the default tenant with
     /// no rules stays open (today's behaviour); a non-default tenant with
     /// no rules denies (closed, counted, logged); an invalid tenant
-    /// denies the same way. Reads under the single tenant-map guard the
-    /// caller already holds no new lock for: one map lookup plus a
-    /// bounded linear scan of at most [`MAX_ACL_RULES_PER_TENANT`]
-    /// entries, so the publish/deliver path takes no new lock and no
-    /// allocation beyond the caller's clones.
+    /// denies the same way. When rules exist and none matches, the stored
+    /// `no_match` setting decides (deny when unlinked). Reads run under
+    /// the single tenant-map guard the caller already holds, plus one
+    /// lock-free settings load only on the unmatched path. The work is
+    /// one map lookup plus a bounded linear scan of at most
+    /// [`MAX_ACL_RULES_PER_TENANT`] entries, so matched messages take no
+    /// new lock and no allocation beyond the caller's clones.
     fn check_in_tenant(
+        &self,
         tenants: &HashMap<String, TenantState>,
         tenant: &str,
         client_id: &str,
@@ -1436,37 +2150,481 @@ impl MemoryAuth {
         // closed (deny). Reason: an empty store cannot distinguish tenants;
         // closing only after provisioning preserves today's open-when-empty
         // while new tenants still start closed.
-        let globally_empty = tenants
-            .values()
-            .all(|s| s.users.is_empty() && s.rules.is_empty());
+        let globally_empty = || {
+            tenants
+                .values()
+                .all(|s| s.users.is_empty() && s.rules.is_empty())
+        };
         let Some(state) = tenants.get(key) else {
             // No state for this tenant yet: the default tenant keeps
             // today's open-when-no-rules behaviour, every other tenant is
             // closed (deny) unless the whole store is still empty (open
             // broker). Unknown non-default tenants are counted by
-            // the caller, not here (this helper takes no `&self` so the
-            // publish path pays no extra atomic).
-            return is_default_tenant(key) || globally_empty;
+            // the caller, not here (this helper takes no atomic itself;
+            // the settings load below runs only on the unmatched path).
+            return is_default_tenant(key) || globally_empty();
         };
         if state.rules.is_empty() {
-            return is_default_tenant(key) || globally_empty;
+            return is_default_tenant(key) || globally_empty();
         }
         for rule in state.rules.iter() {
             if rule.client_matches(client_id) && rule.action.covers(action) && matches_rule(rule) {
                 return rule.allow;
             }
         }
-        false
+        // Rules exist and none matches: the stored setting decides.
+        self.no_match_allows()
     }
 
-    fn check(
+    /// Ordered snapshot of the per-client rule index: every stored rule
+    /// scoped to a concrete client id (the catch-all `*` entries belong
+    /// to the `/rules/all` table and are excluded here), in stored
+    /// evaluation order. Management-plane read only: clones at most the
+    /// capped list under one short read lock; the publish and subscribe
+    /// authorization consults keep reading under their own short locks.
+    // TODO(parity): does the documented per-client listing include the
+    // catch-all `*` entries or only client-scoped ones? The rulebook does
+    // not decide the exact membership; the current choice lists only
+    // client-scoped entries until the checker pins it.
+    pub fn all_client_rules(&self) -> Vec<AclRule> {
+        self.default_rules()
+            .iter()
+            .filter(|rule| rule.client_pattern != "*")
+            .cloned()
+            .collect()
+    }
+
+    /// Ordered snapshot of one client's rules (`None` never: an empty
+    /// client reads as an empty list; callers map empty to 404 where the
+    /// documented shape requires it). Exact id match only: wildcard
+    /// patterns belong to their literal spelling, never to the clients
+    /// they could match. Management-plane read only.
+    pub fn client_rules(&self, clientid: &str) -> Vec<AclRule> {
+        self.default_rules()
+            .iter()
+            .filter(|rule| rule.client_pattern == clientid)
+            .cloned()
+            .collect()
+    }
+
+    /// Append one client-scoped rule (first match wins).
+    ///
+    /// Validate-before-apply: the client id must be non-empty (at most
+    /// [`MAX_AUTHZ_CLIENTID_LEN`] bytes) and must name a concrete client
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// the topic must be non-empty and parse as an MQTT filter. A rule
+    /// for the same client id and topic scope (same client id, topic and
+    /// action; permission is not part of the scope) is rejected as
+    /// [`ClientRuleError::Duplicate`] instead of merging, and a table
+    /// that already holds [`MAX_AUTHZ_CLIENT_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Persists through the registry when one
+    /// is attached, so entries survive a kernel restart.
+    ///
+    /// Management-plane only: one short rule-table write lock per request
+    /// (plus the registry save lock on persist); the publish and
+    /// subscribe authorization consults keep reading under short read
+    /// locks and never take this lock beyond their check.
+    // TODO(parity): is the duplicate scope (clientid, topic, action), or
+    // does permission participate, or is topic alone the scope? The
+    // rulebook does not decide the exact scope; the current choice treats
+    // the same client, topic and action as the same scope (a second
+    // permission for that scope would silently shadow, never merge).
+    pub fn add_client_rule(&self, rule: AclRule) -> std::result::Result<(), ClientRuleError> {
+        if rule.client_pattern.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must not be empty".to_string(),
+            ));
+        }
+        if rule.client_pattern.len() > MAX_AUTHZ_CLIENTID_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `clientid` {:?} exceeds {MAX_AUTHZ_CLIENTID_LEN} bytes",
+                rule.client_pattern
+            )));
+        }
+        if rule.client_pattern == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must name a concrete client, not the catch-all (field `clientid`)".to_string(),
+            ));
+        }
+        if rule.topic_pattern.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `topic` must not be empty".to_string(),
+            ));
+        }
+        if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `topic` {:?} is not a valid filter",
+                rule.topic_pattern
+            )));
+        }
+        {
+            let mut rules = self.default_rules_mut();
+            if rules.iter().any(|stored| {
+                stored.client_pattern == rule.client_pattern
+                    && stored.topic_pattern == rule.topic_pattern
+                    && stored.action == rule.action
+            }) {
+                return Err(ClientRuleError::Duplicate);
+            }
+            if rules.len() >= MAX_AUTHZ_CLIENT_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            rules.push(rule);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Remove every rule scoped to `clientid` (true when at least one
+    /// entry was removed; false when none exist and nothing was
+    /// persisted). The catch-all `*` belongs to the `/rules/all` table
+    /// and is never removed here: asking for it reports false so the
+    /// caller answers 404 instead of emptying another table. Persists
+    /// through the registry when one is attached.
+    /// Management-plane only: one short rule-table write lock per request
+    /// (plus the registry save lock on persist).
+    pub fn remove_client_rules(
         &self,
-        client_id: &str,
-        action: AclAction,
-        matches_rule: impl Fn(&AclRule) -> bool,
-    ) -> bool {
-        let tenants = self.tenants.read();
-        Self::check_in_tenant(&tenants, DEFAULT_TENANT_ID, client_id, action, matches_rule)
+        clientid: &str,
+    ) -> std::result::Result<bool, broker_config::ConfigError> {
+        if clientid == "*" {
+            return Ok(false);
+        }
+        let mut rules = self.default_rules_mut();
+        let before = rules.len();
+        rules.retain(|rule| rule.client_pattern != clientid);
+        let removed = rules.len() != before;
+        drop(rules);
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    /// Replace every rule scoped to `clientid` with `rules` (first match
+    /// wins within the client's set, in the given order).
+    ///
+    /// Validate-all-before-apply: the client id must be non-empty (at most
+    /// [`MAX_AUTHZ_CLIENTID_LEN`] bytes) and must name a concrete client
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// every entry must carry that same client id, a non-empty topic that
+    /// parses as an MQTT filter, and a known action. A batch with two
+    /// entries for the same topic scope (same topic and action) is
+    /// rejected as [`ClientRuleError::Duplicate`] instead of merging, and
+    /// a replacement that would push the table past
+    /// [`MAX_AUTHZ_CLIENT_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Any violation rejects the whole write
+    /// and the stored set is unchanged. Writing an unknown client id
+    /// creates its set; writing an empty list clears it. Persists through
+    /// the registry when one is attached, so the set survives a kernel
+    /// restart.
+    ///
+    /// Management-plane only: topic validation runs before the lock, then
+    /// one short rule-table write lock per request (plus the registry
+    /// save lock on persist); the publish and subscribe authorization
+    /// consults keep reading under short read locks and never take this
+    /// lock beyond their check.
+    // TODO(parity): does the documented replace accept a bare array body
+    // alongside the `{"rules": [...]}` object, and must per-entry key
+    // fields match the path id or are they ignored? The rulebook does not
+    // decide either; the current choice requires the object shape and
+    // rejects key mismatches fail-closed until the checker pins it.
+    pub fn replace_client_rules(
+        &self,
+        clientid: &str,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), ClientRuleError> {
+        if clientid.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must not be empty".to_string(),
+            ));
+        }
+        if clientid.len() > MAX_AUTHZ_CLIENTID_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `clientid` {clientid:?} exceeds {MAX_AUTHZ_CLIENTID_LEN} bytes",
+            )));
+        }
+        if clientid == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must name a concrete client, not the catch-all (field `clientid`)".to_string(),
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern != clientid {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].clientid {:?} does not match {clientid:?} (field `clientid`)",
+                    rule.client_pattern
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        {
+            let mut seen: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::with_capacity(rules.len());
+            for rule in &rules {
+                let scope = (
+                    rule.topic_pattern.as_str(),
+                    match rule.action {
+                        AclAction::Publish => "publish",
+                        AclAction::Subscribe => "subscribe",
+                        AclAction::All => "all",
+                    },
+                );
+                if !seen.insert(scope) {
+                    return Err(ClientRuleError::Duplicate);
+                }
+            }
+        }
+        {
+            let mut table = self.default_rules_mut();
+            let others = table
+                .iter()
+                .filter(|stored| stored.client_pattern != clientid)
+                .count();
+            if others + rules.len() > MAX_AUTHZ_CLIENT_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            table.retain(|stored| stored.client_pattern != clientid);
+            table.extend(rules);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Ordered snapshot of the per-user rule index: every stored rule
+    /// scoped to a concrete id (the catch-all `*` entries belong to the
+    /// `/rules/all` table and are excluded here), in stored evaluation
+    /// order. This is the same shared built-in table the per-client index
+    /// reads: client and user entries share one first-match-wins list, so
+    /// a rule written for id `X` reads back under both the client key
+    /// `X` and the username `X`. Management-plane read only: clones at
+    /// most the capped list under one short read lock; the publish and
+    /// subscribe authorization consults keep reading under their own
+    /// short locks.
+    // TODO(parity): are the per-client and per-user tables separate
+    // stores (a client rule invisible to the user listing and vice
+    // versa), or one shared table keyed by id as implemented here? The
+    // rulebook does not decide the namespace split; the current choice
+    // shares the W2-19 table so every stored rule stays live on the
+    // publish/subscribe decision path until the checker pins it.
+    pub fn all_user_rules(&self) -> Vec<AclRule> {
+        self.all_client_rules()
+    }
+
+    /// Ordered snapshot of one username's rules. Exact id match only,
+    /// like [`MemoryAuth::client_rules`]. Management-plane read only.
+    pub fn user_rules(&self, username: &str) -> Vec<AclRule> {
+        self.client_rules(username)
+    }
+
+    /// Append one user-scoped rule (first match wins).
+    ///
+    /// Validate-before-apply: the username must be non-empty (at most
+    /// [`MAX_AUTHZ_USERNAME_LEN`] bytes) and must name a concrete user
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// the topic must be non-empty and parse as an MQTT filter. A rule
+    /// for the same username and topic scope (same username, topic and
+    /// action; permission is not part of the scope) is rejected as
+    /// [`ClientRuleError::Duplicate`] instead of merging, and a table
+    /// that already holds [`MAX_AUTHZ_USER_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Persists through the registry when one
+    /// is attached, so entries survive a kernel restart. The write lands
+    /// in the same shared built-in table the per-client index reads, so
+    /// it is live on the publish/subscribe decision path.
+    ///
+    /// Management-plane only: one short rule-table write lock per request
+    /// (plus the registry save lock on persist); the publish and
+    /// subscribe authorization consults keep reading under short read
+    /// locks and never take this lock beyond their check.
+    // TODO(parity): is the duplicate scope (username, topic, action), or
+    // does permission participate, or is topic alone the scope? The
+    // rulebook does not decide the exact scope; the current choice treats
+    // the same username, topic and action as the same scope (a second
+    // permission for that scope would silently shadow, never merge).
+    pub fn add_user_rule(&self, rule: AclRule) -> std::result::Result<(), ClientRuleError> {
+        if rule.client_pattern.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `username` must not be empty".to_string(),
+            ));
+        }
+        if rule.client_pattern.len() > MAX_AUTHZ_USERNAME_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `username` {:?} exceeds {MAX_AUTHZ_USERNAME_LEN} bytes",
+                rule.client_pattern
+            )));
+        }
+        if rule.client_pattern == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `username` must name a concrete user, not the catch-all (field `username`)"
+                    .to_string(),
+            ));
+        }
+        if rule.topic_pattern.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `topic` must not be empty".to_string(),
+            ));
+        }
+        if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `topic` {:?} is not a valid filter",
+                rule.topic_pattern
+            )));
+        }
+        {
+            let mut rules = self.default_rules_mut();
+            if rules.iter().any(|stored| {
+                stored.client_pattern == rule.client_pattern
+                    && stored.topic_pattern == rule.topic_pattern
+                    && stored.action == rule.action
+            }) {
+                return Err(ClientRuleError::Duplicate);
+            }
+            if rules.len() >= MAX_AUTHZ_USER_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            rules.push(rule);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Remove every rule scoped to `username` (true when at least one
+    /// entry was removed; false when none exist and nothing was
+    /// persisted). The catch-all `*` belongs to the `/rules/all` table
+    /// and is never removed here: asking for it reports false so the
+    /// caller answers 404 instead of emptying another table. Persists
+    /// through the registry when one is attached.
+    /// Management-plane only: one short rule-table write lock per request
+    /// (plus the registry save lock on persist).
+    pub fn remove_user_rules(
+        &self,
+        username: &str,
+    ) -> std::result::Result<bool, broker_config::ConfigError> {
+        if username == "*" {
+            return Ok(false);
+        }
+        let mut rules = self.default_rules_mut();
+        let before = rules.len();
+        rules.retain(|rule| rule.client_pattern != username);
+        let removed = rules.len() != before;
+        drop(rules);
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    /// Replace every rule scoped to `username` with `rules` (first match
+    /// wins within the user's set, in the given order).
+    ///
+    /// Validate-all-before-apply: the username must be non-empty (at most
+    /// [`MAX_AUTHZ_USERNAME_LEN`] bytes) and must name a concrete user
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// every entry must carry that same username, a non-empty topic that
+    /// parses as an MQTT filter, and a known action. A batch with two
+    /// entries for the same topic scope (same topic and action) is
+    /// rejected as [`ClientRuleError::Duplicate`] instead of merging, and
+    /// a replacement that would push the table past
+    /// [`MAX_AUTHZ_USER_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Any violation rejects the whole write
+    /// and the stored set is unchanged. Writing an unknown username
+    /// creates its set (create-on-write); writing an empty list clears it.
+    /// Persists through the registry when one is attached, so the set
+    /// survives a kernel restart. The write lands in the same shared
+    /// built-in table the per-client index reads, so it is live on the
+    /// publish/subscribe decision path.
+    ///
+    /// Management-plane only: topic validation runs before the lock, then
+    /// one short rule-table write lock per request (plus the registry
+    /// save lock on persist); the publish and subscribe authorization
+    /// consults keep reading under short read locks and never take this
+    /// lock beyond their check.
+    // TODO(parity): does the documented replace accept a bare array body
+    // alongside the `{"rules": [...]}` object, and must per-entry key
+    // fields match the path id or are they ignored? The rulebook does not
+    // decide either; the current choice requires the object shape and
+    // rejects key mismatches fail-closed until the checker pins it.
+    pub fn replace_user_rules(
+        &self,
+        username: &str,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), ClientRuleError> {
+        if username.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `username` must not be empty".to_string(),
+            ));
+        }
+        if username.len() > MAX_AUTHZ_USERNAME_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `username` {username:?} exceeds {MAX_AUTHZ_USERNAME_LEN} bytes",
+            )));
+        }
+        if username == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `username` must name a concrete user, not the catch-all (field `username`)"
+                    .to_string(),
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern != username {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].username {:?} does not match {username:?} (field `username`)",
+                    rule.client_pattern
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        {
+            let mut seen: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::with_capacity(rules.len());
+            for rule in &rules {
+                let scope = (
+                    rule.topic_pattern.as_str(),
+                    match rule.action {
+                        AclAction::Publish => "publish",
+                        AclAction::Subscribe => "subscribe",
+                        AclAction::All => "all",
+                    },
+                );
+                if !seen.insert(scope) {
+                    return Err(ClientRuleError::Duplicate);
+                }
+            }
+        }
+        {
+            let mut table = self.default_rules_mut();
+            let others = table
+                .iter()
+                .filter(|stored| stored.client_pattern != username)
+                .count();
+            if others + rules.len() > MAX_AUTHZ_USER_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            table.retain(|stored| stored.client_pattern != username);
+            table.extend(rules);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
     }
 }
 
@@ -1629,9 +2787,114 @@ impl MemoryAuth {
             )));
         }
 
-        // Expensive verifiers: one owned semaphore permit bounds
-        // concurrency; the blocking hash runs off the accept path while
-        // CONNECT still awaits this future's verdict.
+        // Expensive verifiers share one check for the same credential.
+        // Concurrent CONNECTs with the same tenant, username, password
+        // and verifier await the leader result instead of hashing again.
+        // The sharing stays bounded by [`MAX_VERIFY_DEDUP_INFLIGHT`];
+        // past the cap new CONNECTs verify directly.
+        let pwd_hash = Self::digest(&owned_password);
+        let verifier_encoded = encode_stored_verifier(&verifier);
+        let dedup_key = VerifyDedupKey {
+            tenant: owned_tenant.clone(),
+            username: owned_username.clone(),
+            pwd_hash,
+            verifier: verifier_encoded,
+        };
+        // One lock covers lookup and insert together. Reason: two tasks
+        // must never both lead for one key and overwrite each other.
+        let (joined, leader): (Option<Arc<VerifyInflight>>, Option<Arc<VerifyInflight>>) = {
+            let mut table = self.verify_inflight.lock().await;
+            if let Some(entry) = table.get(&dedup_key).cloned() {
+                // Reclaim a stored entry. Reason: a cancelled leader
+                // leaves a refusal; a new burst verifies fresh.
+                if entry.result.load(std::sync::atomic::Ordering::SeqCst) == VerifyInflight::PENDING
+                {
+                    (Some(entry), None)
+                } else {
+                    let fresh = Arc::new(VerifyInflight {
+                        notify: tokio::sync::Notify::new(),
+                        result: std::sync::atomic::AtomicU8::new(VerifyInflight::PENDING),
+                    });
+                    table.insert(dedup_key.clone(), fresh.clone());
+                    (None, Some(fresh))
+                }
+            } else if table.len() >= MAX_VERIFY_DEDUP_INFLIGHT {
+                (None, None)
+            } else {
+                let entry = Arc::new(VerifyInflight {
+                    notify: tokio::sync::Notify::new(),
+                    result: std::sync::atomic::AtomicU8::new(VerifyInflight::PENDING),
+                });
+                table.insert(dedup_key.clone(), entry.clone());
+                (None, Some(entry))
+            }
+        };
+        if let Some(entry) = joined {
+            // One waiter joined the leader check instead of hashing
+            // again. Count it so a burst test observes the sharing.
+            self.verify_dedup_joins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Register for the wakeup before reading the result.
+            // Reason: the leader stores the result before it wakes
+            // waiters, so a stored result needs no wait and a later
+            // wakeup still arrives.
+            let notified = entry.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let outcome = entry.result.load(std::sync::atomic::Ordering::SeqCst);
+            if outcome == VerifyInflight::PENDING {
+                notified.await;
+            }
+            let ok = entry.result.load(std::sync::atomic::Ordering::SeqCst) == VerifyInflight::OK;
+            if ok {
+                return Ok(());
+            }
+            return Err(AuthError::AuthenticationFailed(format!(
+                "{client_id} presented bad credentials"
+            )));
+        }
+        let Some(leader) = leader else {
+            // Past the cap: verify directly without sharing.
+            // One owned semaphore permit bounds concurrency; the blocking
+            // hash runs off the accept path while CONNECT awaits the verdict.
+            let permit = self.verify_gate.clone().try_acquire_owned().map_err(|_| {
+                // Fail closed: an unbounded queue of pending verifications
+                // would let a CONNECT flood grow memory without limit.
+                tracing::warn!(
+                    client_id,
+                    username = owned_username.as_str(),
+                    "mqtt authentication refused: verification permits exhausted"
+                );
+                AuthError::AuthenticationFailed(format!("{client_id} presented bad credentials"))
+            })?;
+            // Count the run. Reason: the storm test asserts real hashes
+            // stay within the credential count.
+            self.verify_runs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let verified = tokio::task::spawn_blocking(move || {
+                let ok = verify_blocking(&verifier, &owned_password);
+                drop(permit);
+                ok
+            })
+            .await
+            .unwrap_or(false);
+            if verified {
+                return Ok(());
+            }
+            return Err(AuthError::AuthenticationFailed(format!(
+                "{client_id} presented bad credentials"
+            )));
+        };
+        let mut guard = VerifyLeaderGuard {
+            map: self.verify_inflight.clone(),
+            key: Some(dedup_key),
+            entry: leader.clone(),
+            completed: false,
+        };
+        // One owned semaphore permit bounds concurrency; the blocking
+        // hash runs off the accept path while CONNECT awaits the verdict.
+        // Exhaustion fails closed. The guard fails joined waiters closed
+        // too when this return runs.
         let permit = self.verify_gate.clone().try_acquire_owned().map_err(|_| {
             // Fail closed: an unbounded queue of pending verifications
             // would let a CONNECT flood grow memory without limit.
@@ -1642,6 +2905,10 @@ impl MemoryAuth {
             );
             AuthError::AuthenticationFailed(format!("{client_id} presented bad credentials"))
         })?;
+        // Count the run. Reason: the storm test asserts real hashes stay
+        // within the credential count.
+        self.verify_runs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let verified = tokio::task::spawn_blocking(move || {
             let ok = verify_blocking(&verifier, &owned_password);
             drop(permit);
@@ -1649,6 +2916,29 @@ impl MemoryAuth {
         })
         .await
         .unwrap_or(false);
+        // Store the result before waking waiters. Reason: waiters
+        // register before they read, so no wakeup is lost.
+        leader.result.store(
+            if verified {
+                VerifyInflight::OK
+            } else {
+                VerifyInflight::REFUSED
+            },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        leader.notify.notify_waiters();
+        {
+            let key = guard.key.take().expect("leader holds dedup key");
+            let mut table = self.verify_inflight.lock().await;
+            let same = table
+                .get(&key)
+                .map(|current| Arc::ptr_eq(current, &leader))
+                .unwrap_or(false);
+            if same {
+                table.remove(&key);
+            }
+        }
+        guard.completed = true;
         if verified {
             Ok(())
         } else {
@@ -1674,8 +2964,8 @@ async fn migrate_legacy_hash_gated(auth: &MemoryAuth, username: &str, password: 
 
 /// Per-tenant legacy-hash migration (MT-06): re-hashes in the connection's
 /// own tenant so one tenant's login never rewrites another tenant's
-/// entry. Only the default tenant persists (a persist failure keeps the
-/// in-memory migration); other tenants are memory-only by design.
+/// entry. Every tenant persists (TM-01); a persist failure keeps the
+/// in-memory migration and the next login retries it.
 async fn migrate_legacy_hash_gated_in_tenant(
     auth: &MemoryAuth,
     tenant: &str,
@@ -1708,7 +2998,7 @@ async fn migrate_legacy_hash_gated_in_tenant(
     };
     {
         let key = tenant_key(tenant);
-        let mut tenants = auth.tenants.write();
+        let mut tenants = auth.tenants_mut();
         let Some(state) = tenants.get_mut(key) else {
             return;
         };
@@ -1719,9 +3009,6 @@ async fn migrate_legacy_hash_gated_in_tenant(
             return;
         }
         entry.verifier = next;
-    }
-    if !is_default_tenant(tenant_key(tenant)) {
-        return;
     }
     if let Err(error) = auth.persist() {
         tracing::warn!(
@@ -1735,70 +3022,171 @@ async fn migrate_legacy_hash_gated_in_tenant(
 #[async_trait]
 impl Authorizer for MemoryAuth {
     async fn authorize_publish(&self, client_id: &str, topic: &Topic) -> Result<()> {
-        // Default-tenant shim through the shared first-match-wins helper
-        // so single-tenant installs behave exactly as before (same
-        // open-when-empty, same deny-if-unmatched).
-        if self.check(client_id, AclAction::Publish, |rule| {
-            rule.topic_matches(topic)
-        }) {
-            Ok(())
-        } else {
-            Err(AuthError::PublishDenied(format!(
-                "{client_id} cannot publish"
-            )))
-        }
+        // Default-tenant shim: the same chain and source order as the
+        // tenant path. Single-tenant installs behave as before.
+        self.authorize_publish_in_tenant(DEFAULT_TENANT_ID, client_id, topic)
+            .await
     }
 
     async fn authorize_subscribe(&self, client_id: &str, filter: &TopicFilter) -> Result<()> {
-        // Same default-tenant shim as publish (see above).
-        if self.check(client_id, AclAction::Subscribe, |rule| {
-            rule.filter_covered(filter)
-        }) {
-            Ok(())
-        } else {
-            Err(AuthError::SubscribeDenied(format!(
-                "{client_id} cannot subscribe"
-            )))
-        }
+        // Default-tenant shim: the same chain and source order as the
+        // tenant path. Single-tenant installs behave as before.
+        self.authorize_subscribe_in_tenant(DEFAULT_TENANT_ID, client_id, filter)
+            .await
     }
 }
 
 impl MemoryAuth {
+    /// Find the first built-in rule for one decision without fallback.
+    ///
+    /// It returns the matching rule's allow flag, or None when no rule
+    /// matches. It never applies the stored `no_match` setting: a miss
+    /// abstains so a later source in the chain still decides.
+    fn built_in_rule_decision(
+        tenants: &HashMap<String, TenantState>,
+        key: &str,
+        client_id: &str,
+        action: AclAction,
+        matches_rule: &impl Fn(&AclRule) -> bool,
+    ) -> Option<bool> {
+        let state = tenants.get(tenant_key(key))?;
+        for rule in state.rules.iter() {
+            if rule.client_matches(client_id) && rule.action.covers(action) && matches_rule(rule) {
+                return Some(rule.allow);
+            }
+        }
+        None
+    }
+
+    /// Evaluate the stored authorization source order for one decision (D2).
+    ///
+    /// The first enabled source that does not abstain decides.
+    /// A source other than `built_in_database` denies the decision.
+    /// The chain never falls through such a deny.
+    /// The built-in database uses its first matching rule.
+    /// It abstains when no rule matches.
+    /// An abstain leaves the decision to a later source.
+    /// When all abstain, `no_match` decides.
+    /// With no linked registry the caller keeps current behaviour.
+    fn source_chain_verdict(
+        &self,
+        tenants: &HashMap<String, TenantState>,
+        key: &str,
+        client_id: &str,
+        action: AclAction,
+        matches_rule: impl Fn(&AclRule) -> bool,
+    ) -> Option<bool> {
+        let loaded = self.authz_sources.load();
+        let sources = loaded.as_deref()?;
+        let snap = sources.snapshot();
+        let mut built_in_enabled = false;
+        for entry in snap.iter() {
+            if !entry.enable {
+                continue;
+            }
+            if entry.source_type == "built_in_database" {
+                built_in_enabled = true;
+                if let Some(decision) =
+                    Self::built_in_rule_decision(tenants, key, client_id, action, &matches_rule)
+                {
+                    return Some(decision);
+                }
+                // No matching rule: abstain, a later source decides.
+                continue;
+            }
+            // D2: an enabled source this build does not evaluate denies the
+            // decision that reaches it; never fall through to a later allow.
+            sources.record_deny(&entry.source_type);
+            return Some(false);
+        }
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
+            return Some(false);
+        }
+        None
+    }
+
     /// Authorize one publish in one tenant (MT-06): a rule in one tenant
     /// never grants publish in another. The default tenant with no rules
     /// stays open; a non-default tenant with no rules (or an unknown or
     /// invalid tenant) denies, counted and logged. Reads under one short
     /// guard with no new lock and no allocation on the publish path.
+    /// Operation count for one allowed publish in the empty default tenant.
+    /// Before: four read locks and two Arc clones per publish.
+    /// After: four lock-free loads and one atomic add, no lock, no clone,
+    /// no allocation. A non-empty tenant adds one short tenant read lock.
+    /// An unmatched scan adds one lock-free settings load.
     pub async fn authorize_publish_in_tenant(
         &self,
         tenant: &str,
         client_id: &str,
         topic: &Topic,
     ) -> Result<()> {
+        // Superusers bypass all ACL checks.
+        if self.is_superuser(client_id) {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
         let key = tenant_key(tenant);
-        let topic = topic.clone();
+        // The allow path avoids locks. It reads the source link
+        // and the settings with lock-free loads. It counts verdicts
+        // with atomic adds. With no rule in the default tenant it
+        // skips the tenant lock as well.
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_publish");
+            self.record_authz_verdict(false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
         }
-        // One short guard covers the tenant lookup plus the rule scan
-        // (no new lock, no allocation); closed-ness is derived from the
-        // same guard so the deny path takes no second lock either.
-        let (allowed, closed) = {
-            let tenants = self.tenants.read();
-            let closed = match tenants.get(key) {
-                None => !is_default_tenant(key),
-                Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
-            };
-            let allowed =
-                Self::check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
-                    rule.topic_matches(&topic)
-                });
-            (allowed, closed)
+        // Stored order and enable gate: a disabled or removed built-in
+        // source denies fail closed in every tenant.
+        let built_in_enabled = self.built_in_live();
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
+            return Err(AuthError::PublishDenied(format!(
+                "{client_id} cannot publish"
+            )));
+        }
+        // An empty store keeps today's open broker: no lock, no scan.
+        // The fast path also needs a chain with no unsupported source.
+        if is_default_tenant(key)
+            && self
+                .default_rules_empty
+                .load(std::sync::atomic::Ordering::Acquire)
+            && self.chain_has_no_unsupported_source()
+        {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
+        // One short guard covers the tenant lookup, the rule scan and the
+        // source-order walk; closed-ness is derived from the same guard so
+        // the deny path takes no second tenant lock. Only an unmatched
+        // scan takes one lock-free settings load for the `no_match`
+        // value.
+        let tenants = self.tenants.read();
+        let closed = match tenants.get(key) {
+            None => !is_default_tenant(key),
+            Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
         };
+        // D2: walk the stored source order. An enabled source this build
+        // does not evaluate denies the decision that reaches it; the
+        // built-in database's first matching rule decides; an all-abstain
+        // chain falls to the stored `no_match` setting.
+        let allowed =
+            match self.source_chain_verdict(&tenants, key, client_id, AclAction::Publish, |rule| {
+                rule.topic_matches(topic)
+            }) {
+                Some(decision) => decision,
+                None => {
+                    self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
+                        rule.topic_matches(topic)
+                    })
+                }
+            };
+        drop(tenants);
         if allowed {
+            self.record_authz_verdict(true);
             Ok(())
         } else {
             // Count only genuinely closed tenants (unknown or a
@@ -1808,6 +3196,7 @@ impl MemoryAuth {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_publish");
             }
+            self.record_authz_verdict(false);
             Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )))
@@ -1822,33 +3211,75 @@ impl MemoryAuth {
         client_id: &str,
         filter: &TopicFilter,
     ) -> Result<()> {
+        // Superusers bypass all ACL checks.
+        if self.is_superuser(client_id) {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
         let key = tenant_key(tenant);
         let filter = filter.clone();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_subscribe");
+            self.record_authz_verdict(false);
             return Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )));
         }
-        // Same single-guard discipline as the publish path.
-        let (allowed, closed) = {
-            let tenants = self.tenants.read();
-            let closed = match tenants.get(key) {
-                None => !is_default_tenant(key),
-                Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
-            };
-            let allowed =
-                Self::check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
-                    rule.filter_covered(&filter)
-                });
-            (allowed, closed)
+        // Stored order and enable gate: a disabled or removed built-in
+        // source denies fail closed in every tenant.
+        let built_in_enabled = self.built_in_live();
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
+            return Err(AuthError::SubscribeDenied(format!(
+                "{client_id} cannot subscribe"
+            )));
+        }
+        // An empty store keeps today's open broker: no lock, no scan.
+        // The fast path also needs a chain with no unsupported source.
+        if is_default_tenant(key)
+            && self
+                .default_rules_empty
+                .load(std::sync::atomic::Ordering::Acquire)
+            && self.chain_has_no_unsupported_source()
+        {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
+        // One short guard covers the tenant lookup, the rule scan and the
+        // source-order walk; closed-ness is derived from the same guard so
+        // the deny path takes no second tenant lock. Only an unmatched
+        // scan takes one lock-free settings load for the `no_match`
+        // value.
+        let tenants = self.tenants.read();
+        let closed = match tenants.get(key) {
+            None => !is_default_tenant(key),
+            Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
         };
+        // D2: walk the stored source order. An enabled source this build
+        // does not evaluate denies the decision that reaches it; the
+        // built-in database's first matching rule decides; an all-abstain
+        // chain falls to the stored `no_match` setting.
+        let allowed = match self.source_chain_verdict(
+            &tenants,
+            key,
+            client_id,
+            AclAction::Subscribe,
+            |rule| rule.matches_subscribe(&filter),
+        ) {
+            Some(decision) => decision,
+            None => self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
+                rule.matches_subscribe(&filter)
+            }),
+        };
+        drop(tenants);
         if allowed {
+            self.record_authz_verdict(true);
             Ok(())
         } else {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_subscribe");
             }
+            self.record_authz_verdict(false);
             Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )))
@@ -2178,6 +3609,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_snapshot_fails_closed_without_panic() {
+        // A duplicated tenant table is invalid. The load fails closed:
+        // no panic, and every authentication and publish denies.
+        let conf = MqttUsersConf {
+            users: Vec::new(),
+            acls: Vec::new(),
+            tenants: vec![
+                broker_config::TenantMqttConf {
+                    tenant: "dup".to_string(),
+                    users: Vec::new(),
+                    acls: Vec::new(),
+                },
+                broker_config::TenantMqttConf {
+                    tenant: "dup".to_string(),
+                    users: Vec::new(),
+                    acls: Vec::new(),
+                },
+            ],
+        };
+        let auth = MemoryAuth::from_snapshot(&conf);
+        assert!(auth
+            .authenticate("any", Some("u"), Some(b"p"))
+            .await
+            .is_err());
+        assert!(auth.authorize_publish("any", &topic("a/b")).await.is_err());
+        assert!(auth
+            .authorize_subscribe("any", &filter("a/b"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_default_tenant_flag_follows_rules_and_verdicts_are_counted() {
+        // An empty default tenant allows without the tenant lock. The flag
+        // that drives this follows every rule change, and each verdict is
+        // counted on the shared source registry.
+        let auth = MemoryAuth::new();
+        let registry = Arc::new(AuthzSourceRegistry::new());
+        auth.set_authz_sources(Arc::clone(&registry));
+        auth.authorize_publish("client-a", &topic("own/data"))
+            .await
+            .expect("an empty default tenant allows");
+        auth.add_rule(AclRule::new(
+            "client-a",
+            AclAction::Publish,
+            "other/#",
+            true,
+        ))
+        .expect("memory-only persist cannot fail");
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_err());
+        auth.authorize_publish("client-a", &topic("other/data"))
+            .await
+            .expect("the rule allows");
+        auth.clear_rules().expect("memory-only persist cannot fail");
+        auth.authorize_publish("client-a", &topic("own/data"))
+            .await
+            .expect("no rule allows again");
+        auth.add_rule(AclRule::new(
+            "client-a",
+            AclAction::Publish,
+            "other/#",
+            true,
+        ))
+        .expect("memory-only persist cannot fail");
+        auth.replace_rules(Vec::new())
+            .expect("memory-only persist cannot fail");
+        auth.authorize_publish("client-a", &topic("own/data"))
+            .await
+            .expect("replaced with no rule allows");
+        let counts = registry
+            .counter_snapshot("built_in_database")
+            .expect("built-in counters exist");
+        assert_eq!((counts.allow, counts.deny, counts.total), (4, 1, 5));
+    }
+
+    #[tokio::test]
+    async fn unmatched_scan_follows_no_match_setting() {
+        // One rule that never matches the probe topic. Unlinked state
+        // keeps today's behaviour (unmatched denied).
+        let auth = MemoryAuth::new();
+        auth.add_rule(AclRule::new(
+            "client-a",
+            AclAction::Publish,
+            "other/#",
+            true,
+        ))
+        .expect("memory-only persist cannot fail");
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_err());
+        assert!(!auth.authz_deny_disconnects());
+
+        // Linked `no_match: allow` admits the unmatched publish and the
+        // unmatched subscribe while a matched deny still denies.
+        let store = Arc::new(AuthzSettingsStore::from_conf(
+            &broker_config::AuthzSettingsConf {
+                no_match: "allow".to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            },
+        ));
+        auth.set_authz_settings(Arc::clone(&store));
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authorize_subscribe("client-a", &filter("own/#"))
+            .await
+            .is_ok());
+        auth.add_rule(AclRule::new("client-a", AclAction::Publish, "own/#", false))
+            .expect("memory-only persist cannot fail");
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_err());
+
+        // Linked `no_match: deny` with `deny_action: disconnect` denies
+        // the unmatched probe and reports the disconnect.
+        store
+            .replace(broker_config::AuthzSettingsConf {
+                no_match: "deny".to_string(),
+                deny_action: "disconnect".to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            })
+            .expect("valid replace");
+        assert!(auth
+            .authorize_publish("client-b", &topic("own/data"))
+            .await
+            .is_err());
+        assert!(auth.authz_deny_disconnects());
+    }
+
+    #[tokio::test]
+    async fn open_broker_without_rules_stays_open() {
+        // No rules at all: the broker stays open even with an explicit
+        // `no_match: deny` linked.
+        let auth = MemoryAuth::new();
+        let store = Arc::new(AuthzSettingsStore::from_conf(
+            &broker_config::AuthzSettingsConf::default(),
+        ));
+        auth.set_authz_settings(store);
+        assert!(auth.authorize_publish("any", &topic("a/b")).await.is_ok());
+        assert!(auth
+            .authorize_subscribe("any", &filter("a/#"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn test_authenticate_valid_and_invalid_passwords() {
         let auth = MemoryAuth::new();
         auth.add_user("alice", b"s3cret")
@@ -2317,6 +3901,7 @@ mod tests {
                 },
             ],
             acls: vec![],
+            tenants: vec![],
         };
         let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
         auth.seed_from_snapshot(&conf)
@@ -2487,6 +4072,91 @@ mod tests {
             .await
             .is_err());
         assert!(auth.authorize_subscribe("c", &filter("#")).await.is_err());
+    }
+
+    /// SA-23 cover table through the production entry.
+    ///
+    /// Each row holds a request filter, one rule pattern with its allow
+    /// flag, and the expected subscribe decision. Allow rows run against
+    /// that single allow rule. Deny rows run against the deny rule plus
+    /// a trailing catch-all allow. The catch-all is `#`, or `$SYS/#`
+    /// for a `$` request. A denied row proves the deny overlapped the
+    /// request. An allowed row proves it did not.
+    #[tokio::test]
+    async fn sa23_cover_table_through_production_entry() {
+        // (request, rule, rule allows, expected allow).
+        let rows: &[(&str, &str, bool, bool)] = &[
+            // A wider rule covers a narrower request.
+            ("a/b", "a/b", true, true),
+            ("a/b", "a/+", true, true),
+            ("a/b", "a/#", true, true),
+            ("a/b", "#", true, true),
+            ("a", "a/#", true, true),
+            ("a/b/c", "a/#", true, true),
+            ("a/+", "a/#", true, true),
+            ("+", "#", true, true),
+            ("sport/tennis/player1", "sport/tennis/#", true, true),
+            ("sport/+", "sport/#", true, true),
+            ("a/b", "a/b/#", true, true),
+            ("a", "#", true, true),
+            ("#", "#", true, true),
+            ("a/#", "#", true, true),
+            ("$SYS/broker/uptime", "$SYS/#", true, true),
+            ("$SYS/broker", "$SYS/+", true, true),
+            // A narrower rule never covers a wider request.
+            ("a/#", "a/+", true, false),
+            ("#", "+", true, false),
+            ("a/b/c", "a/+", true, false),
+            ("a", "a/+", true, false),
+            ("sensors/+", "sensors/temp", true, false),
+            ("#", "sensors/#", true, false),
+            ("a/b", "b/+", true, false),
+            ("a/b", "a/b/+", true, false),
+            // `#` and `+` at the first level never reach `$` topics.
+            ("$SYS/broker/uptime", "#", true, false),
+            ("$SYS/#", "#", true, false),
+            ("$SYS/broker", "+", true, false),
+            ("$a", "+", true, false),
+            ("$a", "#", true, false),
+            // A deny rule applies on overlap, not only on cover.
+            ("#", "secret/#", false, false),
+            ("secret/x", "secret/#", false, false),
+            ("secret/#", "secret/#", false, false),
+            ("secret", "secret/#", false, false),
+            ("other/x", "secret/#", false, true),
+            ("other/#", "secret/#", false, true),
+            ("$SYS/broker/uptime", "secret/#", false, true),
+            ("$SYS/other/x", "$SYS/broker/#", false, true),
+            ("$SYS/broker/uptime", "$SYS/#", false, false),
+        ];
+        assert!(rows.len() >= 25, "the table holds at least 25 rows");
+        for (request, pattern, rule_allows, expected) in rows {
+            let auth = MemoryAuth::new();
+            auth.add_rule(AclRule::new(
+                "*",
+                AclAction::Subscribe,
+                (*pattern).to_string(),
+                *rule_allows,
+            ))
+            .expect("memory-only persist cannot fail");
+            if !rule_allows {
+                let catch_all = if request.starts_with('$') {
+                    "$SYS/#"
+                } else {
+                    "#"
+                };
+                auth.add_rule(AclRule::new("*", AclAction::Subscribe, catch_all, true))
+                    .expect("memory-only persist cannot fail");
+            }
+            let decision = auth
+                .authorize_subscribe("probe", &filter(request))
+                .await
+                .is_ok();
+            assert_eq!(
+                decision, *expected,
+                "row (request={request}, rule={pattern}, allows={rule_allows}) must be {expected}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3021,5 +4691,197 @@ mod tests {
             err.to_string().contains("acls"),
             "error must name the field, got: {err}"
         );
+    }
+
+    /// TM-01: two tenants hold the same username with different passwords
+    /// and different rules. Each username authenticates only in its own
+    /// tenant, through the CONNECT-time lookup (not the map alone).
+    #[tokio::test]
+    async fn tm01_two_tenants_share_username_with_independent_credentials() {
+        let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
+        auth.add_user_in_tenant("tenant-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        auth.add_user_in_tenant("tenant-b", "sam", b"pw-for-b")
+            .expect("tenant-b user stores");
+        auth.add_rule_in_tenant(
+            "tenant-a",
+            AclRule::new("*", AclAction::Publish, "t/a/#", true),
+        )
+        .expect("tenant-a rule stores");
+        auth.add_rule_in_tenant(
+            "tenant-b",
+            AclRule::new("*", AclAction::Publish, "t/b/#", true),
+        )
+        .expect("tenant-b rule stores");
+        // Each password works only in its own tenant.
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-b"))
+            .await
+            .is_err());
+        assert!(auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_err());
+        // Each rule grants only in its own tenant.
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic("t/a/1"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic("t/b/1"))
+            .await
+            .is_err());
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic("t/b/1"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic("t/a/1"))
+            .await
+            .is_err());
+    }
+
+    /// TM-01: the exported snapshot carries both tenants. A fresh store
+    /// seeded from it (restart) and the same store re-seeded from it
+    /// (reload) keep both tenants with the same passwords and rules.
+    #[tokio::test]
+    async fn tm01_restart_and_reload_keep_both_tenants() {
+        let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
+        auth.add_user_in_tenant("tenant-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        auth.add_user_in_tenant("tenant-b", "sam", b"pw-for-b")
+            .expect("tenant-b user stores");
+        auth.add_rule_in_tenant(
+            "tenant-a",
+            AclRule::new("*", AclAction::Publish, "t/a/#", true),
+        )
+        .expect("tenant-a rule stores");
+        auth.add_rule_in_tenant(
+            "tenant-b",
+            AclRule::new("*", AclAction::Subscribe, "t/b/#", true),
+        )
+        .expect("tenant-b rule stores");
+        // The export carries both tables, tenants sorted.
+        let exported = auth.export_conf();
+        assert_eq!(exported.tenants.len(), 2);
+        assert_eq!(exported.tenants[0].tenant, "tenant-a");
+        assert_eq!(exported.tenants[1].tenant, "tenant-b");
+        // Restart: a fresh store from the exported root keeps both.
+        let rebooted = MemoryAuth::from_snapshot(&exported);
+        for (tenant, password) in [("tenant-a", b"pw-for-a"), ("tenant-b", b"pw-for-b")] {
+            assert!(rebooted
+                .authenticate_in_tenant(tenant, "c", Some("sam"), Some(password))
+                .await
+                .is_ok());
+        }
+        assert!(rebooted
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic("t/a/1"))
+            .await
+            .is_ok());
+        assert!(rebooted
+            .authorize_subscribe_in_tenant("tenant-b", "sam", &filter("t/b/#"))
+            .await
+            .is_ok());
+        // Reload: the live store re-seeded from the same root keeps both.
+        auth.apply_snapshot_conf(&exported)
+            .expect("reload of the exported root succeeds");
+        for (tenant, password) in [("tenant-a", b"pw-for-a"), ("tenant-b", b"pw-for-b")] {
+            assert!(auth
+                .authenticate_in_tenant(tenant, "c", Some("sam"), Some(password))
+                .await
+                .is_ok());
+        }
+    }
+
+    /// TM-01: a snapshot from before per-tenant storage (root fields
+    /// only, no `tenants` list) loads as the default tenant with the same
+    /// passwords and rules; other tenants stay closed.
+    #[tokio::test]
+    async fn tm01_pre_change_snapshot_loads_as_default_tenant() {
+        let conf = MqttUsersConf {
+            users: vec![MqttUser {
+                username: "base".to_string(),
+                password_hash: encode_stored_verifier(&PasswordVerifier::Sha256(
+                    MemoryAuth::digest(b"base-pw"),
+                )),
+                max_connections: None,
+                max_publish_rate: None,
+                max_publish_burst: None,
+            }],
+            acls: vec![AclConf {
+                username: "base".to_string(),
+                topic: "t/#".to_string(),
+                action: "all".to_string(),
+                allow: true,
+            }],
+            tenants: vec![],
+        };
+        let auth = MemoryAuth::from_snapshot(&conf);
+        assert!(auth
+            .authenticate("c", Some("base"), Some(b"base-pw"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authenticate("c", Some("base"), Some(b"wrong"))
+            .await
+            .is_err());
+        assert!(auth.authorize_publish("base", &topic("t/1")).await.is_ok());
+        // Another tenant with no table stays closed (deny, counted).
+        let before = auth.tenant_denial_count();
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("base"), Some(b"base-pw"))
+            .await
+            .is_err());
+        assert!(
+            auth.tenant_denial_count() > before,
+            "unknown-tenant denials stay counted"
+        );
+    }
+
+    /// TM-01: each bad per-tenant write fails with the field named and
+    /// leaves the running state unchanged.
+    #[tokio::test]
+    async fn tm01_bad_tenant_write_fails_and_keeps_running_state() {
+        let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
+        auth.add_user_in_tenant("tenant-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        // A snapshot that names the default tenant inside `tenants` is
+        // invalid; the reload rejects it and the live user still works.
+        let mut bad = auth.export_conf();
+        bad.tenants.push(broker_config::TenantMqttConf {
+            tenant: "default".to_string(),
+            users: vec![],
+            acls: vec![],
+        });
+        let err = bad
+            .validate()
+            .expect_err("default tenant inside `tenants` must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        assert!(auth.apply_snapshot_conf(&bad).is_err());
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_ok());
+        // A duplicated tenant table is invalid too; state stays.
+        let mut dup = auth.export_conf();
+        dup.tenants.push(broker_config::TenantMqttConf {
+            tenant: "tenant-a".to_string(),
+            users: vec![],
+            acls: vec![],
+        });
+        let err = dup.validate().expect_err("duplicated tenant must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_ok());
     }
 }

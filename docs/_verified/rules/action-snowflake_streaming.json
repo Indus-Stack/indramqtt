@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "snowflake_streaming"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-snowflake_streaming",
+        "name": "dx2-action-snowflake_streaming",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "snowflake_streaming"
+      },
+      "name": "dx2-action-snowflake_streaming",
+      "status": 201,
+      "type": "snowflake_streaming"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-snowflake_streaming\" already exists"
+      },
+      "name": "dx2-action-snowflake_streaming",
+      "status": 400,
+      "type": "snowflake_streaming"
+    }
+  ],
+  "item": "action-snowflake_streaming",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

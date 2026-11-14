@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-wss-verify-client-cert"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--wss-verify-client-cert"

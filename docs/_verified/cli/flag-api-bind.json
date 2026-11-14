@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-api-bind",
+  "match": "--api-bind",
+  "output": "      --api-bind <API_BIND>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

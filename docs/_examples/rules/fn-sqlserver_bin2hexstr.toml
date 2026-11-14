@@ -1,0 +1,39 @@
+[example]
+area = "rules"
+item = "fn-sqlserver_bin2hexstr"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT sqlserver_bin2hexstr('AB') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "0x4142"}'
+
+[[case]]
+sql = "SELECT sqlserver_bin2hexstr('a') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "0x61"}'
+
+[[case]]
+sql = "SELECT sqlserver_bin2hexstr('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "0x"}'
+
+[[case]]
+sql = "SELECT sqlserver_bin2hexstr(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT sqlserver_bin2hexstr() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

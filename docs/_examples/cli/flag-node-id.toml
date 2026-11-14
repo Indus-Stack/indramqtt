@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-node-id"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--node-id"

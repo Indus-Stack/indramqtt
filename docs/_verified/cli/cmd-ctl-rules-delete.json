@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "rules",
+    "--help"
+  ],
+  "item": "cmd-ctl-rules-delete",
+  "match": "delete",
+  "output": "Routing rules: list, show, create, delete\n  delete  Delete one rule. Destructive: requires `--yes` or an interactive confirm",
+  "output_bytes": 564,
+  "returncode": 0,
+  "verified": true
+}

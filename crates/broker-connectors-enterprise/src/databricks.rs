@@ -872,11 +872,9 @@ impl DatabricksSink {
         if self.config.column_mappings.is_empty() {
             match &value {
                 serde_json::Value::Object(map) => {
-                    let mut keys: Vec<&String> = map.keys().collect();
-                    keys.sort();
-                    for key in keys {
+                    for (key, value) in map {
                         columns.push(key.clone());
-                        values.push(map[key].clone());
+                        values.push(value.clone());
                     }
                 }
                 other => {
@@ -1152,6 +1150,36 @@ mod tests {
         let transport = Arc::new(MockDatabricksTransport::new());
         let sink = Arc::new(DatabricksSink::new(config, transport.clone()).unwrap());
         (sink, transport)
+    }
+
+    #[test]
+    fn mv00_columns_and_parameters_keep_projection_positions() {
+        let mut config = test_config();
+        config.column_mappings.clear();
+        let (sink, _) = test_sink(config);
+        let (row, _) = sink
+            .build_row(
+                &Topic::new("order/in").expect("topic"),
+                &Bytes::from_static(br#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#),
+                QoS::AtMostOnce,
+                0,
+            )
+            .expect("ordered table row");
+        assert_eq!(row.columns, ["b", "a", "obj"]);
+        let values: Vec<&str> = row
+            .params
+            .iter()
+            .map(|param| param.value.as_str())
+            .collect();
+        assert_eq!(values, ["2", "1", r#"{"z":3,"a":4}"#]);
+        let (sql, parameters) = DatabricksSink::merge_group(
+            &row.table,
+            &row.columns,
+            std::slice::from_ref(&row),
+            &sink.config,
+        );
+        assert!(sql.ends_with("(b, a, obj) VALUES (?, ?, ?)"), "{sql}");
+        assert_eq!(parameters, row.params);
     }
 
     #[test]

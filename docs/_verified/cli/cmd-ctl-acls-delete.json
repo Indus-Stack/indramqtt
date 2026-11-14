@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "acls",
+    "--help"
+  ],
+  "item": "cmd-ctl-acls-delete",
+  "match": "delete",
+  "output": "Per-tenant ACL rules: list, create, delete\n  delete  Delete one ACL rule by its index in the tenant list. Destructive: requires `--yes` or an interactive confirm",
+  "output_bytes": 415,
+  "returncode": 0,
+  "verified": true
+}

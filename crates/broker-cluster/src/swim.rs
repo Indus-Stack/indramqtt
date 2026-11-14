@@ -1296,9 +1296,7 @@ mod tests {
 
         fn signing_key(seed: u8) -> SigningKey {
             let bytes = [seed; 32];
-            let field_bytes =
-                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-            SigningKey::from_bytes(&field_bytes).expect("test seed")
+            SigningKey::from_slice(&bytes).expect("test seed")
         }
         fn mint(signing: &SigningKey, kid: &str, max_nodes: usize, node_id: &str) -> String {
             let payload = LicensePayload {
@@ -1386,9 +1384,7 @@ mod tests {
 
         fn signing_key(seed: u8) -> SigningKey {
             let bytes = [seed; 32];
-            let field_bytes =
-                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-            SigningKey::from_bytes(&field_bytes).expect("test seed")
+            SigningKey::from_slice(&bytes).expect("test seed")
         }
         fn mint(signing: &SigningKey, kid: &str, max_nodes: usize, node_id: &str) -> String {
             let payload = LicensePayload {
@@ -1462,9 +1458,7 @@ mod tests {
 
         fn signing_key(seed: u8) -> SigningKey {
             let bytes = [seed; 32];
-            let field_bytes =
-                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-            SigningKey::from_bytes(&field_bytes).expect("test seed")
+            SigningKey::from_slice(&bytes).expect("test seed")
         }
         fn mint(signing: &SigningKey, kid: &str, max_nodes: usize, node_id: &str) -> String {
             let payload = LicensePayload {

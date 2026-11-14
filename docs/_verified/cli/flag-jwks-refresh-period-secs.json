@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-jwks-refresh-period-secs",
+  "match": "--jwks-refresh-period-secs",
+  "output": "      --jwks-refresh-period-secs <JWKS_REFRESH_PERIOD_SECS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

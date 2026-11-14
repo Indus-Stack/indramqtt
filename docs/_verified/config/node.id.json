@@ -1,0 +1,9 @@
+{
+  "action": "Read the node list with `GET /api/v5/nodes`.",
+  "config": "[node]\nid = \"docs-node-7\"\n",
+  "item": "node.id",
+  "kind": "setting",
+  "output": "docs-node-7",
+  "returncode": 0,
+  "verified": true
+}

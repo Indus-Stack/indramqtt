@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-jwks-ca-cert",
+  "match": "--jwks-ca-cert",
+  "output": "      --jwks-ca-cert <JWKS_CA_CERT>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

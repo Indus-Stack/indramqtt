@@ -64,6 +64,11 @@ pub struct Metrics {
     // Reads via `tenant_mismatch_dropped`; management snapshots stay
     // unchanged (management output belongs to MT-07).
     tenant_mismatch_dropped: AtomicU64,
+    // Per-tenant limit refusals (TM-06). Each bumps where the refusal
+    // already happens; the refused use never proceeds.
+    tenant_conn_refused: AtomicU64,
+    tenant_sess_refused: AtomicU64,
+    tenant_retained_dropped: AtomicU64,
     // QoS 1 downlinks spilled past the in-memory window into the bounded
     // per-session overflow buffer (B4-01). Each bump means one live
     // delivery that IS still tracked for DUP redelivery, unlike
@@ -107,12 +112,6 @@ pub struct Metrics {
     qos0_shed_by_client: std::sync::RwLock<HashMap<String, u64>>,
     puback_deferred: AtomicU64,
     puback_deferred_released: AtomicU64,
-    credit_clamped: AtomicU64,
-    credit_exhausted: AtomicU64,
-    // Edge flow-control frames observed. Counted on receipt today;
-    // per-connection gating against them lands with the kernel queue
-    // split, so no delivery decision may depend on this yet.
-    credit_received: AtomicU64,
 }
 
 /// One consistent read of every counter for API handlers.
@@ -156,14 +155,14 @@ pub struct MetricsSnapshot {
     pub rule_spill_torn: u64,
     pub rule_spill_recovered: u64,
     pub tenant_mismatch_dropped: u64,
+    pub tenant_conn_refused: u64,
+    pub tenant_sess_refused: u64,
+    pub tenant_retained_dropped: u64,
     pub transport_sent: u64,
     pub transport_send_failed: u64,
     pub egress_qos0_shed: u64,
     pub puback_deferred: u64,
     pub puback_deferred_released: u64,
-    pub credit_clamped: u64,
-    pub credit_exhausted: u64,
-    pub credit_received: u64,
 }
 
 impl Metrics {
@@ -173,7 +172,11 @@ impl Metrics {
 
     /// One MQTT ingress message accepted over BrokerLink.
     pub fn inc_messages_received(&self) -> u64 {
-        self.messages_received.fetch_add(1, Ordering::Relaxed) + 1
+        self.inc_messages_received_by(1)
+    }
+
+    pub fn inc_messages_received_by(&self, n: u64) -> u64 {
+        self.messages_received.fetch_add(n, Ordering::Relaxed) + n
     }
 
     /// One `PublishOut` frame admitted into the shard transport mailbox
@@ -580,23 +583,6 @@ impl Metrics {
             + 1
     }
 
-    /// Edge flow-control snapshots applied to a kernel credit balance
-    /// (fires with the kernel queue split; zero until then).
-    pub fn inc_credit_clamped(&self) -> u64 {
-        self.credit_clamped.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Route refusals for exhausted credit (fires with the kernel queue
-    /// split; zero until then).
-    pub fn inc_credit_exhausted(&self) -> u64 {
-        self.credit_exhausted.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Edge flow-control frames observed (counted today, gating later).
-    pub fn inc_credit_received(&self) -> u64 {
-        self.credit_received.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
     pub fn connect_received(&self) -> u64 {
         self.connect_received.load(Ordering::Relaxed)
     }
@@ -685,6 +671,33 @@ impl Metrics {
         self.tenant_mismatch_dropped.load(Ordering::Relaxed)
     }
 
+    /// One CONNECT refused by the per-tenant connection bound.
+    pub fn inc_tenant_conn_refused(&self) -> u64 {
+        self.tenant_conn_refused.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// One CONNECT refused by the per-tenant session bound.
+    pub fn inc_tenant_sess_refused(&self) -> u64 {
+        self.tenant_sess_refused.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// One retained write dropped by the per-tenant retained bound.
+    pub fn inc_tenant_retained_dropped(&self) -> u64 {
+        self.tenant_retained_dropped.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn tenant_conn_refused(&self) -> u64 {
+        self.tenant_conn_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn tenant_sess_refused(&self) -> u64 {
+        self.tenant_sess_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn tenant_retained_dropped(&self) -> u64 {
+        self.tenant_retained_dropped.load(Ordering::Relaxed)
+    }
+
     pub fn inflight_spilled(&self) -> u64 {
         self.inflight_spilled.load(Ordering::Relaxed)
     }
@@ -737,18 +750,6 @@ impl Metrics {
         self.puback_deferred_released.load(Ordering::Relaxed)
     }
 
-    pub fn credit_clamped(&self) -> u64 {
-        self.credit_clamped.load(Ordering::Relaxed)
-    }
-
-    pub fn credit_exhausted(&self) -> u64 {
-        self.credit_exhausted.load(Ordering::Relaxed)
-    }
-
-    pub fn credit_received(&self) -> u64 {
-        self.credit_received.load(Ordering::Relaxed)
-    }
-
     /// Copy every counter in one call for API handlers.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -787,14 +788,14 @@ impl Metrics {
             rule_spill_torn: self.rule_spill_torn(),
             rule_spill_recovered: self.rule_spill_recovered(),
             tenant_mismatch_dropped: self.tenant_mismatch_dropped(),
+            tenant_conn_refused: self.tenant_conn_refused(),
+            tenant_sess_refused: self.tenant_sess_refused(),
+            tenant_retained_dropped: self.tenant_retained_dropped(),
             transport_sent: self.transport_sent(),
             transport_send_failed: self.transport_send_failed(),
             egress_qos0_shed: self.egress_qos0_shed(),
             puback_deferred: self.puback_deferred(),
             puback_deferred_released: self.puback_deferred_released(),
-            credit_clamped: self.credit_clamped(),
-            credit_exhausted: self.credit_exhausted(),
-            credit_received: self.credit_received(),
         }
     }
 
@@ -870,18 +871,9 @@ impl Metrics {
               # HELP indramqtt_puback_deferred_total QoS 1 publishes whose PUBACK is deferred for credit.\n\
               # TYPE indramqtt_puback_deferred_total counter\n\
               indramqtt_puback_deferred_total {}\n\
-              # HELP indramqtt_puback_deferred_released_total Deferred PUBACKs released after credit arrived.\n\
-              # TYPE indramqtt_puback_deferred_released_total counter\n\
-              indramqtt_puback_deferred_released_total {}\n\
-              # HELP indramqtt_credit_clamped_total Edge flow-control snapshots applied to a kernel credit balance.\n\
-              # TYPE indramqtt_credit_clamped_total counter\n\
-              indramqtt_credit_clamped_total {}\n\
-              # HELP indramqtt_credit_exhausted_total Route refusals for exhausted credit.\n\
-              # TYPE indramqtt_credit_exhausted_total counter\n\
-              indramqtt_credit_exhausted_total {}\n\
-              # HELP indramqtt_credit_received_total Edge flow-control frames observed.\n\
-              # TYPE indramqtt_credit_received_total counter\n\
-              indramqtt_credit_received_total {}\n",
+               # HELP indramqtt_puback_deferred_released_total Deferred PUBACKs released after credit arrived.\n\
+               # TYPE indramqtt_puback_deferred_released_total counter\n\
+               indramqtt_puback_deferred_released_total {}\n",
             self.messages_received(),
             self.messages_forwarded(),
             self.messages_dropped(),
@@ -906,9 +898,6 @@ impl Metrics {
             self.egress_qos0_shed(),
             self.puback_deferred(),
             self.puback_deferred_released(),
-            self.credit_clamped(),
-            self.credit_exhausted(),
-            self.credit_received(),
         )
     }
 }
@@ -1294,9 +1283,6 @@ mod tests {
         assert_eq!(metrics.inc_egress_qos0_shed(), 1);
         assert_eq!(metrics.inc_puback_deferred(), 1);
         assert_eq!(metrics.inc_puback_deferred_released(), 1);
-        assert_eq!(metrics.inc_credit_clamped(), 1);
-        assert_eq!(metrics.inc_credit_exhausted(), 1);
-        assert_eq!(metrics.inc_credit_received(), 1);
 
         let snap = metrics.snapshot();
         assert_eq!(snap.transport_sent, 5);
@@ -1304,9 +1290,6 @@ mod tests {
         assert_eq!(snap.egress_qos0_shed, 1);
         assert_eq!(snap.puback_deferred, 1);
         assert_eq!(snap.puback_deferred_released, 1);
-        assert_eq!(snap.credit_clamped, 1);
-        assert_eq!(snap.credit_exhausted, 1);
-        assert_eq!(snap.credit_received, 1);
 
         let text = metrics.render_prometheus_metrics();
         assert!(text.contains("indramqtt_transport_sent_total 5\n"));
@@ -1314,9 +1297,6 @@ mod tests {
         assert!(text.contains("indramqtt_egress_qos0_shed_total 1\n"));
         assert!(text.contains("indramqtt_puback_deferred_total 1\n"));
         assert!(text.contains("indramqtt_puback_deferred_released_total 1\n"));
-        assert!(text.contains("indramqtt_credit_clamped_total 1\n"));
-        assert!(text.contains("indramqtt_credit_exhausted_total 1\n"));
-        assert!(text.contains("indramqtt_credit_received_total 1\n"));
     }
 
     #[test]
@@ -1494,5 +1474,78 @@ mod tests {
         assert_eq!(snap.retained_max, 9);
         assert!(snap.connections <= 99);
         assert!(snap.subscriptions <= 198);
+    }
+
+    /// Drift test for the generated metrics page (DOC-02).
+    ///
+    /// The generator owns the page. This test runs it in check mode.
+    /// It then checks each documented name against the code that
+    /// registers it: the exposition for exposed counters, the
+    /// snapshot shape for snapshot fields.
+    #[test]
+    fn generated_metrics_page_matches_registered_metrics() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let output = std::process::Command::new("python3")
+            .arg("tools/gen_reference_docs.py")
+            .arg("--check")
+            .arg("metrics")
+            .current_dir(&root)
+            .output()
+            .expect("python3 runs the generator");
+        assert!(
+            output.status.success(),
+            "generator check failed:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let page = std::fs::read_to_string(root.join("docs").join("reference").join("metrics.md"))
+            .expect("committed page exists");
+        let exposed = page
+            .split("## Snapshot counters")
+            .next()
+            .expect("exposed section exists");
+        let snapshot = page
+            .split("## Snapshot counters")
+            .nth(1)
+            .expect("snapshot section exists");
+        let metrics = Metrics::new();
+        let text = metrics.render_prometheus_metrics();
+        let mut exposed_rows = 0;
+        for line in exposed.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let name = line.split('`').nth(1).expect("row carries a name");
+            assert!(
+                text.contains(name),
+                "exposition serves documented metric {name}"
+            );
+            exposed_rows += 1;
+        }
+        assert!(exposed_rows >= 1, "page lists exposed metrics");
+        // Each exposition name owns one row, so the page cannot
+        // miss a counter that the broker serves.
+        for line in text.lines() {
+            let name = line.split_whitespace().next().unwrap_or("");
+            if !name.starts_with("indramqtt_") {
+                continue;
+            }
+            assert!(page.contains(name), "page documents served metric {name}");
+        }
+        let shape = format!("{:?}", MetricsSnapshot::default());
+        let mut snapshot_rows = 0;
+        for line in snapshot.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let field = line.split('`').nth(1).expect("row carries a field");
+            assert!(
+                shape.contains(field),
+                "snapshot carries documented field {field}"
+            );
+            snapshot_rows += 1;
+        }
+        assert!(snapshot_rows >= 1, "page lists snapshot fields");
     }
 }

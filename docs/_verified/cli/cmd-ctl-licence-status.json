@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "licence",
+    "--help"
+  ],
+  "item": "cmd-ctl-licence-status",
+  "match": "status",
+  "output": "  status   Show the current licence state (same as a bare `licence`)",
+  "output_bytes": 528,
+  "returncode": 0,
+  "verified": true
+}

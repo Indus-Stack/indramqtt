@@ -217,6 +217,70 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// True when the SQL carries `INTO connector("<id>")`.
+/// The scan skips quoted text and bracket depth.
+/// It reports a valid target only; invalid text returns false.
+fn sql_has_into_connector(sql: &str) -> bool {
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let total = chars.len();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = 0;
+    let mut depth = 0u32;
+    let mut quote: Option<char> = None;
+    while i < total {
+        let (byte, c) = chars[i];
+        if let Some(mark) = quote {
+            if c == mark {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                let is_into = depth == 0
+                    && (c == 'i' || c == 'I')
+                    && sql.len() - byte >= 4
+                    && sql[byte..byte + 4].eq_ignore_ascii_case("into")
+                    && (byte == 0 || !is_word(sql[..byte].chars().next_back().unwrap_or(' ')))
+                    && (byte + 4 >= sql.len()
+                        || !is_word(sql[byte + 4..].chars().next().unwrap_or(' ')));
+                if !is_into {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 4;
+                while j < total && chars[j].1.is_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                while j < total && (chars[j].1.is_alphanumeric() || chars[j].1 == '_') {
+                    j += 1;
+                }
+                let word: String = chars[start..j].iter().map(|(_, c)| *c).collect();
+                if !word.eq_ignore_ascii_case("connector") {
+                    i += 1;
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Validate a full snapshot across roots.
 ///
 /// Per-root structural checks run first; then cross-root checks (every rule
@@ -238,8 +302,51 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
     if let Err(err) = snapshot.rules.validate() {
         problems.push(err.to_string());
     }
-    if let Err(err) = snapshot.connectors.validate() {
+    // A stored legacy or pending-kind record stays readable. The
+    // strict load still refuses a new pending create, but a whole
+    // snapshot keeps the record and marks it pending at apply time.
+    // A refused kind never reloads. A pending kind stays readable.
+    if let Err(err) = snapshot.connectors.validate_legacy() {
         problems.push(err.to_string());
+    }
+    if let Err(err) = snapshot.actions.validate_legacy() {
+        problems.push(err.to_string());
+    }
+    if let Err(err) = snapshot.sources.validate_legacy() {
+        problems.push(err.to_string());
+    }
+    for (index, entry) in snapshot.connectors.connectors.iter().enumerate() {
+        if matches!(
+            crate::kind_state(entry.connector_type.as_str()),
+            Some(crate::KindState::Refused(_))
+        ) {
+            problems.push(format!(
+                "connectors.connectors[{index}].connector_type {:?} is not available in this broker (field `connector_type`)",
+                entry.connector_type
+            ));
+        }
+    }
+    for (index, entry) in snapshot.actions.actions.iter().enumerate() {
+        if matches!(
+            crate::kind_state(entry.action_type.as_str()),
+            Some(crate::KindState::Refused(_))
+        ) {
+            problems.push(format!(
+                "actions.actions[{index}].action_type {:?} is not available in this broker (field `action_type`)",
+                entry.action_type
+            ));
+        }
+    }
+    for (index, entry) in snapshot.sources.sources.iter().enumerate() {
+        if matches!(
+            crate::kind_state(entry.source_type.as_str()),
+            Some(crate::KindState::Refused(_))
+        ) {
+            problems.push(format!(
+                "sources.sources[{index}].source_type {:?} is not available in this broker (field `source_type`)",
+                entry.source_type
+            ));
+        }
     }
     let known: HashSet<&str> = snapshot
         .connectors
@@ -255,6 +362,25 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
                         "rules.rules[{index}].actions[{action_index}].connector_id {connector_id:?} names an unknown connector (field `rules.rules[{index}].actions[{action_index}].connector_id`)"
                     ));
                 }
+            }
+        }
+        // R-TENANT: a connector forward carries no tenant label.
+        // Refuse one outside the default tenant here, so reload
+        // answers 400 before any live owner applies.
+        let tenant = crate::canonical_rule_tenant(&rule.tenant);
+        if tenant != "default" {
+            let explicit = rule
+                .actions
+                .iter()
+                .any(|action| matches!(action, crate::RuleActionEntry::ForwardConnector { .. }));
+            let from_sql = rule
+                .sql_query
+                .as_ref()
+                .is_some_and(|s| sql_has_into_connector(s.as_str()));
+            if explicit || from_sql {
+                problems.push(format!(
+                    "rules.rules[{index}] tenant {tenant:?} cannot forward to connector actions (field `rules.rules[{index}].tenant`)"
+                ));
             }
         }
     }
@@ -273,6 +399,22 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
                     "mqtt_users.users[{index}].password_hash cannot resolve {}: {err} (field `mqtt_users.users[{index}].password_hash`)",
                     crate::secrets::redact_value(trimmed)
                 ));
+            }
+        }
+    }
+    // Same fail-closed secret check for each per-tenant table (TM-01):
+    // an unresolvable tenant password rejects the change set instead of
+    // applying with a locked account.
+    for (table_index, table) in snapshot.mqtt_users.tenants.iter().enumerate() {
+        for (index, user) in table.users.iter().enumerate() {
+            let trimmed = user.password_hash.trim();
+            if crate::secrets::is_secret_ref(trimmed) {
+                if let Err(err) = crate::secrets::resolve_secret(trimmed) {
+                    problems.push(format!(
+                        "mqtt_users.tenants[{table_index}].users[{index}].password_hash cannot resolve {}: {err} (field `mqtt_users.tenants[{table_index}].users[{index}].password_hash`)",
+                        crate::secrets::redact_value(trimmed)
+                    ));
+                }
             }
         }
     }
@@ -489,6 +631,89 @@ pub fn diff_snapshots(old: &FullSnapshot, new: &FullSnapshot) -> Vec<ConfigDiff>
                 .unwrap_or_else(|_| format!("{} entries", new.mqtt_users.acls.len())),
         ));
     }
+    // Per-tenant tables (TM-01), keyed by tenant id. A table that only
+    // one side holds is one row; a table both hold diffs per user plus
+    // one row when its ACL list changes. Secrets stay redacted.
+    {
+        let old_tables: HashMap<&str, &crate::TenantMqttConf> = old
+            .mqtt_users
+            .tenants
+            .iter()
+            .map(|t| (t.tenant.as_str(), t))
+            .collect();
+        let new_tables: HashMap<&str, &crate::TenantMqttConf> = new
+            .mqtt_users
+            .tenants
+            .iter()
+            .map(|t| (t.tenant.as_str(), t))
+            .collect();
+        for tenant in sorted_keys(&old_tables, &new_tables) {
+            match (
+                old_tables.get(tenant.as_str()),
+                new_tables.get(tenant.as_str()),
+            ) {
+                (Some(a), Some(b)) => {
+                    let old_users: HashMap<&str, &crate::MqttUser> =
+                        a.users.iter().map(|u| (u.username.as_str(), u)).collect();
+                    let new_users: HashMap<&str, &crate::MqttUser> =
+                        b.users.iter().map(|u| (u.username.as_str(), u)).collect();
+                    for username in sorted_keys(&old_users, &new_users) {
+                        match (
+                            old_users.get(username.as_str()),
+                            new_users.get(username.as_str()),
+                        ) {
+                            (Some(u), Some(v)) => {
+                                if u != v {
+                                    out.push(row(
+                                        format!("mqtt_users.tenants[{tenant}].users[{username}]"),
+                                        &render_mqtt_user(u),
+                                        &render_mqtt_user(v),
+                                    ));
+                                }
+                            }
+                            (None, Some(_)) => out.push(row(
+                                format!("mqtt_users.tenants[{tenant}].users[{username}]"),
+                                "<absent>",
+                                "<present>",
+                            )),
+                            (Some(_), None) => out.push(row(
+                                format!("mqtt_users.tenants[{tenant}].users[{username}]"),
+                                "<present>",
+                                "<absent>",
+                            )),
+                            (None, None) => {}
+                        }
+                    }
+                    if a.acls != b.acls {
+                        let mut old_value =
+                            serde_json::to_value(&a.acls).unwrap_or(serde_json::Value::Null);
+                        redact_json_value(&mut old_value);
+                        let mut new_value =
+                            serde_json::to_value(&b.acls).unwrap_or(serde_json::Value::Null);
+                        redact_json_value(&mut new_value);
+                        out.push(row(
+                            format!("mqtt_users.tenants[{tenant}].acls"),
+                            &serde_json::to_string(&old_value)
+                                .unwrap_or_else(|_| format!("{} entries", a.acls.len())),
+                            &serde_json::to_string(&new_value)
+                                .unwrap_or_else(|_| format!("{} entries", b.acls.len())),
+                        ));
+                    }
+                }
+                (None, Some(_)) => out.push(row(
+                    format!("mqtt_users.tenants[{tenant}]"),
+                    "<absent>",
+                    "<present>",
+                )),
+                (Some(_), None) => out.push(row(
+                    format!("mqtt_users.tenants[{tenant}]"),
+                    "<present>",
+                    "<absent>",
+                )),
+                (None, None) => {}
+            }
+        }
+    }
     // Rules keyed by id.
     let old_rules: HashMap<&str, &crate::RuleEntry> =
         old.rules.rules.iter().map(|r| (r.id.as_str(), r)).collect();
@@ -634,11 +859,15 @@ mod tests {
             mqtt_users: MqttUsersConf {
                 users: Vec::new(),
                 acls: Vec::new(),
+                tenants: Vec::new(),
             },
             rules: crate::RulesConf {
                 rules: vec![crate::RuleEntry {
                     id: "r1".to_string(),
                     name: "r1".to_string(),
+                    description: String::new(),
+                    metadata: serde_json::json!({}),
+                    tenant: "default".to_string(),
                     topic_filter: "a/#".to_string(),
                     sql_query: None,
                     enabled: true,
@@ -666,6 +895,7 @@ mod tests {
             authn_chain: AuthnChainConf::default(),
             authn_node_cache: AuthnNodeCacheConf::default(),
             authn_settings: AuthnSettingsConf::default(),
+            ..Default::default()
         }
     }
 
@@ -680,6 +910,10 @@ mod tests {
                 role: "viewer".to_string(),
                 description: String::new(),
                 must_change_password: false,
+                mfa_secret: Default::default(),
+                mfa_enabled: false,
+                mfa_last_step: Default::default(),
+                scopes: None,
             }],
         };
         bad.mqtt_users = MqttUsersConf {
@@ -691,6 +925,7 @@ mod tests {
                 max_publish_burst: None,
             }],
             acls: Vec::new(),
+            tenants: Vec::new(),
         };
         let err = validate_whole(&bad).expect_err("must fail");
         let text = err.to_string();

@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-licence-expiry-warn-days"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--licence-expiry-warn-days"

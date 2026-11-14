@@ -1,0 +1,9 @@
+{
+  "action": "Run the WebSocket upgrade on the configured bind.",
+  "config": "[listeners.ws]\nbind = \"127.0.0.1:8083\"\n",
+  "item": "listeners.ws.bind",
+  "kind": "setting",
+  "output": "ws-ok",
+  "returncode": 0,
+  "verified": true
+}

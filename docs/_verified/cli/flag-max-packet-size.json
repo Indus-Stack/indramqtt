@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-max-packet-size",
+  "match": "--max-packet-size",
+  "output": "      --max-packet-size <MAX_PACKET_SIZE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

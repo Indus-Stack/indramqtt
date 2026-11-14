@@ -7,9 +7,9 @@
 
 **Website**: [indramqtt.com](https://indramqtt.com)
 
-[Benchmark](benchmark/README.md) • [Roadmap](ROADMAP.md) • [Architecture](ARCHITECTURE.md) • [Configuration](docs/configuration.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md)
+[Benchmark](benchmark/README.md) • [Documentation](docs/index.md) • [Roadmap](ROADMAP.md) • [Architecture](ARCHITECTURE.md) • [Configuration](docs/operations/configuration.md) • [Operations](docs/operations/index.md) • [Migration](docs/migration.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md)
 
-IndraMQTT is an open-source MQTT broker with a rule engine and connectors. It is for IoT, industrial edge and cloud systems. All the code is under the MIT licence or the Apache-2.0 licence.
+IndraMQTT is the complete MQTT platform in one small binary: broker, SQL rules, data connectors and multi-tenancy in a single process. It is for IoT, industrial edge and cloud systems. All the code is under the MIT licence or the Apache-2.0 licence.
 
 IndraMQTT is not stable yet. The first stable release is planned for April 2027. Read the [limits](#limits-at-this-time) before you use it.
 
@@ -21,62 +21,34 @@ The table shows the highest load that each broker holds for 180 s with 1 CPU and
 
 The method, the tool, the broker settings, the MQTT 3.1.1 results and the raw data are in [`benchmark/`](benchmark/README.md).
 
-| Scenario | IndraMQTT | EMQX Enterprise 6.3.0 | rumqttd 0.19.0 |
+| Scenario | IndraMQTT | Other broker A | Other broker B |
 | :--- | :--- | :--- | :--- |
 | Point-to-point QoS 0 | **100,000 msg/s** | 20,000 msg/s | none: memory increases |
 | Point-to-point QoS 1 | **30,000 msg/s** | 7,500 msg/s | none: memory increases |
 | Fan-in QoS 0 (N publishers, 1 subscriber) | 40,000 msg/s | 10,000 msg/s | **80,000 msg/s** |
 | Fan-out QoS 0 (1 publisher, N subscribers) | **160,000 deliveries/s** | 20,000 deliveries/s | 80,000 deliveries/s |
 | 10,000 idle connections, memory | **283 MiB** | 720 MiB | 638 MiB (161 clients not connected) |
-| Memory with no clients | 76 MiB | 322 MiB | **1.5 MiB** |
+| Memory with no clients | 76 MiB | 391 MiB | **1.6 MiB** |
 
 > [!IMPORTANT]
 > **Limits of this comparison**
 > - Each result is one search and one 180 s run on a shared server.
 > - The test does not use TLS. The load generator runs on the same server as the broker.
-> - IndraMQTT is behind rumqttd in the fan-in scenario and in the memory with no clients.
-> - With MQTT 3.1.1, IndraMQTT uses more memory for each connection than EMQX (21 KiB and 18 KiB).
-> - The IndraMQTT numbers use the MQTT listener of the kernel (`listeners.tcp.native = true`). This listener is off by default at this time. The default path holds approximately 5,000 msg/s in the point-to-point scenario. See [Direction: One Rust Process](#direction-one-rust-process).
+> - IndraMQTT is behind the other brokers in the fan-in scenario and in the memory with no clients.
+> - With MQTT 3.1.1, IndraMQTT uses more memory for each connection than the other broker (21 KiB and 18 KiB).
+> - The IndraMQTT numbers use the MQTT listener of the kernel. This listener is the default path.
 
 ---
 
-## Direction: One Rust Process
+## One Rust Process
 
-IndraMQTT started with two processes. An Erlang/OTP edge held the client sockets. A Rust kernel did the routing, the sessions and the rules. We measured the two paths on the same server with 1 CPU and 1 GB.
+IndraMQTT is one Rust process. The kernel holds the client sockets. It does the routing, the sessions and the rules. The container image runs one process.
 
-| Path for MQTT clients | Point-to-point QoS 0, highest sustained load | Status |
-| :--- | :--- | :--- |
-| Erlang edge, then the kernel through an IPC link (the default today) | approximately 5,000 msg/s | It works with all listeners. It will be deprecated. |
-| MQTT listener of the kernel, Rust only (`listeners.tcp.native = true`) | 100,000 msg/s | It is new. It is the path of the comparison table. |
-
-Because of these results, IndraMQTT moves to one Rust process. These are the steps:
-
-1. The kernel listener gets the functions that only the edge has today: WebSocket, secure WebSocket, PSK and client certificates.
-2. The full end-to-end test suite moves to the kernel listener.
-3. The kernel listener becomes the default.
-4. The Erlang edge is deprecated. A later release removes it.
-
-Until step 3, a broker with the default settings uses the Erlang edge and has the lower load. Set `listeners.tcp.native = true` to get the load of the comparison table. The value for the Erlang edge is from a run of 2026-10-04 with a smaller load generator.
+Do not set `listeners.*.native` in new files. The four `native` settings are deprecated and ignored. Files that set them still load with a warning. A later release removes them.
 
 ### Connections during a restart
 
-With the Erlang edge, a client stays connected when the kernel restarts. This is a property of the Erlang path only. The kernel listener does not have this property at this time. When the kernel restarts, the clients of the kernel listener connect again.
-
-The plan for the Rust process keeps this property. The plan adds no work to the message path.
-
-| Case | Plan | What a client sees |
-| :--- | :--- | :--- |
-| Planned restart (upgrade, change of the configuration) | The old process gives each open socket and a small record of the connection to the new process. | A short pause. No new connection. |
-| Crash of the process | A small process holds a copy of each socket. It gives the sockets to a new broker process. It does not touch the messages. | Most clients stay connected. A client that was in the middle of a packet connects again. |
-
-This plan has limits:
-
-- It is for Linux only.
-- TLS connections stay connected only when the encryption runs in the Linux kernel (kTLS).
-- QUIC connections connect again.
-- Session state that is only in memory is lost in a crash. This is the same today.
-
-This work starts after the kernel listener is the default. The order is: planned restart for TCP and WebSocket, then the crash case, then TLS.
+When the kernel stops, it closes the client sockets. Clients connect again. Durable sessions resume when the offline store keeps them. Clean sessions subscribe again when the new session has no state.
 
 ---
 
@@ -102,11 +74,16 @@ The code still contains licence functions from the earlier model. Examples are t
 ## Limits at This Time
 
 - IndraMQTT is not stable. The behaviour and the settings can change before release 1.0.
-- UNSUBSCRIBE is not available. The broker closes a connection that sends it.
-- The kernel listener has no WebSocket, no PSK and no client certificates. The Erlang edge has them.
-- The end-to-end test suite uses the Erlang edge. The kernel listener has the boot test and unit tests only.
 - Most connectors have tests with a test transport only. [`crates/broker-connectors/CAPABILITY.md`](crates/broker-connectors/CAPABILITY.md) shows what each connector was tested with.
 - A default build does not contain all connectors. Build with `--features full` to get all of them. The container image contains all of them.
+- Single sign-on is not stable and is not available. You can store a backend, but the login endpoints answer the error that the reference API documents (404 or 400). Log in with a user name and a password, with MFA when the user has it, or use an API key.
+- Protocol gateways are not available. `GET /gateways` reads `[]`. An unknown name misses with 404. Writes refuse with 400. Nothing is stored.
+- Message schema validations are not available. `GET /schema_validations` reads `[]`. An unknown name misses with 404. Writes refuse with 400. The schema registry itself stays: it stores and serves schemas.
+- OpenTelemetry export is not available. `GET /opentelemetry` reads the disabled config. `PUT /opentelemetry` refuses with 400. The broker runs no exporter.
+- Cluster links are not available on a single node. `GET /cluster/links` reads `[]`. `POST /cluster/links` refuses with 400. Clustering stays out of the MVP: the broker fails boot when a cluster entry requests it.
+- The broker applies `no_match` (allow or deny with no rule match). It applies `deny_action` (ignore or disconnect on denial). It applies `auth.allow_anonymous` (refuse anonymous CONNECT when false). It stores `auth.password_hash` without applying it (SA-21 owns it).
+- The broker enforces the authorization cache policy. `enable` selects caching. `max_size` bounds entries per client. `ttl` bounds staleness. `excludes` skips listed topics. Rule, source, user and client changes clear entries.
+- The broker refuses unevaluated source kinds with `400` at create and update. Nothing is stored. Stored sources from an older version stay unchanged. They deny each decision that would reach them. They raise an alarm that names the source. The operator can list, read and delete them through the API.
 
 ---
 
@@ -118,7 +95,7 @@ The code still contains licence functions from the earlier model. Examples are t
 - QoS 0, QoS 1 and QoS 2.
 - Retained messages, the last will, shared subscriptions (`$share`) and delayed messages (`$delayed`).
 - MQTT 5 subscription options, subscription identifiers, topic aliases, user properties and reason codes.
-- WebSocket and secure WebSocket on the Erlang edge.
+- WebSocket and secure WebSocket on the kernel listener.
 - Sessions that stay after a disconnect, with an offline queue.
 
 ### Routing
@@ -151,7 +128,7 @@ The full list and the test level of each connector are in [`crates/broker-connec
 - The command `indra ctl` for an operator.
 - Prometheus metrics at `/api/v1/metrics`.
 - Users, access rules, tenants and API keys.
-- One configuration file (`indra.toml`), with environment variables and command flags as more layers. See [docs/configuration.md](docs/configuration.md).
+- One configuration file (`indra.toml`), with environment variables and command flags as more layers. See [docs/operations/configuration.md](docs/operations/configuration.md).
 
 ### Cluster
 
@@ -181,29 +158,18 @@ The source is [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-
 
 ## Architecture at This Time
 
-The diagram shows the default path of today, with the Erlang edge. With `listeners.tcp.native = true`, the clients connect to the Rust kernel directly and the edge is not in the path.
+The diagram shows the broker. Clients connect to the kernel directly.
 
 ```
-                     MQTT CLIENTS
-                          │
-              TCP / TLS / WebSocket
-                          │
-              ┌──────────────────────┐
-              │     ERLANG EDGE      │
-              │  (to be deprecated)  │
-              │                      │
-              │ sockets              │
-              │ MQTT packet codec    │
-              │ keepalive timers     │
-              └──────────┬───────────┘
-                         │
-                 BrokerLink (IPC)
-                         │
-      ┌──────────────────▼───────────────────┐
-      │             RUST KERNEL              │
-      │                                      │
-      │ MQTT listener (TCP, TLS)             │
-      │ Sessions                             │
+                      MQTT CLIENTS
+                           │
+               TCP / TLS / WebSocket
+                           │
+       ┌──────────────────▼───────────────────┐
+       │             RUST KERNEL              │
+       │                                      │
+       │ MQTT listeners (TCP, TLS, WS, WSS)   │
+       │ Sessions                             │
       │ Router (radix trie)                  │
       │ Authentication and access rules      │
       │ Quotas and rate limits               │
@@ -229,10 +195,9 @@ The diagram shows the default path of today, with the Erlang edge. With `listene
 
 ```
 indramqtt/
-├── beam/                 # Erlang edge (to be deprecated)
 ├── benchmark/            # Broker comparison: method, tool, raw results
 ├── crates/
-│   ├── brokerlink/       # Frames between the edge and the kernel
+│   ├── brokerlink/       # Frame codec for tests
 │   ├── broker-protocol/  # MQTT types and the wire codec
 │   ├── broker-router/    # Topic router
 │   ├── broker-session/   # Sessions and QoS state
@@ -269,7 +234,7 @@ Open the dashboard at `http://localhost:18083/dashboard`. MQTT clients connect t
 
 ### Build from source
 
-You need Rust 1.80 or later. For the Erlang edge you also need Erlang/OTP 26 or later.
+You need Rust 1.80 or later.
 
 ```bash
 # Build the kernel and the operator command.
@@ -278,18 +243,8 @@ cargo build --release -p broker-node --features full
 # Run the tests.
 cargo test --workspace
 
-# Compile the Erlang edge.
-cd beam && mkdir -p ebin && erlc -o ebin src/*.erl && cp src/indra_edge.app.src ebin/indra_edge.app && cd ..
-
 # Start the kernel.
 cargo run --release -p broker-node --bin indramqtt
-```
-
-To use the kernel listener without the Erlang edge, put this in `indra.toml`:
-
-```toml
-[listeners.tcp]
-native = true
 ```
 
 ---

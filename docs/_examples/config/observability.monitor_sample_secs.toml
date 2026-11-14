@@ -1,0 +1,23 @@
+[example]
+area = "config"
+item = "observability.monitor_sample_secs"
+kind = "setting"
+expect = "monitor samples>=2"
+expected = "The monitor list grows past one sample within three seconds at a one-second interval."
+source = "`crates/broker-node/src/main.rs` starts the sampler at the configured interval."
+action = "Wait two seconds and read `GET /api/v5/monitor`."
+config = '''
+[observability]
+monitor_sample_secs = 1
+'''
+script = '''
+from config_probe import *
+
+def samples():
+    status, rows = http("GET", "/api/v5/monitor")
+    assert status == 200, (status, rows)
+    return len(rows) if isinstance(rows, list) else 0
+
+assert wait_for(lambda: samples() >= 2, timeout=5), samples()
+print("monitor samples>=2")
+'''

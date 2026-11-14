@@ -1,0 +1,46 @@
+[example]
+area = "rules"
+item = "fn-bin2hexstr"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT bin2hexstr('AB') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "4142"}'
+
+[[case]]
+sql = "SELECT bin2hexstr('a') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "61"}'
+
+[[case]]
+sql = "SELECT bin2hexstr('AB', '0x') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "0x4142"}'
+
+[[case]]
+sql = "SELECT bin2hexstr('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": ""}'
+
+[[case]]
+sql = "SELECT bin2hexstr(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT bin2hexstr() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

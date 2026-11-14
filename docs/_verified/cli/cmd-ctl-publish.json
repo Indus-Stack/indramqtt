@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "publish",
+    "--help"
+  ],
+  "item": "cmd-ctl-publish",
+  "match": "publish",
+  "output": "Usage: indra ctl publish [OPTIONS] --topic <TOPIC>\n      --topic <TOPIC>      Concrete topic to publish to",
+  "output_bytes": 392,
+  "returncode": 0,
+  "verified": true
+}

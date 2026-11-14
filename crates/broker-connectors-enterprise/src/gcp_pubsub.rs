@@ -7,11 +7,8 @@
 //! The write path runs on the maintained `google-cloud-pubsub` driver
 //! ([`SdkGcpPubSubTransport`] below): gRPC `Publisher` publish with
 //! OAuth2 Bearer (anonymous for the emulator, static bearer for raw
-//! access tokens, service-account flow for keys, ADC otherwise). The
-//! legacy hand-written REST [`HttpGcpPubSubTransport`] (`POST
-//! /v1/projects/{project}/topics/{topic}:publish`) is retained for
-//! endpoint overrides and offline unit tests only; production wiring
-//! uses the driver transport.
+//! access tokens, service-account flow for keys, ADC otherwise).
+//! Production wiring uses the driver transport.
 //!
 //! Authentication: `None` (emulator / ADC), `AccessToken` (raw bearer),
 //! or `ServiceAccountKey`, which mints RS256 JWT assertions and exchanges
@@ -593,85 +590,6 @@ impl GcpPubSubTransport for MockGcpPubSubTransport {
     }
 }
 
-/// Production transport: signed `POST {publish-url}` with JSON.
-pub struct HttpGcpPubSubTransport {
-    url: String,
-    token_cache: Option<Arc<GcpTokenCache>>,
-    static_bearer: Option<String>,
-    client: reqwest::Client,
-}
-
-impl HttpGcpPubSubTransport {
-    pub fn new(config: &GcpPubSubSinkConfig, client: reqwest::Client) -> Result<Self> {
-        config.validate()?;
-        let (token_cache, static_bearer) = match &config.auth {
-            GcpAuth::None => (None, None),
-            GcpAuth::AccessToken { token } => (None, Some(format!("Bearer {token}"))),
-            GcpAuth::ServiceAccountKey {
-                client_email,
-                private_key_pem,
-            } => (
-                Some(Arc::new(GcpTokenCache::new(
-                    client_email.clone(),
-                    private_key_pem.clone(),
-                    client.clone(),
-                ))),
-                None,
-            ),
-        };
-        Ok(Self {
-            url: config.publish_url(),
-            token_cache,
-            static_bearer,
-            client,
-        })
-    }
-}
-
-#[async_trait]
-impl GcpPubSubTransport for HttpGcpPubSubTransport {
-    async fn publish(
-        &self,
-        _project: &str,
-        _topic: &str,
-        messages: Vec<GcpPubSubMessage>,
-        _auth: Option<String>,
-    ) -> Result<Vec<String>> {
-        let bearer = match &self.token_cache {
-            Some(cache) => Some(format!("Bearer {}", cache.bearer_token().await?)),
-            None => self.static_bearer.clone(),
-        };
-        let mut request = self
-            .client
-            .post(&self.url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(render_publish_body(&messages));
-        if let Some(bearer) = bearer {
-            request = request.header(reqwest::header::AUTHORIZATION, bearer);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("gcp publish failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || (500..=504).contains(&status) {
-            return Err(ConnectorError::Connection(format!(
-                "gcp publish throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "gcp publish failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("gcp read failed: {e}")))?;
-        parse_publish_response(&bytes)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Maintained-driver transport (`google-cloud-pubsub`).
 // ---------------------------------------------------------------------------
@@ -908,18 +826,31 @@ impl SdkGcpPubSubTransport {
         let auth = self.auth.clone();
         let project = self.project.clone();
         let has_endpoint = endpoint.is_some();
+        let timeout = self.timeout;
         self.publisher
             .get_or_try_init(|| async move {
-                let mut builder = google_cloud_pubsub::client::Publisher::builder(topic);
+                // The sink owns retry and backoff. An inner driver retry can
+                // redeliver a message after a transport flap and duplicate a
+                // restored event.
+                let mut builder = google_cloud_pubsub::client::Publisher::builder(topic)
+                    .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry);
                 if let Some(endpoint) = endpoint {
                     builder = builder.with_endpoint(endpoint);
                 }
                 if let Some(creds) = driver_credentials(&auth, &project, has_endpoint)? {
                     builder = builder.with_credentials(creds);
                 }
-                builder.build().await.map_err(|e| {
-                    ConnectorError::Connection(format!("gcp driver build failed: {e}"))
-                })
+                // The request timeout also bounds the lazy client build, so a
+                // dead endpoint cannot hold the first publish forever.
+                match tokio::time::timeout(timeout, builder.build()).await {
+                    Ok(result) => result.map_err(|e| {
+                        ConnectorError::Connection(format!("gcp driver build failed: {e}"))
+                    }),
+                    Err(_) => Err(ConnectorError::Connection(format!(
+                        "gcp driver build timed out after {}ms",
+                        timeout.as_millis()
+                    ))),
+                }
             })
             .await
             .cloned()

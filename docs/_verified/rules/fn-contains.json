@@ -1,0 +1,86 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": true
+      },
+      "sql": "SELECT contains(20, nums) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": false
+      },
+      "sql": "SELECT contains(99, nums) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT contains(1, 'notalist') AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-contains",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

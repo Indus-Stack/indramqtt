@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with the flag off and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus]\nenable_basic_auth = false\n",
+  "item": "prometheus.enable_basic_auth",
+  "kind": "setting",
+  "output": "basic_auth=false",
+  "returncode": 0,
+  "verified": true
+}

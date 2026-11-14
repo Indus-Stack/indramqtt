@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-date_to_unix_ts"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT date_to_unix_ts('second', 'yyyy-MM-dd', '1970-01-02') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 86400}'
+
+[[case]]
+sql = "SELECT date_to_unix_ts('second', 'yyyy-MM-dd') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

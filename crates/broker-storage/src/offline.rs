@@ -39,9 +39,9 @@
 //!   extend it, evictions and drains rewrite or delete it. With a cap
 //!   `Some(n)` file size is therefore bounded by `n * max_record_bytes`;
 //!   with `None` (explicit unbounded opt-in via `new_with_limits(None)`)
-//!   queue and file both grow without bound by design. The production
-//!   default is a `Some(10_000)` cap per detached session (high enough for
-//!   reconnect storms without drops), so the default deployment is bounded.
+//!   queue and file both grow without bound by design. Production boot
+//!   installs `session.max_offline_queue` (default 50,000) per detached
+//!   session, so the default deployment is bounded.
 //!
 //! Frame layout per file: `[u32 len][record bytes][u32 crc32(record)]`,
 //! all integers little-endian. Recovery scans in order; the first

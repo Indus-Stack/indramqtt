@@ -1,0 +1,37 @@
+[example]
+area = "api"
+item = "deleteAcl"
+kind = "api"
+request = "DELETE /api/v1/auth/acls/{id} for the index of the new doc-acl-delete rule"
+expect = "deleted"
+expected = "The broker deletes the rule, lists no matching rule, and returns 404 for the same index again."
+
+script = '''
+from config_probe import http
+
+body = {
+    "client_pattern": "doc-acl-delete",
+    "action": "subscribe",
+    "topic_pattern": "sensors/delete",
+    "allow": False,
+}
+status, _ = http("POST", "/api/v1/auth/acls", body)
+assert status == 201, status
+status, rules = http("GET", "/api/v1/auth/acls")
+assert status == 200, (status, rules)
+index = next(
+    index for index, rule in enumerate(rules)
+    if rule.get("client_pattern") == "doc-acl-delete"
+)
+code, _ = http("DELETE", f"/api/v1/auth/acls/{index}")
+assert code == 204, code
+status, after = http("GET", "/api/v1/auth/acls")
+assert status == 200, (status, after)
+assert not [
+    rule for rule in after
+    if rule.get("client_pattern") == "doc-acl-delete"
+], after
+code, _ = http("DELETE", f"/api/v1/auth/acls/{index}")
+assert code == 404, code
+print("deleted")
+'''

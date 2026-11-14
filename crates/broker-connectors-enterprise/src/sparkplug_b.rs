@@ -36,7 +36,7 @@ use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use broker_connectors::{BatchQueue, ConnectorError, Result, Sink};
@@ -1298,11 +1298,23 @@ pub struct RumqttcSparkplugTransport {
     client_id: String,
     channel_cap: usize,
     state: tokio::sync::Mutex<Option<RumqttcSparkplugInner>>,
+    /// Set by the pump. A send fails closed while the pump reports the
+    /// link down, instead of queueing behind a broker that is gone.
+    connected: Arc<AtomicBool>,
 }
 
 struct RumqttcSparkplugInner {
     client: rumqttc::AsyncClient,
     _pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RumqttcSparkplugInner {
+    fn drop(&mut self) {
+        // Stop the reconnect loop with the transport. A detached pump
+        // would keep dialling the old target after the connector is
+        // replaced or the broker shuts down.
+        self._pump.abort();
+    }
 }
 
 impl RumqttcSparkplugTransport {
@@ -1328,6 +1340,7 @@ impl RumqttcSparkplugTransport {
             client_id,
             channel_cap: driver_channel_cap(None),
             state: tokio::sync::Mutex::new(None),
+            connected: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1337,9 +1350,19 @@ impl RumqttcSparkplugTransport {
     }
 
     async fn ensure_connected(&self) -> Result<()> {
-        if self.state.lock().await.is_some() {
-            return Ok(());
+        let guard = self.state.lock().await;
+        if guard.is_some() {
+            if self.connected.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            // The pump reports the link down. Fail the send closed
+            // instead of queueing it behind a broker that is gone. The
+            // pump keeps reconnecting and sets the flag when it is back.
+            return Err(ConnectorError::Connection(
+                "sparkplug connection lost".to_string(),
+            ));
         }
+        drop(guard);
         let mut options = rumqttc::MqttOptions::new(
             self.client_id.clone(),
             self.endpoint.host.clone(),
@@ -1369,13 +1392,18 @@ impl RumqttcSparkplugTransport {
                 ))
             })?
             .map_err(|e| ConnectorError::Connection(format!("sparkplug connect failed: {e}")))?;
+        let connected = Arc::clone(&self.connected);
         let pump = tokio::spawn(async move {
             loop {
-                if eventloop.poll().await.is_err() {
-                    // 100ms reconnect pause: keeps a downed server from
-                    // hot-spinning the pump task at 100% CPU while
-                    // staying well under any test timeout.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                match eventloop.poll().await {
+                    Ok(_) => connected.store(true, Ordering::Relaxed),
+                    Err(_) => {
+                        connected.store(false, Ordering::Relaxed);
+                        // 100ms reconnect pause: keeps a downed server
+                        // from hot-spinning the pump task at 100% CPU
+                        // while staying well under any test timeout.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         });
@@ -1383,6 +1411,7 @@ impl RumqttcSparkplugTransport {
             client,
             _pump: pump,
         });
+        self.connected.store(true, Ordering::Relaxed);
         Ok(())
     }
 }

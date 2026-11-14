@@ -1,0 +1,30 @@
+[example]
+area = "config"
+item = "listeners.api.enabled"
+kind = "setting"
+expect = "api-off-mqtt-on"
+expected = "With the API off, the health endpoint refuses and MQTT accepts."
+source = "`crates/broker-node/src/main.rs` opens no socket when the flag is false."
+action = "Dial the API port and the MQTT port with the API off."
+config = '''
+[listeners.api]
+enabled = false
+
+[auth]
+allow_anonymous = true
+'''
+script = '''
+from config_probe import *
+import socket
+try:
+    probe = socket.create_connection(("127.0.0.1", API_PORT), timeout=3)
+except OSError:
+    api_refused = True
+else:
+    probe.close()
+    api_refused = False
+assert api_refused, "the API answered with the flag off"
+sock, ack, props = connect("api-off-mqtt-client", v5=True)
+disconnect(sock)
+print("api-off-mqtt-on")
+'''

@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-mysql"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-mysql"
+type = "mysql"
+expect_status = 201
+expect_type = "mysql"
+
+[[case]]
+name = "dx2-action-mysql"
+type = "mysql"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

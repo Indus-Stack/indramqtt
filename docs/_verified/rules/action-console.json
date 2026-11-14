@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "console"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-console",
+        "name": "dx2-action-console",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "console"
+      },
+      "name": "dx2-action-console",
+      "status": 201,
+      "type": "console"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-console\" already exists"
+      },
+      "name": "dx2-action-console",
+      "status": 400,
+      "type": "console"
+    }
+  ],
+  "item": "action-console",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

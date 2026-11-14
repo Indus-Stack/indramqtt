@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-clientid"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT clientid() AS c FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"clientid": "dev-01"}'
+expect_matched = true
+expect_projected = '{"c": "dev-01"}'
+
+[[case]]
+sql = 'SELECT clientid() AS c FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"c": null}'

@@ -1,0 +1,3 @@
+`tablestore` writes each result row to an Alibaba Cloud Tablestore table with the `BatchWriteRow` API. The v1 route accepts `tablestore`, `ots`, and `alibaba_tablestore`, and stores the runtime as `tablestore`. The v5 route accepts `tablestore` and registers the aliases `tablestore:name` and `ots:name`. The tier is enterprise.
+
+The sink buffers rows as put-rows with primary-key and attribute columns. It signs each request with HMAC-SHA1 over the OTS headers and the body MD5. The v1 route reads the full sink settings. The v5 route reads the endpoint, the instance, the table, the access keys, and the timeout. It fixes the column map and the batch policy.

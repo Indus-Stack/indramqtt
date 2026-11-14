@@ -1,0 +1,92 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": true
+      },
+      "sql": "SELECT is_not_null_var(count) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": false
+      },
+      "sql": "SELECT is_not_null_var(flag) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": false
+      },
+      "sql": "SELECT is_not_null_var(missing) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT is_not_null_var('a', 'b') AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-is_not_null_var",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "clickhouse"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-clickhouse",
+        "name": "dx2-action-clickhouse",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "clickhouse"
+      },
+      "name": "dx2-action-clickhouse",
+      "status": 201,
+      "type": "clickhouse"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-clickhouse\" already exists"
+      },
+      "name": "dx2-action-clickhouse",
+      "status": 400,
+      "type": "clickhouse"
+    }
+  ],
+  "item": "action-clickhouse",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

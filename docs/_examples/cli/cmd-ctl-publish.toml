@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-publish"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "publish"]
+match = "publish"

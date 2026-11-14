@@ -15,6 +15,7 @@ broker-router = { workspace = true }
 broker-observability = { workspace = true }
 broker-auth = { workspace = true }
 broker-config = { workspace = true }
+broker-delayed = { workspace = true }
 brokerlink = { workspace = true }
 broker-connectors = { workspace = true }
 broker-connectors-enterprise = { workspace = true }
@@ -22,6 +23,9 @@ broker-storage = { workspace = true }
 broker-cluster = { workspace = true }
 broker-gateway = { workspace = true }
 bytes = { workspace = true }
+# In-process dispatch of MCP tool calls through the axum router
+# (`tower::ServiceExt::oneshot`). MIT. No socket to self.
+tower = { version = "0.5", features = ["util"] }
 reqwest = { workspace = true }
 regex = "1"
 serde = { workspace = true }
@@ -29,16 +33,33 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
+chrono = { workspace = true }
+tar = "0.4"
+flate2 = { workspace = true }
+# PEM split plus certificate and key checks for the certificate routes.
+# rustls and rustls-pki-types parse the uploads; x509-parser checks each
+# certificate body. All three are MIT or Apache-2.0 or ISC.
+rustls = { version = "0.23" }
+rustls-pki-types = { version = "1" }
+x509-parser = { version = "0.18" }
 
 [features]
-# Mirrors the X1-09 connector feature set so `register_live_sink` can fail
-# closed naming the missing feature. Each forwards to the owning crate:
-# `s3` to `broker-connectors`, the rest to `broker-connectors-enterprise`.
+# Mirrors the connector feature set so registration can fail closed
+# naming the missing feature. Each forwards to the owning crate: `s3`,
+# `clickhouse`, `kafka`, `elasticsearch` and `rabbitmq` to
+# `broker-connectors`, the rest to `broker-connectors-enterprise`.
 # Default build matches those crates' defaults (all gated kinds absent).
+# A feature build (or `--all-features`) restores the full set.
 default = []
 s3 = ["broker-connectors/s3"]
+clickhouse = ["broker-connectors/clickhouse"]
+kafka = ["broker-connectors/kafka"]
+elasticsearch = ["broker-connectors/elasticsearch"]
+rabbitmq = ["broker-connectors/rabbitmq"]
 aws_iot = ["broker-connectors-enterprise/aws_iot"]
 azure_blob = ["broker-connectors-enterprise/azure_blob"]
 azure_eventhubs = ["broker-connectors-enterprise/azure_eventhubs"]
@@ -46,10 +67,21 @@ azure_iot = ["broker-connectors-enterprise/azure_iot"]
 bigquery = ["broker-connectors-enterprise/bigquery"]
 dynamodb = ["broker-connectors-enterprise/dynamodb"]
 gcp_iot = ["broker-connectors-enterprise/gcp_iot"]
+cassandra = ["broker-connectors-enterprise/cassandra"]
+confluent = ["broker-connectors-enterprise/confluent"]
+couchbase = ["broker-connectors-enterprise/couchbase"]
+mongodb = ["broker-connectors-enterprise/mongodb"]
+gcp_pubsub = ["broker-connectors-enterprise/gcp_pubsub"]
+kinesis = ["broker-connectors-enterprise/kinesis"]
+opc_ua = ["broker-connectors-enterprise/opc_ua"]
 
 [dev-dependencies]
 broker-connectors = { workspace = true }
 async-trait = { workspace = true }
-rsa = { workspace = true }
 rand = { workspace = true }
-p256 = "0.13"
+p256 = "0.14"
+# HTTP/2 server for the GCP Pub/Sub loopback fake. The production sink
+# uses the gRPC driver, so the fake must speak gRPC over HTTP/2.
+# `h2` is MIT; `http` is MIT or Apache-2.0.
+h2 = "0.4"
+http = "1"

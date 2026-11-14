@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use broker_connectors::SinkBatchItem;
 use broker_connectors::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
+use std::sync::atomic::AtomicUsize;
+use std::sync::OnceLock;
 
 fn default_batch_size() -> Option<usize> {
     Some(500)
@@ -145,25 +148,150 @@ pub enum OraErrorClassification {
     Unknown,
 }
 
+/// Typed Oracle error kind for the MV-13b contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OraErrorKind {
+    /// Lost session or listener fault. Retry with backoff.
+    Connection,
+    /// Bad user, password, lock or expiry. Never retry.
+    Authentication,
+    /// Row fails a rule (unique, null, check, key). Never retry.
+    Constraint,
+    /// Wrong name or text (identifier, table, command). Never retry.
+    Syntax,
+    /// Work timed out (connect, cancel, inbound). Retry with backoff.
+    Timeout,
+    /// Driver fault with no ORA code (I/O, socket). Retry with backoff.
+    Transport,
+    /// Code is absent or not in the table. Never retry.
+    Unknown,
+}
+
+/// True when the kind retries (connection, timeout, transport).
+/// Others fail closed as terminal errors.
+pub fn ora_error_is_retryable(kind: OraErrorKind) -> bool {
+    matches!(
+        kind,
+        OraErrorKind::Connection | OraErrorKind::Timeout | OraErrorKind::Transport
+    )
+}
+
+/// Map one numeric ORA code to its kind.
+/// Codes come from the database message, not from text search.
+pub fn classify_ora_code(code: u32) -> OraErrorKind {
+    match code {
+        // ORA-00000 carries no detail and closes the session.
+        // Retry it; the probe reports the real cause.
+        0 => OraErrorKind::Connection,
+        // Deadlock: the batch conflicts and a retry wins.
+        60 => OraErrorKind::Connection,
+        // Unique constraint fails the row itself.
+        1 => OraErrorKind::Constraint,
+        // Null or precision fails the row itself.
+        1400 | 1407 | 1438 | 12899 => OraErrorKind::Constraint,
+        // Check or key fails the row itself.
+        2290..=2292 => OraErrorKind::Constraint,
+        // Bad login or locked account fails the credential.
+        1017 | 1005 | 28000 | 28001 | 28009 => OraErrorKind::Authentication,
+        // Startup, shutdown or a down instance is transient; a retry wins.
+        // ORA-01034 reports a down instance; redial after boot.
+        1033 | 1034 | 1089 => OraErrorKind::Connection,
+        // Cancel or limit hit the time budget, so retry.
+        1013 | 2049 | 3136 | 12170 => OraErrorKind::Timeout,
+        // Bad name or bad text fails the statement.
+        904 | 911 | 933 | 923 | 942 => OraErrorKind::Syntax,
+        // Lost session or listener fault; redial wins.
+        // ORA-12537 reports a closed connection; ORA-12543 reports a down host.
+        3113 | 3114 | 3135 | 12154 | 12505 | 12514 | 12537 | 12541 | 12543 | 12545 => {
+            OraErrorKind::Connection
+        }
+        _ => OraErrorKind::Unknown,
+    }
+}
+
+/// Read the first `ORA-<digits>` code from text.
+/// Return `None` when no digits follow the tag.
+pub fn parse_ora_code(text: &str) -> Option<u32> {
+    let upper = text.to_ascii_uppercase();
+    let mut rest = upper.as_str();
+    while let Some(pos) = rest.find("ORA-") {
+        let after = &rest[pos + 4..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            // Codes fit in five digits; longer text keeps its prefix.
+            let trimmed = if digits.len() > 5 {
+                &digits[..5]
+            } else {
+                &digits
+            };
+            if let Ok(code) = trimmed.parse::<u32>() {
+                return Some(code);
+            }
+        }
+        rest = after;
+    }
+    None
+}
+
+/// Classify a driver error by its typed variant and code.
+/// This path never searches message text.
+/// Every variant has an explicit class; there is no catch-all.
+/// Wire faults retry: the frame is cut, not the statement.
+/// Variants with no code and no retry reason fail closed.
+pub fn classify_oracle_driver_error(error: &oracle_rs::Error) -> OraErrorKind {
+    match error {
+        oracle_rs::Error::AuthenticationFailed(_)
+        | oracle_rs::Error::InvalidCredentials
+        | oracle_rs::Error::UnsupportedVerifierType(_) => OraErrorKind::Authentication,
+        oracle_rs::Error::ConnectionTimeout(_) => OraErrorKind::Timeout,
+        // A cut frame carries no ORA code; the statement itself is fine.
+        // Retry with backoff. Only cut frames retry. Other wire faults
+        // fail closed below: a retry cannot fix them.
+        oracle_rs::Error::Protocol(_)
+        | oracle_rs::Error::ProtocolError(_)
+        | oracle_rs::Error::PacketTooShort { .. }
+        | oracle_rs::Error::UnexpectedPacketType { .. }
+        | oracle_rs::Error::BufferUnderflow { .. } => OraErrorKind::Transport,
+        oracle_rs::Error::ConnectionRefused { .. }
+        | oracle_rs::Error::ConnectionRedirected { .. }
+        | oracle_rs::Error::ConnectionRedirect(_)
+        | oracle_rs::Error::ConnectionClosed
+        | oracle_rs::Error::ConnectionClosedByServer(_)
+        | oracle_rs::Error::ConnectionNotReady
+        | oracle_rs::Error::CursorClosed
+        | oracle_rs::Error::InvalidCursor(_)
+        | oracle_rs::Error::Io(_) => OraErrorKind::Transport,
+        oracle_rs::Error::InvalidServiceName { .. } | oracle_rs::Error::InvalidSid { .. } => {
+            OraErrorKind::Connection
+        }
+        oracle_rs::Error::OracleError { code, .. } | oracle_rs::Error::ServerError { code, .. } => {
+            classify_ora_code(*code)
+        }
+        // TODO(parity): does any fault with no code deserve a retry?
+        oracle_rs::Error::ProtocolVersionNotSupported(..)
+        | oracle_rs::Error::InvalidPacketType(_)
+        | oracle_rs::Error::InvalidMessageType(_)
+        | oracle_rs::Error::BufferOverflow { .. }
+        | oracle_rs::Error::InvalidLengthIndicator(_)
+        | oracle_rs::Error::InvalidConnectionString(_)
+        | oracle_rs::Error::SqlError(_)
+        | oracle_rs::Error::NoDataFound
+        | oracle_rs::Error::InvalidDataType(_)
+        | oracle_rs::Error::InvalidOracleType(_)
+        | oracle_rs::Error::DataConversionError(_)
+        | oracle_rs::Error::UnexpectedNull
+        | oracle_rs::Error::FeatureNotSupported(_)
+        | oracle_rs::Error::NativeNetworkEncryptionRequired
+        | oracle_rs::Error::Internal(_) => OraErrorKind::Unknown,
+    }
+}
+
 /// Classify an Oracle error code (e.g. "ORA-00060").
 pub fn classify_ora_error(error_code_or_msg: &str) -> OraErrorClassification {
-    let text = error_code_or_msg.to_ascii_uppercase();
-    if text.contains("ORA-00060")
-        || text.contains("ORA-01033")
-        || text.contains("ORA-03113")
-        || text.contains("ORA-03114")
-        || text.contains("ORA-01089")
-    {
-        OraErrorClassification::Retryable
-    } else if text.contains("ORA-00942")
-        || text.contains("ORA-01017")
-        || text.contains("ORA-00904")
-        || text.contains("ORA-00911")
-        || text.contains("ORA-00001")
-    {
-        OraErrorClassification::Terminal
-    } else {
-        OraErrorClassification::Unknown
+    match parse_ora_code(error_code_or_msg).map(classify_ora_code) {
+        Some(kind) if ora_error_is_retryable(kind) => OraErrorClassification::Retryable,
+        Some(_) => OraErrorClassification::Terminal,
+        None => OraErrorClassification::Unknown,
     }
 }
 
@@ -280,6 +408,26 @@ pub fn extract_oracle_row(payload: &[u8], topic: &str) -> Result<OracleRow> {
 #[async_trait]
 pub trait OracleTransport: Send + Sync {
     async fn execute(&self, statement: &str, binds: &[OracleBindParam]) -> Result<OracleResponse>;
+    /// Run one statement for many rows.
+    /// Send one parse for the batch.
+    /// The default loops over rows.
+    async fn execute_many(
+        &self,
+        statement: &str,
+        all_binds: &[Vec<OracleBindParam>],
+    ) -> Result<OracleResponse> {
+        let mut affected = 0usize;
+        for binds in all_binds {
+            let out = self.execute(statement, binds).await?;
+            affected += out.rows_affected;
+        }
+        Ok(OracleResponse {
+            rows_affected: affected,
+            status: "SUCCESS".into(),
+            error_code: None,
+            error_message: None,
+        })
+    }
 }
 
 /// Production HTTP transport connecting to Oracle REST Data Services (ORDS).
@@ -344,6 +492,437 @@ impl OracleTransport for HttpOracleTransport {
                 ))),
             }
         }
+    }
+}
+
+/// Driver attempts seen on this process, newest last.
+/// The driver records each statement with its binds before dial.
+/// The offline test reads them through the broker path.
+/// Bound is 64 entries: fan-in stays finite.
+fn oracle_attempts_store() -> &'static Mutex<Vec<CapturedOracleExecution>> {
+    static STORE: OnceLock<Mutex<Vec<CapturedOracleExecution>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Record one attempted row before the dial.
+/// Keep only the newest 64 rows.
+fn record_oracle_attempt(statement: &str, binds: &[OracleBindParam]) {
+    const MAX_ORACLE_ATTEMPTS: usize = 64;
+    let mut guard = oracle_attempts_store().lock();
+    guard.push(CapturedOracleExecution {
+        statement: statement.to_string(),
+        binds: binds.to_vec(),
+    });
+    if guard.len() > MAX_ORACLE_ATTEMPTS {
+        let drop = guard.len() - MAX_ORACLE_ATTEMPTS;
+        guard.drain(0..drop);
+    }
+}
+
+/// Read the recorded driver attempts.
+pub fn oracle_driver_attempts() -> Vec<CapturedOracleExecution> {
+    oracle_attempts_store().lock().clone()
+}
+
+/// Clear the recorded driver attempts.
+pub fn clear_oracle_driver_attempts() {
+    oracle_attempts_store().lock().clear();
+}
+
+/// Map a sink bind value onto the driver value.
+/// Booleans become 1/0 numbers: the server type is NUMBER.
+fn oracle_value_to_driver(value: &OracleValue) -> oracle_rs::Value {
+    match value {
+        OracleValue::Null => oracle_rs::Value::Null,
+        OracleValue::String(text) => oracle_rs::Value::String(text.clone()),
+        OracleValue::Integer(num) => oracle_rs::Value::Integer(*num),
+        OracleValue::Number(num) => {
+            oracle_rs::Value::Number(oracle_rs::types::OracleNumber::new(num.to_string()))
+        }
+        OracleValue::Boolean(flag) => oracle_rs::Value::Integer(i64::from(*flag)),
+    }
+}
+
+/// Map a driver error onto the retry contract.
+/// Retry kinds become `Connection`; the sink retries them.
+/// Other kinds become `Dispatch`; the sink stops.
+/// The match uses the typed variant and code only.
+fn map_oracle_driver_error(error: oracle_rs::Error) -> ConnectorError {
+    let kind = classify_oracle_driver_error(&error);
+    if ora_error_is_retryable(kind) {
+        // Keep the server text in the message.
+        if matches!(kind, OraErrorKind::Transport) {
+            return ConnectorError::Connection(format!("oracle driver: {error}"));
+        }
+        return ConnectorError::Connection(format!("oracle transient: {error}"));
+    }
+    ConnectorError::Dispatch(format!("oracle refused: {error}"))
+}
+
+/// Production transport on the maintained driver: real TNS with
+/// native auth and positional binds, negotiated by the driver.
+///
+/// Bound: one cached connection plus the sink buffer in front of
+/// it (batch rows default 500); no pool, no background queue.
+/// The default is finite because an unbounded pool under fan-in
+/// would exhaust file descriptors. The sink send path runs
+/// behind the rule engine bounded queue, so no numbers are needed.
+///
+/// TODO(parity): which entry selects this transport versus ORDS —
+/// should the management API pick by URL scheme?
+pub struct DriverOracleTransport {
+    host: String,
+    port: u16,
+    service: String,
+    uses_sid: bool,
+    username: String,
+    password: String,
+    timeout: Duration,
+    connection: tokio::sync::Mutex<Option<oracle_rs::Connection>>,
+}
+
+impl DriverOracleTransport {
+    /// Create a direct database transport.
+    /// Fails closed on empty host, service, username or zero port.
+    pub fn new(
+        host: &str,
+        port: u16,
+        service: &str,
+        username: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::build(host, port, service, false, username, password, timeout)
+    }
+
+    /// Create a direct database transport that dials by SID.
+    /// Fails closed on empty host, sid, username or zero port.
+    pub fn with_sid(
+        host: &str,
+        port: u16,
+        sid: &str,
+        username: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::build(host, port, sid, true, username, password, timeout)
+    }
+
+    /// Share the build checks of both constructors.
+    fn build(
+        host: &str,
+        port: u16,
+        service: &str,
+        uses_sid: bool,
+        username: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        if host.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "oracle host cannot be empty".into(),
+            ));
+        }
+        if port == 0 {
+            return Err(ConnectorError::Dispatch(
+                "oracle port must be 1..=65535".into(),
+            ));
+        }
+        if service.trim().is_empty() {
+            if uses_sid {
+                return Err(ConnectorError::Dispatch(
+                    "oracle sid cannot be empty".into(),
+                ));
+            }
+            return Err(ConnectorError::Dispatch(
+                "oracle service cannot be empty".into(),
+            ));
+        }
+        if username.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "oracle username cannot be empty".into(),
+            ));
+        }
+        Ok(Self {
+            host: host.to_string(),
+            port,
+            service: service.to_string(),
+            uses_sid,
+            username: username.to_string(),
+            password: password.to_string(),
+            timeout,
+            connection: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    /// True when this transport dials by SID.
+    pub fn uses_sid(&self) -> bool {
+        self.uses_sid
+    }
+
+    /// Open one TNS session for the stored credentials.
+    async fn connect_new(&self) -> Result<oracle_rs::Connection> {
+        let config = if self.uses_sid {
+            oracle_rs::Config::with_sid(
+                self.host.clone(),
+                self.port,
+                self.service.clone(),
+                self.username.clone(),
+                self.password.clone(),
+            )
+        } else {
+            oracle_rs::Config::new(
+                self.host.clone(),
+                self.port,
+                self.service.clone(),
+                self.username.clone(),
+                self.password.clone(),
+            )
+        };
+        tokio::time::timeout(
+            self.timeout,
+            oracle_rs::Connection::connect_with_config(config),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "oracle connect timeout: {}:{}",
+                self.host, self.port
+            ))
+        })?
+        .map_err(map_oracle_driver_error)
+    }
+
+    /// Probe a failed batch for a terminal table error.
+    /// Run at most two statements on the failure path only.
+    /// Return `Dispatch` with the server text when the table is missing.
+    /// Return `None` when the failure stays retryable.
+    async fn probe_batch_failure(
+        &self,
+        statement: &str,
+        _first_binds: Option<&Vec<OracleBindParam>>,
+    ) -> Option<ConnectorError> {
+        // Extract the table name. Return None when unsafe.
+        let table = merge_table_name(statement)?;
+        // Open a fresh session. Return None when unreachable.
+        let fresh = self.connect_new().await.ok()?;
+        // Check the catalog. This query never touches the missing table.
+        let upper = table.to_ascii_uppercase();
+        let params = [oracle_rs::Value::String(upper)];
+        let catalog = tokio::time::timeout(
+            self.timeout,
+            fresh.query(
+                "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = :1",
+                &params,
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let count = catalog.rows.first()?.get(0).and_then(|value| {
+            if let Some(num) = value.as_i64() {
+                return Some(num);
+            }
+            if let Some(num) = value.as_f64() {
+                return Some(num as i64);
+            }
+            value.as_str()?.trim().parse::<i64>().ok()
+        })?;
+        // Return None when the table exists. The failure stays retryable.
+        if count != 0 {
+            return None;
+        }
+        // The table is missing. Read it to obtain the server text.
+        // The read fails because the table is missing. It changes nothing.
+        // Free closes the connection without details on some paths.
+        // The catalog count above proves the cause.
+        let select_sql = format!("SELECT 1 FROM {table} WHERE 1 = 0");
+        let select_error = tokio::time::timeout(self.timeout, fresh.query(&select_sql, &[]))
+            .await
+            .ok()?
+            .err()?;
+        // Match the typed server code, not the display text.
+        // A `ServerError` display carries no `ORA-` tag, so text search misses it.
+        let table_missing = matches!(
+            &select_error,
+            oracle_rs::Error::OracleError { code: 942, .. }
+                | oracle_rs::Error::ServerError { code: 942, .. }
+        );
+        let select_text = select_error.to_string();
+        let mapped = map_oracle_driver_error(select_error);
+        if table_missing {
+            if let ConnectorError::Dispatch(_) = &mapped {
+                return Some(mapped);
+            }
+        }
+        // Report the standard code with the server evidence.
+        // The catalog proves the miss. The text keeps the server reply.
+        Some(ConnectorError::Dispatch(format!(
+            "oracle refused: ORA-00942: table or view does not exist ({table}); probe: USER_TABLES count=0; server said: {select_text}"
+        )))
+    }
+}
+
+/// Extract the table from a `MERGE INTO` statement.
+/// Return `None` for other statements or unsafe names.
+/// Accept only `[A-Za-z0-9_]+`.
+/// The probe interpolates the name, so it must stay safe.
+fn merge_table_name(statement: &str) -> Option<String> {
+    let rest = statement.strip_prefix("MERGE INTO ")?;
+    let end = rest.find([' ', '\n', '\t'])?;
+    let table = &rest[..end];
+    if table.is_empty() {
+        return None;
+    }
+    if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(table.to_string())
+}
+
+#[async_trait]
+impl OracleTransport for DriverOracleTransport {
+    /// Run one statement for many rows in one batch.
+    /// Send one parse for the batch.
+    /// Commit once after the batch.
+    async fn execute_many(
+        &self,
+        statement: &str,
+        all_binds: &[Vec<OracleBindParam>],
+    ) -> Result<OracleResponse> {
+        if all_binds.is_empty() {
+            return Ok(OracleResponse {
+                rows_affected: 0,
+                status: "SUCCESS".into(),
+                error_code: None,
+                error_message: None,
+            });
+        }
+        for binds in all_binds {
+            record_oracle_attempt(statement, binds);
+        }
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            match self.connect_new().await {
+                Ok(connection) => *guard = Some(connection),
+                Err(error) => return Err(error),
+            }
+        }
+        let connection = guard
+            .as_ref()
+            .ok_or_else(|| ConnectorError::Connection("oracle not connected".to_string()))?;
+        let mut builder = oracle_rs::BatchBuilder::new(statement);
+        for binds in all_binds {
+            let params: Vec<oracle_rs::Value> = binds
+                .iter()
+                .map(|bind| oracle_value_to_driver(&bind.value))
+                .collect();
+            builder = builder.add_row(params);
+        }
+        let batch = builder.build();
+        let outcome = tokio::time::timeout(self.timeout, connection.execute_batch(&batch))
+            .await
+            .map_err(|_| ConnectorError::Connection("oracle batch timeout".to_string()));
+        let result = match outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                let mapped = map_oracle_driver_error(error);
+                if matches!(mapped, ConnectorError::Connection(_)) {
+                    *guard = None;
+                    let statement_owned = statement.to_string();
+                    let first = all_binds.first().cloned();
+                    drop(guard);
+                    if let Some(probed) = self
+                        .probe_batch_failure(&statement_owned, first.as_ref())
+                        .await
+                    {
+                        return Err(probed);
+                    }
+                    return Err(mapped);
+                }
+                return Err(mapped);
+            }
+            Err(error) => {
+                *guard = None;
+                let statement_owned = statement.to_string();
+                let first = all_binds.first().cloned();
+                drop(guard);
+                if let Some(probed) = self
+                    .probe_batch_failure(&statement_owned, first.as_ref())
+                    .await
+                {
+                    return Err(probed);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = tokio::time::timeout(self.timeout, connection.commit())
+            .await
+            .map_err(|_| ConnectorError::Connection("oracle commit timeout".to_string()))?
+            .map_err(map_oracle_driver_error)
+        {
+            if matches!(error, ConnectorError::Connection(_)) {
+                *guard = None;
+            }
+            return Err(error);
+        }
+        Ok(OracleResponse {
+            rows_affected: result.total_rows_affected as usize,
+            status: "SUCCESS".into(),
+            error_code: None,
+            error_message: None,
+        })
+    }
+
+    async fn execute(&self, statement: &str, binds: &[OracleBindParam]) -> Result<OracleResponse> {
+        record_oracle_attempt(statement, binds);
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            match self.connect_new().await {
+                Ok(connection) => *guard = Some(connection),
+                Err(error) => return Err(error),
+            }
+        }
+        let connection = guard
+            .as_ref()
+            .ok_or_else(|| ConnectorError::Connection("oracle not connected".to_string()))?;
+        let params: Vec<oracle_rs::Value> = binds
+            .iter()
+            .map(|bind| oracle_value_to_driver(&bind.value))
+            .collect();
+        let outcome = tokio::time::timeout(self.timeout, connection.execute(statement, &params))
+            .await
+            .map_err(|_| ConnectorError::Connection("oracle execute timeout".to_string()));
+        let result = match outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                let mapped = map_oracle_driver_error(error);
+                if matches!(mapped, ConnectorError::Connection(_)) {
+                    *guard = None;
+                }
+                return Err(mapped);
+            }
+            Err(error) => {
+                *guard = None;
+                return Err(error);
+            }
+        };
+        if let Err(error) = tokio::time::timeout(self.timeout, connection.commit())
+            .await
+            .map_err(|_| ConnectorError::Connection("oracle commit timeout".to_string()))?
+            .map_err(map_oracle_driver_error)
+        {
+            if matches!(error, ConnectorError::Connection(_)) {
+                *guard = None;
+            }
+            return Err(error);
+        }
+        Ok(OracleResponse {
+            rows_affected: result.rows_affected as usize,
+            status: "SUCCESS".into(),
+            error_code: None,
+            error_message: None,
+        })
     }
 }
 
@@ -471,6 +1050,9 @@ impl OracleSink {
             return Ok(());
         }
 
+        // Build one statement per row first.
+        // Rows with one shape share one parse.
+        let mut planned: Vec<(String, Vec<OracleBindParam>)> = Vec::with_capacity(rows.len());
         for row in &rows {
             let (statement, binds) = if let Some(ref custom) = self.config.custom_upsert {
                 let binds: Vec<OracleBindParam> = row
@@ -500,8 +1082,34 @@ impl OracleSink {
                     .collect();
                 (stmt, binds)
             };
-
-            match self.transport.execute(&statement, &binds).await {
+            planned.push((statement, binds));
+        }
+        // Send rows with one shape in one batch.
+        // One parse serves the batch.
+        // Mixed shapes fall back to one call per row.
+        let same_shape = planned
+            .iter()
+            .all(|(statement, _)| statement == &planned[0].0);
+        if same_shape {
+            let statement = planned[0].0.clone();
+            let all_binds: Vec<Vec<OracleBindParam>> =
+                planned.into_iter().map(|(_, binds)| binds).collect();
+            let count = all_binds.len() as u64;
+            match self.transport.execute_many(&statement, &all_binds).await {
+                Ok(_) => {
+                    self.backoff.lock().success();
+                    self.sent.fetch_add(count, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    self.backoff.lock().failure();
+                    self.queue.lock().restore(rows, oldest);
+                    return Err(e);
+                }
+            }
+            return Ok(());
+        }
+        for (statement, binds) in &planned {
+            match self.transport.execute(statement, binds).await {
                 Ok(_) => {
                     self.backoff.lock().success();
                     self.sent.fetch_add(1, Ordering::Relaxed);
@@ -528,9 +1136,221 @@ impl Sink for OracleSink {
         };
 
         if should_flush {
-            self.flush().await?;
+            // While backing off, keep rows buffered instead of failing the
+            // send: an explicit flush reports the backoff without dropping.
+            if self.backoff.lock().check().is_err() {
+                return Ok(());
+            }
+            if let Err(e) = self.flush().await {
+                if let ConnectorError::Connection(msg) = &e {
+                    if msg == "sink backing off after errors" {
+                        return Ok(());
+                    }
+                }
+                return Err(e);
+            }
         }
         Ok(())
+    }
+
+    fn kind(&self) -> &'static str {
+        "oracle"
+    }
+}
+
+/// Scan an Oracle statement for positional `:N` markers outside
+/// string literals and comments. A colon counts only when the next
+/// character starts a number and the previous character is not part
+/// of a name (`t.col` is not a marker; `12:10` is not one either).
+/// Returns the marker numbers in order of appearance.
+pub fn referenced_oracle_params(template: &str) -> Vec<u32> {
+    let chars: Vec<char> = template.chars().collect();
+    let n = chars.len();
+    let mut found = Vec::new();
+    let mut i = 0;
+    let mut in_string: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while i < n {
+        let c = chars[i];
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && i + 1 < n && chars[i + 1] == '/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(quote) = in_string {
+            if c == quote {
+                if quote == '\'' && i + 1 < n && chars[i + 1] == '\'' {
+                    i += 2;
+                } else {
+                    in_string = None;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                in_string = Some(c);
+                i += 1;
+            }
+            '-' if i + 1 < n && chars[i + 1] == '-' => {
+                in_line_comment = true;
+                i += 2;
+            }
+            '/' if i + 1 < n && chars[i + 1] == '*' => {
+                in_block_comment = true;
+                i += 2;
+            }
+            ':' => {
+                let prev_is_name = i > 0
+                    && (chars[i - 1].is_ascii_alphanumeric()
+                        || chars[i - 1] == '_'
+                        || chars[i - 1] == ':'
+                        || chars[i - 1] == '.');
+                let mut j = i + 1;
+                while j < n && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if !prev_is_name && j > i + 1 {
+                    if let Ok(number) = chars[i + 1..j].iter().collect::<String>().parse::<u32>() {
+                        found.push(number);
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    found
+}
+
+/// Validate an action statement for [`OracleActionSink`]: at least one
+/// marker, and every marker is `:1` (topic), `:2` (QoS) or `:3`
+/// (payload). Values bind out-of-band; the check keeps a statement
+/// that cannot bind from being stored.
+pub fn validate_oracle_action_sql(statement: &str) -> Result<()> {
+    if statement.trim().is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "oracle sql must not be empty".to_string(),
+        ));
+    }
+    let mut referenced = referenced_oracle_params(statement);
+    referenced.sort_unstable();
+    referenced.dedup();
+    if referenced.is_empty() || referenced.iter().any(|n| *n == 0 || *n > 3) {
+        let shown: Vec<String> = referenced.iter().map(|n| format!(":{n}")).collect();
+        return Err(ConnectorError::Dispatch(format!(
+            "oracle sql must reference :1..:3 (topic, qos, payload), got {}",
+            shown.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Action-owned Oracle sink (MV-02a): the v5 action's `parameters.sql`
+/// runs once per batch with `:1` (topic), `:2` (QoS) and `:3`
+/// (payload) bound through the maintained `oracle_rs` driver, never
+/// formatted into the statement text. The pool holds at most one
+/// driver session per entry (each dials lazily on first use); batches
+/// rotate across entries. Failures map through the typed MV-13b
+/// classifier, so a delivery error counts as failed, never silent.
+pub struct OracleActionSink {
+    statement: String,
+    pool: Vec<Arc<dyn OracleTransport>>,
+    next: AtomicUsize,
+}
+
+impl OracleActionSink {
+    /// Build from an already validated statement and at least one
+    /// transport (one per `pool_size` session, each lazy).
+    pub fn new(statement: String, pool: Vec<Arc<dyn OracleTransport>>) -> Result<Self> {
+        validate_oracle_action_sql(&statement)?;
+        if pool.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "oracle action sink needs at least one transport".to_string(),
+            ));
+        }
+        Ok(Self {
+            statement,
+            pool,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// The bound statement this sink runs.
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    /// Number of pooled sessions.
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
+    fn pick(&self) -> Arc<dyn OracleTransport> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        Arc::clone(&self.pool[index])
+    }
+
+    fn row_binds(item: &SinkBatchItem) -> Vec<OracleBindParam> {
+        vec![
+            OracleBindParam {
+                name: "1".to_string(),
+                value: OracleValue::String(item.topic.as_str().to_string()),
+                data_type: Some("VARCHAR2".to_string()),
+            },
+            OracleBindParam {
+                name: "2".to_string(),
+                value: OracleValue::Integer(i64::from(u8::from(item.qos))),
+                data_type: Some("NUMBER".to_string()),
+            },
+            OracleBindParam {
+                name: "3".to_string(),
+                value: OracleValue::String(String::from_utf8_lossy(&item.payload).into_owned()),
+                data_type: Some("VARCHAR2".to_string()),
+            },
+        ]
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for OracleActionSink {
+    async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        self.send_batch(&[SinkBatchItem {
+            topic: topic.clone(),
+            payload: payload.clone(),
+            qos,
+        }])
+        .await
+    }
+
+    async fn send_batch(&self, items: &[SinkBatchItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let binds: Vec<Vec<OracleBindParam>> = items.iter().map(Self::row_binds).collect();
+        self.pick()
+            .execute_many(&self.statement, &binds)
+            .await
+            .map(|_| ())
     }
 
     fn kind(&self) -> &'static str {
@@ -664,6 +1484,392 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_connection_errors_retry() {
+        // Each case uses the driver error type, not text.
+        let cases = [
+            oracle_rs::Error::oracle(3113, "end-of-file"),
+            oracle_rs::Error::oracle(3114, "not connected"),
+            oracle_rs::Error::ServerError {
+                code: 3135,
+                message: "lost contact".into(),
+            },
+            oracle_rs::Error::InvalidServiceName {
+                service_name: Some("FREEPDB1".into()),
+                message: Some("listener fault".into()),
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Connection,
+                "must be connection: {error:?}"
+            );
+            assert!(
+                ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "connection must retry: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "connection maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_authentication_errors_terminal() {
+        let cases = [
+            oracle_rs::Error::oracle(1017, "bad password"),
+            oracle_rs::Error::oracle(28000, "locked"),
+            oracle_rs::Error::AuthenticationFailed("denied".into()),
+            oracle_rs::Error::InvalidCredentials,
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Authentication,
+                "must be auth: {error:?}"
+            );
+            assert!(
+                !ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "auth must not retry: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "auth maps to terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_constraint_errors_terminal() {
+        // ServerError without ORA prefix still maps by code.
+        // The old text path retried it; the typed path stops.
+        let cases = [
+            oracle_rs::Error::oracle(1, "unique"),
+            oracle_rs::Error::oracle(1400, "null"),
+            oracle_rs::Error::oracle(2291, "parent"),
+            oracle_rs::Error::ServerError {
+                code: 1,
+                message: "unique".into(),
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Constraint,
+                "must be constraint: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "constraint maps to terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_syntax_errors_terminal() {
+        let cases = [
+            oracle_rs::Error::oracle(904, "identifier"),
+            oracle_rs::Error::oracle(942, "table"),
+            oracle_rs::Error::ServerError {
+                code: 942,
+                message: "missing".into(),
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Syntax,
+                "must be syntax: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "syntax maps to terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_timeout_errors_retry() {
+        let cases = [
+            oracle_rs::Error::oracle(12170, "connect timeout"),
+            oracle_rs::Error::oracle(1013, "cancel"),
+            oracle_rs::Error::ConnectionTimeout(Duration::from_secs(1)),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Timeout,
+                "must be timeout: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "timeout maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_transport_errors_retry() {
+        // Non-Oracle faults carry no ORA code and retry.
+        let cases = [
+            oracle_rs::Error::ConnectionClosed,
+            oracle_rs::Error::ConnectionRefused {
+                error_code: None,
+                message: None,
+            },
+            oracle_rs::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Transport,
+                "must be transport: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "transport maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_wire_errors_retry() {
+        // A cut frame carries no ORA code; the statement itself is fine.
+        // The old match fell through to Unknown; each case fails there.
+        let cases = [
+            oracle_rs::Error::Protocol("connection cut".into()),
+            oracle_rs::Error::ProtocolError("bad TNS frame".into()),
+            oracle_rs::Error::PacketTooShort {
+                expected: 8,
+                actual: 2,
+            },
+            oracle_rs::Error::UnexpectedPacketType {
+                expected: oracle_rs::constants::PacketType::Data,
+                actual: oracle_rs::constants::PacketType::Abort,
+            },
+            oracle_rs::Error::BufferUnderflow {
+                needed: 8,
+                available: 2,
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Transport,
+                "must be transport: {error:?}"
+            );
+            assert!(
+                ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "wire fault must retry: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "wire fault maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_instance_and_host_down_retry() {
+        // ORA-01034 reports a down instance; ORA-12537 a closed connection;
+        // ORA-12543 a down host. Each retries. The old table missed them.
+        let cases = [
+            oracle_rs::Error::oracle(1034, "ORACLE not available"),
+            oracle_rs::Error::ServerError {
+                code: 12537,
+                message: "connection closed".into(),
+            },
+            oracle_rs::Error::oracle(12543, "destination host unreachable"),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Connection,
+                "must be connection: {error:?}"
+            );
+            assert!(
+                ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "down instance or host must retry: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "down instance or host maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_table_missing_code_without_ora_tag() {
+        // A `ServerError` display carries no `ORA-` tag, so text search misses it.
+        // The probe matches the typed code. Each case uses the typed value.
+        let missing = oracle_rs::Error::ServerError {
+            code: 942,
+            message: "table or view does not exist".into(),
+        };
+        assert_eq!(
+            classify_oracle_driver_error(&missing),
+            OraErrorKind::Syntax,
+            "code 942 must be syntax"
+        );
+        assert_eq!(parse_ora_code(&missing.to_string()), None);
+        assert!(matches!(
+            map_oracle_driver_error(missing),
+            ConnectorError::Dispatch(_)
+        ));
+        let other = oracle_rs::Error::ServerError {
+            code: 1017,
+            message: "bad password".into(),
+        };
+        assert_eq!(
+            classify_oracle_driver_error(&other),
+            OraErrorKind::Authentication
+        );
+    }
+
+    #[test]
+    fn test_typed_coded_less_faults_fail_closed() {
+        // Faults with no code and no retry reason stay terminal.
+        let cases = [
+            oracle_rs::Error::SqlError("bad execute".into()),
+            oracle_rs::Error::NoDataFound,
+            oracle_rs::Error::FeatureNotSupported("tns".into()),
+            oracle_rs::Error::Internal("bug".into()),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Unknown,
+                "must be unknown: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "coded-less fault maps to terminal"
+            );
+        }
+    }
+
+    /// Transport that fails each batch with one typed driver error.
+    /// It proves the sink retry contract through `send`, not the classifier.
+    struct TypedFailTransport {
+        make: Box<dyn Fn() -> oracle_rs::Error + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl OracleTransport for TypedFailTransport {
+        async fn execute(
+            &self,
+            _statement: &str,
+            _binds: &[OracleBindParam],
+        ) -> Result<OracleResponse> {
+            Err(map_oracle_driver_error((self.make)()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cut_connection_through_sink_retries() {
+        // A cut connection mid-batch must retry through the sink entry.
+        // The old match read Unknown and returned a terminal error.
+        let transport = Arc::new(TypedFailTransport {
+            make: Box::new(|| oracle_rs::Error::Protocol("connection cut".into())),
+        });
+        let sink = OracleSink::new(sample_config(), transport).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload = Bytes::from_static(br#"{"device_id": "dev-cut", "temp": 70.0}"#);
+        let result = sink.send(&topic, &payload, QoS::AtLeastOnce).await;
+        assert!(
+            matches!(result, Err(ConnectorError::Connection(_))),
+            "cut connection must retry"
+        );
+    }
+
+    #[test]
+    fn test_ora_code_unparsable_and_unknown_terminal() {
+        // No digits after the tag means no code.
+        assert_eq!(parse_ora_code("ORA-ABCDE"), None);
+        assert_eq!(parse_ora_code("no code here"), None);
+        assert_eq!(
+            classify_ora_error("ORA-ABCDE: bad tag"),
+            OraErrorClassification::Unknown
+        );
+        // Unknown numeric codes fail closed without retry.
+        assert_eq!(classify_ora_code(99999), OraErrorKind::Unknown);
+        assert!(!ora_error_is_retryable(OraErrorKind::Unknown));
+        let error = oracle_rs::Error::oracle(99999, "future code");
+        assert!(
+            matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+            "unknown code maps to terminal"
+        );
+    }
+
+    #[test]
+    fn test_typed_ora_00000_retries() {
+        // Zero carries no detail and closes the session.
+        let error = oracle_rs::Error::oracle(0, "normal");
+        assert_eq!(
+            classify_oracle_driver_error(&error),
+            OraErrorKind::Connection
+        );
+        assert!(matches!(
+            map_oracle_driver_error(error),
+            ConnectorError::Connection(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_state_after_retries() {
+        // Two transient faults, then success: the end state commits.
+        let transport = Arc::new(MockOracleTransport::with_transient_failures(2, "ORA-00060"));
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let sink = OracleSink::new(cfg, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload = Bytes::from_static(br#"{"device_id": "dev-90", "temp": 70.0}"#);
+        sink.send(&topic, &payload, QoS::AtLeastOnce)
+            .await
+            .expect("buffer row");
+        let first = sink.flush().await;
+        assert!(matches!(first, Err(ConnectorError::Connection(_))));
+        *sink.backoff.lock() = BackoffState::default();
+        let second = sink.flush().await;
+        assert!(matches!(second, Err(ConnectorError::Connection(_))));
+        *sink.backoff.lock() = BackoffState::default();
+        sink.flush().await.expect("retry commits");
+        assert_eq!(sink.sent_count(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        // Terminal fault stops at once with one execution.
+        let bad = Arc::new(MockOracleTransport::with_transient_failures(1, "ORA-00001"));
+        let mut bad_cfg = sample_config();
+        bad_cfg.batch_size = Some(10);
+        let bad_sink = OracleSink::new(bad_cfg, bad.clone()).expect("valid sink");
+        bad_sink
+            .send(&topic, &payload, QoS::AtLeastOnce)
+            .await
+            .expect("buffer row");
+        let refused = bad_sink.flush().await;
+        assert!(matches!(refused, Err(ConnectorError::Dispatch(_))));
+        assert_eq!(bad.executions.lock().len(), 1);
+    }
+
+    #[test]
     fn test_json_to_oracle_primitives() {
         let v_null = json_to_oracle_value(&serde_json::Value::Null);
         assert_eq!(v_null, OracleValue::Null);
@@ -773,5 +1979,537 @@ mod tests {
         assert_eq!(execs.len(), 3);
         assert_eq!(execs[1].binds.len(), 2);
         assert_eq!(execs[2].binds.len(), 2);
+    }
+
+    /// Deny an empty endpoint at build time.
+    /// Show each denial fails closed with a dispatch error.
+    #[test]
+    fn test_driver_transport_rejects_empty_endpoint() {
+        let timeout = Duration::from_secs(1);
+        let denied = DriverOracleTransport::new("", 1521, "FREEPDB1", "system", "pw", timeout);
+        assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
+        let denied = DriverOracleTransport::new("db", 0, "FREEPDB1", "system", "pw", timeout);
+        assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
+        let denied = DriverOracleTransport::new("db", 1521, "", "system", "pw", timeout);
+        assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
+        let denied = DriverOracleTransport::new("db", 1521, "FREEPDB1", "", "pw", timeout);
+        assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
+        let ok = DriverOracleTransport::new("db", 1521, "FREEPDB1", "system", "pw", timeout);
+        assert!(ok.is_ok());
+        assert!(!ok.expect("service name builds").uses_sid());
+    }
+
+    /// A SID transport builds and marks itself for `Config::with_sid`.
+    /// An empty SID fails closed.
+    #[test]
+    fn test_driver_transport_with_sid() {
+        let timeout = Duration::from_secs(1);
+        let denied = DriverOracleTransport::with_sid("db", 1521, "", "system", "pw", timeout);
+        assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
+        let ok = DriverOracleTransport::with_sid("db", 1521, "ORCL", "system", "pw", timeout);
+        assert!(ok.is_ok());
+        assert!(ok.expect("sid builds").uses_sid());
+    }
+
+    /// Fail closed when the environment lacks the named address.
+    fn qual_require(name: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| {
+                panic!("{name} must name a real Oracle Database server for qualification")
+            })
+    }
+
+    /// Fail closed on table names outside the safe identifier set.
+    fn qual_identifier(name: &str, value: &str) -> String {
+        assert!(
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "qual {name} must match [A-Za-z0-9_]+, got {value:?} (failing closed)"
+        );
+        value.to_string()
+    }
+
+    /// Open a bare driver session for setup and assertions.
+    /// Panics with context when unreachable: qualification fails,
+    /// never skips.
+    async fn qual_connect(
+        host: &str,
+        port: u16,
+        service: &str,
+        user: &str,
+        password: &str,
+    ) -> oracle_rs::Connection {
+        let config = oracle_rs::Config::new(host, port, service, user, password);
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            oracle_rs::Connection::connect_with_config(config),
+        )
+        .await
+        .expect("qual connect timed out")
+        .unwrap_or_else(|e| panic!("qual connect failed: {e:?}"))
+    }
+
+    /// Read an integer result. Parse text numbers. Fail the test on other types.
+    fn qual_as_i64(value: &oracle_rs::Value) -> i64 {
+        if let Some(num) = value.as_i64() {
+            return num;
+        }
+        if let Some(num) = value.as_f64() {
+            return num as i64;
+        }
+        if let Some(text) = value.as_str() {
+            if let Ok(num) = text.trim().parse::<i64>() {
+                return num;
+            }
+            if let Ok(num) = text.trim().parse::<f64>() {
+                return num as i64;
+            }
+        }
+        panic!("qual expected integer, got {value:?}")
+    }
+
+    /// Read a float result. Parse text numbers. Fail the test on other types.
+    fn qual_as_f64(value: &oracle_rs::Value) -> f64 {
+        if let Some(num) = value.as_f64() {
+            return num;
+        }
+        if let Some(num) = value.as_i64() {
+            return num as f64;
+        }
+        if let Some(text) = value.as_str() {
+            if let Ok(num) = text.trim().parse::<f64>() {
+                return num;
+            }
+        }
+        panic!("qual expected number, got {value:?}")
+    }
+
+    /// Read a text bind result. Fails the test on other types.
+    fn qual_as_str(value: &oracle_rs::Value) -> String {
+        value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("qual expected text, got {value:?}"))
+    }
+
+    /// Qualification against a real Oracle Database server over
+    /// the maintained driver ([`DriverOracleTransport`]).
+    ///
+    /// Run with e.g.:
+    /// `ORACLE_HOST=127.0.0.1 ORACLE_PORT=1521 ORACLE_SERVICE=FREEPDB1 \
+    ///  ORACLE_USER=system ORACLE_PASSWORD='Oraclepass1' \
+    ///  ORACLE_TABLE=qual_b333 \
+    ///  cargo test -p broker-connectors-enterprise --lib oracle::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates the table.
+    /// Streams 500 rows through [`OracleSink`] on
+    /// [`DriverOracleTransport`] with MERGE binds.
+    /// Asserts the exact count and the first/last content
+    /// through an independent session.
+    /// Proves a wrong table fails as a dispatch error
+    /// with the server text.
+    /// Drops the table.
+    /// Panics when its environment is missing (fail closed,
+    /// never skips).
+    #[tokio::test]
+    #[ignore = "needs a real Oracle Database server (see ORACLE_* env)"]
+    async fn test_qualify_driver_write_path() {
+        const ROWS: usize = 500;
+
+        let host = qual_require("ORACLE_HOST");
+        let port: u16 = qual_require("ORACLE_PORT")
+            .parse()
+            .expect("qual ORACLE_PORT must be a port number");
+        let service = qual_require("ORACLE_SERVICE");
+        let user = qual_require("ORACLE_USER");
+        let password = qual_require("ORACLE_PASSWORD");
+        let table = qual_identifier("table", &qual_require("ORACLE_TABLE"));
+
+        let admin = qual_connect(&host, port, &service, &user, &password).await;
+
+        // Identity: only the real product answers this view.
+        let version_result = admin
+            .query("SELECT BANNER FROM v$version", &[])
+            .await
+            .expect("qual version query");
+        let banners: Vec<String> = version_result
+            .rows
+            .iter()
+            .map(|row| {
+                row.get(0)
+                    .map(qual_as_str)
+                    .expect("qual version row has banner")
+            })
+            .collect();
+        assert!(
+            !banners.is_empty(),
+            "qual version must list rows (failing closed)"
+        );
+        let version_line = banners.join(" | ");
+        assert!(
+            version_line.to_ascii_lowercase().contains("oracle"),
+            "qual version must name the product, got {version_line:?}"
+        );
+        eprintln!("qual server: version={version_line}");
+
+        // Remove stale state from a prior run first.
+        // Use IF EXISTS: the server returns success when the table
+        // is absent. A plain DROP reports ORA-00942 on that path,
+        // and the driver closes the connection for it.
+        match admin
+            .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+            .await
+        {
+            Ok(_) => {
+                admin.commit().await.expect("qual drop commits");
+                eprintln!("qual cleanup stale: dropped {table}");
+            }
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("942") || text.to_ascii_lowercase().contains("does not exist"),
+                    "qual drop stale failed: {text}"
+                );
+                let _ = admin.rollback().await;
+                eprintln!("qual cleanup stale (tolerated): {text}");
+            }
+        }
+
+        // The table for this run exists before the first flush.
+        admin
+            .execute(
+                &format!(
+                    "CREATE TABLE {table} (\
+                     device_id VARCHAR2(64) PRIMARY KEY, \
+                     seq NUMBER NOT NULL, \
+                     reading NUMBER NOT NULL)"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create table");
+        admin.commit().await.expect("qual create commits");
+        eprintln!("qual table created: {table} (VARCHAR2/NUMBER)");
+
+        // The production transport below speaks TNS itself.
+        let timeout = Duration::from_secs(30);
+        let transport = Arc::new(
+            DriverOracleTransport::new(&host, port, &service, &user, &password, timeout)
+                .expect("qual transport builds"),
+        );
+        let config = OracleSinkConfig {
+            url: format!("oracle:thin:@{host}:{port}/{service}"),
+            schema: user.to_ascii_uppercase(),
+            table: table.clone(),
+            username: user.clone(),
+            password: password.clone(),
+            custom_upsert: None,
+            key_columns: vec!["device_id".to_string()],
+            batch_size: Some(100),
+            buffer_capacity: None,
+            timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        let sink = Arc::new(OracleSink::new(config, transport).expect("qual sink builds"));
+        assert_eq!(sink.kind(), "oracle");
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..ROWS {
+            let device = format!("qual-{seq:06}");
+            let reading = 20.0 + seq as f64 * 0.5;
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"{device}","seq":{seq},"reading":{reading}}}"#
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap_or_else(|e| panic!("qual send seq={seq} failed: {e:?}"));
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_count(), ROWS as u64, "qual sent records");
+        eprintln!("qual rows sent: records={ROWS} table={table}");
+
+        // The count comes back from the server, not the counters.
+        let count_result = admin
+            .query(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual count");
+        let count = count_result
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .map(qual_as_i64)
+            .expect("qual count row");
+        assert_eq!(count, ROWS as i64, "qual count mismatch");
+        eprintln!("qual rows asserted: count={ROWS} table={table}");
+
+        // The first and the last row come back with exact content.
+        for (device, seq) in [("qual-000000", 0), ("qual-000499", 499)] {
+            let sample = admin
+                .query(
+                    &format!("SELECT device_id, seq, reading FROM {table} WHERE device_id = :1"),
+                    &[oracle_rs::Value::String(device.to_string())],
+                )
+                .await
+                .expect("qual sample");
+            let row = sample.rows.first().expect("qual sample row");
+            let got_device = row.get(0).map(qual_as_str).expect("qual device");
+            let got_seq = row.get(1).map(qual_as_i64).expect("qual seq");
+            let got_reading = row.get(2).map(qual_as_f64).expect("qual reading");
+            assert_eq!(got_device, device, "qual device mismatch");
+            assert_eq!(got_seq, seq, "qual seq mismatch");
+            let want_reading = 20.0 + seq as f64 * 0.5;
+            assert!(
+                (got_reading - want_reading).abs() < 1e-6,
+                "qual reading mismatch for {device}: got {got_reading}, want {want_reading}"
+            );
+        }
+        eprintln!("qual values asserted: first=(qual-000000,0,20.0) last=(qual-000499,499,269.5)");
+
+        // Fault: a wrong table fails closed with the server text.
+        let bad_table = qual_identifier("missing table", &format!("{table}_missing"));
+        let bad_config = OracleSinkConfig {
+            url: format!("oracle:thin:@{host}:{port}/{service}"),
+            schema: user.to_ascii_uppercase(),
+            table: bad_table.clone(),
+            username: user.clone(),
+            password: password.clone(),
+            custom_upsert: None,
+            key_columns: vec!["device_id".to_string()],
+            batch_size: Some(100),
+            buffer_capacity: None,
+            timeout_ms: Some(30_000),
+        };
+        let bad_transport = Arc::new(
+            DriverOracleTransport::new(&host, port, &service, &user, &password, timeout)
+                .expect("qual bad transport builds"),
+        );
+        let bad_sink =
+            Arc::new(OracleSink::new(bad_config, bad_transport).expect("qual bad sink builds"));
+        bad_sink
+            .send(
+                &topic,
+                &Bytes::from_static(br#"{"device_id":"qual-bad","seq":-1,"reading":0.0}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual bad buffer");
+        let error = bad_sink.flush().await.expect_err("wrong table must fail");
+        match &error {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains("ORA-00942")
+                    || message.to_ascii_lowercase().contains("does not exist"),
+                "qual fault must carry the server text, got {message:?}"
+            ),
+            other => panic!("wrong table must be terminal, got {other:?}"),
+        }
+        eprintln!("qual fault asserted: wrong table is a dispatch error ({error:?})");
+
+        // Cleanup: drop the table for this run.
+        admin
+            .execute(&format!("DROP TABLE {table}"), &[])
+            .await
+            .expect("qual drop table");
+        admin.commit().await.expect("qual drop commits");
+        eprintln!("qual done: rows={ROWS} table={table} cleaned");
+    }
+
+    #[test]
+    fn test_action_sql_validation() {
+        let good = "INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES (:1, :2, :3)";
+        assert!(validate_oracle_action_sql(good).is_ok());
+        // A subset still binds: unused engine values stay unbound.
+        assert!(validate_oracle_action_sql("INSERT INTO t(topic) VALUES (:1)").is_ok());
+        // No marker refuses.
+        assert!(validate_oracle_action_sql("INSERT INTO t VALUES (1)").is_err());
+        // Markers outside 1..=3 refuse.
+        assert!(validate_oracle_action_sql("INSERT INTO t VALUES (:1, :4)").is_err());
+        // Empty refuses.
+        assert!(validate_oracle_action_sql("  ").is_err());
+        // A colon inside a time literal or a qualified name is not a marker.
+        assert_eq!(
+            referenced_oracle_params("SELECT '12:10', t.col FROM t"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            referenced_oracle_params("INSERT INTO t(a, b) VALUES (:1, :2) -- :9"),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_action_sink_binds_engine_row() {
+        let transport = Arc::new(MockOracleTransport::new());
+        let sink = OracleActionSink::new(
+            "INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES (:1, :2, :3)".to_string(),
+            vec![transport.clone() as Arc<dyn OracleTransport>],
+        )
+        .expect("valid action sink");
+        assert_eq!(sink.kind(), "oracle");
+        assert_eq!(sink.pool_len(), 1);
+        let topic = Topic::new("sensors/temp").expect("topic");
+        sink.send(&topic, &Bytes::from_static(b"it's"), QoS::AtLeastOnce)
+            .await
+            .expect("send binds");
+        let executions = transport.executions.lock().clone();
+        assert_eq!(executions.len(), 1);
+        assert!(executions[0].statement.contains("INSERT INTO t_mqtt_msg"));
+        // The engine row binds positionally: topic, qos, payload.
+        assert_eq!(executions[0].binds.len(), 3);
+        assert_eq!(
+            executions[0].binds[0].value,
+            OracleValue::String("sensors/temp".to_string())
+        );
+        assert_eq!(executions[0].binds[1].value, OracleValue::Integer(1));
+        // A quote travels bound, never formatted into the statement.
+        assert_eq!(
+            executions[0].binds[2].value,
+            OracleValue::String("it's".to_string())
+        );
+        assert!(!executions[0].statement.contains("it's"));
+    }
+
+    /// Qualification of the MV-02a action sink against a real Oracle
+    /// Database server over the maintained driver.
+    ///
+    /// Run with e.g.:
+    /// `ORACLE_HOST=127.0.0.1 ORACLE_PORT=1521 ORACLE_SERVICE=FREEPDB1 \
+    ///  ORACLE_USER=system ORACLE_PASSWORD='Oraclepass1' \
+    ///  ORACLE_TABLE=qual_b334 \
+    ///  cargo test -p broker-connectors-enterprise --lib oracle::tests::test_qualify_action_delivery -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates the table. Streams 100 rows through the broker's rule
+    /// path (a rule registered with the connector manager, a message
+    /// published through the rule engine, never `sink.send`
+    /// directly). Asserts the exact count and every key back from the
+    /// server. Drops the table. Panics when its environment is
+    /// missing (fail closed, never skips).
+    #[tokio::test]
+    #[ignore = "needs a real Oracle Database server (see ORACLE_* env)"]
+    async fn test_qualify_action_delivery() {
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+        const ROWS: usize = 100;
+
+        let host = qual_require("ORACLE_HOST");
+        let port: u16 = qual_require("ORACLE_PORT")
+            .parse()
+            .expect("qual ORACLE_PORT must be a port number");
+        let service = qual_require("ORACLE_SERVICE");
+        let user = qual_require("ORACLE_USER");
+        let password = qual_require("ORACLE_PASSWORD");
+        let table = qual_identifier("table", &qual_require("ORACLE_TABLE"));
+
+        let admin = qual_connect(&host, port, &service, &user, &password).await;
+        admin
+            .execute(
+                &format!(
+                    "CREATE TABLE {table} (topic VARCHAR2(256), qos NUMBER, payload VARCHAR2(4000))"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create table");
+        admin.commit().await.expect("qual create commits");
+        eprintln!("qual table created: {table}");
+
+        // The broker's path: the action sink registers with the
+        // shared connector manager and a rule forwards into it, so
+        // the qualification publishes through the rule engine.
+        let timeout = Duration::from_secs(30);
+        let mut pool: Vec<Arc<dyn OracleTransport>> = Vec::new();
+        for _ in 0..4 {
+            pool.push(Arc::new(
+                DriverOracleTransport::new(&host, port, &service, &user, &password, timeout)
+                    .expect("qual transport builds"),
+            ));
+        }
+        let statement = format!("INSERT INTO {table}(topic, qos, payload) VALUES (:1, :2, :3)");
+        let sink =
+            Arc::new(OracleActionSink::new(statement, pool).expect("qual action sink builds"));
+        assert_eq!(sink.kind(), "oracle");
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        engine.connectors().register("qual-ora-action", sink);
+        engine
+            .create_rule(
+                "qual-ora-rule".to_string(),
+                broker_protocol::TopicFilter::new("sensors/qual").unwrap(),
+                Some(
+                    r#"SELECT * FROM "sensors/qual" INTO connector("qual-ora-action")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("qual rule creates");
+
+        #[derive(Debug, Default)]
+        struct DiscardSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for DiscardSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: Bytes,
+                _qos: QoS,
+                _retain: bool,
+            ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(DiscardSink);
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(r#"{{"client_id":"qual-{seq:04}","seq":{seq}}}"#));
+            engine
+                .dispatch_ingress(&topic, &payload, QoS::AtLeastOnce, &egress)
+                .await;
+        }
+
+        let count_rows = admin
+            .query(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual count");
+        let count = count_rows
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .map(qual_as_i64)
+            .expect("qual count row");
+        assert_eq!(count, ROWS as i64, "qual count mismatch");
+        eprintln!("qual rows asserted: count={ROWS} table={table}");
+
+        let value_rows = admin
+            .query(&format!("SELECT topic, qos, payload FROM {table}"), &[])
+            .await
+            .expect("qual values");
+        assert_eq!(value_rows.rows.len(), ROWS, "qual value row count");
+        let mut seen = std::collections::HashSet::with_capacity(ROWS);
+        for row in &value_rows.rows {
+            let row_topic = row.get(0).map(qual_as_str).expect("qual topic");
+            let row_qos = row.get(1).map(qual_as_i64).expect("qual qos");
+            let row_payload = row.get(2).map(qual_as_str).expect("qual payload");
+            assert_eq!(row_topic, "sensors/qual");
+            assert_eq!(row_qos, 1);
+            let value: serde_json::Value =
+                serde_json::from_str(&row_payload).expect("qual payload JSON");
+            let client = value
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .expect("qual client_id");
+            assert!(seen.insert(client.to_string()), "qual duplicate {client}");
+        }
+        for seq in 0..ROWS {
+            assert!(
+                seen.contains(&format!("qual-{seq:04}")),
+                "qual missing key qual-{seq:04}"
+            );
+        }
+        eprintln!("qual values asserted: every key present");
+
+        admin
+            .execute(&format!("DROP TABLE {table}"), &[])
+            .await
+            .expect("qual drop table");
+        admin.commit().await.expect("qual drop commits");
+        eprintln!("qual done: rows={ROWS} table={table}");
     }
 }

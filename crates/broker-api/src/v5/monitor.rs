@@ -29,28 +29,25 @@ use std::sync::RwLock;
 use crate::node_scope::resolve_node;
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes` and the other v5
-/// rows (`alarms`, `monitoring`, `clients`). Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Upper bound for stored history points. Recording past this size evicts
 /// the oldest point first instead of growing the buffer without limit.
 /// 1440 points cover four hours at one sample per ten seconds; one point
-/// holds nineteen integers, so the buffer stays well under one megabyte.
+/// holds nine integers, so the buffer stays well under one megabyte.
 pub const MAX_MONITOR_SAMPLES: usize = 1440;
 
-/// One sampled history point: the sampling instant (`time_stamp`, Unix
-/// seconds) plus gauge and cumulative counters as plain integers.
+/// One sampled history point: owning tenant (`tenant`), the sampling
+/// instant (`time_stamp`, Unix seconds) plus gauge and cumulative
+/// counters as plain integers.
 ///
-/// Gauges (`connections`, `live_connections`, `topics`, `subscriptions`,
-/// `subscriptions_durable`, `disconnected_durable_sessions`) describe the
-/// node at sampling time. Cumulative counters (`received`, `sent`,
-/// `dropped`, `persisted`, `validation_*`, `transformation_*`,
-/// `rules_matched`, `actions_executed`, `actions_messages`) only move
-/// forward within a run. Fields with no kernel tracking yet read zero so
-/// the shape stays stable; they rise once their subsystem records them.
+/// Gauges (`connections`, `live_connections`, `topics`, `subscriptions`)
+/// describe the tenant at sampling time. Cumulative counters
+/// (`received`, `sent`, `dropped`, `rules_matched`) only move forward
+/// within a run. The struct holds only tracked counters; names without
+/// kernel tracking have no field and stay out of the shape, never zero.
+/// Omitted: `subscriptions_durable`, `disconnected_durable_sessions`,
+/// `persisted`, `validation_*`, `transformation_*`, `actions_*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorSample {
     pub time_stamp: u64,
@@ -58,24 +55,16 @@ pub struct MonitorSample {
     pub live_connections: u64,
     pub topics: u64,
     pub subscriptions: u64,
-    pub subscriptions_durable: u64,
-    pub disconnected_durable_sessions: u64,
     pub received: u64,
     pub sent: u64,
     pub dropped: u64,
-    pub persisted: u64,
-    pub validation_succeeded: u64,
-    pub validation_failed: u64,
-    pub transformation_succeeded: u64,
-    pub transformation_failed: u64,
     pub rules_matched: u64,
-    pub actions_executed: u64,
-    pub actions_messages: u64,
+    pub tenant: String,
 }
 
 /// Live counter values captured into one history point. Gauges come from
 /// the session directory; cumulative counters come from the lock-free
-/// metrics snapshot. Untracked fields stay zero.
+/// metrics snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LiveCounters {
     pub connections: u64,
@@ -89,29 +78,32 @@ pub struct LiveCounters {
 }
 
 impl MonitorSample {
-    /// Build a point from live counters at `time_stamp`. Untracked fields
-    /// (durable gauges, validation/transformation splits, persistence and
-    /// action counters) read zero until their subsystem records them.
+    /// Build a point from live counters at `time_stamp`. Copy each
+    /// tracked counter. The point belongs to the default tenant; the
+    /// sampler records the default-tenant view only.
     pub fn from_live(time_stamp: u64, counters: LiveCounters) -> Self {
+        Self::from_live_in_tenant(
+            time_stamp,
+            counters,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+        )
+    }
+
+    /// Build a point from live counters at `time_stamp` in `tenant`.
+    /// Copy each tracked counter. Names without kernel tracking have
+    /// no field and stay out of the shape.
+    pub fn from_live_in_tenant(time_stamp: u64, counters: LiveCounters, tenant: &str) -> Self {
         Self {
             time_stamp,
             connections: counters.connections,
             live_connections: counters.live_connections,
             topics: counters.topics,
             subscriptions: counters.subscriptions,
-            subscriptions_durable: 0,
-            disconnected_durable_sessions: 0,
             received: counters.received,
             sent: counters.sent,
             dropped: counters.dropped,
-            persisted: 0,
-            validation_succeeded: 0,
-            validation_failed: 0,
-            transformation_succeeded: 0,
-            transformation_failed: 0,
             rules_matched: counters.rules_matched,
-            actions_executed: 0,
-            actions_messages: 0,
+            tenant: tenant.to_string(),
         }
     }
 
@@ -122,19 +114,11 @@ impl MonitorSample {
             "live_connections": self.live_connections,
             "topics": self.topics,
             "subscriptions": self.subscriptions,
-            "subscriptions_durable": self.subscriptions_durable,
-            "disconnected_durable_sessions": self.disconnected_durable_sessions,
             "received": self.received,
             "sent": self.sent,
             "dropped": self.dropped,
-            "persisted": self.persisted,
-            "validation_succeeded": self.validation_succeeded,
-            "validation_failed": self.validation_failed,
-            "transformation_succeeded": self.transformation_succeeded,
-            "transformation_failed": self.transformation_failed,
             "rules_matched": self.rules_matched,
-            "actions_executed": self.actions_executed,
-            "actions_messages": self.actions_messages,
+            "tenant": self.tenant,
         })
     }
 }
@@ -167,9 +151,23 @@ impl MonitorHistory {
     }
 
     /// Capture live counters into one point and record it. Constant-time,
-    /// like [`Self::record`]. Returns the stored point.
+    /// like [`Self::record`]. Returns the stored point. Records the
+    /// default-tenant view; other tenants keep their own points once
+    /// per-tenant sampling lands.
     pub fn capture_live(&self, time_stamp: u64, counters: LiveCounters) -> MonitorSample {
         let sample = MonitorSample::from_live(time_stamp, counters);
+        self.record(sample.clone());
+        sample
+    }
+
+    /// Capture live counters for `tenant` and record the point.
+    pub fn capture_live_in_tenant(
+        &self,
+        time_stamp: u64,
+        counters: LiveCounters,
+        tenant: &str,
+    ) -> MonitorSample {
+        let sample = MonitorSample::from_live_in_tenant(time_stamp, counters, tenant);
         self.record(sample.clone());
         sample
     }
@@ -196,6 +194,21 @@ impl MonitorHistory {
         out
     }
 
+    /// Snapshot of stored points of one tenant in ascending
+    /// `time_stamp` order (oldest first). Same window rule as
+    /// [`Self::list`].
+    pub fn list_in_tenant(
+        &self,
+        tenant: &str,
+        latest_secs: Option<u64>,
+        now_secs: u64,
+    ) -> Vec<MonitorSample> {
+        self.list(latest_secs, now_secs)
+            .into_iter()
+            .filter(|s| s.tenant == tenant)
+            .collect()
+    }
+
     /// Drop every stored point. Always succeeds, even when nothing is
     /// stored.
     pub fn clear(&self) {
@@ -214,11 +227,32 @@ impl MonitorHistory {
             .cloned()
     }
 
+    /// The two newest stored points, newest first. A missing point reads as
+    /// `None`. Constant-time: one short read lock and two clones.
+    /// Management-plane only; never touched on the per-message path.
+    pub fn newest_two(&self) -> (Option<MonitorSample>, Option<MonitorSample>) {
+        let buffer = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut newest_first = buffer.iter().rev();
+        (newest_first.next().cloned(), newest_first.next().cloned())
+    }
+
     /// Number of stored points (never above [`MAX_MONITOR_SAMPLES`]).
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().expect("monitor store lock").len()
     }
+}
+
+/// Events per second between two readings of one cumulative counter.
+///
+/// `secs` is the time between the readings. A zero `secs` counts as one
+/// second, because the points carry stamps of one second. A counter that
+/// went backwards (a restart of its owner) reads as no events. The result
+/// is rounded to the nearest whole event per second.
+pub fn rate_per_sec(newer: u64, older: u64, secs: u64) -> u64 {
+    let secs = secs.max(1);
+    let delta = newer.saturating_sub(older);
+    delta.saturating_add(secs / 2) / secs
 }
 
 impl Default for MonitorHistory {
@@ -246,13 +280,24 @@ fn parse_latest(query: &MonitorListQuery) -> Option<u64> {
 
 /// `GET /monitor`: ordered history array (oldest first). An empty store
 /// reads as an empty array, never an error. `?latest=N` keeps only points
-/// sampled within the last N seconds; unknown query keys are ignored and
-/// a malformed `latest` falls back to the full history. Management-plane
-/// only: one short store lock, no work on the per-message path.
+/// sampled within the last N seconds (`N` is at least 1; zero fails with
+/// 400 `BAD_RPC`); unknown query keys are ignored and a malformed
+/// `latest` falls back to the full history. Management-plane only: one
+/// short store lock, no work on the per-message path.
 pub async fn list_monitor(
     State(state): State<ApiState>,
     Query(query): Query<MonitorListQuery>,
 ) -> Response {
+    if let Some(raw) = query.latest.as_deref() {
+        if let Ok(value) = raw.trim().parse::<u64>() {
+            if value == 0 {
+                return crate::errors::ApiError::BadRpc(
+                    "query parameter `latest` must be at least 1".to_string(),
+                )
+                .into_response();
+            }
+        }
+    }
     let latest = parse_latest(&query);
     let now = now_epoch_secs();
     let rows = state.monitor.list(latest, now);
@@ -273,7 +318,7 @@ pub async fn clear_monitor(State(state): State<ApiState>) -> Response {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same ordered array shape as
 /// [`list_monitor`] (same `?latest=N` window, same unknown-query-keys
@@ -285,13 +330,23 @@ pub async fn get_monitor_node(
     Query(query): Query<MonitorListQuery>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
         return resolve_node(&state.node_id, &node)
             .expect_err("node already checked as unknown")
             .into_response();
+    }
+    if let Some(raw) = query.latest.as_deref() {
+        if let Ok(value) = raw.trim().parse::<u64>() {
+            if value == 0 {
+                return crate::errors::ApiError::BadRpc(
+                    "query parameter `latest` must be at least 1".to_string(),
+                )
+                .into_response();
+            }
+        }
     }
     let latest = parse_latest(&query);
     let now = now_epoch_secs();
@@ -310,6 +365,31 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_per_sec_divides_by_the_window_and_rounds() {
+        assert_eq!(rate_per_sec(600, 100, 10), 50);
+        // 14 events in 10 s is 1.4 per second and rounds down.
+        assert_eq!(rate_per_sec(14, 0, 10), 1);
+        // 15 events in 10 s is 1.5 per second and rounds up.
+        assert_eq!(rate_per_sec(15, 0, 10), 2);
+        // A zero window counts as one second.
+        assert_eq!(rate_per_sec(7, 2, 0), 5);
+        // A counter that went backwards reads as no events.
+        assert_eq!(rate_per_sec(3, 90, 10), 0);
+    }
+
+    #[test]
+    fn newest_two_returns_the_last_points_newest_first() {
+        let history = MonitorHistory::new();
+        assert_eq!(history.newest_two(), (None, None));
+        for stamp in [10u64, 20, 30] {
+            history.capture_live(stamp, LiveCounters::default());
+        }
+        let (newest, previous) = history.newest_two();
+        assert_eq!(newest.map(|s| s.time_stamp), Some(30));
+        assert_eq!(previous.map(|s| s.time_stamp), Some(20));
+    }
 
     fn sample_at(time_stamp: u64, connections: u64) -> MonitorSample {
         MonitorSample::from_live(
@@ -400,22 +480,27 @@ mod tests {
         for field in [
             "topics",
             "subscriptions",
-            "subscriptions_durable",
-            "disconnected_durable_sessions",
             "received",
             "sent",
             "dropped",
+            "rules_matched",
+        ] {
+            assert!(rendered.get(field).is_some(), "missing field {field}");
+            assert!(rendered[field].is_u64(), "field {field} must be an integer");
+        }
+        // Fields without kernel tracking stay out, never zero.
+        for field in [
+            "subscriptions_durable",
+            "disconnected_durable_sessions",
             "persisted",
             "validation_succeeded",
             "validation_failed",
             "transformation_succeeded",
             "transformation_failed",
-            "rules_matched",
             "actions_executed",
             "actions_messages",
         ] {
-            assert!(rendered.get(field).is_some(), "missing field {field}");
-            assert!(rendered[field].is_u64(), "field {field} must be an integer");
+            assert!(rendered.get(field).is_none(), "untracked field {field}");
         }
     }
 
@@ -440,6 +525,27 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
+    #[test]
+    fn samples_stay_in_their_own_tenant() {
+        let store = MonitorHistory::new();
+        let counters = LiveCounters {
+            connections: 1,
+            live_connections: 1,
+            topics: 1,
+            subscriptions: 1,
+            received: 2,
+            sent: 2,
+            dropped: 0,
+            rules_matched: 0,
+        };
+        store.capture_live(1_700_000_100, counters);
+        store.capture_live_in_tenant(1_700_000_200, counters, "tenant-b");
+        assert_eq!(store.list(None, 1_700_000_300).len(), 2);
+        let scoped = store.list_in_tenant("tenant-b", None, 1_700_000_300);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].tenant, "tenant-b");
+    }
+
     fn standalone_state() -> ApiState {
         let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
             16,
@@ -462,7 +568,7 @@ mod tests {
         let state = standalone_state();
         state.monitor.record(sample_at(1_700_000_100, 3));
         state.monitor.record(sample_at(1_700_000_200, 5));
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_monitor_node(
                 State(state.clone()),
                 Path(known.to_string()),
@@ -484,22 +590,26 @@ mod tests {
                     "live_connections",
                     "topics",
                     "subscriptions",
-                    "subscriptions_durable",
-                    "disconnected_durable_sessions",
                     "received",
                     "sent",
                     "dropped",
+                    "rules_matched",
+                ] {
+                    assert!(row.get(field).is_some(), "missing field {field}");
+                    assert!(row[field].is_u64(), "field {field} must be an integer");
+                }
+                for field in [
+                    "subscriptions_durable",
+                    "disconnected_durable_sessions",
                     "persisted",
                     "validation_succeeded",
                     "validation_failed",
                     "transformation_succeeded",
                     "transformation_failed",
-                    "rules_matched",
                     "actions_executed",
                     "actions_messages",
                 ] {
-                    assert!(row.get(field).is_some(), "missing field {field}");
-                    assert!(row[field].is_u64(), "field {field} must be an integer");
+                    assert!(row.get(field).is_none(), "untracked field {field}");
                 }
             }
         }

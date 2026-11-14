@@ -1,0 +1,9 @@
+{
+  "action": "Boot with four pooled connections and a PostgreSQL source, read the boot log, and connect anonymously.",
+  "config": "[auth]\nallow_anonymous = true\n\n[logging]\nlevel = \"info\"\n\n[dbauth]\npostgres_url = \"postgres://docs:docs@127.0.0.1:9/docs\"\npool_size = 4\n",
+  "item": "dbauth.pool_size",
+  "kind": "setting",
+  "output": "pool-logged anonymous-refused",
+  "returncode": 0,
+  "verified": true
+}

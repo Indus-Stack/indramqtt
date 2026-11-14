@@ -1,0 +1,9 @@
+{
+  "action": "Connect two clients with a cap of one.",
+  "config": "[listeners.tcp]\nmax_connections = 1\n\n[auth]\nallow_anonymous = true\n",
+  "item": "listeners.tcp.max_connections",
+  "kind": "setting",
+  "output": "limited",
+  "returncode": 0,
+  "verified": true
+}

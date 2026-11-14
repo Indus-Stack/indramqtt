@@ -16,9 +16,6 @@ id = "indra-node-1"
 # Data directory for persistent segmented logs and cursor metadata
 data_dir = "/var/lib/indramqtt/data"
 
-# BrokerLink IPC listen address for edge clients (TCP loopback)
-brokerlink_bind = "127.0.0.1:18883"
-
 # =============================================================================
 # Network Listeners
 # =============================================================================
@@ -36,6 +33,18 @@ enabled = false
 bind = "0.0.0.0:8883"
 cert_file = "/etc/indramqtt/certs/server.crt"
 key_file = "/etc/indramqtt/certs/server.key"
+# Request and verify a client certificate. Off by default.
+verify_client_cert = false
+# Client certificate chain check mode: verify_none or verify_peer.
+verify = "verify_none"
+# CA file for client certificate checks. Required when verification is on.
+cacertfile = ""
+# Refuse a handshake without a certificate. Needs verification on.
+fail_if_no_peer_cert = false
+# Take the bind username from the certificate: disabled, cn or dn.
+peer_cert_as_username = "disabled"
+# Take the bind client identifier from the certificate: disabled, cn or dn.
+peer_cert_as_clientid = "disabled"
 
 [listeners.ws]
 # Binary MQTT-over-WebSocket listener (older files may use
@@ -51,6 +60,18 @@ bind = "0.0.0.0:8084"
 path = "/mqtt"
 cert_file = ""
 key_file = ""
+# Request and verify a client certificate. Off by default.
+verify_client_cert = false
+# Client certificate chain check mode: verify_none or verify_peer.
+verify = "verify_none"
+# CA file for client certificate checks. Required when verification is on.
+cacertfile = ""
+# Refuse a handshake without a certificate. Needs verification on.
+fail_if_no_peer_cert = false
+# Take the bind username from the certificate: disabled, cn or dn.
+peer_cert_as_username = "disabled"
+# Take the bind client identifier from the certificate: disabled, cn or dn.
+peer_cert_as_clientid = "disabled"
 
 [listeners.api]
 # Axum REST Management API & Embedded Web Dashboard SPA
@@ -70,6 +91,15 @@ default_max_publish_rate = 50000
 
 # Token bucket burst multiplier (allows burst up to burst * rate)
 burst_multiplier = 2.0
+
+# Default max live connections per tenant (0 = unlimited)
+max_connections_per_tenant = 10000
+
+# Default max sessions per tenant (0 = unlimited)
+max_sessions_per_tenant = 10000
+
+# Default max retained topics per tenant (0 = unlimited)
+max_retained_per_tenant = 10000
 
 # =============================================================================
 # Session & Protocol Invariants
@@ -235,3 +265,13 @@ allowed_realms = []
 clock_skew_secs = 300
 role_map = ""
 replay_max_entries = 1024
+
+# =============================================================================
+# Built-in MCP Endpoint (Model Context Protocol)
+# =============================================================================
+
+[mcp]
+# Serve POST /mcp on the management listener. A disabled path answers 404.
+enabled = true
+# Refuse mutating tool calls. Read-only mode still serves broker_status.
+read_only = false

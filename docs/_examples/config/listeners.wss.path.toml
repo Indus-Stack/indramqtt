@@ -1,0 +1,41 @@
+[example]
+area = "config"
+item = "listeners.wss.path"
+kind = "setting"
+expect = "path=/docs-mqtt"
+expected = "A WebSocket upgrade on the configured path answers 101."
+source = "`crates/broker-node/src/native.rs` checks the request path against the setting before the upgrade."
+action = "Run one secure WebSocket upgrade on the configured path."
+config = '''
+[listeners.wss]
+enabled = true
+bind = "127.0.0.1:28884"
+path = "/docs-mqtt"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+'''
+script = '''
+from config_probe import *
+import base64
+import os
+import socket
+import ssl
+
+raw = socket.create_connection(("127.0.0.1", 28884), timeout=10)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+tls = ctx.wrap_socket(raw, server_hostname="localhost")
+tls.settimeout(10)
+wskey = base64.b64encode(os.urandom(16)).decode()
+tls.sendall(("GET /docs-mqtt HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + wskey + "\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n").encode())
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = tls.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+assert resp.startswith(b"HTTP/1.1 101"), resp[:60]
+tls.close()
+print("path=/docs-mqtt")
+'''

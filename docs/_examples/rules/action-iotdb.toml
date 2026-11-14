@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-iotdb"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-iotdb"
+type = "iotdb"
+expect_status = 201
+expect_type = "iotdb"
+
+[[case]]
+name = "dx2-action-iotdb"
+type = "iotdb"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

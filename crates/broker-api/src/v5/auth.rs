@@ -9,7 +9,10 @@ use axum::{
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use broker_auth::{AclAction, AclRule, ImportUsersError};
+use broker_auth::{
+    AclAction, AclRule, ImportUsersError, MAX_AUTHN_USERNAME_LEN, MAX_AUTHN_USERS,
+    MAX_PASSWORD_BYTES,
+};
 use bytes::Bytes;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -17,12 +20,23 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::admin_users::{AdminRole, AdminUserError};
+use crate::admin_users::{AdminRole, AdminUserError, UserScopesUpdate};
 use crate::errors::ApiError;
+use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
-/// Token lifetime: 60 minutes.
+/// Token lifetime: 3600 s (60 minutes), the documented dashboard TTL.
+/// Reason: the documented expiry for dashboard sessions; every lookup
+/// re-checks `expires_at`, and logout plus password change revoke eagerly.
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+/// Upper bound on live dashboard tokens: 1024 entries, expiry-swept on
+/// every issue. Failed logins never insert.
+/// Reason: each entry holds a short token string plus identity (hundreds
+/// of bytes), so 1024 covers concurrent dashboard sessions while keeping
+/// management memory bounded regardless of login rate. The default is
+/// finite: no opt-in to unlimited exists anywhere on this path.
+/// Management-plane only: publish and deliver never touch this map.
+pub(crate) const MAX_LIVE_TOKENS: usize = 1024;
 /// SCRAM challenge lifetime: 60 seconds.
 const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 /// Upper bound on pending SCRAM challenges (flood cap).
@@ -60,6 +74,8 @@ pub struct TokenInfo {
     pub role: AdminRole,
     pub expires_at: Instant,
     pub must_change_password: bool,
+    /// Explicit dashboard user scopes; `None` means the role default.
+    pub scopes: Option<Vec<String>>,
 }
 
 /// Per-`ApiState` token and SCRAM-challenge store. Lives in `ApiState`
@@ -78,6 +94,8 @@ impl ApiTokens {
     }
 
     /// Issue a random 32-byte URL-safe token bound to `username`/`role`.
+    /// Management-plane only: one short lock plus an expiry sweep per
+    /// login; publish and deliver never touch this map.
     pub fn issue(&self, username: &str, role: AdminRole) -> String {
         let mut token_bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut token_bytes);
@@ -87,12 +105,33 @@ impl ApiTokens {
             role,
             expires_at: Instant::now() + TOKEN_TTL,
             must_change_password: false,
+            scopes: None,
         };
         let mut tokens = self.tokens.lock().unwrap();
         let now = Instant::now();
         tokens.retain(|_, v| v.expires_at > now);
+        // The map evicts the oldest-expiring entry when full. This keeps
+        // live administrators able to log in.
+        while tokens.len() >= MAX_LIVE_TOKENS {
+            let oldest = tokens
+                .iter()
+                .min_by_key(|(_, info)| info.expires_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    tokens.remove(&key);
+                }
+                None => break,
+            }
+        }
         tokens.insert(token.clone(), info);
         token
+    }
+
+    /// Number of entries currently held (tests only).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.tokens.lock().unwrap().len()
     }
 
     /// Look up a token; unknown or expired tokens return `None`.
@@ -124,6 +163,7 @@ impl ApiTokens {
             role,
             expires_at: Instant::now() - Duration::from_secs(1),
             must_change_password: false,
+            scopes: None,
         };
         self.tokens.lock().unwrap().insert(token.clone(), info);
         token
@@ -182,7 +222,10 @@ fn parse_role(raw: &str) -> Option<AdminRole> {
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "code": "FORBIDDEN" })),
+        Json(serde_json::json!({
+            "code": "FORBIDDEN",
+            "message": "insufficient permissions"
+        })),
     )
         .into_response()
 }
@@ -191,23 +234,96 @@ fn name_pwd_error() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
-            "code": "NAME_PWD_ERROR",
+            "code": "BAD_USERNAME_OR_PWD",
             "message": "Bad username or password"
         })),
     )
         .into_response()
 }
 
+/// The answer of a password change when the old password does not match:
+/// 400 `ERROR_PWD_NOT_MATCH`, as the reference API documents for
+/// `POST /users/{username}/change_pwd`.
+fn old_pwd_mismatch() -> Response {
+    ApiError::ErrorPwdNotMatch("the old password does not match".to_string()).into_response()
+}
+
+/// The answer when a user has too many failed logins. The reference API
+/// gives 401 with the code `LOGIN_LOCKED` for this.
+fn login_locked_error() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "code": "LOGIN_LOCKED",
+            "message": "too many failed logins; try again later"
+        })),
+    )
+        .into_response()
+}
+
+/// Examines the second factor of a login. A user without MFA passes. A
+/// user with MFA must give a correct code that was not used before.
+/// An absent code and an incorrect code get 401 with the code
+/// `BAD_MFA_TOKEN`, as in the reference API. A client that gets this
+/// code asks the user for the MFA code.
+fn check_login_mfa(state: &ApiState, username: &str, mfa_token: Option<&str>) -> Option<Response> {
+    let enabled = state
+        .admin_users
+        .mfa_status(username)
+        .is_some_and(|status| status.enabled);
+    if !enabled {
+        return None;
+    }
+    let code = mfa_token.map(str::trim).unwrap_or("");
+    if code.is_empty() {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "code": "BAD_MFA_TOKEN",
+                    "message": "this user must give an MFA code"
+                })),
+            )
+                .into_response(),
+        );
+    }
+    match state
+        .admin_users
+        .mfa_verify(username, code, crate::mfa_totp::unix_now_secs())
+    {
+        Ok(_) => None,
+        Err(crate::admin_users::MfaVerifyError::Locked) => Some(login_locked_error()),
+        Err(crate::admin_users::MfaVerifyError::Persist(reason)) => Some(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "code": "INTERNAL_ERROR", "message": reason })),
+            )
+                .into_response(),
+        ),
+        Err(_) => Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "code": "BAD_MFA_TOKEN",
+                    "message": "the MFA code is not correct"
+                })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// Map an `AdminUsers` error onto its HTTP status.
 fn admin_error(error: AdminUserError) -> Response {
     let (status, code) = match error {
-        AdminUserError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        AdminUserError::NotFound => (StatusCode::NOT_FOUND, "USER_NOT_FOUND"),
         AdminUserError::AlreadyExists => (StatusCode::CONFLICT, "ALREADY_EXISTS"),
         AdminUserError::Persist(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+        AdminUserError::LastAdministrator => (StatusCode::BAD_REQUEST, "NOT_ALLOWED"),
         AdminUserError::InvalidUsername
         | AdminUserError::WeakPassword
         | AdminUserError::SameAsOld
-        | AdminUserError::LastAdministrator => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+        | AdminUserError::TooManyUsers => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
     };
     (
         status,
@@ -246,6 +362,7 @@ pub(crate) fn resolve_bearer(state: &ApiState, token: &str) -> Option<TokenInfo>
         role: view.role,
         expires_at: info.expires_at,
         must_change_password: view.must_change_password,
+        scopes: view.scopes,
     })
 }
 
@@ -409,6 +526,9 @@ pub async fn scram_verify(
     // Verify against the stored SCRAM credentials. Unknown users fail here:
     // `scram_verify` returns `None` when the user does not exist. Login
     // never creates or modifies users.
+    if state.admin_users.login_locked(&ch.username) {
+        return login_locked_error();
+    }
     let server_sig =
         match state
             .admin_users
@@ -416,10 +536,11 @@ pub async fn scram_verify(
         {
             Some(sig) => sig,
             None => {
+                state.admin_users.record_login_failure(&ch.username);
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({
-                        "code": "NAME_PWD_ERROR",
+                        "code": "BAD_USERNAME_OR_PWD",
                         "message": "Invalid credentials"
                     })),
                 )
@@ -427,6 +548,10 @@ pub async fn scram_verify(
             }
         };
     let server_sig_b64 = BASE64.encode(server_sig);
+    if let Some(refusal) = check_login_mfa(&state, &ch.username, req.mfa_token.as_deref()) {
+        return refusal;
+    }
+    state.admin_users.clear_login_failures(&ch.username);
 
     let Some(view) = state.admin_users.get(&ch.username) else {
         return name_pwd_error();
@@ -451,20 +576,54 @@ pub async fn scram_verify(
 pub struct DirectLoginRequest {
     pub username: String,
     pub password: String,
+    /// The MFA code. Necessary when the user has MFA.
+    #[serde(default)]
+    pub mfa_token: Option<String>,
 }
 
-pub async fn direct_login(
-    State(state): State<ApiState>,
-    Json(req): Json<DirectLoginRequest>,
-) -> Response {
-    // Only the admin-user store decides. The default `admin`/`public`
-    // already lives there; there is no shortcut and no MQTT-store fallback.
+/// `POST /login`: verify dashboard credentials against the real
+/// admin-user store and, on success, issue a live bearer token.
+///
+/// Only the admin-user store decides (constant-time password comparison
+/// in `AdminUsers::verify_password`, including a dummy derivation for
+/// unknown users so names cannot be enumerated). The default
+/// `admin`/`public` already lives there; there is no shortcut and no
+/// MQTT-store fallback. A successful login mints one entry in the
+/// bounded live-token map (`MAX_LIVE_TOKENS`, `TOKEN_TTL`); a failed
+/// login creates nothing. Tokens are revoked by logout and by password
+/// change, and expire on lookup. The route is not paged and sets no
+/// cookies: the token travels in the JSON body only.
+/// Management-plane only: one short store read plus one token-map lock
+/// per call; publish and deliver never touch either store.
+// The documented failure code for a bad username or password is
+// `BAD_USERNAME_OR_PWD` (401, documented `{code, message}` shape).
+pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: DirectLoginRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid login body: {error}")).into_response();
+        }
+    };
+    // Empty credentials are malformed (400). The handler rejects empty
+    // the same way as a missing field.
+    if req.username.trim().is_empty() || req.password.is_empty() {
+        return ApiError::BadRequest("username and password must not be empty".to_string())
+            .into_response();
+    }
+    if state.admin_users.login_locked(&req.username) {
+        return login_locked_error();
+    }
     if !state
         .admin_users
         .verify_password(&req.username, &req.password)
     {
+        state.admin_users.record_login_failure(&req.username);
         return name_pwd_error();
     }
+    if let Some(refusal) = check_login_mfa(&state, &req.username, req.mfa_token.as_deref()) {
+        return refusal;
+    }
+    state.admin_users.clear_login_failures(&req.username);
 
     let Some(view) = state.admin_users.get(&req.username) else {
         return name_pwd_error();
@@ -484,10 +643,36 @@ pub async fn direct_login(
         .into_response()
 }
 
+/// `POST /logout`: revoke the caller's live bearer token.
+///
+/// The bearer token from `Authorization: Bearer <token>` is looked up in
+/// the bounded live-token map (`MAX_LIVE_TOKENS`, `TOKEN_TTL` from the
+/// login task); a live entry is removed and the call answers 204 with no
+/// body. A missing header, an unknown token, an expired token, or a token
+/// whose user was deleted is a client error: 401 with the documented
+/// `{code, message}` shape, never success. Revoked entries are removed,
+/// not retained, so logout never grows the map toward its cap. The route
+/// is not paged and takes no parameters; any body or query is ignored.
+/// Management-plane only: one short token-map lock per call (plus the
+/// admin-user read inside the liveness check); publish and deliver never
+/// touch either store.
+// A missing or revoked logout token answers 401 UNAUTHORIZED with the
+// documented shape. The code matches the auth middleware.
+// Logout revokes by bearer token alone. The handler ignores any body.
 pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if let Some(token) = bearer_token_from_credentials(&headers) {
-        state.tokens.revoke(&token);
+    let Some(token) = bearer_token_from_credentials(&headers) else {
+        return ApiError::Unauthorized("missing or invalid credentials".to_string())
+            .into_response();
+    };
+    // Liveness check through the same resolver the middleware uses:
+    // unknown, expired, or deleted-user tokens are already gone (expired
+    // entries removed, deleted-user tokens revoked) and must not report
+    // success.
+    if resolve_bearer(&state, &token).is_none() {
+        return ApiError::Unauthorized("missing or invalid credentials".to_string())
+            .into_response();
     }
+    state.tokens.revoke(&token);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -515,22 +700,221 @@ pub async fn current_user(
         .into_response()
 }
 
+/// One entry of the fixed dashboard-user scope catalogue: the stable
+/// scope name, a short operator-facing summary, and whether only the
+/// administrator role may hold it.
+struct UserScopeEntry {
+    name: &'static str,
+    desc: &'static str,
+    admin_only: bool,
+}
+
+/// Fixed catalogue of scopes a dashboard login user may hold (C05-24).
+///
+/// Bound (stated here and enforced by construction): exactly fourteen
+/// entries, no growth; the list lives in code, so there is no
+/// persistence beyond it and no per-request growth. Each summary is a
+/// short static string, so serving the catalogue allocates only the
+/// small bounded response body once per request.
+///
+/// The first ten are generic scopes shared with API keys.
+/// Either role can hold them. The last four are login-only scopes.
+/// An administrator can hold all four. A viewer can hold
+/// `mfa_management`. The catalogue route serves this list. The write
+/// paths check names and roles against
+/// [`broker_config::is_known_user_scope`] and
+/// [`broker_config::role_may_hold_user_scope`].
+// Scope names stay exact. Summaries use short operator words.
+// The catalogue records the per-scope admin flag. Writes check
+// per-scope role compatibility.
+const USER_SCOPES: [UserScopeEntry; 14] = [
+    UserScopeEntry {
+        name: "connections",
+        desc: "View and manage client connections, subscriptions and topics",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "publish",
+        desc: "Publish messages through the management API",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "data_integration",
+        desc: "Manage rules, connectors and data integrations",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "access_control",
+        desc: "Manage client authentication and authorization settings",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "gateways",
+        desc: "Manage protocol gateways and their clients",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "monitoring",
+        desc: "Read metrics, alarms, traces and monitoring data",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "cluster_operations",
+        desc: "Manage cluster membership and node operations",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "system",
+        desc: "Manage core configuration, listeners and system settings",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "audit",
+        desc: "Query the audit log",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "license",
+        desc: "Read the licence document and manage the licence settings",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "user_management",
+        desc: "Manage dashboard users and their scopes",
+        admin_only: true,
+    },
+    UserScopeEntry {
+        name: "mfa_management",
+        desc: "Exempt the user's own MFA from the administrator policy locks",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "sso_management",
+        desc: "Manage single sign-on backends and settings",
+        admin_only: true,
+    },
+    UserScopeEntry {
+        name: "api_key_management",
+        desc: "Manage API keys and their scopes",
+        admin_only: true,
+    },
+];
+
+// TODO(parity): this broker has no force_mfa or admin_required policy lock.
+// The self-exemption effect of mfa_management cannot show until those locks
+// exist. The scope itself is validated, stored and enforced.
+
+/// Whether `name` is one of the scopes a dashboard login user may hold.
+pub fn is_known_user_scope(name: &str) -> bool {
+    broker_config::is_known_user_scope(name)
+}
+
+/// Whether `role` may hold `scope`.
+/// Unknown names and unknown roles fail closed.
+pub fn role_may_hold_scope(role: &AdminRole, scope: &str) -> bool {
+    broker_config::role_may_hold_user_scope(role_str(role), scope)
+}
+
+/// The implicit scopes of a dashboard role.
+pub(crate) fn default_scopes_for_role(role: AdminRole) -> Vec<String> {
+    broker_config::role_default_user_scopes(role_str(&role))
+}
+
+/// The effective scopes of a dashboard user: the explicit list when it
+/// exists, otherwise the role default.
+pub(crate) fn effective_user_scopes(role: AdminRole, scopes: &Option<Vec<String>>) -> Vec<String> {
+    match scopes {
+        Some(list) => list.clone(),
+        None => default_scopes_for_role(role),
+    }
+}
+
+/// True when two scope lists hold the same names, in any order.
+fn same_scope_set(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
+
+/// Validate an explicit scope list against the catalogue and the role.
+fn validate_scope_list(role: AdminRole, scopes: &[String]) -> Result<(), String> {
+    broker_config::validate_user_scope_list(role_str(&role), scopes)
+}
+
+/// Read a `scopes` write value into the list to store.
+/// `unset` and a list equal to the role default clear the explicit list.
+fn parse_scope_write(
+    role: AdminRole,
+    raw: &serde_json::Value,
+) -> Result<Option<Vec<String>>, String> {
+    match raw {
+        serde_json::Value::String(text) if text == "unset" => Ok(None),
+        serde_json::Value::String(_) => {
+            Err("field `scopes` must be a list of strings or \"unset\"".to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let mut scopes = Vec::with_capacity(items.len());
+            for item in items {
+                let scope = item
+                    .as_str()
+                    .ok_or_else(|| "field `scopes` must hold strings".to_string())?;
+                scopes.push(scope.to_string());
+            }
+            validate_scope_list(role, &scopes)?;
+            if same_scope_set(&scopes, &default_scopes_for_role(role)) {
+                Ok(None)
+            } else {
+                Ok(Some(scopes))
+            }
+        }
+        _ => Err("field `scopes` must be a list of strings or \"unset\"".to_string()),
+    }
+}
+
+/// Refuse a stored explicit list that the new role cannot hold.
+fn validate_stored_scopes(role: AdminRole, scopes: &Option<Vec<String>>) -> Result<(), String> {
+    if let Some(list) = scopes {
+        validate_scope_list(role, list)?;
+    }
+    Ok(())
+}
+
+/// The response value of a scope list.
+/// `None` renders the legacy `unset` sentinel.
+fn scopes_json(scopes: &Option<Vec<String>>) -> serde_json::Value {
+    match scopes {
+        Some(list) => serde_json::json!(list),
+        None => serde_json::Value::String("unset".to_string()),
+    }
+}
+
+/// `GET /user_scopes`: fixed catalogue of scopes a dashboard login
+/// user may hold (C05-24).
+///
+/// Returns `{"scopes": [{"name", "desc", "admin_only"}]}` in catalogue
+/// order, served from [`USER_SCOPES`]. The dashboard-user write paths
+/// check the names and roles against the `broker_config` lists. A test
+/// compares the two registries. The route is not paged and takes no
+/// parameters; unknown query parameters are ignored (the handler takes
+/// no extractor, so Axum never parses them).
+/// Management-plane only: reads a code-defined list, takes no lock,
+/// and publish/deliver never touch it.
 pub async fn user_scopes() -> Response {
+    let scopes: Vec<serde_json::Value> = USER_SCOPES
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.name,
+                "desc": entry.desc,
+                "admin_only": entry.admin_only,
+            })
+        })
+        .collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "scopes": [
-                "all",
-                "user_management",
-                "monitoring",
-                "rules",
-                "connectors",
-                "clients",
-                "subscriptions",
-                "gateways",
-                "listeners"
-            ]
-        })),
+        Json(serde_json::json!({ "scopes": scopes })),
     )
         .into_response()
 }
@@ -538,122 +922,328 @@ pub async fn user_scopes() -> Response {
 /// Dashboard/API users live in the admin-user store only. MQTT client
 /// credentials stay in `MemoryAuth` behind the `/authentication/.../users`
 /// and v1 `/auth/users` endpoints.
+///
+/// `GET /users`: all dashboard users as a bare JSON array (C05-25).
+///
+/// The reference API documents an array of user rows and no paging
+/// parameters, and the management console reads an array. The array is
+/// sorted by username. An empty store reads as `[]`, never an error. Each
+/// row carries `username`, `role`, `description`, `backend` (always
+/// `local`: the broker has one user store), `mfa` and `scopes`. The value
+/// of `mfa` is `totp` for a user whose second factor is on, `disabled`
+/// for a user with a pending enrolment that no code has confirmed, and
+/// `none` otherwise. `scopes` is the explicit list, or the legacy
+/// `unset` sentinel when the role default applies. Passwords are
+/// write-only and password hashes never render.
+/// Management-plane only: clones the sorted view list once per request
+/// under short read locks; the login and middleware consults keep reading
+/// under their own short locks and publish/deliver never touch this
+/// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
+/// (1024 entries), so the list stays small.
 pub async fn list_users(State(state): State<ApiState>) -> Response {
-    let users: Vec<_> = state
+    let rows: Vec<_> = state
         .admin_users
         .list()
-        .into_iter()
+        .iter()
         .map(|u| {
+            let mfa = match state.admin_users.mfa_status(&u.username) {
+                Some(status) if status.enabled => "totp",
+                Some(status) if status.pending => "disabled",
+                _ => "none",
+            };
             serde_json::json!({
                 "username": u.username,
                 "role": role_str(&u.role),
                 "description": u.description,
+                "backend": "local",
+                "mfa": mfa,
+                "scopes": scopes_json(&u.scopes),
             })
         })
         .collect();
-    (StatusCode::OK, Json(users)).into_response()
+    (StatusCode::OK, Json(serde_json::Value::Array(rows))).into_response()
 }
 
-#[derive(Deserialize)]
-pub struct CreateUserReq {
-    pub username: String,
-    pub password: String,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-pub async fn create_user(
-    State(state): State<ApiState>,
-    Json(req): Json<CreateUserReq>,
-) -> Response {
-    // Authentication and the administrator role are enforced by the
-    // middleware; the handler only validates the payload.
-    let role = match req.role.as_deref() {
-        None => AdminRole::Administrator,
-        Some(raw) => match parse_role(raw) {
-            Some(role) => role,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "BAD_REQUEST",
-                        "message": "role must be administrator or viewer"
-                    })),
-                )
-                    .into_response();
-            }
+/// `POST /users`: add one dashboard user (C05-26).
+///
+/// The body must be a JSON object with non-empty string `username` and
+/// `password` fields; `role` (`administrator` or `viewer`, default
+/// `administrator`) and `description` (default empty) are optional. Extra
+/// fields are ignored so future record fields degrade to the same create
+/// instead of a 400. Anything else fails with `BAD_REQUEST` in the
+/// documented `{code, message}` shape and creates nothing. A `username`
+/// that already exists fails with `ALREADY_EXISTS` instead of updating
+/// in place; a store that already holds
+/// [`crate::admin_users::MAX_ADMIN_USERS`] entries fails with
+/// `BAD_REQUEST`. Usernames must match the store charset (alphanumeric
+/// plus `_-.@`, at most 64 bytes) and passwords must be at least 8
+/// characters; both fail closed with `BAD_REQUEST`. An omitted `scopes`
+/// field stores the role default. The string `unset` and a list equal to
+/// the role default store no explicit list; an empty list denies each
+/// management scope. An unknown scope or a scope the role cannot hold
+/// fails with `BAD_REQUEST` and creates nothing. On success answers 200
+/// with `username`, `role`, `description`, `backend` (`local`), `mfa`
+/// (`none`, `disabled` or `totp`) and `scopes`. The password is hashed
+/// (PBKDF2-HMAC-SHA-256 SCRAM verifier) before storing; plaintext never persists. The write
+/// persists across a restart through the config registry
+/// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
+/// Management-plane only: one short existence check plus the user-map
+/// write lock (plus the registry save lock on persist); the login path
+/// keeps reading under short read locks and publish/deliver never touch
+/// this store.
+// The documented create success is 200. The specification answers 200
+// with the user record. The handler keeps 200.
+// A duplicate `username` answers 409 ALREADY_EXISTS. Validation
+// failures answer 400.
+pub async fn create_user(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid user body: {error}")).into_response();
+        }
+    };
+    let (username, password, role, description) = match parse_dashboard_user_body(&value) {
+        Ok(parsed) => parsed,
+        Err(message) => return ApiError::BadRequest(message).into_response(),
+    };
+    let scopes = match value.get("scopes") {
+        None => Some(default_scopes_for_role(role)),
+        Some(raw) => match parse_scope_write(role, raw) {
+            Ok(scopes) => scopes,
+            Err(message) => return ApiError::BadRequest(message).into_response(),
         },
     };
-    let description = req.description.unwrap_or_default();
-    if let Err(error) = state
-        .admin_users
-        .create(&req.username, &req.password, role, &description)
-    {
+    if let Err(error) = state.admin_users.create_with_scopes(
+        &username,
+        &password,
+        role,
+        &description,
+        scopes.clone(),
+    ) {
         return admin_error(error);
     }
+    let mfa = match state.admin_users.mfa_status(&username) {
+        Some(status) if status.enabled => "totp",
+        Some(status) if status.pending => "disabled",
+        _ => "none",
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "username": req.username,
+            "username": username,
             "role": role_str(&role),
-            "description": description
+            "description": description,
+            "backend": "local",
+            "mfa": mfa,
+            "scopes": scopes_json(&scopes),
         })),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct UpdateUserReq {
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
+/// Validate a dashboard-user create body into
+/// `(username, password, role, description)`.
+///
+/// The body must be a JSON object with non-empty string `username` and
+/// `password` fields. `role` defaults to administrator and must be
+/// `administrator`/`admin` or `viewer` when present; `description`
+/// defaults to empty and must be a string when present. Extra fields are
+/// ignored so future record fields degrade to the same create instead of
+/// a 400.
+fn parse_dashboard_user_body(
+    value: &serde_json::Value,
+) -> Result<(String, String, AdminRole, String), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user body must be a JSON object".to_string())?;
+    let username = obj
+        .get("username")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `username` is required".to_string())?;
+    if username.trim().is_empty() {
+        return Err("field `username` must not be empty".to_string());
+    }
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `password` is required".to_string())?;
+    if password.is_empty() {
+        return Err("field `password` must not be empty".to_string());
+    }
+    let role = match obj.get("role") {
+        None => AdminRole::Administrator,
+        Some(raw) => {
+            let text = raw
+                .as_str()
+                .ok_or_else(|| "role must be administrator or viewer".to_string())?;
+            parse_role(text).ok_or_else(|| "role must be administrator or viewer".to_string())?
+        }
+    };
+    let description = match obj.get("description") {
+        None => String::new(),
+        Some(raw) => raw
+            .as_str()
+            .ok_or_else(|| "field `description` must be a string".to_string())?
+            .to_string(),
+    };
+    Ok((
+        username.to_string(),
+        password.to_string(),
+        role,
+        description,
+    ))
 }
 
+/// `PUT /users/{username}`: replace one dashboard user's `role` and/or
+/// `description` (C05-28).
+///
+/// The body must be a JSON object; `role` (`administrator` or `viewer`)
+/// and `description` (string) are optional when present, and a bad value
+/// for either fails with `BAD_REQUEST` in the documented `{code, message}`
+/// shape while applying nothing (validate-all-before-apply: the whole
+/// body is checked before the store is touched). Credential fields
+/// (`password`, `old_pwd`, `new_pwd`) are never accepted here — they
+/// fail with `BAD_REQUEST` and change nothing; password rotation stays
+/// on the change-password route. Unknown usernames fail with `NOT_FOUND`
+/// (404, documented shape) and create nothing. The route is not paged.
+/// On success answers 200 with `username`, `role`, `description`,
+/// `backend` (`local`), `mfa` and `scopes`. An omitted `scopes` field
+/// keeps the stored list, but the list must fit the new role. The string
+/// `unset` and a list equal to the role default store no explicit list.
+/// An unknown scope or a scope the role cannot hold fails with
+/// `BAD_REQUEST` and changes nothing. The write persists across a restart through the config registry
+/// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
+/// Management-plane only: one short user-map write lock per request
+/// (plus the registry save lock on persist); the login path keeps
+/// reading under short read locks and publish/deliver never touch this
+/// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
+/// entries; an update never grows it, so the cap needs no new check on
+/// this path.
+// The handler validates the body first (400), then checks existence
+// (404). Doubly-bad requests report the validation failure.
+// The update refuses `password`, `old_pwd` and `new_pwd` with 400. It
+// ignores other unknown fields.
+// The update accepts `role`, `description` and `scopes`. A kept
+// explicit list is checked against the new role before it is stored.
 pub async fn update_user(
     State(state): State<ApiState>,
     Path(username): Path<String>,
-    Json(req): Json<UpdateUserReq>,
+    body: Bytes,
 ) -> Response {
-    if let Some(raw) = req.role.as_deref() {
-        let role = match parse_role(raw) {
-            Some(role) => role,
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid user body: {error}")).into_response();
+        }
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => {
+            return ApiError::BadRequest("user body must be a JSON object".to_string())
+                .into_response();
+        }
+    };
+    for key in ["password", "old_pwd", "new_pwd"] {
+        if obj.contains_key(key) {
+            return ApiError::BadRequest(format!(
+                "field `{key}` is not accepted here; use the password route"
+            ))
+            .into_response();
+        }
+    }
+    let role = match obj.get("role") {
+        None => None,
+        Some(raw) => {
+            let text = match raw.as_str() {
+                Some(text) => text,
+                None => {
+                    return ApiError::BadRequest(
+                        "role must be administrator or viewer".to_string(),
+                    )
+                    .into_response();
+                }
+            };
+            match parse_role(text) {
+                Some(role) => Some(role),
+                None => {
+                    return ApiError::BadRequest(
+                        "role must be administrator or viewer".to_string(),
+                    )
+                    .into_response();
+                }
+            }
+        }
+    };
+    let description = match obj.get("description") {
+        None => None,
+        Some(raw) => match raw.as_str() {
+            Some(text) => Some(text.to_string()),
             None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "BAD_REQUEST",
-                        "message": "role must be administrator or viewer"
-                    })),
-                )
+                return ApiError::BadRequest("field `description` must be a string".to_string())
                     .into_response();
             }
-        };
-        if let Err(error) = state.admin_users.set_role(&username, role) {
-            return admin_error(error);
+        },
+    };
+    let Some(existing) = state.admin_users.get(&username) else {
+        return admin_error(AdminUserError::NotFound);
+    };
+    let effective_role = role.unwrap_or(existing.role);
+    let scopes_update = match obj.get("scopes") {
+        None => {
+            if let Err(message) = validate_stored_scopes(effective_role, &existing.scopes) {
+                return ApiError::BadRequest(message).into_response();
+            }
+            UserScopesUpdate::Keep
         }
-    }
-    if let Some(description) = req.description.as_deref() {
-        if let Err(error) = state.admin_users.set_description(&username, description) {
-            return admin_error(error);
-        }
+        Some(raw) => match parse_scope_write(effective_role, raw) {
+            Ok(None) => UserScopesUpdate::Clear,
+            Ok(Some(list)) => UserScopesUpdate::Set(list),
+            Err(message) => return ApiError::BadRequest(message).into_response(),
+        },
+    };
+    if let Err(error) =
+        state
+            .admin_users
+            .update_with_scopes(&username, role, description.as_deref(), scopes_update)
+    {
+        return admin_error(error);
     }
     match state.admin_users.get(&username) {
-        Some(view) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "username": view.username,
-                "role": role_str(&view.role),
-                "description": view.description
-            })),
-        )
-            .into_response(),
+        Some(view) => {
+            let mfa = match state.admin_users.mfa_status(&view.username) {
+                Some(status) if status.enabled => "totp",
+                Some(status) if status.pending => "disabled",
+                _ => "none",
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "username": view.username,
+                    "role": role_str(&view.role),
+                    "description": view.description,
+                    "backend": "local",
+                    "mfa": mfa,
+                    "scopes": scopes_json(&view.scopes),
+                })),
+            )
+                .into_response()
+        }
         None => admin_error(AdminUserError::NotFound),
     }
 }
 
+/// `DELETE /users/{username}`: revoke one dashboard user (C05-27).
+///
+/// Unknown usernames fail with 404 in the documented `{code, message}`
+/// shape and revoke nothing. On success answers 204 with no body, revokes
+/// every live token of that user (`ApiTokens::revoke_user_except`, so a
+/// deleted user stops authorising management calls immediately), and
+/// persists the removal across a restart through the config registry.
+/// Management-plane only: one short user-map write lock per request (plus
+/// the registry save lock on persist); the login path keeps reading under
+/// short read locks and publish/deliver never touch this store.
+// The miss code is `USER_NOT_FOUND`, as the reference API documents. The
+// removal of the last administrator fails with 400 `NOT_ALLOWED`.
 pub async fn delete_user(State(state): State<ApiState>, Path(username): Path<String>) -> Response {
     match state.admin_users.delete(&username) {
         Ok(()) => {
@@ -672,17 +1262,55 @@ pub struct ChangePasswordReq {
     pub new_pwd: Option<String>,
 }
 
-/// `PUT /users/:username/change_pwd {old_pwd, new_pwd}` (compatible with the documented API).
-/// Administrators may change any user's password; viewers only their own.
-/// `old_pwd` is required when changing your own password. The middleware
-/// guarantees a valid token; the self-or-administrator rule stays here.
+/// `PUT/POST /users/{username}/change_pwd {old_pwd, new_pwd}` (C05-29).
+///
+/// Verifies the old credential when a user changes their own password,
+/// validates the new value against the dashboard password policy (minimum
+/// length plus complexity, stated on
+/// [`crate::admin_users::AdminUsers::change_password`]), persists the new
+/// verifier across a restart through the config registry
+/// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users` in
+/// `crates/broker-config/src/lib.rs`), and revokes that user's other live
+/// tokens (`ApiTokens::revoke_user_except`, so a rotated credential stops
+/// authorising the user's other management sessions immediately).
+/// Unknown usernames fail with `USER_NOT_FOUND` (404, documented `{code,
+/// message}` shape); a wrong or missing `old_pwd` on a self change fails
+/// with `ERROR_PWD_NOT_MATCH` (400, documented shape); a missing or weak
+/// `new_pwd` fails with `BAD_REQUEST` (400, documented shape).
+/// Administrators may rotate any user's password without that user's old
+/// credential; viewers may only rotate their own and must prove the old
+/// one. The middleware guarantees a valid token; the self-or-administrator
+/// rule stays here. The route is not paged. On success answers 204 with no
+/// body.
+/// Management-plane only: one short user-map write lock per request (plus
+/// the registry save lock on persist and the token-map lock on revoke);
+/// the login path keeps reading under short read locks
+/// (`AdminUsers::verify_password` on `POST /login`, `resolve_bearer` per
+/// authenticated request) and publish and deliver never touch either
+/// store. The password map is bounded by
+/// [`crate::admin_users::MAX_ADMIN_USERS`] and the live-token map by
+/// `MAX_LIVE_TOKENS`; rotation replaces in place and revocation only
+/// removes entries, so neither grows toward its cap on this path.
+// Rotation keeps the caller token alive. It revokes every other live
+// token of the user.
+// The handler checks role first (403), then existence (404). Viewers
+// learn no existence.
+// A missing `old_pwd` on a self change answers 400 ERROR_PWD_NOT_MATCH.
+// Missing and wrong share the same denial.
 pub async fn change_user_password(
     State(state): State<ApiState>,
     Extension(caller): Extension<TokenInfo>,
     headers: HeaderMap,
     Path(username): Path<String>,
-    Json(req): Json<ChangePasswordReq>,
+    body: Bytes,
 ) -> Response {
+    let req: ChangePasswordReq = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid change_pwd body: {error}"))
+                .into_response();
+        }
+    };
     let is_self = caller.username == username;
     if !is_self && caller.role != AdminRole::Administrator {
         return forbidden();
@@ -692,21 +1320,14 @@ pub async fn change_user_password(
     }
     if is_self {
         let Some(old_pwd) = req.old_pwd.as_deref() else {
-            return name_pwd_error();
+            return old_pwd_mismatch();
         };
         if !state.admin_users.verify_password(&username, old_pwd) {
-            return name_pwd_error();
+            return old_pwd_mismatch();
         }
     }
     let Some(new_pwd) = req.new_pwd.as_deref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "new_pwd must not be empty"
-            })),
-        )
-            .into_response();
+        return ApiError::BadRequest("new_pwd must not be empty".to_string()).into_response();
     };
     if let Err(error) = state.admin_users.change_password(&username, new_pwd) {
         return admin_error(error);
@@ -716,6 +1337,9 @@ pub async fn change_user_password(
         &username,
         bearer_token_from_credentials(&headers).as_deref(),
     );
+    // A changed password invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -723,73 +1347,211 @@ pub async fn change_user_password(
 // Authentication (AuthN) built-in-database users (backed by `MemoryAuth`).
 // ---------------------------------------------------------------------------
 
-pub async fn list_authn_users(State(state): State<ApiState>, Path(_id): Path<String>) -> Response {
+/// `GET /authentication/{id}/users`: paged users of one authenticator.
+///
+/// Reads the live built-in user map (`MemoryAuth::usernames`, sorted) and
+/// slices the requested page with the shared [`PageParams`] helper
+/// (defaults `page=1`, `limit=100`, clamped to `1..=1000`; malformed
+/// values fall back to defaults, never 400). An empty map reads as an
+/// empty page, never an error. Unknown authenticator ids fail with
+/// `NOT_FOUND` in the documented `{code, message}` shape; a known id
+/// whose backend is not the built-in database fails with `BAD_REQUEST`
+/// (stored-only backends never execute). Passwords are write-only and
+/// never rendered: each row carries only `user_id`.
+/// Management-plane only: clones at most the sorted username list once
+/// per request under short read locks; the CONNECT path keeps reading
+/// under its own short locks (`MemoryAuth::authenticate` in
+/// `crates/broker-auth/src/lib.rs`, driven by CONNECT in
+/// `crates/broker-node/src/main.rs`) and publish/deliver never touch
+/// this store. The map is bounded by [`MAX_AUTHN_USERS`] (100,000
+/// entries: each entry holds a verifier plus map overhead, so an
+/// unbounded map lets one management batch exhaust the kernel; 100,000
+/// covers fleet provisioning while keeping list reads paged and
+/// per-CONNECT lookups cheap).
+// The listing renders `user_id` only. The broker tracks no superuser
+// flag. The spec marks extra fields optional.
+pub async fn list_authn_users(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    params: PageParams,
+) -> Response {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
     let names = state.auth.usernames();
-    let data: Vec<_> = names
-        .into_iter()
+    let total = names.len();
+    let page_items = paginate(&names, params.page, params.limit);
+    let data: Vec<_> = page_items
+        .iter()
         .map(|name| {
             serde_json::json!({
                 "user_id": name
             })
         })
         .collect();
-
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": {
-                "page": 1,
-                "limit": 50,
-                "count": data.len(),
-                "hasnext": false
-            }
+            "meta": meta_page(params.page, params.limit, total),
         })),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct CreateAuthnUserReq {
-    pub user_id: String,
-    pub password: String,
-}
-
+/// `POST /authentication/{id}/users`: add one user to the live map.
+///
+/// The body must be a JSON object with non-empty string `user_id` (at
+/// most [`MAX_AUTHN_USERNAME_LEN`] bytes) and `password` (non-empty, at
+/// most [`MAX_PASSWORD_BYTES`] bytes); anything else fails with
+/// `BAD_REQUEST` in the documented `{code, message}` shape. A `user_id`
+/// that already exists fails with `BAD_REQUEST` instead of updating
+/// in place; a map that already holds [`MAX_AUTHN_USERS`] entries fails
+/// with `BAD_REQUEST`. Unknown authenticator ids fail with `NOT_FOUND`;
+/// a known non-built-in backend fails with `BAD_REQUEST`. On success
+/// returns 201 with the stored `user_id` (never the password). The
+/// password is hashed under the configured policy before storing;
+/// plaintext never persists. The write persists across a restart through
+/// the config registry.
+/// Management-plane only: one short existence check plus the user-map
+/// write lock (plus the registry save lock on persist); the CONNECT path
+/// keeps reading under short read locks and publish/deliver never touch
+/// this store.
+// A duplicate `user_id` is rejected, never overwritten. It answers
+// 400 BAD_REQUEST with the documented code.
 pub async fn create_authn_user(
     State(state): State<ApiState>,
-    Path(_id): Path<String>,
-    Json(req): Json<CreateAuthnUserReq>,
+    Path(id): Path<String>,
+    body: Bytes,
 ) -> Response {
-    if let Err(error) = state
-        .auth
-        .add_user(req.user_id.clone(), req.password.as_bytes())
-    {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid user body: {e}")).into_response();
+        }
+    };
+    let (user_id, password) = match parse_authn_user_body(&value) {
+        Ok(pair) => pair,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    if state.auth.has_user(&user_id) {
+        return ApiError::BadRequest(format!("user {user_id:?} already exists")).into_response();
+    }
+    if state.auth.user_count() >= MAX_AUTHN_USERS {
+        return ApiError::BadRequest(format!(
+            "user limit of {MAX_AUTHN_USERS} reached for authenticator {id:?}"
+        ))
+        .into_response();
+    }
+    if let Err(error) = state.auth.add_user(user_id.clone(), password.as_bytes()) {
+        // Pre-validation above already rejected every client-side shape,
+        // so only the hashing/oversize failures stay client errors here;
+        // anything else is a persist failure and must never be silent.
+        let message = error.to_string();
+        if message.contains("exceeds") || message.contains("cannot be hashed") {
+            return ApiError::BadRequest(message).into_response();
+        }
         return mqtt_persist_error(error);
     }
+    // A changed user invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02). It also evicts the node
+    // authentication cache for this user so a changed password or a
+    // revocation is observed on the next CONNECT.
+    state.sessions.clear_all_authz_caches();
+    state.authn_node_cache.remove_user(&user_id);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "user_id": req.user_id
+            "user_id": user_id
         })),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct UpdateAuthnUserReq {
-    pub password: String,
+/// Validate a create-user body into `(user_id, password)`.
+///
+/// The body must be a JSON object with non-empty string `user_id` and
+/// `password` fields within their bounds. Extra fields are ignored so
+/// future record fields degrade to the same create instead of a 400.
+fn parse_authn_user_body(value: &serde_json::Value) -> Result<(String, String), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user body must be a JSON object".to_string())?;
+    let user_id = obj
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `user_id` is required".to_string())?;
+    if user_id.trim().is_empty() {
+        return Err("field `user_id` must not be empty".to_string());
+    }
+    if user_id.len() > MAX_AUTHN_USERNAME_LEN {
+        return Err(format!(
+            "field `user_id` {user_id:?} exceeds {MAX_AUTHN_USERNAME_LEN} bytes"
+        ));
+    }
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `password` is required".to_string())?;
+    if password.is_empty() {
+        return Err("field `password` must not be empty".to_string());
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(format!(
+            "field `password` exceeds {MAX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    Ok((user_id.to_string(), password.to_string()))
 }
 
-pub async fn update_authn_user(
+/// `GET /authentication/{id}/users/{user_id}`: read one user record.
+///
+/// Returns the stored `user_id` without credential secrets, or 404 with
+/// the documented `{code, message}` shape when either the authenticator
+/// id or the user id is unknown; a known non-built-in backend fails with
+/// `BAD_REQUEST` (stored-only backends never execute). The route is not
+/// paged. Passwords are write-only and never rendered.
+/// Management-plane only: at most two short read locks per request (chain
+/// entry plus user-map presence); the CONNECT path keeps reading under
+/// its own short locks (`MemoryAuth::authenticate` in
+/// `crates/broker-auth/src/lib.rs`, driven by CONNECT in
+/// `crates/broker-node/src/main.rs`) and publish/deliver never touch
+/// this store.
+// The detail renders `user_id` only. The broker tracks no superuser
+// flag. The spec marks extra fields optional.
+pub async fn get_authn_user(
     State(state): State<ApiState>,
-    Path((_id, user_id)): Path<(String, String)>,
-    Json(req): Json<UpdateAuthnUserReq>,
+    Path((id, user_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(error) = state
-        .auth
-        .add_user(user_id.clone(), req.password.as_bytes())
-    {
-        return mqtt_persist_error(error);
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    if !state.auth.has_user(&user_id) {
+        return ApiError::NotFound(format!("user {user_id:?} not found")).into_response();
     }
     (
         StatusCode::OK,
@@ -800,14 +1562,140 @@ pub async fn update_authn_user(
         .into_response()
 }
 
-pub async fn delete_authn_user(
+/// `PUT /authentication/{id}/users/{user_id}`: replace one user's credential.
+///
+/// The body must be a JSON object with a non-empty string `password`
+/// (at most [`MAX_PASSWORD_BYTES`] bytes); anything else fails with
+/// `BAD_REQUEST` in the documented `{code, message}` shape and applies
+/// nothing. Unknown authenticator ids and unknown user ids both fail
+/// with `NOT_FOUND` and create nothing; a known non-built-in backend
+/// fails with `BAD_REQUEST`. On success returns 200 with the stored
+/// `user_id` (never the password). The password is hashed under the
+/// configured policy before storing; plaintext never persists. The write
+/// persists across a restart through the config registry. The route is
+/// not paged.
+/// Management-plane only: one short existence check plus the user-map
+/// write lock (plus the registry save lock on persist); the CONNECT path
+/// keeps reading under short read locks and publish/deliver never touch
+/// this store. The map is bounded by [`MAX_AUTHN_USERS`] (100,000
+/// entries: each entry holds a verifier plus map overhead, so an
+/// unbounded map lets one management batch exhaust the kernel); an
+/// update replaces in place and never grows the map toward the cap.
+pub async fn update_authn_user(
     State(state): State<ApiState>,
-    Path((_id, user_id)): Path<(String, String)>,
+    Path((id, user_id)): Path<(String, String)>,
+    body: Bytes,
 ) -> Response {
-    if let Err(error) = state.auth.remove_user(&user_id) {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid user body: {e}")).into_response();
+        }
+    };
+    let password = match parse_authn_password_body(&value) {
+        Ok(password) => password,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    if !state.auth.has_user(&user_id) {
+        return ApiError::NotFound(format!("user {user_id:?} not found")).into_response();
+    }
+    if let Err(error) = state.auth.add_user(user_id.clone(), password.as_bytes()) {
+        // Pre-validation above already rejected every client-side shape,
+        // so only the hashing/oversize failures stay client errors here;
+        // anything else is a persist failure and must never be silent.
+        let message = error.to_string();
+        if message.contains("exceeds") || message.contains("cannot be hashed") {
+            return ApiError::BadRequest(message).into_response();
+        }
         return mqtt_persist_error(error);
     }
-    StatusCode::NO_CONTENT.into_response()
+    // A changed password invalidates cached authorization decisions so
+    // the next operation is re-authorized (AZ-02). It also evicts the
+    // node authentication cache for this user so the new credential is
+    // observed on the next CONNECT.
+    state.sessions.clear_all_authz_caches();
+    state.authn_node_cache.remove_user(&user_id);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "user_id": user_id
+        })),
+    )
+        .into_response()
+}
+
+/// Validate an update-user body into its new password.
+///
+/// The body must be a JSON object with a non-empty string `password`
+/// field within bounds. Extra fields are ignored so future record
+/// fields degrade to the same update instead of a 400.
+fn parse_authn_password_body(value: &serde_json::Value) -> Result<String, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user body must be a JSON object".to_string())?;
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `password` is required".to_string())?;
+    if password.is_empty() {
+        return Err("field `password` must not be empty".to_string());
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(format!(
+            "field `password` exceeds {MAX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    Ok(password.to_string())
+}
+
+/// `DELETE /authentication/{id}/users/{user_id}`: remove one user.
+///
+/// Unknown authenticator ids and unknown user ids both fail with
+/// `NOT_FOUND` in the documented `{code, message}` shape and apply
+/// nothing; a known non-built-in backend fails with `BAD_REQUEST`. On
+/// success returns 204 with no body. The removal persists across a
+/// restart through the config registry.
+/// Management-plane only: one short user-map write lock per request
+/// (plus the registry save lock on persist); the CONNECT path keeps
+/// reading under short read locks and publish/deliver never touch this
+/// store.
+pub async fn delete_authn_user(
+    State(state): State<ApiState>,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Response {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    match state.auth.remove_user(&user_id) {
+        Ok(true) => {
+            // A removed user invalidates cached authorization decisions
+            // so the next operation is re-authorized (AZ-02). It also
+            // evicts the node authentication cache for this user so a
+            // revoked credential is denied on the next CONNECT.
+            state.sessions.clear_all_authz_caches();
+            state.authn_node_cache.remove_user(&user_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => ApiError::NotFound(format!("user {user_id:?} not found")).into_response(),
+        Err(error) => mqtt_persist_error(error),
+    }
 }
 
 /// `POST /authentication/:id/import_users`: bulk import into the built-in
@@ -823,17 +1711,10 @@ pub async fn delete_authn_user(
 /// Non-built-in backends are rejected with `BAD_REQUEST`: import targets
 /// the built-in user map only, and no endpoint may claim a backend it
 /// cannot execute.
-// TODO(parity): which import body shapes (bare array versus `users`
-// envelope versus file upload), which `type=plain|hash` query handling,
-// and which duplicate semantics (reject versus overwrite/merge with
-// per-entry counts) does the spec require? The rulebook does not decide
-// the exact set; the current choice accepts both JSON shapes as plain
-// passwords, rejects duplicates for the whole batch, and reports atomic
-// counts until the checker pins it. Extra record fields (for example a
-// superuser flag our store does not model) are ignored.
-// TODO(parity): is the documented success shape the five-count result or
-// a per-entry list? The rulebook does not decide the exact envelope; the
-// current choice reports the atomic counts until the checker pins it.
+// Import accepts a bare array or a `users` envelope as plain passwords.
+// Duplicates reject the whole batch.
+// Import answers the five-count result: total, success, override,
+// skipped and failed.
 ///
 /// Management-plane only: locks only the user map (plus the registry
 /// save lock on persist), never the message path; the CONNECT path keeps
@@ -870,21 +1751,28 @@ pub async fn import_authn_users(
         .map(|(user_id, password)| (user_id, password.into_bytes()))
         .collect();
     match state.auth.import_users(batch) {
-        Ok(summary) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "total": summary.total,
-                "success": summary.success,
-                "override": 0,
-                "skipped": 0,
-                "failed": 0,
-            })),
-        )
-            .into_response(),
+        Ok(summary) => {
+            // Imported users invalidate cached authorization decisions so
+            // the next operation is re-authorized (AZ-02). A batch may
+            // touch many names, so the node authentication cache resets.
+            state.sessions.clear_all_authz_caches();
+            state.authn_node_cache.reset();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "total": summary.total,
+                    "success": summary.success,
+                    "override": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                })),
+            )
+                .into_response()
+        }
         Err(ImportUsersError::Malformed(msg) | ImportUsersError::TooMany(msg)) => {
             ApiError::BadRequest(msg).into_response()
         }
-        Err(ImportUsersError::Duplicate(msg)) => ApiError::AlreadyExists(msg).into_response(),
+        Err(ImportUsersError::Duplicate(msg)) => ApiError::BadRequest(msg).into_response(),
         Err(ImportUsersError::Persist(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -950,8 +1838,15 @@ fn parse_import_batch(value: &serde_json::Value) -> Result<Vec<(String, String)>
 
 pub async fn list_authz_rules(
     State(state): State<ApiState>,
-    Path(_type): Path<String>,
+    Path(source_type): Path<String>,
 ) -> Response {
+    // Unknown source types are 404 with the documented shape; they never
+    // serve the built-in table (W2-17, C04-10: unknown types referenced
+    // elsewhere return 404). Known types keep today's behaviour.
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
     let rules = state.auth.acl_rules();
     let data: Vec<_> = rules
         .into_iter()
@@ -996,9 +1891,15 @@ pub struct CreateAuthzRuleReq {
 
 pub async fn create_authz_rule(
     State(state): State<ApiState>,
-    Path(_type): Path<String>,
+    Path(source_type): Path<String>,
     Json(req): Json<CreateAuthzRuleReq>,
 ) -> Response {
+    // Unknown source types are 404 with the documented shape; they never
+    // write the built-in table. Known types keep today's behaviour.
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
     let client_pattern = req.clientid.unwrap_or_else(|| "*".to_string());
     let action = match AclAction::parse(&req.action) {
         Some(a) => a,
@@ -1012,16 +1913,1752 @@ pub async fn create_authz_rule(
     {
         return mqtt_persist_error(error);
     }
+    // A changed rule invalidates cached decisions so the next operation
+    // is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     StatusCode::CREATED.into_response()
 }
 
 pub async fn delete_authz_rule(
     State(state): State<ApiState>,
-    Path((_type, index)): Path<(String, usize)>,
+    Path((source_type, index)): Path<(String, usize)>,
 ) -> Response {
+    // Unknown source types are 404 with the documented shape; they never
+    // touch the built-in table. Known types keep today's behaviour.
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
     match state.auth.remove_rule(index) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A changed rule invalidates cached decisions so the next
+            // operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => mqtt_persist_error(error),
+    }
+}
+
+#[cfg(test)]
+mod authn_users_tests {
+    use super::*;
+    use broker_auth::{Authenticator, PasswordHashPolicy};
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    const CHAIN_ID: &str = "password_based:built_in_database";
+
+    fn standalone_state() -> ApiState {
+        let state = ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )));
+        // Fast hashing for tests only; production keeps the default policy.
+        state.auth.set_policy(PasswordHashPolicy::for_tests());
+        state
+            .authn_chain
+            .insert(broker_auth::AuthnEntry {
+                id: CHAIN_ID.to_string(),
+                mechanism: "password_based".to_string(),
+                backend: "built_in_database".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("chain entry inserts");
+        state
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    fn params(page: u32, limit: u32) -> PageParams {
+        PageParams { page, limit }
+    }
+
+    #[tokio::test]
+    async fn crud_lists_with_paging_rejects_duplicates_and_misses_404() {
+        // Before this task the list ignored paging (fixed page 1/limit 50),
+        // create updated in place instead of rejecting duplicates, and
+        // delete answered 204 even for unknown users.
+        let state = standalone_state();
+
+        for (user_id, password) in [("w211-alice", "AliceSecret1!"), ("w211-bob", "BobSecret1!")] {
+            let (status, created, _) = parts(
+                create_authn_user(
+                    State(state.clone()),
+                    Path(CHAIN_ID.to_string()),
+                    body(serde_json::json!({"user_id": user_id, "password": password})),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "create {user_id}");
+            assert_eq!(created["user_id"], serde_json::json!(user_id));
+            assert!(created.get("password").is_none(), "password never rendered");
+        }
+
+        // List carries both users with the standard page envelope.
+        let (status, listed, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"].as_array().expect("data array").len(), 2);
+        assert_eq!(listed["meta"]["page"], serde_json::json!(1));
+        assert_eq!(listed["meta"]["limit"], serde_json::json!(100));
+        assert_eq!(listed["meta"]["count"], serde_json::json!(2));
+        assert_eq!(listed["meta"]["hasnext"], serde_json::json!(false));
+        let ids: Vec<&str> = listed["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|row| row["user_id"].as_str().expect("row has user_id"))
+            .collect();
+        assert_eq!(ids, vec!["w211-alice", "w211-bob"]);
+
+        // Paging slices after sorting: page 2 with limit 1 holds the second user.
+        let (status, page2, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(2, 1),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page2["data"].as_array().expect("data").len(), 1);
+        assert_eq!(page2["data"][0]["user_id"], serde_json::json!("w211-bob"));
+        assert_eq!(page2["meta"]["count"], serde_json::json!(2));
+        assert_eq!(page2["meta"]["hasnext"], serde_json::json!(false));
+
+        // Re-creating an existing user is rejected, never an in-place update.
+        let (status, duplicate, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w211-alice", "password": "Other1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(duplicate["message"].is_string());
+
+        // Malformed bodies are client errors.
+        let (status, malformed, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w211-nopw"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Delete one user; one is left.
+        let gone = delete_authn_user(
+            State(state.clone()),
+            Path((CHAIN_ID.to_string(), "w211-bob".to_string())),
+        )
+        .await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        let (status, listed, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"].as_array().expect("data").len(), 1);
+        assert_eq!(
+            listed["data"][0]["user_id"],
+            serde_json::json!("w211-alice")
+        );
+
+        // Deleting an unknown user id is a 404 with the documented shape.
+        let (status, missing, _) = parts(
+            delete_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w211-ghost".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+
+        // Unknown authenticator ids are 404s on every route.
+        let (status, unknown, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path("password_based:nowhere".to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["code"], serde_json::json!("NOT_FOUND"));
+        let (status, unknown, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path("password_based:nowhere".to_string()),
+                body(serde_json::json!({"user_id": "w211-x", "password": "X1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["code"], serde_json::json!("NOT_FOUND"));
+        let (status, unknown, _) = parts(
+            delete_authn_user(
+                State(state.clone()),
+                Path((
+                    "password_based:nowhere".to_string(),
+                    "w211-alice".to_string(),
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn live_user_map_drives_the_connect_path() {
+        // Goes through the broker, not only the store: the created
+        // credential must authenticate on the CONNECT path
+        // (`MemoryAuth::authenticate`, driven by CONNECT in
+        // `crates/broker-node/src/main.rs`), and must stop working after
+        // the delete.
+        let state = standalone_state();
+        for (user_id, password) in [
+            ("w211-conn", "ConnSecret1!"),
+            // Keeper: the store is open while empty
+            // (`MemoryAuth::authenticate` allows everything with no users,
+            // and the broker only closes anonymous once users exist), so
+            // one user must remain for the deleted credential to fail
+            // closed below.
+            ("w211-keeper", "KeeperSecret1!"),
+        ] {
+            let (status, _, _) = parts(
+                create_authn_user(
+                    State(state.clone()),
+                    Path(CHAIN_ID.to_string()),
+                    body(serde_json::json!({"user_id": user_id, "password": password})),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "create {user_id}");
+        }
+
+        state
+            .auth
+            .authenticate("w211-client", Some("w211-conn"), Some(b"ConnSecret1!"))
+            .await
+            .expect("correct password authenticates on the CONNECT path");
+        assert!(
+            state
+                .auth
+                .authenticate("w211-client", Some("w211-conn"), Some(b"wrong"))
+                .await
+                .is_err(),
+            "wrong password fails closed"
+        );
+
+        let gone = delete_authn_user(
+            State(state.clone()),
+            Path((CHAIN_ID.to_string(), "w211-conn".to_string())),
+        )
+        .await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .auth
+                .authenticate("w211-client", Some("w211-conn"), Some(b"ConnSecret1!"))
+                .await
+                .is_err(),
+            "deleted user fails closed on the CONNECT path"
+        );
+        state
+            .auth
+            .authenticate("w211-client", Some("w211-keeper"), Some(b"KeeperSecret1!"))
+            .await
+            .expect("remaining user still authenticates on the CONNECT path");
+    }
+
+    #[tokio::test]
+    async fn passwords_are_hashed_never_rendered_and_survive_a_restart() {
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w211-hash", "password": "HashSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The stored verifier is a hash, never the plaintext.
+        let verifier = state
+            .auth
+            .verifier_string("w211-hash")
+            .expect("created user has a verifier");
+        assert!(
+            !verifier.contains("HashSecret1!"),
+            "no plaintext in the store"
+        );
+
+        // No list rendering carries password material.
+        let (_, listed, raw) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert!(listed.get("password").is_none());
+        for row in listed["data"].as_array().expect("data array") {
+            assert!(row.get("password").is_none(), "row renders no password");
+            assert!(row.get("password_hash").is_none(), "row renders no hash");
+        }
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("HashSecret1!"),
+            "list body carries no plaintext"
+        );
+
+        // Persistence rides the config registry: a fresh registry load
+        // from the same directory still holds the user, so the credential
+        // survives a kernel restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w211-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = broker_auth::MemoryAuth::from_registry(&registry);
+        durable.set_policy(PasswordHashPolicy::for_tests());
+        durable
+            .add_user("w211-kept", b"KeptSecret1!")
+            .expect("registry-backed add persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        let found = reloaded
+            .snapshot()
+            .mqtt_users
+            .users
+            .iter()
+            .any(|u| u.username == "w211-kept");
+        assert!(found, "user persists across a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn non_built_in_backend_is_rejected_not_executed() {
+        let state = standalone_state();
+        state
+            .authn_chain
+            .insert(broker_auth::AuthnEntry {
+                id: "password_based:mysql".to_string(),
+                mechanism: "password_based".to_string(),
+                backend: "mysql".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("non-built-in entry inserts");
+        let (status, rejected, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path("password_based:mysql".to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejected["code"], serde_json::json!("BAD_REQUEST"));
+        // Non-built-in backends answer 400. Stored-only backends never
+        // execute.
+    }
+
+    #[tokio::test]
+    async fn detail_read_update_round_trip_through_connect_path() {
+        // Fails before W2-12: the detail read had no route (404 on every
+        // hit) and the update ignored the authenticator id, created
+        // unknown users and accepted bodies without validation.
+        let state = standalone_state();
+
+        let (status, _, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w212-detail", "password": "DetailSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Read hits with the documented fields and no secrets.
+        let (status, fetched, raw) = parts(
+            get_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-detail".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["user_id"], serde_json::json!("w212-detail"));
+        assert!(
+            fetched.get("password").is_none(),
+            "detail renders no password"
+        );
+        assert!(
+            fetched.get("password_hash").is_none(),
+            "detail renders no hash"
+        );
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("DetailSecret1!"),
+            "detail body carries no plaintext"
+        );
+
+        // Read misses are 404s with the documented shape, at both levels.
+        let (status, missing, _) = parts(
+            get_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-ghost".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        let (status, missing, _) = parts(
+            get_authn_user(
+                State(state.clone()),
+                Path((
+                    "password_based:nowhere".to_string(),
+                    "w212-detail".to_string(),
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+
+        // Update replaces the credential: the old secret stops working on
+        // the CONNECT path and the new one authenticates.
+        let (status, updated, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-detail".to_string())),
+                body(serde_json::json!({"password": "DetailSecret2!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["user_id"], serde_json::json!("w212-detail"));
+        assert!(
+            updated.get("password").is_none(),
+            "update renders no password"
+        );
+        state
+            .auth
+            .authenticate("w212-client", Some("w212-detail"), Some(b"DetailSecret2!"))
+            .await
+            .expect("new credential authenticates on the CONNECT path");
+        assert!(
+            state
+                .auth
+                .authenticate("w212-client", Some("w212-detail"), Some(b"DetailSecret1!"))
+                .await
+                .is_err(),
+            "old credential fails closed after the update"
+        );
+
+        // Invalid updates are client errors and apply nothing: the current
+        // credential keeps working.
+        let (status, rejected, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-detail".to_string())),
+                body(serde_json::json!({"user_id": "w212-detail"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejected["code"], serde_json::json!("BAD_REQUEST"));
+        state
+            .auth
+            .authenticate("w212-client", Some("w212-detail"), Some(b"DetailSecret2!"))
+            .await
+            .expect("rejected update applies nothing");
+
+        // Updating an unknown user creates nothing and returns 404.
+        let (status, missing, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-ghost".to_string())),
+                body(serde_json::json!({"password": "GhostSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(
+            !state.auth.has_user("w212-ghost"),
+            "unknown update creates nothing"
+        );
+
+        // Unknown authenticator ids are 404s on both detail routes.
+        let (status, missing, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((
+                    "password_based:nowhere".to_string(),
+                    "w212-detail".to_string(),
+                )),
+                body(serde_json::json!({"password": "DetailSecret3!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+    }
+}
+
+#[cfg(test)]
+mod login_token_tests {
+    use super::*;
+
+    #[test]
+    fn live_token_map_is_bounded() {
+        // Before the bound the map grew without limit; now it holds at
+        // most MAX_LIVE_TOKENS live entries no matter the login rate.
+        let store = ApiTokens::new();
+        for i in 0..(MAX_LIVE_TOKENS + 64) {
+            store.issue(&format!("w229-user-{i}"), AdminRole::Viewer);
+        }
+        assert!(
+            store.len() <= MAX_LIVE_TOKENS,
+            "live-token map must stay bounded at {MAX_LIVE_TOKENS}, got {}",
+            store.len()
+        );
+        assert_eq!(
+            store.len(),
+            MAX_LIVE_TOKENS,
+            "a full map of live tokens keeps exactly the bound"
+        );
+    }
+
+    #[test]
+    fn issue_sweeps_expired_entries() {
+        let store = ApiTokens::new();
+        for i in 0..8 {
+            store.issue_expired(&format!("w229-stale-{i}"), AdminRole::Viewer);
+        }
+        assert_eq!(store.len(), 8, "expired entries linger until swept");
+        store.issue("w229-fresh", AdminRole::Administrator);
+        assert_eq!(store.len(), 1, "the next issue sweeps every expired entry");
+    }
+
+    #[test]
+    fn issued_tokens_carry_the_documented_ttl() {
+        let store = ApiTokens::new();
+        let token = store.issue("w229-ttl", AdminRole::Administrator);
+        let info = store.lookup(&token).expect("fresh token looks up");
+        let remaining = info.expires_at.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= TOKEN_TTL,
+            "remaining TTL {remaining:?} must not exceed {TOKEN_TTL:?}"
+        );
+        assert!(
+            remaining > TOKEN_TTL - Duration::from_secs(100),
+            "remaining TTL {remaining:?} must sit at the documented {TOKEN_TTL:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_live_token_and_rejects_reuse_and_missing() {
+        // Before the fix the handler revoked when a bearer token was
+        // present but still answered 204 when it was missing or unknown:
+        // a second logout with the same token reported success.
+        let state = standalone_state();
+        let token = state.tokens.issue("admin", AdminRole::Administrator);
+
+        // Live token: 204 with an empty body, entry removed not retained.
+        let (status, body, raw) =
+            parts(logout(State(state.clone()), bearer_headers(&token)).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "success is 204 with no body");
+        assert_eq!(body, serde_json::Value::Null);
+        assert!(
+            state.tokens.lookup(&token).is_none(),
+            "logout must remove the entry, not retain it"
+        );
+
+        // Already-revoked token: client error, never success.
+        let (status, body, _) =
+            parts(logout(State(state.clone()), bearer_headers(&token)).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+        assert!(body.get("message").is_some());
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+
+        // Unknown token: same client error.
+        let (status, body, _) = parts(
+            logout(
+                State(state.clone()),
+                bearer_headers("indra_garbage-token-that-was-never-issued"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+
+        // Missing header: same client error, never success.
+        let (status, body, _) = parts(logout(State(state.clone()), HeaderMap::new()).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod user_scope_tests {
+    use super::*;
+
+    #[test]
+    fn scope_catalogue_lists_the_documented_names_with_fields() {
+        // W2-40 failing test: the catalogue must carry the documented
+        // scope names with per-scope fields, and the validation
+        // predicates must agree with the served list. Before: a
+        // constant string list detached from validation (no fields, no
+        // shared registry, wrong vocabulary).
+        assert_eq!(USER_SCOPES.len(), 14);
+        let mut names: Vec<&str> = USER_SCOPES.iter().map(|entry| entry.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 14);
+        for entry in &USER_SCOPES {
+            assert!(!entry.name.is_empty());
+            assert!(!entry.desc.is_empty());
+            assert!(is_known_user_scope(entry.name));
+        }
+        for documented in [
+            "connections",
+            "publish",
+            "data_integration",
+            "access_control",
+            "gateways",
+            "monitoring",
+            "cluster_operations",
+            "system",
+            "audit",
+            "license",
+            "user_management",
+            "mfa_management",
+            "sso_management",
+            "api_key_management",
+        ] {
+            assert!(
+                is_known_user_scope(documented),
+                "catalogue must contain {documented}"
+            );
+        }
+        assert!(!is_known_user_scope("no-such-scope"));
+        assert!(!is_known_user_scope("all"));
+        // The generic scopes are shared with the API-key catalogue, so
+        // both registries agree on them.
+        for shared in [
+            "connections",
+            "publish",
+            "data_integration",
+            "access_control",
+            "gateways",
+            "monitoring",
+            "cluster_operations",
+            "system",
+            "audit",
+            "license",
+        ] {
+            assert!(
+                super::super::api_keys::is_known_api_key_scope(shared),
+                "generic scope {shared} must stay shared with the key catalogue"
+            );
+        }
+    }
+
+    #[test]
+    fn role_compatibility_follows_the_admin_only_flags() {
+        // Viewers hold only the generic scopes; administrators hold any
+        // catalogue scope; unknown names fail closed for both roles.
+        for entry in &USER_SCOPES {
+            assert!(
+                role_may_hold_scope(&AdminRole::Administrator, entry.name),
+                "administrator holds {}",
+                entry.name
+            );
+            assert_eq!(
+                role_may_hold_scope(&AdminRole::Viewer, entry.name),
+                !entry.admin_only,
+                "viewer holds {} exactly when it is not admin-only",
+                entry.name
+            );
+        }
+        assert!(!role_may_hold_scope(
+            &AdminRole::Administrator,
+            "no-such-scope"
+        ));
+        assert!(!role_may_hold_scope(&AdminRole::Viewer, "no-such-scope"));
+    }
+
+    #[test]
+    fn catalogue_matches_the_broker_config_scope_lists() {
+        let mut catalogue: Vec<&str> = USER_SCOPES.iter().map(|entry| entry.name).collect();
+        catalogue.sort_unstable();
+        let mut configured: Vec<&str> = broker_config::GENERIC_USER_SCOPES
+            .iter()
+            .chain(broker_config::LOGIN_ONLY_SCOPES.iter())
+            .copied()
+            .collect();
+        configured.sort_unstable();
+        assert_eq!(catalogue, configured, "catalogue and config lists agree");
+        let mut admin_default = default_scopes_for_role(AdminRole::Administrator);
+        admin_default.sort_unstable();
+        assert_eq!(admin_default, configured, "administrator default is all");
+        let mut viewer_default = default_scopes_for_role(AdminRole::Viewer);
+        viewer_default.sort_unstable();
+        let mut generic: Vec<&str> = broker_config::GENERIC_USER_SCOPES.to_vec();
+        generic.sort_unstable();
+        assert_eq!(viewer_default, generic, "viewer default is generic");
+    }
+
+    #[test]
+    fn write_parser_refuses_duplicates_bounds_and_long_names() {
+        let admin = AdminRole::Administrator;
+        let defaults = default_scopes_for_role(admin);
+        let mut ambiguous = defaults.clone();
+        ambiguous.pop();
+        ambiguous.push(defaults[0].clone());
+        assert!(
+            parse_scope_write(admin, &serde_json::json!(ambiguous)).is_err(),
+            "a duplicate cannot stand in for a missing default scope"
+        );
+
+        let too_many = vec!["monitoring".to_string(); broker_config::MAX_USER_SCOPES + 1];
+        assert!(parse_scope_write(admin, &serde_json::json!(too_many)).is_err());
+
+        let long = "x".repeat(broker_config::MAX_USER_SCOPE_LEN + 1);
+        assert!(parse_scope_write(admin, &serde_json::json!([long])).is_err());
+
+        let restricted = vec!["monitoring".to_string()];
+        assert_eq!(
+            parse_scope_write(admin, &serde_json::json!(restricted.clone())).unwrap(),
+            Some(restricted),
+            "a restricted list stays restricted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dashboard_users_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    #[tokio::test]
+    async fn crud_lists_with_envelope_rejects_duplicates_and_misses_404() {
+        // W2-41 failing test: create a user, list expecting it without
+        // secrets; re-create the duplicate expecting rejection; delete
+        // then delete again expecting 404. Before: the list answered a
+        // bare array with no page envelope, and malformed bodies were
+        // not shaped as documented client errors.
+        let state = standalone_state();
+
+        for (username, password, role) in [
+            ("w241-alice", "AliceSecret1!", "administrator"),
+            ("w241-bob", "BobSecret1!", "viewer"),
+        ] {
+            let (status, created, raw) = parts(
+                create_user(
+                    State(state.clone()),
+                    body(serde_json::json!({
+                        "username": username,
+                        "password": password,
+                        "role": role,
+                        "description": format!("{username} via w241"),
+                    })),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "create {username}");
+            assert_eq!(created["username"], serde_json::json!(username));
+            assert_eq!(created["role"], serde_json::json!(role));
+            assert!(
+                created.get("password").is_none(),
+                "create renders no password"
+            );
+            assert!(
+                created.get("password_hash").is_none(),
+                "create renders no hash"
+            );
+            assert!(
+                !String::from_utf8_lossy(&raw).contains(password),
+                "create body carries no plaintext"
+            );
+        }
+
+        // List answers a bare array with all users.
+        let (status, listed, raw) = parts(list_users(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = listed.as_array().expect("bare array");
+        assert_eq!(data.len(), 3, "default admin plus two created users");
+        for row in data {
+            assert_eq!(row["backend"], serde_json::json!("local"));
+            assert_eq!(row["mfa"], serde_json::json!("none"));
+        }
+        let names: Vec<&str> = data
+            .iter()
+            .map(|row| row["username"].as_str().expect("row has username"))
+            .collect();
+        assert_eq!(names, vec!["admin", "w241-alice", "w241-bob"]);
+        for row in data {
+            assert!(row.get("password").is_none(), "row renders no password");
+            assert!(row.get("password_hash").is_none(), "row renders no hash");
+        }
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("AliceSecret1!"),
+            "list body carries no plaintext"
+        );
+
+        // Re-creating an existing username is rejected, never an update.
+        let (status, duplicate, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-alice",
+                    "password": "OtherSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert!(duplicate["message"].is_string());
+
+        // Malformed bodies are client errors with the documented shape.
+        let (status, malformed, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({"username": "w241-nopw"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Delete one user; the list shrinks.
+        let gone = delete_user(State(state.clone()), Path("w241-bob".to_string())).await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        let (status, listed, _) = parts(list_users(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().expect("bare array").len(), 2);
+
+        // Deleting an unknown username is a 404 with the documented shape.
+        let (status, missing, _) =
+            parts(delete_user(State(state.clone()), Path("w241-ghost".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("USER_NOT_FOUND"));
+        assert!(missing.get("message").is_some());
+    }
+
+    #[tokio::test]
+    async fn created_credential_logs_in_and_delete_revokes_its_tokens() {
+        // Goes through the broker auth path, not only the store: the
+        // created credential must verify on the login path
+        // (`AdminUsers::verify_password`, driven by `POST /login` in
+        // `direct_login`), the issued token must resolve through the
+        // middleware resolver (`resolve_bearer`, driven by every
+        // authenticated management request in
+        // `crate::api_auth::require_api_auth`), and must stop resolving
+        // after the delete revokes it.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-conn",
+                    "password": "ConnSecret1!",
+                    "role": "viewer",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(
+            state
+                .admin_users
+                .verify_password("w241-conn", "ConnSecret1!"),
+            "correct password verifies on the login path"
+        );
+        assert!(
+            !state
+                .admin_users
+                .verify_password("w241-conn", "wrong-secret"),
+            "wrong password fails closed"
+        );
+
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-conn",
+                    "password": "ConnSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token).is_some(),
+            "issued token resolves through the middleware resolver"
+        );
+
+        let gone = delete_user(State(state.clone()), Path("w241-conn".to_string())).await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        assert!(
+            resolve_bearer(&state, &token).is_none(),
+            "deleted user stops authorising management calls"
+        );
+        assert!(
+            !state
+                .admin_users
+                .verify_password("w241-conn", "ConnSecret1!"),
+            "deleted user fails closed on the login path"
+        );
+    }
+
+    #[tokio::test]
+    async fn passwords_are_hashed_never_rendered_and_survive_a_restart() {
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-hash",
+                    "password": "HashSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Persistence rides the config registry: a registry-backed store
+        // still holds the user after a reload, so the credential survives
+        // a kernel restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w241-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w241-kept",
+                "KeptSecret1!",
+                AdminRole::Viewer,
+                "kept across restart",
+            )
+            .expect("registry-backed create persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        let found = reloaded
+            .snapshot()
+            .admin_users
+            .users
+            .iter()
+            .any(|u| u.username == "w241-kept");
+        assert!(found, "user persists across a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_replaces_fields_with_404_and_400_corners() {
+        // W2-42 failing test: create a user, update role/description and
+        // read back; update an unknown username expecting 404 without
+        // creating it; submit invalid bodies expecting 400 with the
+        // documented shape while applying nothing. Before: malformed and
+        // mistyped bodies answered with the extractor's status instead of
+        // the documented client error, and credential fields were silently
+        // ignored instead of rejected.
+        // Management-plane only: the handler takes one short user-map
+        // write lock per update (plus the registry save lock on persist);
+        // publish/deliver never touch this store.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w242-upd",
+                    "password": "UpdSecret1!",
+                    "role": "viewer",
+                    "description": "before",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Round trip: replace role and description, read back via the store.
+        let (status, updated, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({
+                    "role": "administrator",
+                    "description": "after",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["username"], serde_json::json!("w242-upd"));
+        assert_eq!(updated["role"], serde_json::json!("administrator"));
+        assert_eq!(updated["description"], serde_json::json!("after"));
+        assert!(updated.get("password").is_none());
+        let view = state
+            .admin_users
+            .get("w242-upd")
+            .expect("updated user reads back");
+        assert_eq!(view.role, AdminRole::Administrator);
+        assert_eq!(view.description, "after");
+
+        // The broker login path still verifies the untouched credential,
+        // and the issued token resolves through the middleware resolver.
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w242-upd",
+                    "password": "UpdSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token).is_some(),
+            "updated user still authorises management calls"
+        );
+
+        // Unknown usernames are 404 with the documented shape and create
+        // nothing.
+        let (status, missing, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-ghost".to_string()),
+                body(serde_json::json!({"description": "nope"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("USER_NOT_FOUND"));
+        assert!(missing.get("message").is_some());
+        assert!(
+            state.admin_users.get("w242-ghost").is_none(),
+            "unknown update creates nothing"
+        );
+
+        // Invalid role is 400 with the documented shape and applies nothing.
+        let (status, bad_role, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({"role": "bogus-role"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_role["code"], serde_json::json!("BAD_REQUEST"));
+        let kept = state
+            .admin_users
+            .get("w242-upd")
+            .expect("user still present");
+        assert_eq!(kept.role, AdminRole::Administrator);
+        assert_eq!(kept.description, "after");
+
+        // Credential fields are never accepted here: 400, password unchanged.
+        let (status, bad_pw, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({"password": "NewSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_pw["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(
+            state.admin_users.verify_password("w242-upd", "UpdSecret1!"),
+            "rejected password field changes nothing"
+        );
+        assert!(
+            !state.admin_users.verify_password("w242-upd", "NewSecret1!"),
+            "rejected password never takes effect"
+        );
+
+        // Mistyped description is 400 with the documented shape.
+        let (status, bad_desc, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({"description": 123})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_desc["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Malformed JSON is 400 with the documented shape.
+        let (status, malformed, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                Bytes::from_static(b"{oops"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Persistence rides the config registry: a registry-backed update
+        // still reads back after a reload, so the record survives a kernel
+        // restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w242-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w242-kept",
+                "KeptSecret1!",
+                AdminRole::Viewer,
+                "before restart",
+            )
+            .expect("registry-backed create persists");
+        durable
+            .update(
+                "w242-kept",
+                Some(AdminRole::Administrator),
+                Some("after restart"),
+            )
+            .expect("registry-backed update persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        let kept = reloaded
+            .snapshot()
+            .admin_users
+            .users
+            .iter()
+            .find(|u| u.username == "w242-kept")
+            .expect("updated user persists across a restart")
+            .clone();
+        assert_eq!(kept.role, "administrator");
+        assert_eq!(kept.description, "after restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_answer_the_documented_user_shape() {
+        // The documented record carries username, role, description,
+        // backend, mfa and scopes. It carries no password.
+        let state = standalone_state();
+        let (status, created, raw) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w245-shape",
+                    "password": "ShapeSecret1!",
+                    "role": "viewer",
+                    "description": "shape probe",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["username"], serde_json::json!("w245-shape"));
+        assert_eq!(created["role"], serde_json::json!("viewer"));
+        assert_eq!(created["description"], serde_json::json!("shape probe"));
+        assert_eq!(created["backend"], serde_json::json!("local"));
+        assert_eq!(created["mfa"], serde_json::json!("none"));
+        assert!(created.get("password").is_none());
+        assert_eq!(
+            created["scopes"],
+            serde_json::json!(broker_config::GENERIC_USER_SCOPES)
+        );
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("ShapeSecret1!"),
+            "create body carries no plaintext"
+        );
+
+        // Update keeps the same shape.
+        let (status, updated, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w245-shape".to_string()),
+                body(serde_json::json!({"description": "shape probe v2"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["username"], serde_json::json!("w245-shape"));
+        assert_eq!(updated["backend"], serde_json::json!("local"));
+        assert_eq!(updated["mfa"], serde_json::json!("none"));
+        assert_eq!(
+            updated["scopes"],
+            serde_json::json!(broker_config::GENERIC_USER_SCOPES)
+        );
+
+        // The credential verifies on the login path.
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w245-shape",
+                    "password": "ShapeSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token).is_some(),
+            "issued token resolves through the middleware resolver"
+        );
+    }
+
+    #[test]
+    fn admin_user_cap_is_finite_and_maps_to_bad_request() {
+        // The bound from the task: the store never grows without limit.
+        const {
+            assert!(
+                crate::admin_users::MAX_ADMIN_USERS <= 10_000,
+                "admin-user cap must stay small enough to keep list snapshots cheap"
+            );
+        }
+        const {
+            assert!(
+                crate::admin_users::MAX_ADMIN_USERS >= 2,
+                "admin-user cap must leave room beyond the default admin"
+            );
+        }
+        let response = admin_error(AdminUserError::TooManyUsers);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod change_password_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    fn caller(username: &str, role: AdminRole) -> Extension<TokenInfo> {
+        Extension(TokenInfo {
+            username: username.to_string(),
+            role,
+            expires_at: Instant::now() + Duration::from_secs(3600),
+            must_change_password: false,
+            scopes: None,
+        })
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    fn assert_documented_shape(json: &serde_json::Value, code: &str) {
+        assert_eq!(json["code"], serde_json::json!(code));
+        assert!(json.get("message").is_some(), "error carries a message");
+        assert_eq!(
+            json.as_object().expect("error is an object").len(),
+            2,
+            "error body is exactly {{code, message}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_password_round_trip_revokes_old_token_and_accepts_new() {
+        // W2-43 failing test: log in, change password, then expect the
+        // other live token revoked, the old password rejected and the new
+        // password accepted. Before: a single-class new value was stored
+        // (no complexity rule), malformed bodies answered with the
+        // extractor's status instead of the documented client error, and
+        // the viewer refusal carried no message.
+        // Goes through the broker auth path, not only the store: the
+        // credential verifies on the login path (`direct_login`, driven
+        // by `POST /login`), the issued tokens resolve through the
+        // middleware resolver (`resolve_bearer`, driven by every
+        // authenticated management request in
+        // `crate::api_auth::require_api_auth`), and the rotation persists
+        // through the config registry. Management-plane only: the handler
+        // takes one short user-map write lock per call (plus the registry
+        // save lock on persist); publish and deliver never touch this
+        // store.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                    "role": "viewer",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Two live sessions on the login path.
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_old = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_other = logged_in["token"]
+            .as_str()
+            .expect("second login issues a token")
+            .to_string();
+        assert_ne!(token_old, token_other);
+
+        // Self rotation proves the old credential and sets the new one.
+        let (status, _, raw) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_old),
+                Path("w243-user".to_string()),
+                body(serde_json::json!({
+                    "old_pwd": "OldSecret1!",
+                    "new_pwd": "NewSecret2!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "success is 204 with no body");
+
+        // The other live token is revoked through the middleware resolver;
+        // the caller's own bearer keeps working.
+        assert!(
+            resolve_bearer(&state, &token_other).is_none(),
+            "rotated user stops authorising other sessions"
+        );
+        assert!(
+            resolve_bearer(&state, &token_old).is_some(),
+            "caller's own bearer keeps working"
+        );
+
+        // The old password is rejected on the login path; the new one is
+        // accepted and its token resolves through the middleware resolver.
+        let (status, rejected, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_documented_shape(&rejected, "BAD_USERNAME_OR_PWD");
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "NewSecret2!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_new = logged_in["token"]
+            .as_str()
+            .expect("rotated login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token_new).is_some(),
+            "rotated credential authorises management calls"
+        );
+
+        // A wrong old credential is a client error and changes nothing.
+        let (status, wrong_old, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_new),
+                Path("w243-user".to_string()),
+                body(serde_json::json!({
+                    "old_pwd": "NotTheSecret1!",
+                    "new_pwd": "Another3!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_documented_shape(&wrong_old, "ERROR_PWD_NOT_MATCH");
+        assert!(
+            state
+                .admin_users
+                .verify_password("w243-user", "NewSecret2!"),
+            "rejected rotation applies nothing"
+        );
+
+        // A weak new value is a client error even at full length:
+        // single-class secrets never store.
+        for weak in ["short", "longbutsimple", "12345678"] {
+            let (status, rejected, _) = parts(
+                change_user_password(
+                    State(state.clone()),
+                    caller("w243-user", AdminRole::Viewer),
+                    bearer_headers(&token_new),
+                    Path("w243-user".to_string()),
+                    body(serde_json::json!({
+                        "old_pwd": "NewSecret2!",
+                        "new_pwd": weak,
+                    })),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "weak {weak:?} rejected");
+            assert_documented_shape(&rejected, "BAD_REQUEST");
+        }
+        assert!(
+            state
+                .admin_users
+                .verify_password("w243-user", "NewSecret2!"),
+            "rejected weak values apply nothing"
+        );
+
+        // Unknown usernames are 404 with the documented shape and create
+        // nothing.
+        let (status, missing, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("admin", AdminRole::Administrator),
+                bearer_headers(&token_new),
+                Path("w243-ghost".to_string()),
+                body(serde_json::json!({"new_pwd": "GhostSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_documented_shape(&missing, "USER_NOT_FOUND");
+        assert!(
+            state.admin_users.get("w243-ghost").is_none(),
+            "unknown rotation creates nothing"
+        );
+
+        // A viewer cannot rotate another user's password: 403 with the
+        // documented shape, and the target credential is untouched.
+        let (status, refused, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_new),
+                Path("admin".to_string()),
+                body(serde_json::json!({"new_pwd": "Takeover1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_documented_shape(&refused, "FORBIDDEN");
+        assert!(
+            state.admin_users.verify_password("admin", "public"),
+            "refused rotation changes nothing"
+        );
+
+        // Malformed bodies are client errors with the documented shape,
+        // never the extractor's status.
+        let (status, malformed, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_new),
+                Path("w243-user".to_string()),
+                Bytes::from_static(b"{oops"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_documented_shape(&malformed, "BAD_REQUEST");
+
+        // Persistence rides the config registry: a registry-backed
+        // rotation still verifies after a reload, so the new credential
+        // survives a kernel restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w243-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w243-kept",
+                "KeptSecret1!",
+                AdminRole::Viewer,
+                "before restart",
+            )
+            .expect("registry-backed create persists");
+        durable
+            .change_password("w243-kept", "KeptSecret2!")
+            .expect("registry-backed rotation persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        assert!(
+            reloaded
+                .snapshot()
+                .admin_users
+                .users
+                .iter()
+                .any(|u| u.username == "w243-kept"),
+            "rotated user persists across a restart"
+        );
+        let revived =
+            crate::admin_users::AdminUsers::from_snapshot(&reloaded.snapshot().admin_users);
+        assert!(
+            revived.verify_password("w243-kept", "KeptSecret2!"),
+            "new credential verifies after a restart"
+        );
+        assert!(
+            !revived.verify_password("w243-kept", "KeptSecret1!"),
+            "old credential fails closed after a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -299,6 +299,12 @@ pub enum RewriteRuleError {
     /// The replacement alone already exceeds [`MAX_REWRITE_LEN`].
     #[error("topic-rewrite replacement exceeds {0} bytes (field `replacement`)")]
     ReplacementTooLong(usize),
+    /// The source-topic filter is not a valid topic filter.
+    #[error("invalid topic-rewrite source {0:?}: not a valid topic filter (field `source_topic`)")]
+    InvalidSource(String),
+    /// The source-topic filter was empty.
+    #[error("topic-rewrite source must not be empty (field `source_topic`)")]
+    EmptySource,
 }
 
 impl RewriteScope {
@@ -341,6 +347,11 @@ impl RewriteScope {
 /// capture-group replacement (`$1`, `${name}`) plus the direction it
 /// fires in. Compiled once by [`Router::set_rewrite_rules`]; the
 /// per-message path never compiles.
+///
+/// The optional source filter gates the rule: the input must match it
+/// before the regex runs, and the first gated rule in scope decides the
+/// outcome even when its regex misses. `None` keeps the original
+/// regex-only behaviour (first regex match wins).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteRuleConfig {
     /// Regular expression matched against the whole topic or filter.
@@ -349,6 +360,8 @@ pub struct RewriteRuleConfig {
     pub replacement: String,
     /// Direction this rule fires in.
     pub scope: RewriteScope,
+    /// Optional source-topic filter gate (`source_topic` in the API).
+    pub source: Option<String>,
 }
 
 impl RewriteRuleConfig {
@@ -363,7 +376,17 @@ impl RewriteRuleConfig {
             pattern: pattern.into(),
             replacement: replacement.into(),
             scope,
+            source: None,
         }
+    }
+
+    /// Attach a source-topic filter gate to this rule. The filter is
+    /// validated later by [`Router::set_rewrite_rules`] with
+    /// [`RewriteRuleError::EmptySource`] or
+    /// [`RewriteRuleError::InvalidSource`].
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 }
 
@@ -373,8 +396,38 @@ impl RewriteRuleConfig {
 #[derive(Debug)]
 struct CompiledRewriteRule {
     scope: RewriteScope,
+    pattern: String,
     replacement: String,
+    source: Option<String>,
     regex: regex::Regex,
+}
+
+/// Match one input (concrete topic or subscribe filter) against a
+/// source-topic filter, level by level. A `#` source level matches the
+/// rest; a `+` source level matches any single input level, including a
+/// wildcard level of a subscribe filter; other levels must read equal.
+/// A name starting with `$` matches a wildcard source head never, only a
+/// literal one, so system names keep their semantics. Bounded string
+/// scan, no lock.
+fn source_matches(source: &str, input: &str) -> bool {
+    if input.starts_with('$') {
+        // System names match literally only: a wildcard source head
+        // never matches them (mirrors the reference match rule).
+        if matches!(source.split('/').next(), Some("+" | "#")) {
+            return false;
+        }
+    }
+    let mut inputs = input.split('/');
+    let mut sources = source.split('/');
+    loop {
+        match (inputs.next(), sources.next()) {
+            (None, None) => return true,
+            (_, Some("#")) => return true,
+            (Some(_), Some("+")) => {}
+            (Some(left), Some(right)) if left == right => {}
+            _ => return false,
+        }
+    }
 }
 
 /// Snapshot of the rewrite counters for operators and tests.
@@ -897,8 +950,8 @@ impl Router {
     /// The table swaps atomically under one write lock: readers always
     /// see the old or the new table, never a mix. Rejects fail closed
     /// with the table unchanged: too many rules, an empty pattern, an
-    /// uncompilable pattern, or a replacement already past
-    /// [`MAX_REWRITE_LEN`].
+    /// uncompilable pattern, an empty or invalid source filter, or a
+    /// replacement already past [`MAX_REWRITE_LEN`].
     pub fn set_rewrite_rules(
         &self,
         configs: Vec<RewriteRuleConfig>,
@@ -914,11 +967,20 @@ impl Router {
             if config.replacement.len() > MAX_REWRITE_LEN {
                 return Err(RewriteRuleError::ReplacementTooLong(MAX_REWRITE_LEN));
             }
+            if let Some(source) = config.source.as_deref() {
+                if source.is_empty() {
+                    return Err(RewriteRuleError::EmptySource);
+                }
+                TopicFilter::new(source)
+                    .map_err(|_| RewriteRuleError::InvalidSource(source.to_string()))?;
+            }
             let regex = regex::Regex::new(&config.pattern)
                 .map_err(|_| RewriteRuleError::InvalidPattern(config.pattern.clone()))?;
             compiled.push(CompiledRewriteRule {
                 scope: config.scope,
+                pattern: config.pattern.clone(),
                 replacement: config.replacement.clone(),
+                source: config.source.clone(),
                 regex,
             });
         }
@@ -937,6 +999,23 @@ impl Router {
         self.rewrite_rules.read().len()
     }
 
+    /// Snapshot the installed rules in evaluation order, with the
+    /// configured strings (pattern, replacement, scope, source) the
+    /// management API renders. One short read lock; management plane
+    /// only, never on the publish path.
+    pub fn rewrite_rules_snapshot(&self) -> Vec<RewriteRuleConfig> {
+        self.rewrite_rules
+            .read()
+            .iter()
+            .map(|rule| RewriteRuleConfig {
+                pattern: rule.pattern.clone(),
+                replacement: rule.replacement.clone(),
+                scope: rule.scope,
+                source: rule.source.clone(),
+            })
+            .collect()
+    }
+
     /// Copy the rewrite counters in one call for operators and tests.
     pub fn rewrite_stats(&self) -> RewriteStats {
         RewriteStats {
@@ -948,8 +1027,9 @@ impl Router {
     }
 
     /// Rewrite one publish topic (B4-04). Evaluates publish/both rules
-    /// in configuration order; the first regex that matches wins and
-    /// its capture-group replacement is returned. `None` means deliver
+    /// in configuration order; the first rule that matches wins (a gated
+    /// rule on its source filter, a plain rule on its regex) and its
+    /// capture-group replacement is returned. `None` means deliver
     /// unchanged (no rules, no match, system prefix, or budget failure).
     ///
     /// Called by the publish ingress event before auth, retained state,
@@ -960,8 +1040,8 @@ impl Router {
     }
 
     /// Rewrite one subscribe filter (B4-04). Same ordered first-match
-    /// rule, restricted to subscribe/both rules. `None` means subscribe
-    /// with the filter unchanged.
+    /// rule (source gate, then regex), restricted to subscribe/both
+    /// rules. `None` means subscribe with the filter unchanged.
     ///
     /// Called by the subscribe event before validation and group
     /// splitting observe the filter, so the router, the session mirror
@@ -971,13 +1051,16 @@ impl Router {
     }
 
     /// Shared ordered evaluation for both directions. Per-message cost:
-    /// one short read lock, at most one `is_match` probe per installed
-    /// rule (at most [`MAX_REWRITE_RULES`], linear-time engine in the
-    /// input length, early exit on the first match), plus a single
-    /// bounded replacement allocation (at most [`MAX_REWRITE_LEN`]
-    /// bytes) on a hit. No compilation, no unbounded allocation, no
-    /// waiting: an over-long input or output fails closed to `None`
-    /// with the budget counter bumped.
+    /// one short read lock, at most one source-filter scan plus one
+    /// `is_match` probe per installed rule (at most
+    /// [`MAX_REWRITE_RULES`], both linear in the input length, early
+    /// exit on the first decision), plus a single bounded replacement
+    /// allocation (at most [`MAX_REWRITE_LEN`] bytes) on a hit. No
+    /// compilation, no unbounded allocation, no waiting: an over-long
+    /// input or output fails closed to `None` with the budget counter
+    /// bumped. A gated rule decides on the first source match, even
+    /// when its regex misses. A plain rule keeps the original
+    /// first-regex-match behaviour.
     fn rewrite_for(&self, input: &str, is_publish: bool) -> Option<String> {
         if input.len() > MAX_REWRITE_LEN {
             self.rewrite_budget_exceeded.fetch_add(1, Ordering::Relaxed);
@@ -1006,7 +1089,18 @@ impl Router {
             if !in_scope {
                 continue;
             }
-            if !rule.regex.is_match(input) {
+            if let Some(source) = rule.source.as_deref() {
+                // Gated rule: the first source match decides, even when
+                // the regex misses (mirrors the reference order).
+                if !source_matches(source, input) {
+                    continue;
+                }
+                if !rule.regex.is_match(input) {
+                    drop(rules);
+                    self.rewrite_passthrough.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            } else if !rule.regex.is_match(input) {
                 continue;
             }
             let out = rule.regex.replace(input, rule.replacement.as_str());
@@ -1562,8 +1656,60 @@ impl Router {
         topic: &Topic,
         publisher: Option<&str>,
     ) {
-        if !matched.iter().any(|s| s.group.is_some()) {
+        // One pass finds shared entries and one group key.
+        // Fan-in publishes land here, so skip the group map.
+        let mut single_key: Option<(Arc<str>, Arc<str>)> = None;
+        let mut single = true;
+        let mut has_shared = false;
+        for sub in matched.iter() {
+            if let Some(group) = sub.group.as_ref() {
+                has_shared = true;
+                match single_key.as_ref() {
+                    Some((tenant, name))
+                        if tenant.as_ref() == sub.tenant.as_ref()
+                            && name.as_ref() == group.as_ref() => {}
+                    Some(_) => {
+                        single = false;
+                        break;
+                    }
+                    None => {
+                        single_key = Some((sub.tenant.clone(), group.clone()));
+                    }
+                }
+            }
+        }
+        if !has_shared {
             return;
+        }
+        let strategies = self.strategies.load_full();
+        if single {
+            if let Some((tenant, group)) = single_key {
+                // Move members out. Plain entries move back.
+                // No clone except the one picked entry.
+                let all: Vec<Subscription> = matched.drain().collect();
+                let mut members: Vec<Subscription> = Vec::with_capacity(all.len());
+                for sub in all {
+                    if sub.group.is_some() {
+                        members.push(sub);
+                    } else {
+                        matched.insert(sub);
+                    }
+                }
+                members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+                let strategy = strategies.get(&group).copied().unwrap_or_default();
+                let pick = match strategy {
+                    SharedStrategy::RoundRobin => self.pick_round_robin(&tenant, &group, &members),
+                    SharedStrategy::Random => self.pick_random(&members),
+                    SharedStrategy::HashClientId => {
+                        let key = publisher.unwrap_or("");
+                        Self::pick_hash(&members, key)
+                    }
+                    SharedStrategy::HashTopic => Self::pick_hash(&members, topic.as_str()),
+                    SharedStrategy::Sticky => self.pick_sticky(&tenant, &group, &members),
+                };
+                matched.insert(pick);
+                return;
+            }
         }
         // Keyed by `(tenant, group)` (MT-02): the same group name in two
         // tenants balances independently, and a tenant-filtered match set
@@ -1584,9 +1730,8 @@ impl Router {
         if groups.is_empty() {
             return;
         }
-        // Lock-free strategy snapshot: one `ArcSwap` load for the whole
+        // Lock-free strategy snapshot loads once above for the whole
         // delivery, then no lock per group on the hot path.
-        let strategies = self.strategies.load_full();
         for ((tenant, group), mut members) in groups {
             members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
             let strategy = strategies.get(&group).copied().unwrap_or_default();
@@ -2012,6 +2157,63 @@ mod tests {
             assert_eq!(matched.len(), 2);
             assert!(matched.iter().any(|s| s.client_id.as_ref() == "plain-c"));
             assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_shared_fast_path_single_group_keeps_plain() {
+        // PF-02 checks the fast path condition. One group plus one
+        // plain entry uses the fast path and keeps both parts.
+        let router = Router::new();
+        let inner = TopicFilter::new("fast/single").unwrap();
+        router.subscribe(
+            &inner,
+            Subscription::shared("fast-a", 1, QoS::AtMostOnce, "solo"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("fast-b", 2, QoS::AtMostOnce, "solo"),
+        );
+        router.subscribe(
+            &TopicFilter::new("fast/single").unwrap(),
+            Subscription::new("fast-plain", 3, QoS::AtMostOnce),
+        );
+        let topic = Topic::new("fast/single").unwrap();
+        for _ in 0..4 {
+            let matched = router.matches(&topic);
+            assert_eq!(matched.len(), 2);
+            assert!(matched.iter().any(|s| s.client_id.as_ref() == "fast-plain"));
+            assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_shared_fallback_multi_group_reduces_each() {
+        // PF-02 checks the fallback path. Two groups reduce to one
+        // member each, so the set holds two entries.
+        let router = Router::new();
+        let inner = TopicFilter::new("fast/multi").unwrap();
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-a", 1, QoS::AtMostOnce, "g1"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-b", 2, QoS::AtMostOnce, "g1"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-c", 3, QoS::AtMostOnce, "g2"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-d", 4, QoS::AtMostOnce, "g2"),
+        );
+        let topic = Topic::new("fast/multi").unwrap();
+        for _ in 0..4 {
+            let matched = router.matches(&topic);
+            assert_eq!(matched.len(), 2);
+            assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 2);
         }
     }
 
@@ -3133,6 +3335,100 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_source_gate_filters_before_regex() {
+        let router = Router::new();
+        router
+            .set_rewrite_rules(vec![
+                RewriteRuleConfig::new("^keep/(.*)$", "kept/$1", RewriteScope::Publish)
+                    .with_source("keep/#"),
+                RewriteRuleConfig::new("^x/(.*)$", "open/$1", RewriteScope::Publish)
+                    .with_source("#"),
+            ])
+            .expect("gated rules install");
+        // First source misses: the second rule decides.
+        assert_eq!(router.rewrite_publish("x/a"), Some("open/a".to_string()));
+        // First source matches and the regex matches: rewrite.
+        assert_eq!(router.rewrite_publish("keep/x"), Some("kept/x".to_string()));
+    }
+
+    #[test]
+    fn rewrite_source_match_stops_scan_on_regex_miss() {
+        let router = Router::new();
+        router
+            .set_rewrite_rules(vec![
+                RewriteRuleConfig::new("^nomatch/(.*)$", "first/$1", RewriteScope::Publish)
+                    .with_source("a/#"),
+                RewriteRuleConfig::new("^(.*)$", "second/$1", RewriteScope::Publish)
+                    .with_source("#"),
+            ])
+            .expect("gated rules install");
+        // The first source matches but its regex misses: no rewrite and
+        // the second rule never runs.
+        assert_eq!(router.rewrite_publish("a/z"), None);
+        let stats = router.rewrite_stats();
+        assert_eq!(stats.rewritten, 0);
+        assert_eq!(stats.passthrough, 1);
+    }
+
+    #[test]
+    fn rewrite_source_matches_wildcard_subscribe_filters() {
+        let router = Router::new();
+        router
+            .set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "^x/(.*)$",
+                "sub/$1",
+                RewriteScope::Subscribe,
+            )
+            .with_source("x/#")])
+            .expect("gated rule installs");
+        // A wildcard subscribe filter still matches the source.
+        assert_eq!(router.rewrite_subscribe("x/+"), Some("sub/+".to_string()));
+        assert_eq!(router.rewrite_subscribe("other/+"), None);
+    }
+
+    #[test]
+    fn rewrite_source_rejects_empty_and_invalid_filters() {
+        let router = Router::new();
+        let err = router
+            .set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "^x/(.*)$",
+                "y/$1",
+                RewriteScope::Publish,
+            )
+            .with_source("")])
+            .expect_err("empty source must fail");
+        assert_eq!(err, super::RewriteRuleError::EmptySource);
+        let err = router
+            .set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "^x/(.*)$",
+                "y/$1",
+                RewriteScope::Publish,
+            )
+            .with_source("sport/#/bogus")])
+            .expect_err("invalid source must fail");
+        assert_eq!(
+            err,
+            super::RewriteRuleError::InvalidSource("sport/#/bogus".to_string())
+        );
+        assert_eq!(router.rewrite_rule_count(), 0);
+    }
+
+    #[test]
+    fn rewrite_source_match_vectors() {
+        assert!(super::source_matches("#", "a/b/c"));
+        assert!(super::source_matches("a/#", "a"));
+        assert!(super::source_matches("a/#", "a/b"));
+        assert!(!super::source_matches("a/#", "b/a"));
+        assert!(super::source_matches("a/+", "a/b"));
+        assert!(!super::source_matches("a/+", "a/b/c"));
+        assert!(super::source_matches("a/#", "a/+"));
+        assert!(!super::source_matches("#", "$SYS/broker"));
+        assert!(!super::source_matches("+/#", "$SYS/broker"));
+        assert!(super::source_matches("$SYS/#", "$SYS/broker"));
+        assert!(super::source_matches("$SYS/broker", "$SYS/broker"));
+    }
+
+    #[test]
     fn rewrite_rule_count_bound_rejects_fail_closed() {
         assert_eq!(super::MAX_REWRITE_RULES, 64);
         let router = Router::new();
@@ -3315,6 +3611,10 @@ struct ConnSlot {
     /// manually) means no directed wakeup; the global
     /// [`ConnTable::qos0_notify`] still fires.
     waker: RwLock<Option<Arc<Notify>>>,
+    /// Set when a close of this connection was ordered with
+    /// [`ConnTable::order_close`]. The owning transport reads it with one
+    /// atomic load, so it stops handling input that is already buffered.
+    closing: Arc<AtomicBool>,
 }
 
 impl ConnTable {
@@ -3342,6 +3642,7 @@ impl ConnTable {
                 client: RwLock::new(None),
                 tenant: RwLock::new(None),
                 waker: RwLock::new(None),
+                closing: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -3448,6 +3749,29 @@ impl ConnTable {
         if let Some(slot) = shard.get(&conn_id) {
             *slot.waker.write() = Some(waker.clone());
         }
+    }
+
+    /// The flag that [`ConnTable::order_close`] sets for `conn_id`. A
+    /// transport takes it once after the bind and reads it for each
+    /// inbound packet. Unknown connections have no flag.
+    pub fn closing_flag(&self, conn_id: u64) -> Option<Arc<AtomicBool>> {
+        let shard = self.shard(conn_id).lock();
+        shard.get(&conn_id).map(|slot| slot.closing.clone())
+    }
+
+    /// Orders the close of `conn_id`: sets its closing flag, then routes
+    /// `frame` (the `ConnClose` frame) like [`ConnTable::route`]. The
+    /// flag is set first, so no packet that the connection still holds
+    /// in its read buffer is handled after the order. Used on denial
+    /// events only, never for an allowed message.
+    pub fn order_close(&self, conn_id: u64, frame: BrokerFrame) -> bool {
+        {
+            let shard = self.shard(conn_id).lock();
+            if let Some(slot) = shard.get(&conn_id) {
+                slot.closing.store(true, Ordering::Release);
+            }
+        }
+        self.route(conn_id, frame)
     }
 
     /// Configured QoS 0 backlog bound (floored at 1 on write).
@@ -3716,5 +4040,19 @@ impl ConnTable {
             metrics.inc_unknown_conn_dropped();
         }
         false
+    }
+
+    /// Snapshot of every registered connection id.
+    ///
+    /// Locks one bucket at a time. Shutdown path only. The publish
+    /// and deliver paths never call this.
+    pub fn connection_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for shard in &self.shards {
+            for id in shard.lock().keys() {
+                ids.push(*id);
+            }
+        }
+        ids
     }
 }

@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "a": null
+      },
+      "projected": {
+        "v": "dflt"
+      },
+      "sql": "SELECT coalesce_ne(a, 'dflt') AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "a": null,
+        "b": ""
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT coalesce_ne(a, b) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-coalesce_ne",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

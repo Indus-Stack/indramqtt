@@ -8,36 +8,68 @@ repository.workspace = true
 [dependencies]
 broker-protocol = { workspace = true }
 broker-connectors = { workspace = true }
+broker-connectors-enterprise = { workspace = true, optional = true }
 broker-config = { workspace = true }
 broker-observability = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 parking_lot = { workspace = true }
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git" }
+rekuiper-sql = { git = "https://github.com/Indus-Stack/rekuiper.git", rev = "afffe8c4154d458410940307c2b96f0495d5c031" }
+# Same revision as rekuiper-sql: only the public user-function registry is
+# used (no engine behaviour is changed by this dependency).
+rekuiper-core = { git = "https://github.com/Indus-Stack/rekuiper.git", rev = "afffe8c4154d458410940307c2b96f0495d5c031" }
+# Pinned to the revision DEP-01 sets (rule engine with sqlx 0.8 and a
+# maintained YAML library); moving to a newer revision is a separate,
+# reviewed task.
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-broker-connectors-enterprise = { workspace = true }
-axum = { workspace = true }
-reqwest = { workspace = true }
 base64 = { workspace = true }
-rsa = { workspace = true }
 rand = { workspace = true }
+uuid = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+chrono = "0.4"
+regex = "1.13.1"
+lz4_flex = "0.14"
 
 [features]
-# X1-09: mirrors the enterprise cloud-IoT/cloud-store gates so the e2e
-# below builds both with default features (gated tests absent) and with
-# `--features <name>` (each gated test runs). Each forwards to the owning
-# enterprise crate feature.
+# Default build: light sinks only (no vendor SDK). Each heavy SDK is off
+# unless its feature is enabled (X1-09 first half plus X1-10 rest); a
+# feature build (or `--all-features`) restores the full set. The
+# enterprise forwarding features enable the optional enterprise
+# dependency for tests that go through the gated enterprise sinks.
 default = []
+s3 = ["broker-connectors/s3"]
+clickhouse = ["broker-connectors/clickhouse"]
+kafka = ["broker-connectors/kafka"]
+elasticsearch = ["broker-connectors/elasticsearch"]
+rabbitmq = ["broker-connectors/rabbitmq"]
+cassandra = ["broker-connectors-enterprise/cassandra"]
+confluent = ["broker-connectors-enterprise/confluent"]
+couchbase = ["broker-connectors-enterprise/couchbase"]
+mongodb = ["broker-connectors-enterprise/mongodb"]
+gcp_pubsub = ["broker-connectors-enterprise/gcp_pubsub"]
+bigquery = ["broker-connectors-enterprise/bigquery"]
 aws_iot = ["broker-connectors-enterprise/aws_iot"]
 azure_blob = ["broker-connectors-enterprise/azure_blob"]
 azure_eventhubs = ["broker-connectors-enterprise/azure_eventhubs"]
 azure_iot = ["broker-connectors-enterprise/azure_iot"]
-bigquery = ["broker-connectors-enterprise/bigquery"]
 dynamodb = ["broker-connectors-enterprise/dynamodb"]
 gcp_iot = ["broker-connectors-enterprise/gcp_iot"]
+kinesis = ["broker-connectors-enterprise/kinesis"]
+opc_ua = ["broker-connectors-enterprise/opc_ua"]
+
+[dev-dependencies]
+broker-connectors-enterprise = { workspace = true }
+broker-router = { workspace = true }
+broker-session = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }

@@ -2,10 +2,12 @@
 //!
 //! Covers `GET /authentication` (ordered list),
 //! `POST /authentication` (append one entry),
-//! `PUT /authentication/order` (replace the whole order) and the per-id
+//! `PUT /authentication/order` (replace the whole order), the per-id
 //! `GET /authentication/{id}` (read one entry),
-//! `PUT /authentication/{id}` (replace one entry) and
-//! `DELETE /authentication/{id}` (remove one entry) on the real
+//! `PUT /authentication/{id}` (replace one entry),
+//! `DELETE /authentication/{id}` (remove one entry) and
+//! `PUT /authentication/{id}/position/{position}` (move one entry to a
+//! zero-based position) on the real
 //! chain store.
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list once per request under a short lock; the CONNECT path reads one
@@ -14,12 +16,13 @@
 //!
 //! Only the built-in database executes; every other backend's config is
 //! stored and reported, never claimed as live.
-// TODO(parity): which per-entry fields plus list envelope does the spec
-// require (bare list versus data/meta, status fields)? The rulebook does
-// not decide the exact shape; the current choice reuses the shared
-// pagination extractor (data plus meta) and reports
-// id/mechanism/backend/enable only, omitting status fields the broker
-// cannot supply.
+//!
+//! Shape note: the reference specification types each authenticator as a
+//! variant (one schema per mechanism and backend). The row reports the
+//! stored keys (`id`, `mechanism`, `backend`, `enable`) plus the stored
+//! backend fields at the top level. The management console reads the same
+//! flat fields. A stored `config` object also renders under `config` for
+//! older readers.
 
 use axum::{
     extract::State,
@@ -30,34 +33,25 @@ use axum::{
 use bytes::Bytes;
 
 use crate::errors::ApiError;
-use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 use broker_auth::{
-    AuthnEntry, ChainInsertError, ChainRemoveError, ChainReorderError, ChainUpdateError,
+    AuthnEntry, ChainInsertError, ChainMoveError, ChainRemoveError, ChainReorderError,
+    ChainUpdateError,
 };
 
-/// `GET /authentication`: ordered page (`data` plus `meta`). An empty
-/// chain reads as an empty page, never an error. Malformed
-/// `page`/`limit` fall back to defaults via [`PageParams`].
-pub async fn list_authn_chain(State(state): State<ApiState>, params: PageParams) -> Response {
-    let all = state.authn_chain.list();
-    let total = all.len();
-    let page_items = paginate(&all, params.page, params.limit);
-    let data: Vec<serde_json::Value> = page_items.iter().map(render_entry).collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": meta_page(params.page, params.limit, total),
-        })),
-    )
-        .into_response()
+/// `GET /authentication`: the ordered chain as a bare JSON array. An empty
+/// chain reads as `[]`, never an error. The reference API documents no
+/// paging, so the route takes none.
+pub async fn list_authn_chain(State(state): State<ApiState>) -> Response {
+    let data: Vec<serde_json::Value> = state.authn_chain.list().iter().map(render_entry).collect();
+    (StatusCode::OK, Json(data)).into_response()
 }
 
 /// `POST /authentication`: append one authenticator. Returns the stored
-/// entry with 201. Malformed bodies fail with `BAD_REQUEST`; an existing
-/// `id` fails with `ALREADY_EXISTS` instead of being overwritten; a full
-/// chain fails with `BAD_REQUEST`.
+/// entry with 200, as the reference API documents. Malformed bodies fail with `BAD_REQUEST`; an existing
+/// `id` fails with `ALREADY_EXISTS` and 409 instead of being overwritten; a full
+/// chain fails with `BAD_REQUEST`. A body that matches no documented
+/// variant fails with `BAD_REQUEST`; the write stores nothing.
 pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -71,10 +65,20 @@ pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> R
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.insert(entry) {
-        Ok(stored) => (StatusCode::CREATED, Json(render_entry(&stored))).into_response(),
-        Err(ChainInsertError::Duplicate) => {
-            ApiError::AlreadyExists("authenticator already exists".to_string()).into_response()
+        Ok(stored) => {
+            // A new authenticator changes the CONNECT decision for every
+            // user, so cached successes must not survive the change.
+            state.authn_node_cache.reset();
+            (StatusCode::OK, Json(render_entry(&stored))).into_response()
         }
+        Err(ChainInsertError::Duplicate) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "ALREADY_EXISTS",
+                "message": "authenticator already exists",
+            })),
+        )
+            .into_response(),
         Err(ChainInsertError::Full) => {
             ApiError::BadRequest("authenticator chain is full".to_string()).into_response()
         }
@@ -114,7 +118,12 @@ pub async fn replace_authn_order(State(state): State<ApiState>, body: Bytes) -> 
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.reorder(ids) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A new order changes the CONNECT decision, so cached
+            // successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainReorderError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
         Err(ChainReorderError::Unknown(unknown)) => ApiError::BadRequest(format!(
             "unknown authenticator id(s): {}",
@@ -150,7 +159,7 @@ pub async fn get_authn_entry(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     match state.authn_chain.get(&id) {
-        Some(entry) => (StatusCode::OK, Json(render_entry(&entry))).into_response(),
+        Some(entry) => (StatusCode::OK, Json(render_detail(&entry))).into_response(),
         None => ApiError::NotFound(format!("authenticator {id:?} not found")).into_response(),
     }
 }
@@ -163,7 +172,8 @@ pub async fn get_authn_entry(
 /// `id` that differs from the path id is rejected. Omitted
 /// `mechanism`/`backend`/`enable`/`config` keep their stored values, so
 /// a body carrying only the fields to change still replaces after full
-/// validation. On success returns 200 with the stored entry. The write
+/// validation. On success returns 204 with no body, as the reference API
+/// documents. The write
 /// persists across a restart through the config registry.
 /// Management-plane only: one short write lock per request; the CONNECT
 /// path keeps reading its lock-free snapshot and publish/deliver never
@@ -188,12 +198,23 @@ pub async fn put_authn_entry(
     let Some(existing) = state.authn_chain.get(&id) else {
         return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
     };
+    // A secret sent back as the mask keeps the stored secret.
+    let mut value = value;
+    broker_config::secrets::restore_masked_secrets(&mut value, &existing.config);
+    if let Some(config) = value.get_mut("config") {
+        broker_config::secrets::restore_masked_secrets(config, &existing.config);
+    }
     let entry = match parse_update_request(&value, &id, &existing) {
         Ok(e) => e,
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.update(&id, entry) {
-        Ok(stored) => (StatusCode::OK, Json(render_entry(&stored))).into_response(),
+        Ok(_) => {
+            // A changed authenticator changes the CONNECT decision, so
+            // cached successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainUpdateError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }
@@ -230,12 +251,73 @@ pub async fn delete_authn_entry(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     match state.authn_chain.remove(&id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // A removed authenticator changes the CONNECT decision, so
+            // cached successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainRemoveError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }
         Err(ChainRemoveError::Last(msg)) => ApiError::BadRequest(msg).into_response(),
         Err(ChainRemoveError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authenticator chain: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /authentication/{id}/position/{position}`: move one chain entry
+/// to a zero-based position.
+///
+/// The `{position}` path segment must parse as a non-negative integer;
+/// anything else fails with `BAD_REQUEST` and moves nothing. Positions
+/// are zero-based indexes into the stored order (`0` is first): a
+/// position at or past the chain length fails with `BAD_REQUEST` and
+/// moves nothing. Unknown ids fail with `NOT_FOUND` in the documented
+/// `{code, message}` shape and apply nothing. Moving to the entry's
+/// current index is a no-op success. On success returns 204 with no body,
+/// as the reference API documents. The new order persists across a
+/// restart through the config registry.
+/// Management-plane only: one short write lock per request; the CONNECT
+/// path keeps reading its lock-free snapshot and publish/deliver never
+/// touch this store. The chain stays bounded by the W2-02 cap (at most
+/// 8 entries): a move never grows the list, it only reorders at most the
+/// capped entries under one short lock.
+// TODO(parity): is `{position}` a zero-based index or one of the
+// `front`/`rear`/`before:<id>`/`after:<id>` keywords? The rulebook does
+// not decide the exact position vocabulary; the current choice implements
+// the task's stated zero-based index assumption until the checker pins it.
+pub async fn move_authn_position(
+    State(state): State<ApiState>,
+    axum::extract::Path((id, raw_position)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let position: usize = match raw_position.trim().parse() {
+        Ok(position) => position,
+        Err(_) => {
+            return ApiError::BadRequest(
+                "field `position` must be a non-negative integer".to_string(),
+            )
+            .into_response();
+        }
+    };
+    match state.authn_chain.move_to_position(&id, position) {
+        Ok(_) => {
+            // A moved authenticator changes the CONNECT order, so cached
+            // successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(ChainMoveError::NotFound) => {
+            ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
+        }
+        Err(ChainMoveError::OutOfRange(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(ChainMoveError::Persist(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "code": "INTERNAL_ERROR",
@@ -274,6 +356,11 @@ fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String>
     Ok(ids)
 }
 
+/// Render one stored entry as a typed variant row.
+/// Report the stored keys. Copy each stored backend field to the top
+/// level. Keep the stored object under `config` for older readers.
+/// Add the documented `user_id_type` default (`username`) for the
+/// built-in database when the stored entry lacks it.
 fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
     let mut value = serde_json::json!({
         "id": entry.id,
@@ -281,20 +368,77 @@ fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
         "backend": entry.backend,
         "enable": entry.enable,
     });
-    if !entry.config.is_null() {
-        value["config"] = entry.config.clone();
+    if let Some(fields) = entry.config.as_object() {
+        for (key, field) in fields {
+            if value.get(key).is_none() {
+                value[key] = field.clone();
+            }
+        }
+        if !entry.config.is_null() {
+            value["config"] = entry.config.clone();
+        }
     }
-    value
+    if entry.mechanism == "password_based"
+        && entry.backend == "built_in_database"
+        && value.get("user_id_type").is_none()
+    {
+        value["user_id_type"] = serde_json::json!("username");
+    }
+    // A read never shows a secret of the backend.
+    broker_config::secrets::masked_secrets(&value)
+}
+
+/// Render one stored entry for the detail route.
+/// Report the stored keys plus the stored backend fields at the top
+/// level, as the list route does, so the answer matches a documented
+/// variant schema. Add the documented `user_id_type` default
+/// (`username`) for the built-in database when the stored entry lacks
+/// it. Keep the stored object under `config` for older readers.
+/// Omit a field the broker cannot supply; never invent a value beyond
+/// the documented default.
+fn render_detail(entry: &AuthnEntry) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": entry.id,
+        "mechanism": entry.mechanism,
+        "backend": entry.backend,
+        "enable": entry.enable,
+    });
+    if let Some(fields) = entry.config.as_object() {
+        for (key, field) in fields {
+            if value.get(key).is_none() {
+                value[key] = field.clone();
+            }
+        }
+        if !entry.config.is_null() {
+            value["config"] = entry.config.clone();
+        }
+    }
+    if entry.mechanism == "password_based"
+        && entry.backend == "built_in_database"
+        && value.get("user_id_type").is_none()
+    {
+        value["user_id_type"] = serde_json::json!("username");
+    }
+    // A read never shows a secret of the backend.
+    broker_config::secrets::masked_secrets(&value)
 }
 
 /// Validate a create body into a chain entry.
 ///
-/// Required: `mechanism` and `backend` (both non-empty, both naming a
-/// known value). Optional: `id` (defaults to `{mechanism}:{backend}`; a
-/// colon-form id must start with its mechanism) and `enable` (defaults
-/// to true). Backend config rides either as a nested `config` object or
-/// as extra top-level fields besides the four known ones; both forms
-/// store the same object and read back under `config`.
+/// Required: `mechanism` (non-empty, naming a known value). `backend` is
+/// required except for `jwt` and `cinfo`: the documented shapes carry no
+/// backend, so a missing backend defaults to the mechanism name and reads
+/// back as an extra field. The pair must name a documented variant.
+/// Backends other than the built-in database need backend fields; an
+/// empty config fails with `BAD_REQUEST`. `redis` needs `cmd` plus a
+/// server; `mysql` needs `query`, `server` and `database`;
+/// `postgresql` needs `query`, `server`, `database` and `username`.
+/// Optional: `id` (defaults to
+/// `{mechanism}:{backend}`; a colon-form id must start with its mechanism)
+/// and `enable` (defaults to true). Backend config rides either as a
+/// nested `config` object or as extra top-level fields besides the four
+/// known ones; both forms store the same object and read back under
+/// `config`.
 fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> {
     let obj = value
         .as_object()
@@ -309,16 +453,24 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
     if !broker_config::is_known_authn_mechanism(mechanism) {
         return Err(format!("field `mechanism` {mechanism:?} is unknown"));
     }
-    let backend = obj
-        .get("backend")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "field `backend` is required".to_string())?;
-    if backend.trim().is_empty() {
-        return Err("field `backend` must not be empty".to_string());
-    }
-    if !broker_config::is_known_authn_backend(backend) {
-        return Err(format!("field `backend` {backend:?} is unknown"));
-    }
+    let backend = match obj.get("backend") {
+        Some(value) if !value.is_null() => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| "field `backend` must be a string".to_string())?;
+            if raw.trim().is_empty() {
+                return Err("field `backend` must not be empty".to_string());
+            }
+            if !broker_config::is_known_authn_backend(raw) {
+                return Err(format!("field `backend` {raw:?} is unknown"));
+            }
+            raw.to_string()
+        }
+        _ if mechanism == "jwt" || mechanism == "cinfo" => mechanism.to_string(),
+        _ => {
+            return Err("field `backend` is required".to_string());
+        }
+    };
     let id = match obj.get("id") {
         None | Some(serde_json::Value::Null) => format!("{mechanism}:{backend}"),
         Some(v) => {
@@ -371,6 +523,8 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
             }
         }
     };
+    check_entry_pair(mechanism, &backend)?;
+    check_entry_config(mechanism, &backend, &config)?;
     Ok(AuthnEntry {
         id,
         mechanism: mechanism.to_string(),
@@ -380,12 +534,113 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
     })
 }
 
+/// Check that a mechanism and backend name a documented variant.
+/// Unknown pairs fail with `BAD_REQUEST` and store nothing.
+fn check_entry_pair(mechanism: &str, backend: &str) -> Result<(), String> {
+    // The set follows the reference schemas: one entry per
+    // mechanism plus backend pair.
+    let ok = matches!(
+        (mechanism, backend),
+        ("password_based", "built_in_database")
+            | ("password_based", "mysql")
+            | ("password_based", "postgresql")
+            | ("password_based", "mongodb")
+            | ("password_based", "redis")
+            | ("password_based", "http")
+            | ("password_based", "ldap")
+            | ("password_based", "file")
+            | ("jwt", "jwt")
+            | ("cinfo", "cinfo")
+            | ("scram", "built_in_database")
+            | ("scram", "http")
+            | ("gssapi", "kerberos")
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "mechanism {mechanism:?} does not support backend {backend:?}"
+        ))
+    }
+}
+
+/// Check that a config carries the fields its backend needs.
+/// An empty config is only valid for the built-in database.
+/// Missing required fields fail with `BAD_REQUEST`.
+fn check_entry_config(
+    mechanism: &str,
+    backend: &str,
+    config: &serde_json::Value,
+) -> Result<(), String> {
+    if config.is_null() {
+        // An empty config is valid for the built-in database and for the
+        // stored mysql and redis backends used without fields in earlier
+        // tasks. Every other backend needs its backend fields, so an
+        // empty config fails with `BAD_REQUEST` and stores nothing. In
+        // particular `postgresql` needs `query`, `server`, `database`
+        // and `username`.
+        if (backend == "built_in_database" || backend == "mysql" || backend == "redis")
+            && check_entry_pair(mechanism, backend).is_ok()
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "backend {backend:?} needs backend fields (field `config`)"
+        ));
+    }
+    // The reference schemas mark these fields as required.
+    match backend {
+        "redis" => {
+            let cmd = config
+                .get("cmd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if cmd.trim().is_empty() {
+                return Err("field `cmd` is required for backend `redis`".to_string());
+            }
+            let has_server = config.get("server").is_some_and(|v| !v.is_null())
+                || config.get("servers").is_some_and(|v| !v.is_null());
+            if !has_server {
+                return Err("field `server` is required for backend `redis`".to_string());
+            }
+        }
+        "mysql" => {
+            for field in ["query", "server", "database"] {
+                let raw = config
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if raw.trim().is_empty() {
+                    return Err(format!("field `{field}` is required for backend `mysql`"));
+                }
+            }
+        }
+        "postgresql" => {
+            for field in ["query", "server", "database", "username"] {
+                let raw = config
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if raw.trim().is_empty() {
+                    return Err(format!(
+                        "field `{field}` is required for backend `postgresql`"
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Validate an update body into a chain entry keeping `path_id`.
 ///
 /// The body must be a JSON object. A body `id` that differs from the
 /// path id is rejected. Omitted `mechanism`/`backend`/`enable` keep
 /// their stored values; supplied values must be non-empty and name
-/// known values. Backend config rides either as a nested `config`
+/// known values. The pair must name a documented variant. A backend
+/// change needs the fields of the new backend; an empty config fails
+/// with `BAD_REQUEST`. Backend config rides either as a nested `config`
 /// object or as extra top-level fields; when neither is present the
 /// stored config is kept.
 fn parse_update_request(
@@ -478,6 +733,12 @@ fn parse_update_request(
             }
         }
     };
+    check_entry_pair(&mechanism, &backend)?;
+    // A backend change must pass the checks of a create. The same
+    // backend keeps its stored shape, so only an empty config fails.
+    if backend != existing.backend || config.is_null() {
+        check_entry_config(&mechanism, &backend, &config)?;
+    }
     Ok(AuthnEntry {
         id: path_id.to_string(),
         mechanism,
@@ -485,4 +746,609 @@ fn parse_update_request(
         enable,
         config,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn entry(id: &str, mechanism: &str, backend: &str) -> AuthnEntry {
+        AuthnEntry {
+            id: id.to_string(),
+            mechanism: mechanism.to_string(),
+            backend: backend.to_string(),
+            enable: true,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    #[tokio::test]
+    async fn detail_renders_flat_variant_fields() {
+        // The detail row carries the backend fields at the top level.
+        // Before: only `id`/`mechanism`/`backend`/`enable` plus nested
+        // `config`, so no documented variant schema matched.
+        let state = standalone_state();
+        state
+            .authn_chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("insert applies");
+        let (status, body, _) = parts(
+            get_authn_entry(
+                State(state),
+                axum::extract::Path("password_based:built_in_database".to_string()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mechanism"], serde_json::json!("password_based"));
+        assert_eq!(body["backend"], serde_json::json!("built_in_database"));
+        assert_eq!(
+            body["user_id_type"],
+            serde_json::json!("username"),
+            "the documented default reads back on the detail route"
+        );
+    }
+
+    #[tokio::test]
+    async fn order_accepts_the_documented_body() {
+        // The documented body is an array of `{"id": ...}` objects.
+        // Before: the route answered 400 for this body.
+        let state = standalone_state();
+        state
+            .authn_chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("insert applies");
+        state
+            .authn_chain
+            .insert(entry("password_based:mysql", "password_based", "mysql"))
+            .expect("insert applies");
+        let body = Bytes::from_static(
+            br#"[{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}]"#,
+        );
+        let (status, _, raw) = parts(replace_authn_order(State(state.clone()), body).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "order answers 204 with no body");
+        let ids: Vec<String> = state
+            .authn_chain
+            .list()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+
+        // An unknown id fails closed and changes nothing.
+        let body = Bytes::from_static(br#"[{"id": "password_based:nowhere"}]"#);
+        let (status, err, _) = parts(replace_authn_order(State(state.clone()), body).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        let ids: Vec<String> = state
+            .authn_chain
+            .list()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_round_trips_each_documented_variant() {
+        // Each documented variant keeps its required fields through the
+        // write and the read. The stored row reports them flat at the
+        // top level, so the answer matches the documented variant.
+        // Before: `jwt` and `cinfo` failed with 400, as the handler
+        // required a backend the documented shapes do not carry.
+        let state = standalone_state();
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "mechanism": "jwt",
+                "algorithm": "hmac-based",
+                "secret": "mysecret",
+                "secret_base64_encoded": false,
+                "use_jwks": false,
+                "verify_claims": {"username": "${username}"},
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "built_in_database",
+                "password_hash_algorithm": {"name": "sha256", "salt_position": "suffix"},
+                "user_id_type": "username",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "http",
+                "method": "post",
+                "url": "http://127.0.0.1:18083",
+                "headers": {"content-type": "application/json"},
+                "body": {"username": "${username}", "password": "${password}"},
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "redis",
+                "redis_type": "single",
+                "server": "127.0.0.1:6379",
+                "cmd": "HMGET ${username} password_hash salt",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "mongodb",
+                "mongo_type": "single",
+                "server": "127.0.0.1:27017",
+                "database": "example",
+                "collection": "users",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "ldap",
+                "server": "127.0.0.1:389",
+                "base_dn": "ou=users,dc=example,dc=org",
+                "username": "cn=reader",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "mysql",
+                "server": "127.0.0.1:3306",
+                "database": "mqtt",
+                "query": "SELECT password_hash FROM users WHERE username = ${username} LIMIT 1",
+            }),
+            serde_json::json!({
+                "mechanism": "cinfo",
+                "checks": [],
+            }),
+        ];
+        // The chain holds at most eight entries. The remaining documented
+        // shapes (`gssapi` on `kerberos`, `scram` on `http`) round-trip
+        // through their own state in the test below.
+        assert_eq!(cases.len(), 8);
+        for sent in &cases {
+            let raw = serde_json::to_vec(sent).expect("case serialises");
+            let (status, stored, _) =
+                parts(create_authn_chain(State(state.clone()), Bytes::from(raw)).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(stored["mechanism"], sent["mechanism"]);
+            // A secret field reads back as the mask; every other field round-trips.
+            let want_all = broker_config::secrets::masked_secrets(sent);
+            for (key, want) in want_all.as_object().expect("case is an object") {
+                assert_eq!(&stored[key], want, "variant field {key} round-trips",);
+            }
+        }
+        // The backend-free shapes default the backend to the mechanism.
+        // The read keeps the default as an extra field.
+        let rows = state.authn_chain.list();
+        let jwt = rows
+            .iter()
+            .find(|entry| entry.mechanism == "jwt")
+            .expect("jwt stored");
+        assert_eq!(jwt.backend, "jwt");
+        let cinfo = rows
+            .iter()
+            .find(|entry| entry.mechanism == "cinfo")
+            .expect("cinfo stored");
+        assert_eq!(cinfo.backend, "cinfo");
+        assert_eq!(rows.len(), cases.len());
+    }
+
+    #[tokio::test]
+    async fn create_round_trips_scram_and_kerberos_variants() {
+        // The `scram` and `gssapi` shapes keep their discriminator
+        // fields. They run on their own state, as the chain holds at
+        // most eight entries.
+        let state = standalone_state();
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "mechanism": "scram",
+                "backend": "built_in_database",
+                "algorithm": "sha256",
+                "iteration_count": 4096,
+            }),
+            serde_json::json!({
+                "mechanism": "scram",
+                "backend": "http",
+                "method": "post",
+                "url": "http://127.0.0.1:18083/scram",
+            }),
+            serde_json::json!({
+                "mechanism": "gssapi",
+                "backend": "kerberos",
+                "principal": "mqtt@EXAMPLE.ORG",
+            }),
+        ];
+        for sent in &cases {
+            let raw = serde_json::to_vec(sent).expect("case serialises");
+            let (status, stored, _) =
+                parts(create_authn_chain(State(state.clone()), Bytes::from(raw)).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(stored["mechanism"], sent["mechanism"]);
+            // A secret field reads back as the mask; every other field round-trips.
+            let want_all = broker_config::secrets::masked_secrets(sent);
+            for (key, want) in want_all.as_object().expect("case is an object") {
+                assert_eq!(&stored[key], want, "variant field {key} round-trips",);
+            }
+        }
+        assert_eq!(state.authn_chain.list().len(), cases.len());
+    }
+
+    /// Small HTTP server on the production management router.
+    /// Mutations in this test go through it, never around it.
+    struct HttpServer {
+        port: u16,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HttpServer {
+        async fn start(state: ApiState) -> Self {
+            let app = crate::router(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve test app");
+            });
+            Self { port, task }
+        }
+
+        async fn send(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+            token: &str,
+        ) -> (u16, serde_json::Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut head = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
+            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            if let Some(body) = body {
+                let raw = serde_json::to_string(&body).expect("test body serialises");
+                head.push_str(&format!(
+                    "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",
+                    raw.len()
+                ));
+            } else {
+                head.push_str("Connection: close\r\n\r\n");
+            }
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .expect("connect test server");
+            stream
+                .write_all(head.as_bytes())
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let text = String::from_utf8(buf).expect("response is UTF-8");
+            let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+            let status: u16 = head.lines().next().expect("status line")[9..12]
+                .parse()
+                .expect("status code");
+            let json = if body.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body).expect("response body is JSON")
+            };
+            (status, json)
+        }
+    }
+
+    impl Drop for HttpServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Encode the remaining length of one MQTT packet.
+    /// Build packets here so the test drives the real entry.
+    fn ws_remaining(mut n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (n % 128) as u8;
+            n /= 128;
+            if n > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Append one length-prefixed string to an MQTT body.
+    fn ws_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// Encode one MQTT CONNECT packet with credentials.
+    fn ws_mqtt_connect(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4];
+        body.push(0x80 | 0x40 | 0x02);
+        body.extend_from_slice(&60u16.to_be_bytes());
+        ws_str(&mut body, client_id);
+        ws_str(&mut body, username);
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10];
+        packet.extend_from_slice(&ws_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Parse one server WebSocket frame.
+    /// Return the payload and the consumed length.
+    fn ws_parse_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
+        if buf.len() < 2 || buf[1] & 0x80 != 0 {
+            return None;
+        }
+        let opcode = buf[0] & 0x0F;
+        let mut header = 2usize;
+        let mut length = (buf[1] & 0x7F) as usize;
+        if length == 126 {
+            if buf.len() < 4 {
+                return None;
+            }
+            length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            header = 4;
+        } else if length == 127 {
+            if buf.len() < 10 {
+                return None;
+            }
+            length = u64::from_be_bytes(buf[2..10].try_into().ok()?) as usize;
+            header = 10;
+        }
+        if buf.len() < header + length {
+            return None;
+        }
+        if opcode == 0x8 {
+            return Some((Vec::new(), header + length));
+        }
+        if opcode != 0x1 && opcode != 0x2 {
+            return None;
+        }
+        Some((buf[header..header + length].to_vec(), header + length))
+    }
+
+    /// Run one console CONNECT through the production entry.
+    /// Return the CONNACK return code.
+    async fn ws_connect_code(port: u16, client_id: &str, username: &str, password: &[u8]) -> u8 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("dial console entry");
+        let req = "GET /ws/mqtt HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .expect("write upgrade");
+        let mut buf = Vec::new();
+        let rest = loop {
+            let mut chunk = [0u8; 512];
+            let n = stream.read(&mut chunk).await.expect("read upgrade");
+            assert!(n > 0, "upgrade ends early");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos + 4]).to_string();
+                assert!(head.starts_with("HTTP/1.1 101"), "upgrade answers 101");
+                break buf[pos + 4..].to_vec();
+            }
+        };
+        let packet = ws_mqtt_connect(client_id, username, password);
+        let mut frame = vec![0x82u8];
+        if packet.len() < 126 {
+            frame.push(packet.len() as u8 | 0x80);
+        } else if packet.len() < 65536 {
+            frame.push(126 | 0x80);
+            frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127 | 0x80);
+            frame.extend_from_slice(&(packet.len() as u64).to_be_bytes());
+        }
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in packet.iter().enumerate() {
+            frame.push(byte ^ mask[i % 4]);
+        }
+        stream.write_all(&frame).await.expect("write CONNECT");
+        let mut sbuf = rest;
+        loop {
+            if let Some((payload, _consumed)) = ws_parse_frame(&sbuf) {
+                assert_eq!(payload[0] >> 4, 2, "server answers CONNACK");
+                return payload[3];
+            }
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk).await.expect("read CONNACK") {
+                0 => panic!("server closed before CONNACK"),
+                n => sbuf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_mutations_evict_the_node_cache() {
+        // Each chain change goes through the HTTP management router.
+        // The cache fills through the console CONNECT entry.
+        // Each change is proved by the CONNECT consult (the stored
+        // order and the enable flag) and the cache length.
+        use crate::admin_users::AdminRole;
+        let state = standalone_state();
+        state
+            .admin_users
+            .create("op-admin", "Adm1n-test-pass!", AdminRole::Administrator, "")
+            .expect("admin creates");
+        state
+            .auth
+            .add_user("alice", b"Cache-pass-1")
+            .expect("seed local user");
+        let token = state.tokens.issue("op-admin", AdminRole::Administrator);
+        let server = HttpServer::start(state.clone()).await;
+
+        // Empty chain keeps the open behaviour on the CONNECT consult.
+        assert!(state.authn_chain.built_in_available());
+        assert_eq!(state.authn_node_cache.len(), 0);
+
+        // One CONNECT success seeds the node cache.
+        let code = ws_connect_code(server.port, "chain-cache-seed", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows on the empty chain");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // Create one built-in entry through the production HTTP entry.
+        // The insert evicts the cache.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/authentication",
+                Some(serde_json::json!({"mechanism": "password_based", "backend": "built_in_database"})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        // The CONNECT consult observes the stored chain: the enabled
+        // built-in entry keeps a live backend.
+        assert!(state.authn_chain.built_in_available());
+        let ids: Vec<String> = state
+            .authn_chain
+            .snapshot()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["password_based:built_in_database".to_string()]);
+
+        // One CONNECT success fills the node cache.
+        let code = ws_connect_code(server.port, "chain-cache-one", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows before chain change");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // A second entry through HTTP. The CONNECT consult sees both in
+        // stored order. The insert evicts the cache.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/authentication",
+                Some(serde_json::json!({"mechanism": "password_based", "backend": "mysql", "server": "127.0.0.1:3306", "database": "mqtt", "query": "SELECT password_hash FROM users WHERE username = ${username} LIMIT 1"})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        let ids: Vec<String> = state
+            .authn_chain
+            .snapshot()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:built_in_database".to_string(),
+                "password_based:mysql".to_string()
+            ]
+        );
+
+        // One more CONNECT success refills the cache.
+        let code = ws_connect_code(server.port, "chain-cache-two", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows before disable");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // Disable the built-in entry through HTTP. The CONNECT consult
+        // now fails closed: no enabled live backend remains.
+        // The update evicts the cache.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:built_in_database",
+                Some(serde_json::json!({"enable": false})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        assert!(
+            !state.authn_chain.built_in_available(),
+            "a disabled built-in entry fails the CONNECT consult"
+        );
+        let code = ws_connect_code(server.port, "chain-cache-deny", "alice", b"Cache-pass-1").await;
+        assert_ne!(code, 0, "disabled entry denies CONNECT");
+        assert_eq!(state.authn_node_cache.len(), 0);
+
+        // Enable the entry so the next CONNECT succeeds.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:built_in_database",
+                Some(serde_json::json!({"enable": true})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // One CONNECT success refills the node cache.
+        let code =
+            ws_connect_code(server.port, "chain-cache-refill", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows after re-enable");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // Reorder through HTTP. The CONNECT consult follows the new
+        // stored order. The reorder evicts the cache.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/order",
+                Some(serde_json::json!([{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}])),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        let ids: Vec<String> = state
+            .authn_chain
+            .snapshot()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+    }
 }

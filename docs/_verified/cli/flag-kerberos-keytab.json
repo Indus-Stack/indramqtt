@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-kerberos-keytab",
+  "match": "--kerberos-keytab",
+  "output": "      --kerberos-keytab <KERBEROS_KEYTAB>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

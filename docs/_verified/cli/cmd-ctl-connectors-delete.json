@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "connectors",
+    "--help"
+  ],
+  "item": "cmd-ctl-connectors-delete",
+  "match": "delete",
+  "output": "Data connectors: list, show, create, delete\n  delete  Delete one connector. Destructive: requires `--yes` or an interactive confirm. The server answers success even for an unknown id, so the command is idempotent",
+  "output_bytes": 609,
+  "returncode": 0,
+  "verified": true
+}

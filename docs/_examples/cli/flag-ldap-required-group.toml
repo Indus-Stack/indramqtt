@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-ldap-required-group"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--ldap-required-group"

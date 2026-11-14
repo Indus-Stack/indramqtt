@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "allow": true
+      },
+      "projected": {
+        "allow": true
+      },
+      "sql": "SELECT allow FROM \"$events/client_check_authz_complete\"",
+      "topic": "$events/client_check_authz_complete"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "allow": true
+      },
+      "projected": null,
+      "sql": "SELECT allow FROM \"$events/client_check_authz_complete\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-client_check_authz_complete",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

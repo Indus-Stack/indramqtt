@@ -1,0 +1,39 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "username": "alice"
+      },
+      "projected": {
+        "u": "alice"
+      },
+      "sql": "SELECT username() AS u FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "u": null
+      },
+      "sql": "SELECT username() AS u FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "username": 42
+      },
+      "projected": {
+        "u": 42
+      },
+      "sql": "SELECT username() AS u FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-username",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

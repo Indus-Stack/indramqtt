@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-wss-verify-client-cert",
+  "match": "--wss-verify-client-cert",
+  "output": "      --wss-verify-client-cert <WSS_VERIFY_CLIENT_CERT>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

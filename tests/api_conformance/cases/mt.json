@@ -1,0 +1,182 @@
+[
+  {
+    "operation": "POST /mt/ns/{ns}",
+    "path_params": {"ns": "conf-mt-a"},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-a"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-a"}}]
+  },
+  {
+    "operation": "POST /mt/ns/{ns}",
+    "path_params": {"ns": "conf-mt-dup"},
+    "query": {},
+    "body": null,
+    "expect_status": 409,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-dup"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-dup"}}]
+  },
+  {
+    "operation": "DELETE /mt/ns/{ns}",
+    "path_params": {"ns": "conf-mt-del"},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-del"}}],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mt/managed_ns_list",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-list"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-list"}}]
+  },
+  {
+    "operation": "GET /mt/ns_list",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mt/managed_ns_list_details",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-md"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-md"}}]
+  },
+  {
+    "operation": "GET /mt/ns_list_details",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mt/ns/{ns}/client_count",
+    "path_params": {"ns": "conf-mt-cc"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-cc"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-cc"}}]
+  },
+  {
+    "operation": "GET /mt/ns/{ns}/client_count",
+    "path_params": {"ns": "conf-mt-ghost"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mt/ns/{ns}/client_list",
+    "path_params": {"ns": "conf-mt-cl"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-cl"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-cl"}}]
+  },
+  {
+    "operation": "GET /mt/ns/{ns}/config",
+    "path_params": {"ns": "conf-mt-cfg"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-cfg"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-cfg"}}]
+  },
+  {
+    "operation": "GET /mt/ns/{ns}/config",
+    "path_params": {"ns": "conf-mt-ghost"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mt/ns/{ns}/config",
+    "path_params": {"ns": "conf-mt-put"},
+    "query": {},
+    "body": {"session": {"max_sessions": 10}},
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-put"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-put"}}]
+  },
+  {
+    "operation": "POST /mt/ns/{ns}/kick_all_clients",
+    "path_params": {"ns": "conf-mt-kick"},
+    "query": {},
+    "body": null,
+    "expect_status": 202,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-kick"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-kick"}}]
+  },
+  {
+    "operation": "POST /mt/ns/{ns}/kick_all_clients",
+    "path_params": {"ns": "conf-mt-ghost"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mt/ns/{ns}/metrics",
+    "path_params": {"ns": "conf-mt-met"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-met"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-met"}}]
+  },
+  {
+    "operation": "DELETE /mt/bulk_delete_ns",
+    "path_params": {},
+    "query": {},
+    "body": {"nss": ["conf-mt-bulk-del"]},
+    "expect_status": 204,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-bulk-del"}}],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /mt/bulk_export_ns_configs",
+    "path_params": {},
+    "query": {},
+    "body": {"namespaces": ["conf-mt-exp"]},
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/mt/ns/conf-mt-exp"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-exp"}}]
+  },
+  {
+    "operation": "POST /mt/bulk_import_configs",
+    "path_params": {},
+    "query": {},
+    "body": [{"ns": "conf-mt-imp", "config": {"session": {"max_sessions": 5}}}],
+    "expect_status": 204,
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/mt/ns/conf-mt-imp"}}]
+  },
+  {
+    "operation": "POST /mt/bulk_import_ns_configs",
+    "path_params": {},
+    "query": {},
+    "body": {"configs": {"conf-mt-impns": {"session": {"max_sessions": 7}}}, "dry_run": true},
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  }
+]

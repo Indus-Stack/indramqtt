@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-message_delivered"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT retain FROM "$events/message_delivered"'
+topic = "$events/message_delivered"
+payload = '{"retain": false}'
+expect_matched = true
+expect_projected = '{"retain": false}'
+
+[[case]]
+sql = 'SELECT retain FROM "$events/message_delivered"'
+topic = "sensors/kitchen"
+payload = '{"retain": false}'
+expect_matched = false

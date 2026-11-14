@@ -10,7 +10,7 @@ internals: adjust the named values below, then start and connect.
 | `[node] id` | `deploy/compose/indra.toml` | `"indra-node-1"` | Give each node a unique id (matters once clustering is used). |
 | `[auth] allow_anonymous` | `deploy/compose/indra.toml` | `true` | Set `false` for anything beyond evaluation, and create users first. |
 | `[logging] level` | `deploy/compose/indra.toml`, but `INDRA_LOGGING__LEVEL` in `docker-compose.yml` wins | file `info`, running `debug` | Change the environment entry to set the running level without editing the file. |
-| Listener binds | `deploy/compose/indra.toml` (`listeners.tcp/ws/api`) | `1883` / `8083` / `18083` on all interfaces | Change the bind and the related `ports:` entry in `docker-compose.yml` together. Set a listener in this file only. The kernel gives the MQTT and WebSocket binds to the edge at start. |
+| Listener binds | `deploy/compose/indra.toml` (`listeners.tcp/ws/api`) | `1883` / `8083` / `18083` on all interfaces | Change the bind and the related `ports:` entry in `docker-compose.yml` together. Set a listener in this file only. |
 | Image tag | `docker-compose.yml` (`image:`) | `indramqtt/indramqtt:0.1.0` (workspace version) | Track releases; never use `:latest` for a running deployment. |
 
 Every other setting keeps its schema default (see

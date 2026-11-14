@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-bigquery"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-bigquery"
+type = "bigquery"
+expect_status = 201
+expect_type = "bigquery"
+
+[[case]]
+name = "dx2-action-bigquery"
+type = "bigquery"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

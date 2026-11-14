@@ -1,0 +1,46 @@
+[example]
+area = "rules"
+item = "fn-str"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT str(42) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "42"}'
+
+[[case]]
+sql = "SELECT str(true) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "true"}'
+
+[[case]]
+sql = "SELECT str([1, 2]) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "[1,2]"}'
+
+[[case]]
+sql = "SELECT str(map('{\"a\":1}')) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "{\"a\":1}"}'
+
+[[case]]
+sql = "SELECT str(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT str() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

@@ -1,0 +1,63 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "2.57"
+      },
+      "sql": "SELECT float2str(2.567, 2) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "42.000"
+      },
+      "sql": "SELECT float2str(42, 3) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "2"
+      },
+      "sql": "SELECT float2str(2.5, 0) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT float2str(1.0, 99) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT float2str() AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-float2str",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

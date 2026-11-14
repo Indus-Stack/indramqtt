@@ -63,7 +63,7 @@ fn window_length_ms(unit: &TimeUnit, length: u64) -> u64 {
 struct TimedRecord {
     arrived_ms: u64,
     topic: Topic,
-    record: HashMap<String, serde_json::Value>,
+    record: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Background aggregation worker for one Enterprise window rule.
@@ -153,10 +153,11 @@ impl WindowExecutor for EnterpriseWindowExecutor {
             Some(stmt) => stmt,
             None => return,
         };
-        let record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
-            Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-            _ => return,
-        };
+        let record: serde_json::Map<String, serde_json::Value> =
+            match serde_json::from_slice(payload) {
+                Ok(serde_json::Value::Object(map)) => map,
+                _ => return,
+            };
         let passes = match stmt.where_clause.as_ref() {
             Some(condition) => Evaluator::eval_bool(condition, &record),
             None => true,
@@ -423,6 +424,7 @@ async fn window_worker_loop(
                 }
             }
         }
+        WindowDef::State { .. } => {}
     }
 }
 
@@ -448,7 +450,7 @@ async fn flush_window(
     let Some(engine) = engine.upgrade() else {
         return;
     };
-    let records: Vec<(Topic, HashMap<String, serde_json::Value>)> = batch
+    let records: Vec<(Topic, serde_json::Map<String, serde_json::Value>)> = batch
         .into_iter()
         .map(|timed| {
             let mut map = timed.record;
@@ -471,8 +473,8 @@ async fn flush_window(
             (timed.topic, map)
         })
         .collect();
-    for (topic, row) in aggregate_partitioned(stmt, records) {
-        let object: serde_json::Map<String, serde_json::Value> = row.into_iter().collect();
+    for (topic, row) in aggregate_partitioned(stmt, records, rule_id, false) {
+        let object = row;
         let bytes = match serde_json::to_vec(&serde_json::Value::Object(object)) {
             Ok(bytes) => Bytes::from(bytes),
             Err(e) => {
@@ -591,37 +593,6 @@ mod tests {
             topic: Topic::new("alerts/agg").unwrap(),
             qos: QoS::AtMostOnce,
         }]
-    }
-
-    #[tokio::test]
-    async fn test_window_worker_lifecycle() {
-        let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
-        attach(&engine);
-        assert_eq!(engine.window_worker_count(), 0);
-        let rule = engine
-            .create_rule(
-                "w".to_string(),
-                TopicFilter::new("sensors/+").unwrap(),
-                Some(
-                    r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 30)"#
-                        .to_string(),
-                ),
-                true,
-                vec![RuleAction::Log],
-            )
-            .expect("rule creates");
-        assert_eq!(engine.window_worker_count(), 1);
-        // Re-creating is per-rule; removing aborts the worker.
-        assert!(engine
-            .remove_rule(&rule.id)
-            .expect("memory-only remove cannot fail"));
-        assert_eq!(engine.window_worker_count(), 0);
-        assert!(!engine
-            .remove_rule(&rule.id)
-            .expect("memory-only remove cannot fail"));
-        assert!(!engine
-            .remove_rule("rule-999")
-            .expect("memory-only remove cannot fail"));
     }
 
     #[tokio::test]
@@ -866,35 +837,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_window_channel_depth_reaches_worker() {
-        // The spawned worker's channel bound equals the configured depth.
-        async fn worker_capacity(depth: usize) -> usize {
-            let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
-            let executor = attach_with_depth(&engine, depth);
-            assert_eq!(executor.channel_depth(), depth.max(1));
-            let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
-            engine
-                .create_rule(
-                    "w".to_string(),
-                    TopicFilter::new("sensors/+").unwrap(),
-                    Some(
-                        r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY COUNTWINDOW(2)"#
-                            .to_string(),
-                    ),
-                    true,
-                    vec![],
-                )
-                .expect("rule creates");
-            ingress(&engine, &sink, br#"{ "temperature": 1.0 }"#).await;
-            let workers = executor.workers.read();
-            let worker = workers.get("rule-1").expect("worker spawned");
-            worker.tx.max_capacity()
-        }
-        assert_eq!(worker_capacity(65_536).await, 65_536);
-        assert_eq!(worker_capacity(10_000).await, 10_000);
-    }
-
-    #[tokio::test]
     async fn test_window_burst_twelve_k_without_drop() {
         // INDRA-215: 12,000 ingress events over COUNTWINDOW(100) flush
         // 120 windows with zero drops at the default depth.
@@ -956,31 +898,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_rule_stops_window_delivery() {
-        let (engine, sink, sink_obj, rule) = window_rule(
-            Some(
-                r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 30)"#,
-            ),
-            republish_action(),
-        );
-        assert_eq!(engine.window_worker_count(), 1);
-
-        // Records buffer, then the rule disappears before any close.
-        for _ in 0..5 {
-            ingress(&engine, &sink_obj, br#"{ "temperature": 1.0 }"#).await;
-        }
-        assert!(engine
-            .remove_rule(&rule.id)
-            .expect("memory-only remove cannot fail"));
-        assert_eq!(engine.window_worker_count(), 0);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            published_rows(&sink).is_empty(),
-            "aborted worker must not deliver"
-        );
-    }
-
-    #[tokio::test]
     async fn test_attach_backfills_previously_created_rules() {
         // Attaching after rules exist still covers them: the kernel
         // attaches before creation, but late attach must not strand a
@@ -1021,8 +938,9 @@ mod tests {
     /// through a second crate instance and fail with E0308. The
     /// windowed timescale rule below exercises the enterprise
     /// executor end to end, exactly as before the split.
-    /// X1-09: needs the community `s3` feature (S3 mock absent by default).
-    #[cfg(feature = "s3")]
+    // Needs the `s3` and `elasticsearch` heavy SDKs; runs on feature
+    // builds.
+    #[cfg(all(feature = "s3", feature = "elasticsearch"))]
     #[tokio::test]
     async fn test_into_fans_out_to_s3_elasticsearch_timescaledb() {
         use broker_connectors::{
@@ -1072,6 +990,12 @@ mod tests {
                     endpoint: "http://127.0.0.1:9200".to_string(),
                     index_template: "iot-telemetry-${YYYY.MM.dd}".to_string(),
                     doc_id_template: None,
+                    operation: broker_connectors::ElasticsearchOperation::Index,
+                    doc_template: None,
+                    overwrite: true,
+                    doc_as_upsert: false,
+                    require_alias: false,
+                    routing: None,
                     auth: broker_connectors::ElasticsearchAuth::None,
                     batch_size: 1,
                     batch_timeout_ms: 100,

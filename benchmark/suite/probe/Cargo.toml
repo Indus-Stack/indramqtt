@@ -1,0 +1,15 @@
+[package]
+name = "latency-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "End-to-end latency probe for an MQTT broker under load"
+
+[dependencies]
+rumqttc = { version = "0.24", default-features = false }
+hdrhistogram = { version = "7", default-features = false }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

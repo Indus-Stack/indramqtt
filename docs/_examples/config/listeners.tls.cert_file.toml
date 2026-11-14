@@ -1,0 +1,34 @@
+[example]
+area = "config"
+item = "listeners.tls.cert_file"
+kind = "setting"
+expect = "server-cn=localhost"
+expected = "The TLS handshake serves the configured certificate with common name localhost."
+source = "`crates/broker-node/src/native.rs` loads the certificate from the setting at listener start."
+action = "Run a TLS handshake against the secure listener and read the served certificate."
+config = '''
+[listeners.tls]
+enabled = true
+bind = "127.0.0.1:28883"
+cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
+key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+'''
+script = '''
+from config_probe import *
+import socket
+import ssl
+
+CA = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+raw = socket.create_connection(("127.0.0.1", 28883), timeout=10)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_REQUIRED
+ctx.load_verify_locations(cafile=CA)
+tls = ctx.wrap_socket(raw, server_hostname="localhost")
+tls.settimeout(10)
+peer = tls.getpeercert()
+tls.close()
+cn = dict(entry[0] for entry in peer["subject"])["commonName"]
+assert cn == "localhost", cn
+print("server-cn=localhost")
+'''

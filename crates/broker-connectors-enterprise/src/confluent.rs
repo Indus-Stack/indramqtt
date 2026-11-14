@@ -24,26 +24,18 @@
 //! `schema-registry-client` driver ([`RegistrySchemaClient`] below): schemas register under
 //! `{topic}-value` subjects and values carry the documented wire
 //! header (magic `0x00` + big-endian schema id, see
-//! [`frame_schema_registry`]). The legacy hand-written
-//! `TcpConfluentTransport` is retained for offline unit tests only;
-//! production wiring uses the driver transport.
+//! [`frame_schema_registry`]). Production wiring uses the driver
+//! transport.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock as AsyncRwLock;
 
-use broker_connectors::kafka::{
-    decode_api_versions_response, encode_api_versions_request, encode_produce_request,
-    encode_request_header, parse_acks, read_response, send_frame, KafkaRecord,
-};
 use broker_connectors::{now_millis, BackoffState, ConnectorError, Result, Sink};
 
 /// SASL mechanism for Confluent Cloud.
@@ -118,6 +110,20 @@ fn default_partitions() -> u32 {
     12
 }
 
+/// Default broker acknowledgement: all in-sync replicas.
+fn default_acks() -> String {
+    "all".to_string()
+}
+
+/// Encoding of extra header values on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfluentHeaderEncodeMode {
+    #[default]
+    None,
+    Json,
+}
+
 /// Confluent Cloud Kafka sink configuration. Every depth is
 /// user-configurable with no clamped ceiling (`None` = unbounded).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +154,30 @@ pub struct ConfluentKafkaConfig {
     /// Partition count for murmur2 routing (default 12).
     #[serde(default = "default_partitions")]
     pub partitions: u32,
+    /// Broker acknowledgement: `all` (default), `-1`, `1` or `0`.
+    /// Reason: the reference `required_acks` action field.
+    #[serde(default = "default_acks")]
+    pub acks: String,
+    /// Partition strategy of the action: false hashes the key
+    /// (`key_dispatch`), true spreads rows at random. Reason: the
+    /// reference default is `random`.
+    #[serde(default)]
+    pub random_partition: bool,
+    /// Single headers template (rendered per event, then parsed as a
+    /// JSON object or array of key/value pairs). Reason: the reference
+    /// `kafka_headers` action field.
+    #[serde(default)]
+    pub headers_template: Option<String>,
+    /// Extra record headers: each pair is a header name plus a value
+    /// template (`${topic}`, `${payload}`). Reason: the reference
+    /// `kafka_ext_headers` action field.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Value encoding of the extra headers: `none` sends raw bytes,
+    /// `json` sends each value JSON-encoded. Reason: the reference
+    /// `kafka_header_value_encode_mode` action field.
+    #[serde(default)]
+    pub header_encode_mode: ConfluentHeaderEncodeMode,
     /// Flush trigger record count (default 500).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
@@ -190,11 +220,14 @@ impl ConfluentKafkaConfig {
         // send time, shallower ones fail there as dispatch errors.
         resolve_topic(&self.topic_template, "dummy/seg2/seg3/seg4")?;
         if let Some(template) = &self.partition_key_template {
+            // Validate with a dummy client id. Reason: the reference
+            // default `${.clientid}` reads the payload `client_id`
+            // field, so an empty object rejects a valid default.
             resolve_key(
                 template,
                 "dummy/seg2/seg3/seg4",
                 "dummy-client",
-                &serde_json::json!({}),
+                &serde_json::json!({"client_id": "dummy-client"}),
             )?;
         }
         if let Some(registry) = &self.schema_registry {
@@ -216,6 +249,14 @@ impl ConfluentKafkaConfig {
             return Err(ConnectorError::Dispatch(
                 "confluent partitions must be >= 1".to_string(),
             ));
+        }
+        match self.acks.as_str() {
+            "all" | "-1" | "1" | "0" => {}
+            other => {
+                return Err(ConnectorError::Dispatch(format!(
+                    "confluent acks must be one of all/-1/1/0, got {other:?}"
+                )))
+            }
         }
         if self.batch_size == Some(0) {
             return Err(ConnectorError::Dispatch(
@@ -299,6 +340,12 @@ pub fn resolve_template(
             }
             let value = if let Some(leaf) = name.strip_prefix("payload.") {
                 payload_leaf(payload, leaf)
+            } else if name == ".clientid" {
+                // Reference default key `${.clientid}`: the client id
+                // of the event. The sink reads it from the payload
+                // `client_id` field, which is where the rule output
+                // carries it.
+                payload_leaf(payload, "client_id")
             } else {
                 vars.iter()
                     .find(|(key, _)| key == name)
@@ -667,387 +714,6 @@ impl ConfluentTransport for MemoryConfluentTransport {
     }
 }
 
-/// TCP transport: SASL handshake (PLAIN or full SCRAM conversation)
-/// after the ApiVersions probe, then Produce v3 with RecordBatch-v2.
-/// One in-flight exchange at a time; dropped connections redial once.
-pub struct TcpConfluentTransport {
-    endpoint: String,
-    client_id: String,
-    acks: i16,
-    mechanism: SaslMechanism,
-    username: String,
-    password: String,
-    timeout: Duration,
-    conn: AsyncMutex<Option<TcpConfluentConn>>,
-}
-
-struct TcpConfluentConn {
-    stream: TcpStream,
-    correlation: i32,
-}
-
-impl TcpConfluentTransport {
-    pub fn new(config: &ConfluentKafkaConfig) -> Result<Self> {
-        config.validate()?;
-        Ok(Self {
-            endpoint: config.bootstrap_servers[0].clone(),
-            client_id: format!("indra-confluent-{}", config.api_key),
-            acks: parse_acks("all")?,
-            mechanism: config.auth_mechanism,
-            username: config.api_key.clone(),
-            password: config.api_secret.clone(),
-            timeout: config.timeout(),
-            conn: AsyncMutex::new(None),
-        })
-    }
-
-    async fn roundtrip(&self, api_key: i16, api_version: i16, body: Vec<u8>) -> Result<Vec<u8>> {
-        let mut guard = self.conn.lock().await;
-        for attempt in 0..2 {
-            if guard.is_none() {
-                *guard = Some(self.dial().await?);
-            }
-            let conn = guard.as_mut().expect("connected");
-            let correlation = conn.correlation;
-            conn.correlation = conn.correlation.wrapping_add(1);
-            let mut frame =
-                encode_request_header(api_key, api_version, correlation, &self.client_id);
-            frame.extend_from_slice(&body);
-            let exchange = async {
-                send_frame(&mut conn.stream, frame).await?;
-                read_response(&mut conn.stream).await
-            };
-            match tokio::time::timeout(self.timeout, exchange).await {
-                Ok(Ok(mut response)) => {
-                    if response.len() < 4 {
-                        *guard = None;
-                        if attempt == 0 {
-                            continue;
-                        }
-                        return Err(ConnectorError::Connection(
-                            "truncated confluent response".to_string(),
-                        ));
-                    }
-                    let echoed =
-                        i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-                    if echoed != correlation {
-                        *guard = None;
-                        if attempt == 0 {
-                            continue;
-                        }
-                        return Err(ConnectorError::Connection(format!(
-                            "confluent correlation mismatch: {echoed} != {correlation}"
-                        )));
-                    }
-                    response.drain(..4);
-                    return Ok(response);
-                }
-                Ok(Err(_)) | Err(_) if attempt == 0 => {
-                    *guard = None;
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    *guard = None;
-                    return Err(e);
-                }
-                Err(_) => {
-                    *guard = None;
-                    return Err(ConnectorError::Connection(
-                        "confluent exchange timed out".to_string(),
-                    ));
-                }
-            }
-        }
-        Err(ConnectorError::Connection(
-            "confluent exchange failed".to_string(),
-        ))
-    }
-
-    async fn dial(&self) -> Result<TcpConfluentConn> {
-        let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
-            .await
-            .map_err(|_| {
-                ConnectorError::Connection(format!("confluent connect timeout: {}", self.endpoint))
-            })?
-            .map_err(|e| {
-                ConnectorError::Connection(format!(
-                    "confluent connect to {} failed: {e}",
-                    self.endpoint
-                ))
-            })?;
-        let mut conn = TcpConfluentConn {
-            stream,
-            correlation: 1,
-        };
-        // Prove framing before authenticating.
-        let frame = encode_api_versions_request(0, &self.client_id);
-        send_frame(&mut conn.stream, frame).await?;
-        let response = read_response(&mut conn.stream).await?;
-        decode_api_versions_response(&response, 0)?;
-        self.sasl_authenticate(&mut conn).await?;
-        conn.correlation = 1;
-        Ok(conn)
-    }
-
-    async fn sasl_authenticate(&self, conn: &mut TcpConfluentConn) -> Result<()> {
-        // SaslHandshake v1: mechanism STRING.
-        let mut body = Vec::new();
-        encode_kafka_string(self.mechanism.kafka_name(), &mut body);
-        let correlation = conn.correlation;
-        conn.correlation = conn.correlation.wrapping_add(1);
-        let mut frame = encode_request_header(17, 1, correlation, &self.client_id);
-        frame.extend_from_slice(&body);
-        send_frame(&mut conn.stream, frame).await?;
-        let response = read_response(&mut conn.stream).await?;
-        let error = read_response_error(&response, correlation)?;
-        if error != 0 {
-            return Err(ConnectorError::Dispatch(format!(
-                "confluent sasl handshake for {} failed with error {error}",
-                self.mechanism.kafka_name()
-            )));
-        }
-        match self.mechanism {
-            SaslMechanism::Plain => self
-                .sasl_authenticate_bytes(conn, &sasl_plain_payload(&self.username, &self.password))
-                .await
-                .map(|_| ()),
-            SaslMechanism::ScramSha256 => self.scram_conversation(conn, ScramHash::Sha256).await,
-            SaslMechanism::ScramSha512 => self.scram_conversation(conn, ScramHash::Sha512).await,
-        }
-    }
-
-    /// One SaslAuthenticate v1 exchange; returns the server bytes.
-    async fn sasl_authenticate_bytes(
-        &self,
-        conn: &mut TcpConfluentConn,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&(payload.len() as i32).to_be_bytes());
-        body.extend_from_slice(payload);
-        let correlation = conn.correlation;
-        conn.correlation = conn.correlation.wrapping_add(1);
-        let mut frame = encode_request_header(36, 1, correlation, &self.client_id);
-        frame.extend_from_slice(&body);
-        send_frame(&mut conn.stream, frame).await?;
-        let response = read_response(&mut conn.stream).await?;
-        let error = read_response_error(&response, correlation)?;
-        if error != 0 {
-            let code = if error == 58 {
-                "SASL_AUTHENTICATION_FAILED"
-            } else {
-                "sasl"
-            };
-            return Err(ConnectorError::Dispatch(format!(
-                "confluent sasl authenticate failed ({code}) with error {error}"
-            )));
-        }
-        // Response: error(2) + message(NULLABLE_STRING) + lifetime(8) +
-        // sasl_auth_bytes(BYTES). Skip to the trailing bytes.
-        let mut cursor = &response[4..];
-        let message_len = read_i16(&mut cursor)?;
-        if message_len > 0 {
-            if cursor.len() < message_len as usize {
-                return Err(ConnectorError::Connection(
-                    "truncated confluent sasl response".to_string(),
-                ));
-            }
-            cursor = &cursor[message_len as usize..];
-        }
-        if cursor.len() < 8 {
-            return Err(ConnectorError::Connection(
-                "truncated confluent sasl response".to_string(),
-            ));
-        }
-        cursor = &cursor[8..];
-        if cursor.len() < 4 {
-            return Err(ConnectorError::Connection(
-                "truncated confluent sasl response".to_string(),
-            ));
-        }
-        let bytes_len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-        if bytes_len < 0 || cursor.len() < 4 + bytes_len as usize {
-            return Err(ConnectorError::Connection(
-                "truncated confluent sasl response".to_string(),
-            ));
-        }
-        Ok(cursor[4..4 + bytes_len as usize].to_vec())
-    }
-
-    /// Full SCRAM client conversation: client-first, server-first
-    /// proof, mutual server-signature check.
-    async fn scram_conversation(&self, conn: &mut TcpConfluentConn, hash: ScramHash) -> Result<()> {
-        let nonce = scram_nonce();
-        let client_first_bare = format!("n={},r={}", self.username, nonce);
-        let client_first = format!("n,,{client_first_bare}");
-        let server_first = String::from_utf8(
-            self.sasl_authenticate_bytes(conn, client_first.as_bytes())
-                .await?,
-        )
-        .map_err(|_| {
-            ConnectorError::Connection("confluent scram server-first is not UTF-8".to_string())
-        })?;
-        let parsed = parse_scram_server_first(&server_first)?;
-        if !parsed.nonce.starts_with(&nonce) {
-            return Err(ConnectorError::Dispatch(
-                "confluent scram server nonce does not extend the client nonce".to_string(),
-            ));
-        }
-        let client_final_wo = format!("c=biws,r={}", parsed.nonce);
-        let auth_message = format!("{client_first_bare},{server_first},{client_final_wo}");
-        let proof = scram_client_proof(
-            hash,
-            self.password.as_bytes(),
-            &parsed.salt_b64,
-            parsed.iterations,
-            auth_message.as_bytes(),
-        )?;
-        let client_final = format!("{client_final_wo},p={proof}");
-        let server_final = String::from_utf8(
-            self.sasl_authenticate_bytes(conn, client_final.as_bytes())
-                .await?,
-        )
-        .map_err(|_| {
-            ConnectorError::Connection("confluent scram server-final is not UTF-8".to_string())
-        })?;
-        let signature = server_final.strip_prefix("v=").ok_or_else(|| {
-            ConnectorError::Dispatch(format!(
-                "confluent scram server-final is malformed: {server_final:?}"
-            ))
-        })?;
-        let expected = scram_server_signature(
-            hash,
-            self.password.as_bytes(),
-            &parsed.salt_b64,
-            parsed.iterations,
-            auth_message.as_bytes(),
-        )?;
-        if signature != expected {
-            return Err(ConnectorError::Dispatch(
-                "confluent scram server signature mismatch".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn produce_grouped(
-        &self,
-        grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
-    ) -> Result<()> {
-        if grouped.is_empty() {
-            return Ok(());
-        }
-        let framed = encode_produce_request(0, &self.client_id, self.acks, grouped);
-        // encode_produce_request frames header+body; the shared
-        // roundtrip re-adds its own header, so strip to the body.
-        let header_len = 2 + 2 + 4 + 2 + self.client_id.len();
-        let body = framed[header_len..].to_vec();
-        let response = self.roundtrip(0, 3, body).await?;
-        let mut cursor = response.as_slice();
-        let topics = read_i32(&mut cursor)?;
-        for _ in 0..topics {
-            let name_len = read_i16(&mut cursor)? as usize;
-            if cursor.len() < name_len {
-                return Err(ConnectorError::Connection(
-                    "truncated confluent produce response".to_string(),
-                ));
-            }
-            let name = String::from_utf8_lossy(&cursor[..name_len]).to_string();
-            cursor = &cursor[name_len..];
-            let partitions = read_i32(&mut cursor)?;
-            for _ in 0..partitions {
-                let index = read_i32(&mut cursor)?;
-                let error = read_i16(&mut cursor)?;
-                match classify_kafka_error(error) {
-                    ConfluentOutcome::Success => {}
-                    ConfluentOutcome::Retryable => {
-                        return Err(ConnectorError::Connection(format!(
-                            "confluent produce to {name}[{index}] failed retryably with error {error}"
-                        )))
-                    }
-                    ConfluentOutcome::Terminal => {
-                        return Err(ConnectorError::Dispatch(format!(
-                            "confluent produce to {name}[{index}] failed terminally with error {error}"
-                        )))
-                    }
-                }
-                if cursor.len() < 8 + 8 + 8 + 4 {
-                    return Err(ConnectorError::Connection(
-                        "truncated confluent produce response".to_string(),
-                    ));
-                }
-                cursor = &cursor[8 + 8 + 8 + 4..];
-            }
-        }
-        Ok(())
-    }
-}
-
-fn encode_kafka_string(s: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(s.len() as i16).to_be_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-fn read_i16(cursor: &mut &[u8]) -> Result<i16> {
-    if cursor.len() < 2 {
-        return Err(ConnectorError::Connection(
-            "truncated confluent response".to_string(),
-        ));
-    }
-    let value = i16::from_be_bytes([cursor[0], cursor[1]]);
-    *cursor = &cursor[2..];
-    Ok(value)
-}
-
-fn read_i32(cursor: &mut &[u8]) -> Result<i32> {
-    if cursor.len() < 4 {
-        return Err(ConnectorError::Connection(
-            "truncated confluent response".to_string(),
-        ));
-    }
-    let value = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-    *cursor = &cursor[4..];
-    Ok(value)
-}
-
-/// Check the echoed correlation and return the error code that opens
-/// SaslHandshake / SaslAuthenticate v1 responses.
-fn read_response_error(response: &[u8], correlation: i32) -> Result<i16> {
-    if response.len() < 6 {
-        return Err(ConnectorError::Connection(
-            "truncated confluent sasl response".to_string(),
-        ));
-    }
-    let echoed = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-    if echoed != correlation {
-        return Err(ConnectorError::Connection(format!(
-            "confluent correlation mismatch: {echoed} != {correlation}"
-        )));
-    }
-    Ok(i16::from_be_bytes([response[4], response[5]]))
-}
-
-#[async_trait]
-impl ConfluentTransport for TcpConfluentTransport {
-    async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
-        let mut grouped: BTreeMap<(String, i32), Vec<KafkaRecord>> = BTreeMap::new();
-        for record in records {
-            grouped
-                .entry((record.topic.clone(), record.partition))
-                .or_default()
-                .push(KafkaRecord {
-                    topic: record.topic.clone(),
-                    partition: record.partition,
-                    key: record.key.clone(),
-                    value: record.value.clone(),
-                    headers: record.headers.clone(),
-                    timestamp_ms: broker_connectors::now_millis(),
-                });
-        }
-        self.produce_grouped(&grouped).await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Maintained-driver transport (production write path).
 // ---------------------------------------------------------------------------
@@ -1080,7 +746,7 @@ pub fn rdkafka_client_config(config: &ConfluentKafkaConfig) -> rdkafka::config::
         .set("sasl.username", config.api_key.clone())
         .set("sasl.password", config.api_secret.clone())
         .set("client.id", format!("indra-confluent-{}", config.api_key))
-        .set("request.required.acks", "all")
+        .set("request.required.acks", config.acks.clone())
         .set(
             "message.timeout.ms",
             config.timeout().as_millis().to_string(),
@@ -1134,6 +800,10 @@ pub fn classify_driver_error(error: &rdkafka::error::KafkaError) -> ConnectorErr
 /// holds at most one flush in flight: no new unbounded buffer on the
 /// publish path, no lock held across I/O (the producer handle is
 /// cloned under a short read lock, then used lock-free).
+/// One short TCP handshake per publish bounds the down check to 1 s.
+// A closed listener fails closed even when an old producer still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub struct RdkafkaConfluentTransport {
     config: ConfluentKafkaConfig,
     producer: AsyncRwLock<Option<rdkafka::producer::FutureProducer>>,
@@ -1192,6 +862,30 @@ impl ConfluentTransport for RdkafkaConfluentTransport {
     async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
+        }
+        // Probe the listener before reusing the cached producer. A
+        // refused port clears the cache and fails closed. It skips the
+        // driver send timeout, so the action counts one failed forward
+        // fast. The error is terminal, so the sink does not retry it.
+        let probe_target = self
+            .config
+            .bootstrap_servers
+            .first()
+            .map(|entry| entry.trim())
+            .unwrap_or("");
+        if !probe_target.is_empty() {
+            let reachable =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_target))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .is_some();
+            if !reachable {
+                *self.producer.write().await = None;
+                return Err(ConnectorError::Dispatch(format!(
+                    "confluent broker unreachable: {probe_target}"
+                )));
+            }
         }
         let producer = self.producer().await?;
         let timeout = self.config.timeout();
@@ -1403,27 +1097,60 @@ impl ConfluentKafkaSink {
         if let Some(registry) = &self.config.schema_registry {
             value = Bytes::from(frame_schema_registry(registry.schema_id, payload));
         }
-        let partition =
-            broker_connectors::kafka::partition_for_key(key.as_deref(), self.config.partitions);
+        // One means unconfigured. Pass -1 so the driver assigns
+        // the partition from real broker Metadata. Explicit counts
+        // stay for offline unit tests with fixed topics.
+        let partition = if self.config.partitions <= 1 {
+            -1
+        } else if self.config.random_partition {
+            (rand::random::<u32>() % self.config.partitions.max(1)) as i32
+        } else {
+            broker_connectors::kafka::partition_for_key(key.as_deref(), self.config.partitions)
+        };
+        let mut headers = vec![
+            (
+                "mqtt.topic".to_string(),
+                Bytes::from(topic.as_str().to_string()),
+            ),
+            (
+                "mqtt.qos".to_string(),
+                Bytes::from(u8::from(qos).to_string()),
+            ),
+            (
+                "mqtt.timestamp".to_string(),
+                Bytes::from(now_millis().to_string()),
+            ),
+        ];
+        for (name, template) in &self.config.extra_headers {
+            let rendered =
+                broker_connectors::kafka::render_header_template(template, topic.as_str(), payload);
+            let value = match self.config.header_encode_mode {
+                ConfluentHeaderEncodeMode::None => Bytes::from(rendered),
+                ConfluentHeaderEncodeMode::Json => {
+                    Bytes::from(serde_json::Value::String(rendered).to_string())
+                }
+            };
+            headers.push((name.clone(), value));
+        }
+        if let Some(template) = &self.config.headers_template {
+            let rendered =
+                broker_connectors::kafka::render_header_template(template, topic.as_str(), payload);
+            for (name, value) in broker_connectors::kafka::parse_rendered_headers(&rendered)? {
+                let value = match self.config.header_encode_mode {
+                    ConfluentHeaderEncodeMode::None => Bytes::from(value),
+                    ConfluentHeaderEncodeMode::Json => {
+                        Bytes::from(serde_json::Value::String(value).to_string())
+                    }
+                };
+                headers.push((name, value));
+            }
+        }
         Ok(ConfluentRecord {
             topic: rendered_topic,
             partition,
             key,
             value,
-            headers: vec![
-                (
-                    "mqtt.topic".to_string(),
-                    Bytes::from(topic.as_str().to_string()),
-                ),
-                (
-                    "mqtt.qos".to_string(),
-                    Bytes::from(u8::from(qos).to_string()),
-                ),
-                (
-                    "mqtt.timestamp".to_string(),
-                    Bytes::from(now_millis().to_string()),
-                ),
-            ],
+            headers,
         })
     }
 
@@ -1533,7 +1260,6 @@ impl broker_connectors::Connector for ConfluentKafkaConnector {
 mod tests {
     use super::*;
     use broker_connectors::Sink;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_config() -> ConfluentKafkaConfig {
         ConfluentKafkaConfig {
@@ -1554,6 +1280,11 @@ mod tests {
             batch_size: Some(500),
             buffer_capacity: None,
             timeout_ms: None,
+            acks: "all".to_string(),
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: ConfluentHeaderEncodeMode::None,
         }
     }
 
@@ -1721,7 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_batch_framing_and_flow() {
-        use broker_connectors::kafka::{encode_record_batch_v2, partition_for_key};
+        use broker_connectors::kafka::{encode_record_batch_v2, partition_for_key, KafkaRecord};
 
         let transport = Arc::new(MemoryConfluentTransport::new());
         let mut config = test_config();
@@ -1772,128 +1503,6 @@ mod tests {
         transport.fail_next(10);
         sink.send(&topic, &payload, QoS::AtMostOnce).await.unwrap();
         sink.flush().await.expect_err("mock down must fail");
-    }
-
-    /// Fake Confluent broker: ApiVersions + SASL/PLAIN handshake +
-    /// authenticate + Produce v3 over raw TCP, capturing the produce.
-    #[tokio::test]
-    async fn test_tcp_plain_produce_against_fake_broker() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let captured_rx = captured.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // 1) ApiVersions v0 -> success.
-            let frame = read_tcp_frame(&mut stream).await;
-            assert_eq!(&frame[..6], &[0, 18, 0, 0, 0, 0]);
-            write_tcp_frame(&mut stream, &[0, 0, 0, 0, 0, 0, 0, 0]).await;
-            // 2) SaslHandshake v1 PLAIN -> success, no mechanisms listed.
-            let frame = read_tcp_frame(&mut stream).await;
-            assert_eq!(&frame[..4], &[0, 17, 0, 1]);
-            let client_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
-            let mechanism = read_kafka_string(&frame[8 + 2 + client_len..]);
-            assert_eq!(mechanism, "PLAIN");
-            let mut response = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            response[0..4].copy_from_slice(&frame[4..8]);
-            write_tcp_frame(&mut stream, &response).await;
-            // 3) SaslAuthenticate v1 -> check the PLAIN payload, success.
-            let frame = read_tcp_frame(&mut stream).await;
-            assert_eq!(&frame[..4], &[0, 36, 0, 1]);
-            let client_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
-            let body = &frame[8 + 2 + client_len..];
-            let auth_len = i32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-            assert_eq!(&body[4..4 + auth_len], b"\0confluent-key\0confluent-secret");
-            let mut response = vec![0u8; 4 + 2 + 2 + 8 + 4];
-            response[0..4].copy_from_slice(&frame[4..8]);
-            write_tcp_frame(&mut stream, &response).await;
-            // 4) Produce v3 -> capture, canned success.
-            let frame = read_tcp_frame(&mut stream).await;
-            assert_eq!(&frame[..4], &[0, 0, 0, 3]);
-            captured_rx.lock().extend_from_slice(&frame);
-            let mut response = vec![0, 0, 0, 0];
-            response.extend_from_slice(&[0, 0, 0, 1]);
-            response.extend_from_slice(&[0, 4]);
-            response.extend_from_slice(b"test");
-            response.extend_from_slice(&[0, 0, 0, 1]);
-            response.extend_from_slice(&[0, 0, 0, 0]);
-            response.extend_from_slice(&[0, 0]);
-            response.extend_from_slice(&[0u8; 8 + 8 + 8]);
-            response.extend_from_slice(&[0, 0, 0, 0]);
-            response[0..4].copy_from_slice(&frame[4..8]);
-            write_tcp_frame(&mut stream, &response).await;
-        });
-
-        let mut config = test_config();
-        config.bootstrap_servers = vec![format!("127.0.0.1:{port}")];
-        config.batch_size = Some(1);
-        let sink = ConfluentKafkaSink::new(
-            config,
-            Arc::new(TcpConfluentTransport::new(&test_config_with_port(port)).unwrap()),
-        )
-        .expect("valid sink");
-
-        let topic = Topic::new("sensors/temp").unwrap();
-        sink.send(
-            &topic,
-            &Bytes::from_static(br#"{ "client_id": "d7" }"#),
-            QoS::AtMostOnce,
-        )
-        .await
-        .expect("produce over TCP");
-        assert_eq!(sink.sent_batches(), 1);
-
-        let mut finished = false;
-        for _ in 0..500 {
-            if server.is_finished() {
-                finished = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(finished, "fake broker never consumed the produce");
-        server.await.expect("fake broker task");
-        let wire = captured.lock().clone();
-        let topic_bytes = b"telemetry-sensors";
-        assert!(
-            wire.windows(topic_bytes.len()).any(|w| w == topic_bytes),
-            "topic on the wire"
-        );
-        assert!(wire.windows(2).any(|w| w == b"d7"), "key on the wire");
-        // Schema-registry magic + id ride inside the record value.
-        assert!(
-            wire.windows(5)
-                .any(|w| *w == [0x00, 0x00, 0x00, 0x03, 0xE9]),
-            "registry prefix on the wire"
-        );
-    }
-
-    fn test_config_with_port(port: u16) -> ConfluentKafkaConfig {
-        let mut config = test_config();
-        config.bootstrap_servers = vec![format!("127.0.0.1:{port}")];
-        config
-    }
-
-    async fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.expect("read len");
-        let len = i32::from_be_bytes(len_buf) as usize;
-        let mut frame = vec![0u8; len];
-        stream.read_exact(&mut frame).await.expect("read frame");
-        frame
-    }
-
-    async fn write_tcp_frame(stream: &mut TcpStream, body: &[u8]) {
-        let mut prefixed = (body.len() as i32).to_be_bytes().to_vec();
-        prefixed.extend_from_slice(body);
-        stream.write_all(&prefixed).await.expect("write frame");
-    }
-
-    fn read_kafka_string(frame: &[u8]) -> String {
-        let len = i16::from_be_bytes([frame[0], frame[1]]) as usize;
-        String::from_utf8_lossy(&frame[2..2 + len]).to_string()
     }
 
     #[test]
@@ -2166,6 +1775,11 @@ mod tests {
             batch_size: Some(100),
             buffer_capacity: None,
             timeout_ms: Some(30_000),
+            acks: "all".to_string(),
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: ConfluentHeaderEncodeMode::None,
         };
         admin_config.validate().expect("qual config validates");
 

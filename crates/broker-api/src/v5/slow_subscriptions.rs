@@ -42,8 +42,7 @@ const MAX_CLIENTID_LEN: usize = 256;
 /// Longest accepted `topic`.
 const MAX_TOPIC_LEN: usize = 512;
 
-/// Node name rendered on every slow-subscription row (single node).
-const NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// One recorded slow delivery: which subscriber on which topic was slow,
 /// by how much (`timespan`, milliseconds of delivery latency) and when
@@ -60,7 +59,7 @@ impl SlowSubEntry {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "clientid": self.clientid,
-            "node": NODE_NAME,
+            "node": local_node_name(),
             "topic": self.topic,
             "timespan": self.timespan,
             "last_update_time": self.last_update_time,
@@ -724,7 +723,7 @@ mod tests {
         assert_eq!(rows[1].clientid, "c-slow-1");
         let rendered = rows[0].to_json();
         assert_eq!(rendered["clientid"], serde_json::json!("c-slow-2"));
-        assert_eq!(rendered["node"], serde_json::json!(NODE_NAME));
+        assert_eq!(rendered["node"], serde_json::json!(local_node_name()));
         assert_eq!(rendered["topic"], serde_json::json!("t/b"));
         assert_eq!(rendered["timespan"], serde_json::json!(450));
         assert_eq!(
@@ -815,7 +814,7 @@ mod tests {
         assert_eq!(body["meta"]["hasnext"], serde_json::json!(false));
         let row = &body["data"][0];
         assert_eq!(row["clientid"], serde_json::json!("conf-slow-1"));
-        assert_eq!(row["node"], serde_json::json!(NODE_NAME));
+        assert_eq!(row["node"], serde_json::json!(local_node_name()));
         assert_eq!(row["topic"], serde_json::json!("conf/slow/t1"));
         assert_eq!(row["timespan"], serde_json::json!(850));
         assert_eq!(

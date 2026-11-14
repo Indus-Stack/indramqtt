@@ -51,6 +51,21 @@ pub trait MessageStore: Send + Sync {
     async fn get(&self, offset: u64) -> Result<StoredMessage>;
 }
 
+/// Result of one tenant retained write.
+///
+/// The store decides inside its single write lock. Callers count
+/// a per-tenant drop without extra reads. Global drops carry no
+/// tenant count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedWriteOutcome {
+    /// The topic is stored.
+    Stored,
+    /// A new topic drops at the per-tenant cap.
+    DroppedPerTenantLimit,
+    /// A new topic drops at the global cap.
+    DroppedGlobalLimit,
+}
+
 #[async_trait]
 pub trait RetainedStore: Send + Sync {
     async fn set_retained(&self, topic: Topic, qos: QoS, payload: Bytes) -> Result<()>;
@@ -72,6 +87,22 @@ pub trait RetainedStore: Send + Sync {
         payload: Bytes,
         tenant: &str,
     ) -> Result<()>;
+    /// Store one tenant retained topic and report the outcome.
+    ///
+    /// The check and the write share one write lock. The publish
+    /// path uses this call and takes no extra lock. The default
+    /// impl stores through the plain call and reports stored.
+    async fn set_retained_in_tenant_checked(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        payload: Bytes,
+        tenant: &str,
+    ) -> Result<RetainedWriteOutcome> {
+        self.set_retained_in_tenant(topic, qos, payload, tenant)
+            .await
+            .map(|()| RetainedWriteOutcome::Stored)
+    }
     async fn get_retained_in_tenant(
         &self,
         topic: &Topic,
@@ -86,6 +117,26 @@ pub trait RetainedStore: Send + Sync {
     /// Total retained entries across all tenants (for the global
     /// `stats.retained` counter). O(1) map length, no scan, no allocation.
     async fn count_retained(&self) -> Result<usize>;
+    /// Retained entries in one tenant. O(1) counter read, never a scan.
+    async fn count_retained_in_tenant(&self, tenant: &str) -> Result<usize> {
+        let _ = tenant;
+        Ok(0)
+    }
+    /// Set the default per-tenant retained cap (0 = unlimited).
+    fn set_default_retained_per_tenant_cap(&self, _cap: usize) {}
+    /// Set one tenant retained cap (0 = unlimited).
+    fn set_retained_per_tenant_cap(&self, _tenant: &str, _cap: usize) {}
+    /// Effective retained cap for one tenant (0 = unlimited).
+    fn retained_cap_for_tenant(&self, _tenant: &str) -> usize {
+        DEFAULT_MAX_RETAINED_PER_TENANT
+    }
+    /// Removes every retained entry of one tenant together with its cap
+    /// override and its count, and returns the number of entries removed.
+    /// Used when the operator deletes a tenant, so a later tenant with the
+    /// same name starts empty.
+    async fn clear_tenant(&self, _tenant: &str) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -128,22 +179,91 @@ fn normalize_tenant_key(tenant: &str) -> std::sync::Arc<str> {
 /// never scanning without a cap, and take only short read locks so they
 /// never block delivery.
 ///
-/// 100_000 entries cover the documented unlimited default (`0`) while
-/// keeping per-entry memory (one shared topic string plus payload) under
-/// control on the 12 GB test host.
+/// Each entry holds one shared topic string plus payload.
+/// 100_000 entries bound total retained state.
+/// Inserts past the cap drop the new topic.
 pub const MAX_RETAINED_MESSAGES: usize = 100_000;
+
+/// Default max retained topics per tenant (0 = unlimited).
+///
+/// The broker sets no per-tenant bound unless the operator sets one. The
+/// global bound [`MAX_RETAINED_MESSAGES`] always applies.
+pub const DEFAULT_MAX_RETAINED_PER_TENANT: usize = 0;
+
+/// One retained table plus its per-tenant counts and caps.
+///
+/// Counts and caps live beside the map under the same lock, so a
+/// retained write pays one lock and two integer compares, never a
+/// scan and never a second lock. The deliver path takes no lock here.
+struct RetainedInner {
+    map: HashMap<(std::sync::Arc<str>, Topic), StoredMessage>,
+    per_tenant: HashMap<std::sync::Arc<str>, usize>,
+    caps: HashMap<std::sync::Arc<str>, usize>,
+    default_cap: usize,
+}
+
+impl Default for RetainedInner {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            per_tenant: HashMap::new(),
+            caps: HashMap::new(),
+            default_cap: DEFAULT_MAX_RETAINED_PER_TENANT,
+        }
+    }
+}
 
 /// In-memory storage engine for local fast tests and zero-disk development.
 #[derive(Default)]
 pub struct MemoryStore {
     messages: RwLock<Vec<StoredMessage>>,
-    retained: RwLock<HashMap<(std::sync::Arc<str>, Topic), StoredMessage>>,
+    retained: RwLock<RetainedInner>,
     cursors: RwLock<HashMap<u64, u64>>,
 }
 
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Retained topics held by one tenant.
+    ///
+    /// Reads one integer under the same short read lock, never a scan.
+    pub fn count_retained_in_tenant_sync(&self, tenant: &str) -> usize {
+        let scope = normalize_tenant_key(tenant);
+        self.retained
+            .read()
+            .per_tenant
+            .get(scope.as_ref())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Set the default per-tenant retained cap (0 = unlimited).
+    ///
+    /// Applies to tenants with no override. Boot and API paths only.
+    pub fn set_default_retained_per_tenant_cap(&self, cap: usize) {
+        self.retained.write().default_cap = cap;
+    }
+
+    /// Set one tenant retained cap (0 = unlimited).
+    ///
+    /// Applies on the next retained write in that tenant. Boot and
+    /// API paths only; the publish path never calls this.
+    pub fn set_retained_per_tenant_cap(&self, tenant: &str, cap: usize) {
+        let scope = normalize_tenant_key(tenant);
+        self.retained.write().caps.insert(scope, cap);
+    }
+
+    /// Effective retained cap for one tenant (0 = unlimited).
+    pub fn retained_cap_for_tenant_sync(&self, tenant: &str) -> usize {
+        let scope = normalize_tenant_key(tenant);
+        let inner = self.retained.read();
+        inner
+            .caps
+            .get(scope.as_ref())
+            .copied()
+            .unwrap_or(inner.default_cap)
     }
 }
 
@@ -199,13 +319,39 @@ impl RetainedStore for MemoryStore {
         payload: Bytes,
         tenant: &str,
     ) -> Result<()> {
+        self.set_retained_in_tenant_checked(topic, qos, payload, tenant)
+            .await
+            .map(|_| ())
+    }
+
+    async fn set_retained_in_tenant_checked(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        payload: Bytes,
+        tenant: &str,
+    ) -> Result<RetainedWriteOutcome> {
         let key = (normalize_tenant_key(tenant), topic.clone());
-        let mut map = self.retained.write();
-        if map.len() >= MAX_RETAINED_MESSAGES && !map.contains_key(&key) {
-            return Ok(());
+        let mut inner = self.retained.write();
+        if inner.map.len() >= MAX_RETAINED_MESSAGES && !inner.map.contains_key(&key) {
+            return Ok(RetainedWriteOutcome::DroppedGlobalLimit);
         }
-        map.insert(
-            key,
+        let is_new = !inner.map.contains_key(&key);
+        if is_new {
+            let cap = inner
+                .caps
+                .get(key.0.as_ref())
+                .copied()
+                .unwrap_or(inner.default_cap);
+            if cap > 0 {
+                let used = inner.per_tenant.get(key.0.as_ref()).copied().unwrap_or(0);
+                if used >= cap {
+                    return Ok(RetainedWriteOutcome::DroppedPerTenantLimit);
+                }
+            }
+        }
+        inner.map.insert(
+            key.clone(),
             StoredMessage {
                 offset: 0,
                 topic,
@@ -215,7 +361,10 @@ impl RetainedStore for MemoryStore {
                 publish_at_ms: Some(now_ms()),
             },
         );
-        Ok(())
+        if is_new {
+            *inner.per_tenant.entry(key.0).or_insert(0) += 1;
+        }
+        Ok(RetainedWriteOutcome::Stored)
     }
 
     async fn get_retained_in_tenant(
@@ -223,16 +372,40 @@ impl RetainedStore for MemoryStore {
         topic: &Topic,
         tenant: &str,
     ) -> Result<Option<StoredMessage>> {
-        let map = self.retained.read();
-        Ok(map
+        let inner = self.retained.read();
+        Ok(inner
+            .map
             .get(&(normalize_tenant_key(tenant), topic.clone()))
             .cloned())
     }
 
     async fn clear_retained_in_tenant(&self, topic: &Topic, tenant: &str) -> Result<()> {
-        let mut map = self.retained.write();
-        map.remove(&(normalize_tenant_key(tenant), topic.clone()));
+        let mut inner = self.retained.write();
+        let key = (normalize_tenant_key(tenant), topic.clone());
+        if inner.map.remove(&key).is_some() {
+            if let Some(count) = inner.per_tenant.get_mut(key.0.as_ref()) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.per_tenant.remove(key.0.as_ref());
+                }
+            }
+        }
         Ok(())
+    }
+
+    async fn clear_tenant(&self, tenant: &str) -> Result<usize> {
+        let scope = normalize_tenant_key(tenant);
+        // The default tenant never leaves.
+        if scope.as_ref() == DEFAULT_TENANT_ID {
+            return Ok(0);
+        }
+        let mut inner = self.retained.write();
+        let before = inner.map.len();
+        inner.map.retain(|(key_tenant, _), _| *key_tenant != scope);
+        let removed = before - inner.map.len();
+        inner.per_tenant.remove(scope.as_ref());
+        inner.caps.remove(scope.as_ref());
+        Ok(removed)
     }
 
     async fn find_matching_in_tenant(
@@ -241,8 +414,9 @@ impl RetainedStore for MemoryStore {
         tenant: &str,
     ) -> Result<Vec<StoredMessage>> {
         let scope = normalize_tenant_key(tenant);
-        let map = self.retained.read();
-        let mut matched: Vec<StoredMessage> = map
+        let inner = self.retained.read();
+        let mut matched: Vec<StoredMessage> = inner
+            .map
             .iter()
             .filter(|((entry_tenant, _), msg)| {
                 entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic)
@@ -254,7 +428,23 @@ impl RetainedStore for MemoryStore {
     }
 
     async fn count_retained(&self) -> Result<usize> {
-        Ok(self.retained.read().len())
+        Ok(self.retained.read().map.len())
+    }
+
+    async fn count_retained_in_tenant(&self, tenant: &str) -> Result<usize> {
+        Ok(self.count_retained_in_tenant_sync(tenant))
+    }
+
+    fn set_default_retained_per_tenant_cap(&self, cap: usize) {
+        self.set_default_retained_per_tenant_cap(cap);
+    }
+
+    fn set_retained_per_tenant_cap(&self, tenant: &str, cap: usize) {
+        self.set_retained_per_tenant_cap(tenant, cap);
+    }
+
+    fn retained_cap_for_tenant(&self, tenant: &str) -> usize {
+        self.retained_cap_for_tenant_sync(tenant)
     }
 }
 
@@ -296,6 +486,46 @@ mod tests {
 
         store.update_cursor(101, offset).await.unwrap();
         assert_eq!(store.get_cursor(101).await.unwrap(), offset);
+    }
+
+    #[tokio::test]
+    async fn clear_tenant_removes_entries_cap_and_count() {
+        let store = MemoryStore::new();
+        let topic = Topic::new("device/state").unwrap();
+        store.set_retained_per_tenant_cap("t-gone", 5);
+        for tenant in ["t-gone", "t-kept", DEFAULT_TENANT_ID] {
+            store
+                .set_retained_in_tenant(
+                    topic.clone(),
+                    QoS::AtMostOnce,
+                    Bytes::from_static(b"v"),
+                    tenant,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.clear_tenant("t-gone").await.unwrap(), 1);
+        assert!(store
+            .get_retained_in_tenant(&topic, "t-gone")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.count_retained_in_tenant_sync("t-gone"), 0);
+        assert_eq!(
+            store.retained_cap_for_tenant_sync("t-gone"),
+            DEFAULT_MAX_RETAINED_PER_TENANT,
+            "the cap override is gone"
+        );
+        for tenant in ["t-kept", DEFAULT_TENANT_ID] {
+            assert!(store
+                .get_retained_in_tenant(&topic, tenant)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        // The default tenant is never cleared.
+        assert_eq!(store.clear_tenant(DEFAULT_TENANT_ID).await.unwrap(), 0);
+        assert_eq!(store.count_retained().await.unwrap(), 2);
     }
 
     #[tokio::test]

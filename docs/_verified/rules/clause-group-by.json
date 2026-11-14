@@ -1,0 +1,45 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": [
+        {
+          "device": "a",
+          "temperature": 70
+        },
+        {
+          "device": "b",
+          "temperature": 72
+        }
+      ],
+      "projected": [
+        {
+          "device": "a",
+          "n": 1
+        },
+        {
+          "device": "b",
+          "n": 1
+        }
+      ],
+      "sql": "SELECT device, count(temperature) AS n FROM \"sensors/+\" GROUP BY device",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "device": null,
+        "n": 1
+      },
+      "sql": "SELECT device, count(temperature) AS n FROM \"sensors/+\" GROUP BY device",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "clause-group-by",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

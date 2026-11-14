@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "clause-having"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT device, count(temperature) AS n FROM "sensors/+" GROUP BY device HAVING count(temperature) > 1'
+topic = "sensors/kitchen"
+payload = '[{"device": "a", "temperature": 70}, {"device": "a", "temperature": 72}]'
+expect_matched = true
+expect_projected = '[{"device": "a", "n": 2}]'
+
+[[case]]
+sql = 'SELECT device, count(temperature) AS n FROM "sensors/+" GROUP BY device HAVING count(temperature) > 1'
+topic = "sensors/kitchen"
+payload = '[{"device": "a", "temperature": 70}]'
+expect_matched = false

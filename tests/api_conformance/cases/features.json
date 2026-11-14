@@ -1,0 +1,1 @@
+[{"body": null, "cleanup": [], "expect_status": 200, "operation": "GET /features", "path_params": {}, "query": {"probe": "C13-15-list-shape"}, "setup": []}, {"body": null, "cleanup": [], "expect_status": 200, "operation": "GET /features", "path_params": {}, "query": {"unexpected_param": "1", "probe": "C13-15-unknown-ignored"}, "setup": []}]

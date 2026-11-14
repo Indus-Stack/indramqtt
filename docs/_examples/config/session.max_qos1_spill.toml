@@ -1,0 +1,29 @@
+[example]
+area = "config"
+item = "session.max_qos1_spill"
+kind = "setting"
+expect = "inflight_cnt=102"
+timeout = 90
+expected = "A session with the default window of 100 and a spill of two tracks at most 102 unacknowledged messages."
+source = "`crates/broker-node/src/main.rs` applies the spill bound to the session manager before any listener binds."
+action = "Publish 150 QoS 1 messages to a subscriber that does not acknowledge them, then read `GET /api/v5/clients/<id>`."
+config = '''
+[session]
+max_qos1_spill = 2
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("qos1-spill-client", v5=True)
+subscribe(sock, "docs/qos1-spill", 1, v5=True)
+pub, ack, props = connect("qos1-spill-pub", v5=True)
+for index in range(150):
+    publish(pub, "docs/qos1-spill", f"m{index}".encode(), qos=1, v5=True)
+time.sleep(0.5)
+status, client = http("GET", "/api/v5/clients/qos1-spill-client")
+assert status == 200, (status, client)
+assert client.get("inflight_max") == 100, client.get("inflight_max")
+assert client.get("inflight_cnt") == 102, client.get("inflight_cnt")
+disconnect(sock)
+disconnect(pub)
+print("inflight_cnt=102")
+'''

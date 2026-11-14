@@ -1,0 +1,74 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "42"
+      },
+      "sql": "SELECT str(42) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "true"
+      },
+      "sql": "SELECT str(true) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "[1,2]"
+      },
+      "sql": "SELECT str([1, 2]) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": "{\"a\":1}"
+      },
+      "sql": "SELECT str(map('{\"a\":1}')) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT str(NULL) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT str() AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-str",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

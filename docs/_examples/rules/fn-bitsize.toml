@@ -1,0 +1,32 @@
+[example]
+area = "rules"
+item = "fn-bitsize"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT bitsize('abc') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 24}'
+
+[[case]]
+sql = "SELECT bitsize('é') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 16}'
+
+[[case]]
+sql = "SELECT bitsize('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 0}'
+
+[[case]]
+sql = 'SELECT bitsize(255) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

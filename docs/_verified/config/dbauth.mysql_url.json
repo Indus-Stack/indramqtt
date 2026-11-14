@@ -1,0 +1,9 @@
+{
+  "action": "Connect anonymously and with a password while the MySQL source stays unreachable.",
+  "config": "[auth]\nallow_anonymous = true\n\n[dbauth]\nmysql_url = \"mysql://docs:docs@127.0.0.1:9/docs\"\n",
+  "item": "dbauth.mysql_url",
+  "kind": "setting",
+  "output": "anonymous-refused credential-denied",
+  "returncode": 0,
+  "verified": true
+}

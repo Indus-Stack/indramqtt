@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "temperature": 72.5
+      },
+      "sql": "SELECT temperature FROM \"sensors/+\" WHERE temperature IN (70, 72.5, 80)",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "device": "kitchen"
+      },
+      "projected": null,
+      "sql": "SELECT device FROM \"sensors/+\" WHERE device IN ('a', 'b')",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "op-in",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

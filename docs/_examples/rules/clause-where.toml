@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "clause-where"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature > 80.0'
+topic = "sensors/kitchen"
+payload = '{"temperature": 95.0}'
+expect_matched = true
+expect_projected = '{"temperature": 95.0}'
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature > 80.0'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = false

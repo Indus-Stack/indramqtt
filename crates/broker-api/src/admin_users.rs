@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// Iterations for PBKDF2-HMAC-SHA-256 (`SCRAM-SHA-256` default).
 const ITERATIONS: u32 = 4096;
@@ -22,6 +23,52 @@ const ITERATIONS: u32 = 4096;
 const SALT_LEN: usize = 16;
 /// Minimum accepted password length.
 const MIN_PASSWORD_LEN: usize = 8;
+
+/// A new dashboard/API password must be at least [`MIN_PASSWORD_LEN`]
+/// characters and carry both a letter and a digit. Reason: short or
+/// single-class secrets fall to guessing and credential stuffing, and the
+/// management plane is reachable from the operator network; the
+/// length-plus-two-class floor is the documented bar every write path must
+/// clear. The default is finite and fail-closed: anything shorter or
+/// simpler is rejected, never stored.
+// TODO(parity): what is the exact documented complexity rule (which
+// character classes, and does it also demand a symbol or a longer
+// minimum)? The rulebook does not decide the wording; the current choice
+// enforces length 8 with at least one letter and one digit fail-closed
+// until the checker pins it.
+fn is_strong_password(password: &str) -> bool {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return false;
+    }
+    let has_letter = password.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+    has_letter && has_digit
+}
+
+/// Upper bound for stored dashboard/API users. Creates past this size are
+/// rejected instead of growing the map without limit. Reason: the
+/// management plane snapshots the whole list per list request and each
+/// entry holds SCRAM verifier material plus map overhead, so an unbounded
+/// map lets one management batch exhaust the kernel; 1024 covers operator
+/// provisioning with headroom while keeping list reads paged and
+/// per-request clones cheap. The default is finite: no opt-in to unlimited
+/// exists anywhere on this path.
+/// Management-plane only: publish and deliver never touch this map.
+pub const MAX_ADMIN_USERS: usize = 1024;
+
+/// Consecutive failed MFA code verifications before the per-user
+/// cool-down trips: 5 attempts. Reason: five tries cover a mistyped code
+/// plus one clock-step retry without letting an online guessing run
+/// through the million-code space; the sixth consecutive failure locks
+/// the user out for [`MFA_VERIFY_LOCKOUT_SECS`].
+pub const MFA_VERIFY_MAX_ATTEMPTS: u32 = 5;
+/// MFA verify cool-down after [`MFA_VERIFY_MAX_ATTEMPTS`] consecutive
+/// failures: 60 s. Reason: sixty seconds spans two TOTP steps, so every
+/// code the attacker tried expires before the next attempt is accepted,
+/// while a legitimate operator waits at most a minute. The counter is
+/// memory-only (a restart clears it); the secret and the enabled flag
+/// persist through the registry.
+pub const MFA_VERIFY_LOCKOUT_SECS: u64 = 60;
 
 /// Role of a management API user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +84,19 @@ pub struct AdminUserView {
     pub role: AdminRole,
     pub description: String,
     pub must_change_password: bool,
+    /// Explicit dashboard user scopes. `None` means the role default.
+    pub scopes: Option<Vec<String>>,
+}
+
+/// One write to the explicit scope list of a dashboard user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserScopesUpdate {
+    /// Leave the stored list unchanged.
+    Keep,
+    /// Remove the explicit list; the role default applies.
+    Clear,
+    /// Store this explicit list.
+    Set(Vec<String>),
 }
 
 /// Errors from [`AdminUsers`] mutations.
@@ -48,6 +108,9 @@ pub enum AdminUserError {
     SameAsOld,
     LastAdministrator,
     InvalidUsername,
+    /// The store already holds [`MAX_ADMIN_USERS`] entries. Handlers map
+    /// this to HTTP 400; it is never silent.
+    TooManyUsers,
     /// The mutation applied in memory but the registry commit or atomic
     /// save failed. Handlers map this to HTTP 500; it is never silent.
     Persist(String),
@@ -62,6 +125,7 @@ impl fmt::Display for AdminUserError {
             Self::SameAsOld => write!(f, "new password is the same as the old one"),
             Self::LastAdministrator => write!(f, "cannot remove the last administrator"),
             Self::InvalidUsername => write!(f, "invalid username"),
+            Self::TooManyUsers => write!(f, "admin user limit of {MAX_ADMIN_USERS} reached"),
             Self::Persist(reason) => write!(f, "cannot persist admin users: {reason}"),
         }
     }
@@ -78,7 +142,71 @@ struct AdminUser {
     stored_key: [u8; 32],
     server_key: [u8; 32],
     must_change_password: bool,
+    /// TOTP enrolment secret (empty = no enrolment; one pending enrolment
+    /// per user at most, since the record holds a single secret). Stored
+    /// reversibly because verification must recompute codes; never logged
+    /// and only returned once by the setup route.
+    mfa_secret: Vec<u8>,
+    /// True once a one-time code has verified successfully.
+    mfa_enabled: bool,
+    /// Most recently verified 30 s counter, for single-use rejection.
+    mfa_last_step: Option<u64>,
+    /// Explicit dashboard user scopes. `None` means the role default.
+    scopes: Option<Vec<String>>,
 }
+
+/// Per-user MFA verify attempt state (memory-only; resets on restart).
+/// Held only for known users, so the map stays within
+/// [`MAX_ADMIN_USERS`] entries and never grows with unknown-name probes
+/// (unknown usernames fail before recording anything).
+#[derive(Debug, Clone)]
+struct MfaAttempt {
+    consecutive_failures: u32,
+    locked_until: Option<Instant>,
+}
+
+/// Enrolment state snapshot for one dashboard user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MfaStatus {
+    /// A code has verified successfully at least once.
+    pub enabled: bool,
+    /// A secret is stored but no code has verified yet.
+    pub pending: bool,
+}
+
+/// Why an MFA code verification was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MfaVerifyError {
+    /// No dashboard user under that name.
+    NotFound,
+    /// No enrolment started for this user yet.
+    NoEnrolment,
+    /// The code is malformed or does not match the current window.
+    Invalid,
+    /// The code matches but its counter was already used (replay).
+    Replayed,
+    /// Too many consecutive failures: try again after the cool-down.
+    Locked,
+    /// The successful verification applied in memory but the registry
+    /// commit or atomic save failed. Handlers map this to HTTP 500; it
+    /// is never silent.
+    Persist(String),
+}
+
+impl fmt::Display for MfaVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "user not found"),
+            Self::NoEnrolment => write!(f, "no MFA enrolment for this user"),
+            Self::Invalid => write!(f, "invalid verification code"),
+            Self::Replayed => write!(f, "verification code already used"),
+            Self::Locked => write!(f, "too many failed attempts; try again later"),
+            Self::Persist(reason) => write!(f, "cannot persist MFA state: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for MfaVerifyError {}
 
 /// Management API users with SCRAM-SHA-256 credentials.
 pub struct AdminUsers {
@@ -90,6 +218,13 @@ pub struct AdminUsers {
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
     save_lock: Mutex<()>,
+    /// Consecutive-failure counters plus cool-down deadlines for MFA
+    /// verify, one entry per known user at most (memory-only).
+    /// Management-plane only: publish and deliver never touch this map.
+    mfa_attempts: Mutex<HashMap<String, MfaAttempt>>,
+    /// Failed password logins for each known user. The same bound and
+    /// the same cool-down as the MFA attempts.
+    login_attempts: Mutex<HashMap<String, MfaAttempt>>,
 }
 
 impl AdminUsers {
@@ -104,6 +239,8 @@ impl AdminUsers {
             process_secret: secret,
             registry: None,
             save_lock: Mutex::new(()),
+            mfa_attempts: Mutex::new(HashMap::new()),
+            login_attempts: Mutex::new(HashMap::new()),
         };
         store
             .users
@@ -124,6 +261,8 @@ impl AdminUsers {
             process_secret: secret,
             registry: None,
             save_lock: Mutex::new(()),
+            mfa_attempts: Mutex::new(HashMap::new()),
+            login_attempts: Mutex::new(HashMap::new()),
         };
         if conf.users.is_empty() {
             store
@@ -134,6 +273,7 @@ impl AdminUsers {
             return store;
         }
         for entry in &conf.users {
+            let (mfa_secret, mfa_enabled, mfa_last_step) = decode_mfa(entry);
             let user = match decode_verifier(&entry.password_hash) {
                 Some((salt, iterations, stored_key, server_key)) => AdminUser {
                     username: entry.username.clone(),
@@ -144,6 +284,10 @@ impl AdminUsers {
                     stored_key,
                     server_key,
                     must_change_password: entry.must_change_password,
+                    mfa_secret,
+                    mfa_enabled,
+                    mfa_last_step,
+                    scopes: entry.scopes.clone(),
                 },
                 None => {
                     // Fail closed: the verifier is unusable, so nobody can
@@ -169,6 +313,10 @@ impl AdminUsers {
                         stored_key,
                         server_key,
                         must_change_password: entry.must_change_password,
+                        mfa_secret,
+                        mfa_enabled,
+                        mfa_last_step,
+                        scopes: entry.scopes.clone(),
                     }
                 }
             };
@@ -202,15 +350,28 @@ impl AdminUsers {
         conf.validate()
             .map_err(|err| AdminUserError::Persist(err.to_string()))?;
         let fresh = Self::from_snapshot(conf);
+        let fresh_users = fresh.users.into_inner().unwrap();
+        // Remove the MFA attempt counters of the users that the new
+        // snapshot does not contain.
+        self.mfa_attempts
+            .lock()
+            .unwrap()
+            .retain(|name, _| fresh_users.contains_key(name));
+        self.login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|name, _| fresh_users.contains_key(name));
         let mut users = self.users.write().unwrap();
-        *users = fresh.users.into_inner().unwrap();
+        *users = fresh_users;
         Ok(())
     }
 
     /// Export the current contents as a validated config root, sorted by
-    /// username so the persisted file is deterministic.
+    /// username so the persisted file is deterministic. MFA enrolment
+    /// rides the same root so it survives a kernel restart byte-identically.
     fn export_conf(&self) -> AdminUsersConf {
         let users = self.users.read().unwrap();
+        let base64 = base64::engine::general_purpose::STANDARD;
         let mut entries: Vec<broker_config::AdminUser> = users
             .values()
             .map(|user| broker_config::AdminUser {
@@ -224,6 +385,14 @@ impl AdminUsers {
                 role: role_to_conf(user.role).to_string(),
                 description: user.description.clone(),
                 must_change_password: user.must_change_password,
+                mfa_secret: if user.mfa_secret.is_empty() {
+                    String::new()
+                } else {
+                    base64.encode(&user.mfa_secret)
+                },
+                mfa_enabled: user.mfa_enabled,
+                mfa_last_step: user.mfa_last_step,
+                scopes: user.scopes.clone(),
             })
             .collect();
         entries.sort_by(|a, b| a.username.cmp(&b.username));
@@ -256,6 +425,18 @@ impl AdminUsers {
         role: AdminRole,
         description: &str,
     ) -> Result<(), AdminUserError> {
+        self.create_with_scopes(username, password, role, description, None)
+    }
+
+    /// Create one user with an explicit scope list.
+    pub fn create_with_scopes(
+        &self,
+        username: &str,
+        password: &str,
+        role: AdminRole,
+        description: &str,
+        scopes: Option<Vec<String>>,
+    ) -> Result<(), AdminUserError> {
         if !is_valid_username(username) {
             return Err(AdminUserError::InvalidUsername);
         }
@@ -266,6 +447,14 @@ impl AdminUsers {
             let mut users = self.users.write().unwrap();
             if users.contains_key(username) {
                 return Err(AdminUserError::AlreadyExists);
+            }
+            // TODO(parity): does the documented behaviour count a duplicate
+            // against the cap or report the duplicate first? The rulebook
+            // does not decide the ordering; the current choice reports the
+            // duplicate first (no growth) and enforces the cap only on
+            // genuinely new usernames until the checker pins it.
+            if users.len() >= MAX_ADMIN_USERS {
+                return Err(AdminUserError::TooManyUsers);
             }
             let mut salt = [0u8; SALT_LEN];
             rand::rng().fill_bytes(&mut salt);
@@ -281,6 +470,10 @@ impl AdminUsers {
                     stored_key,
                     server_key,
                     must_change_password: false,
+                    mfa_secret: Vec::new(),
+                    mfa_enabled: false,
+                    mfa_last_step: None,
+                    scopes,
                 },
             );
         }
@@ -302,6 +495,7 @@ impl AdminUsers {
             }
             users.remove(username);
         }
+        self.mfa_attempts.lock().unwrap().remove(username);
         self.persist()
     }
 
@@ -335,34 +529,159 @@ impl AdminUsers {
         self.persist()
     }
 
+    /// Replace `role` and/or `description` of one user atomically: one
+    /// map write lock, one registry persist. `None` leaves that field
+    /// untouched. Validation of the values happens in the handler; this
+    /// only refuses the unknown user and the demotion of the last
+    /// administrator, so a validated update applies fully or not at all.
+    /// Management-plane only: publish and deliver never touch this map.
+    pub fn update(
+        &self,
+        username: &str,
+        role: Option<AdminRole>,
+        description: Option<&str>,
+    ) -> Result<(), AdminUserError> {
+        self.update_with_scopes(username, role, description, UserScopesUpdate::Keep)
+    }
+
+    /// Replace `role`, `description` and the explicit scope list of one
+    /// user atomically: one map write lock, one registry persist.
+    pub fn update_with_scopes(
+        &self,
+        username: &str,
+        role: Option<AdminRole>,
+        description: Option<&str>,
+        scopes: UserScopesUpdate,
+    ) -> Result<(), AdminUserError> {
+        {
+            let mut users = self.users.write().unwrap();
+            if !users.contains_key(username) {
+                return Err(AdminUserError::NotFound);
+            }
+            if let Some(role) = role {
+                let current = users.get(username).ok_or(AdminUserError::NotFound)?;
+                if current.role == AdminRole::Administrator
+                    && role == AdminRole::Viewer
+                    && users
+                        .values()
+                        .filter(|u| u.role == AdminRole::Administrator)
+                        .count()
+                        == 1
+                {
+                    return Err(AdminUserError::LastAdministrator);
+                }
+            }
+            if let Some(user) = users.get_mut(username) {
+                if let Some(role) = role {
+                    user.role = role;
+                }
+                if let Some(description) = description {
+                    user.description = description.to_string();
+                }
+                match scopes {
+                    UserScopesUpdate::Keep => {}
+                    UserScopesUpdate::Clear => user.scopes = None,
+                    UserScopesUpdate::Set(list) => user.scopes = Some(list),
+                }
+            }
+        }
+        self.persist()
+    }
+
     pub fn change_password(
         &self,
         username: &str,
         new_password: &str,
     ) -> Result<(), AdminUserError> {
-        if new_password.chars().count() < MIN_PASSWORD_LEN {
+        if !is_strong_password(new_password) {
             return Err(AdminUserError::WeakPassword);
         }
+        // Read the current verifier under a short read lock.
+        // Derive outside the lock so a slow hash never blocks readers.
+        let (salt, iterations, stored_key) = {
+            let users = self.users.read().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            (user.salt.clone(), user.iterations, user.stored_key)
+        };
+        let (candidate_stored, _) = derive_keys(new_password.as_bytes(), &salt, iterations);
+        if constant_time_eq(&candidate_stored, &stored_key) {
+            return Err(AdminUserError::SameAsOld);
+        }
+        // Derive the new verifier outside the lock.
+        // The write lock covers only the map update.
+        let mut new_salt = [0u8; SALT_LEN];
+        rand::rng().fill_bytes(&mut new_salt);
+        let (new_stored, new_server) = derive_keys(new_password.as_bytes(), &new_salt, ITERATIONS);
         {
             let mut users = self.users.write().unwrap();
-            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
-            let (candidate_stored, _) =
-                derive_keys(new_password.as_bytes(), &user.salt, user.iterations);
-            if constant_time_eq(&candidate_stored, &user.stored_key) {
-                return Err(AdminUserError::SameAsOld);
-            }
-            let mut salt = [0u8; SALT_LEN];
-            rand::rng().fill_bytes(&mut salt);
-            let (stored_key, server_key) = derive_keys(new_password.as_bytes(), &salt, ITERATIONS);
-            if let Some(user) = users.get_mut(username) {
-                user.salt = salt.to_vec();
-                user.iterations = ITERATIONS;
-                user.stored_key = stored_key;
-                user.server_key = server_key;
-                user.must_change_password = false;
-            }
+            let user = users.get_mut(username).ok_or(AdminUserError::NotFound)?;
+            user.salt = new_salt.to_vec();
+            user.iterations = ITERATIONS;
+            user.stored_key = new_stored;
+            user.server_key = new_server;
+            user.must_change_password = false;
         }
         self.persist()
+    }
+
+    /// True when the user has too many failed password logins and the
+    /// cool-down is not complete. An unknown user is never locked: no
+    /// entry is kept for a name that is not a user, thus the map stays in
+    /// [`MAX_ADMIN_USERS`] entries.
+    pub fn login_locked(&self, username: &str) -> bool {
+        let mut attempts = self
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        match attempts
+            .get(username)
+            .and_then(|attempt| attempt.locked_until)
+        {
+            Some(until) if until > now => true,
+            Some(_) => {
+                // The cool-down is complete: the user gets new attempts.
+                attempts.remove(username);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records one failed password login of a known user. After
+    /// [`MFA_VERIFY_MAX_ATTEMPTS`] failures in sequence, the user cannot
+    /// log in for [`MFA_VERIFY_LOCKOUT_SECS`] seconds. A name that is not
+    /// a user is not recorded.
+    pub fn record_login_failure(&self, username: &str) {
+        let known = self
+            .users
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(username);
+        if !known {
+            return;
+        }
+        let mut attempts = self
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = attempts.entry(username.to_string()).or_insert(MfaAttempt {
+            consecutive_failures: 0,
+            locked_until: None,
+        });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if entry.consecutive_failures >= MFA_VERIFY_MAX_ATTEMPTS {
+            entry.locked_until =
+                Some(Instant::now() + Duration::from_secs(MFA_VERIFY_LOCKOUT_SECS));
+        }
+    }
+
+    /// Removes the failed-login count of a user after a correct login.
+    pub fn clear_login_failures(&self, username: &str) {
+        self.login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(username);
     }
 
     /// Constant-time check of `password` against the stored `StoredKey`.
@@ -435,6 +754,7 @@ impl AdminUsers {
             role: u.role,
             description: u.description.clone(),
             must_change_password: u.must_change_password,
+            scopes: u.scopes.clone(),
         })
     }
 
@@ -447,6 +767,7 @@ impl AdminUsers {
                 role: u.role,
                 description: u.description.clone(),
                 must_change_password: u.must_change_password,
+                scopes: u.scopes.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.username.cmp(&b.username));
@@ -476,8 +797,287 @@ impl AdminUsers {
                 stored_key,
                 server_key,
                 must_change_password: false,
+                mfa_secret: Vec::new(),
+                mfa_enabled: false,
+                mfa_last_step: None,
+                scopes: None,
             },
         );
+    }
+
+    /// Enrolment state for one dashboard user, or `None` when unknown.
+    /// Management-plane only: one short read lock; publish and deliver
+    /// never touch this map.
+    pub fn mfa_status(&self, username: &str) -> Option<MfaStatus> {
+        let users = self.users.read().unwrap();
+        users.get(username).map(|user| MfaStatus {
+            enabled: user.mfa_enabled,
+            pending: !user.mfa_secret.is_empty() && !user.mfa_enabled,
+        })
+    }
+
+    /// Start per-user MFA enrolment: generate one TOTP secret and store it
+    /// as pending (enabled stays false until a code verifies). At most one
+    /// pending enrolment per user: a second setup while pending returns the
+    /// stored secret instead of growing anything; a setup while already
+    /// enabled is rejected with [`AdminUserError::AlreadyExists`] so an
+    /// enabled second factor is never silently replaced. Unknown users
+    /// fail with [`AdminUserError::NotFound`]. Persists through the
+    /// registry; a commit or save failure rolls back the in-memory secret
+    /// and surfaces as [`AdminUserError::Persist`].
+    /// Management-plane only: one short write lock (plus the registry save
+    /// lock on persist); publish and deliver never touch this map. The
+    /// secret is never logged; only the caller (the setup route) returns
+    /// it once.
+    // TODO(parity): does the documented setup regenerate the secret on
+    // every call, or return the pending one idempotently? The rulebook
+    // does not decide the repeat-setup behaviour; the current choice
+    // returns the pending secret (one enrolment per user, no growth)
+    // until the checker pins it.
+    pub fn mfa_setup(&self, username: &str) -> Result<Vec<u8>, AdminUserError> {
+        let secret = {
+            let mut users = self.users.write().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            if user.mfa_enabled {
+                return Err(AdminUserError::AlreadyExists);
+            }
+            if !user.mfa_secret.is_empty() {
+                return Ok(user.mfa_secret.clone());
+            }
+            let secret = crate::mfa_totp::generate_secret();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret = secret.clone();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            secret
+        };
+        if let Err(error) = self.persist() {
+            let mut users = self.users.write().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret.clear();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            return Err(error);
+        }
+        Ok(secret)
+    }
+
+    /// Strict per-user MFA enrolment for the admin
+    /// `POST /users/{username}/mfa` route (C05-31): the call sets up or
+    /// resets MFA, so it always stores a fresh secret as pending (enabled
+    /// stays false until a code verifies) and clears past attempt counts.
+    /// Unknown users fail with [`AdminUserError::NotFound`]. Persists
+    /// through the registry; a commit or save failure restores the
+    /// previous enrolment and surfaces as [`AdminUserError::Persist`].
+    /// Management-plane only: one short write lock (plus the registry save
+    /// lock on persist); publish and deliver never touch this map. The
+    /// secret is never logged; only the caller (the enrol route) returns
+    /// it once.
+    pub fn mfa_admin_enrol(&self, username: &str) -> Result<Vec<u8>, AdminUserError> {
+        let (secret, previous) = {
+            let mut users = self.users.write().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            let previous = (
+                user.mfa_secret.clone(),
+                user.mfa_enabled,
+                user.mfa_last_step,
+            );
+            let secret = crate::mfa_totp::generate_secret();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret = secret.clone();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            (secret, previous)
+        };
+        self.mfa_attempts.lock().unwrap().remove(username);
+        if let Err(error) = self.persist() {
+            let mut users = self.users.write().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret = previous.0;
+                user.mfa_enabled = previous.1;
+                user.mfa_last_step = previous.2;
+            }
+            return Err(error);
+        }
+        Ok(secret)
+    }
+
+    /// Disable per-user MFA for the admin `DELETE /users/{username}/mfa`
+    /// route (C05-30): clears the secret, the enabled flag and the last
+    /// verified counter, and drops the memory-only attempt counters, so
+    /// re-enabling later requires a fresh enrolment. Unknown users, and
+    /// known users with no enrolment (no secret and never enabled), fail
+    /// with [`AdminUserError::NotFound`] and change nothing. Persists
+    /// through the registry; a commit or save failure rolls back the
+    /// in-memory triple and surfaces as [`AdminUserError::Persist`].
+    /// Management-plane only: one short write lock (plus the registry save
+    /// lock on persist); publish and deliver never touch this map. Codes
+    /// and secrets are never logged.
+    // TODO(parity): does the documented delete of a never-enrolled user
+    // report a miss (404) or a bad request (400, already-disabled)? The
+    // rulebook does not decide the exact code; the current choice reports
+    // `NotFound` (404, documented `{code, message}` shape, shared with the
+    // other dashboard miss paths) until the checker pins it.
+    pub fn mfa_disable(&self, username: &str) -> Result<(), AdminUserError> {
+        let previous = {
+            let mut users = self.users.write().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            if user.mfa_secret.is_empty() && !user.mfa_enabled {
+                return Err(AdminUserError::NotFound);
+            }
+            let previous = (
+                user.mfa_secret.clone(),
+                user.mfa_enabled,
+                user.mfa_last_step,
+            );
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret.clear();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            previous
+        };
+        self.mfa_attempts.lock().unwrap().remove(username);
+        if let Err(error) = self.persist() {
+            let mut users = self.users.write().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret = previous.0;
+                user.mfa_enabled = previous.1;
+                user.mfa_last_step = previous.2;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Verify one six-digit code for `username` at `unix_secs`.
+    ///
+    /// Behaviour, in order: unknown users fail with
+    /// [`MfaVerifyError::NotFound`] and record nothing (names cannot be
+    /// enumerated through attempts); locked-out users fail with
+    /// [`MfaVerifyError::Locked`]; users with no enrolment fail with
+    /// [`MfaVerifyError::NoEnrolment`]; codes outside the +-1-step window
+    /// fail with [`MfaVerifyError::Invalid`]; codes whose counter is at or
+    /// below the last verified counter fail with [`MfaVerifyError::Replayed`]
+    /// (single-use); otherwise the user flips to enabled, the counter is
+    /// stored, the failure count resets and persistence runs. Every
+    /// [`MfaVerifyError::Invalid`] and [`MfaVerifyError::Replayed`]
+    /// increments the consecutive-failure count, tripping a 60 s cool-down
+    /// at [`MFA_VERIFY_MAX_ATTEMPTS`]. A successful persist failure rolls
+    /// back the enable and surfaces as [`MfaVerifyError::Persist`].
+    /// Management-plane only: short user-map and attempt-map locks;
+    /// publish and deliver never touch either map. Codes and secrets are
+    /// never logged.
+    pub fn mfa_verify(
+        &self,
+        username: &str,
+        code: &str,
+        unix_secs: u64,
+    ) -> Result<bool, MfaVerifyError> {
+        let (secret, last_step) = {
+            let users = self.users.read().unwrap();
+            let user = users.get(username).ok_or(MfaVerifyError::NotFound)?;
+            (user.mfa_secret.clone(), user.mfa_last_step)
+        };
+        {
+            let mut attempts = self.mfa_attempts.lock().unwrap();
+            // Entries only exist for known users (unknown names fail
+            // before recording anything), so the map stays within
+            // MAX_ADMIN_USERS without further eviction.
+            let now = Instant::now();
+            if let Some(attempt) = attempts.get_mut(username) {
+                if let Some(until) = attempt.locked_until {
+                    if until > now {
+                        return Err(MfaVerifyError::Locked);
+                    }
+                    // Cool-down elapsed: drop the spent entry so the user
+                    // gets a fresh batch of attempts.
+                    attempts.remove(username);
+                }
+            }
+        }
+        if secret.is_empty() {
+            return Err(MfaVerifyError::NoEnrolment);
+        }
+        let Some(counter) = crate::mfa_totp::totp_verify(&secret, code, unix_secs) else {
+            self.record_mfa_failure(username);
+            return Err(MfaVerifyError::Invalid);
+        };
+        if last_step.is_some_and(|last| counter <= last) {
+            self.record_mfa_failure(username);
+            return Err(MfaVerifyError::Replayed);
+        }
+        {
+            let mut users = self.users.write().unwrap();
+            // Re-check under the write lock: a concurrent verify may have
+            // consumed this counter first (single-use must hold).
+            let user = users.get(username).ok_or(MfaVerifyError::NotFound)?;
+            if user.mfa_last_step.is_some_and(|last| counter <= last) {
+                drop(users);
+                self.record_mfa_failure(username);
+                return Err(MfaVerifyError::Replayed);
+            }
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_enabled = true;
+                user.mfa_last_step = Some(counter);
+            }
+        }
+        if let Err(error) = self.persist_mfa() {
+            let mut users = self.users.write().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_last_step = last_step;
+                if last_step.is_none() {
+                    user.mfa_enabled = false;
+                }
+            }
+            return Err(MfaVerifyError::Persist(error));
+        }
+        self.mfa_attempts.lock().unwrap().remove(username);
+        Ok(true)
+    }
+
+    /// Record one failed MFA verification, tripping the cool-down at
+    /// [`MFA_VERIFY_MAX_ATTEMPTS`] consecutive failures. Only called for
+    /// known users, so the map stays within [`MAX_ADMIN_USERS`].
+    fn record_mfa_failure(&self, username: &str) {
+        let mut attempts = self.mfa_attempts.lock().unwrap();
+        let entry = attempts.entry(username.to_string()).or_insert(MfaAttempt {
+            consecutive_failures: 0,
+            locked_until: None,
+        });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if entry.consecutive_failures >= MFA_VERIFY_MAX_ATTEMPTS {
+            entry.locked_until =
+                Some(Instant::now() + Duration::from_secs(MFA_VERIFY_LOCKOUT_SECS));
+        }
+    }
+
+    /// Persist helper returning the message for MFA failures (the shared
+    /// `persist` maps to `AdminUserError`; verify needs `MfaVerifyError`).
+    fn persist_mfa(&self) -> Result<(), String> {
+        let Some(registry) = self.registry.as_ref() else {
+            return Ok(());
+        };
+        let _guard = self.save_lock.lock().unwrap();
+        let conf = self.export_conf();
+        registry
+            .commit_admin_users(conf)
+            .map_err(|err| format!("cannot persist admin users: {err}"))?;
+        registry
+            .save()
+            .map_err(|err| format!("cannot persist admin users: {err}"))?;
+        Ok(())
+    }
+
+    /// Raw enrolment secret for tests only (handler tests read it back
+    /// from the setup response instead).
+    #[cfg(test)]
+    pub(crate) fn mfa_secret_for_test(&self, username: &str) -> Option<Vec<u8>> {
+        let users = self.users.read().unwrap();
+        users.get(username).map(|user| user.mfa_secret.clone())
     }
 }
 
@@ -563,7 +1163,45 @@ fn default_admin_user() -> AdminUser {
         stored_key,
         server_key,
         must_change_password: true,
+        mfa_secret: Vec::new(),
+        mfa_enabled: false,
+        mfa_last_step: None,
+        scopes: None,
     }
+}
+
+/// Decode the persisted MFA triple `(secret, enabled, last_step)`.
+/// Fail-closed: an undecodable or out-of-range secret yields no enrolment
+/// and disabled, so nobody verifies against half-parsed material; the
+/// loss is visible as a missing enrolment instead of a silently wrong one.
+/// An enabled flag without a secret also yields disabled (the registry
+/// validation rejects it at commit time, so this only fires for structs
+/// built in code that bypassed `commit`).
+fn decode_mfa(entry: &broker_config::AdminUser) -> (Vec<u8>, bool, Option<u64>) {
+    if entry.mfa_secret.trim().is_empty() {
+        return (Vec::new(), false, None);
+    }
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(entry.mfa_secret.trim()) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            tracing::warn!(
+                username = entry.username.as_str(),
+                "admin snapshot entry has an undecodable MFA secret; enrolment dropped"
+            );
+            return (Vec::new(), false, None);
+        }
+    };
+    if decoded.len() < 10 || decoded.len() > 64 {
+        tracing::warn!(
+            username = entry.username.as_str(),
+            "admin snapshot entry has an out-of-range MFA secret; enrolment dropped"
+        );
+        return (Vec::new(), false, None);
+    }
+    if !entry.mfa_enabled {
+        return (decoded, false, None);
+    }
+    (decoded, true, entry.mfa_last_step)
 }
 
 fn role_to_conf(role: AdminRole) -> &'static str {

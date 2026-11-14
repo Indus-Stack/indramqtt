@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "licence.request_out"
+kind = "setting"
+expect = "ok"
+expected = "The broker writes the installation licence request to the given path and exits."
+source = "`crates/broker-config/src/schema.rs` documents `licence.request_out` as the path to write the installation licence request to and exit."
+action = "Start the broker with a request output path and check that the request file exists."
+config = '''
+[licence]
+request_out = "/tmp/docs-licence-request.json"
+'''
+script = '''
+from config_probe import *
+import os
+path = os.path.join(os.environ["WORK_DIR"], "docs-licence-request.json")
+assert os.path.exists(path), path
+print("ok")
+'''

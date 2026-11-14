@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-kerberos-replay-max",
+  "match": "--kerberos-replay-max",
+  "output": "      --kerberos-replay-max <KERBEROS_REPLAY_MAX>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

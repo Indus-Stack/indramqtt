@@ -10,11 +10,7 @@ use axum::{
 use crate::node_scope::resolve_node;
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes` and the other v5
-/// rows (`alarms`, `monitoring`, `clients`). Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Live gauges for the current snapshot, read from the session
 /// directory and lock-free metrics. Management-plane only.
@@ -44,26 +40,21 @@ fn live_counters(state: &ApiState) -> crate::v5::monitor::LiveCounters {
     }
 }
 
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Documented `GET /monitor_current` snapshot: the latest sample as a
-/// single object with the same current-value fields as one `GET /monitor`
-/// history point.
+/// Documented `GET /monitor_current` snapshot: one object with the
+/// current gauges and the message rates of the last sampling window.
 ///
-/// Every value is numeric. Gauges (`connections`, `live_connections`,
-/// `topics`, `subscriptions`) and cumulative counters (`received`,
-/// `sent`, `dropped`, `rules_matched`) are read live from the session
-/// directory and lock-free metrics, so two reads with traffic in between
-/// never move those counters backwards. Fields with no kernel tracking yet
-/// (durable gauges, validation/transformation splits, persistence and
-/// action counters) are carried over from the newest history point when one
-/// exists, else zero, so the shape stays stable and the snapshot combines
-/// live counters with history without doing any sampling work here.
+/// Gauges (`connections`, `live_connections`, `topics`, `subscriptions`,
+/// `cluster_sessions`, `retained_msg_count`) are read live from the
+/// session directory, the lock-free metrics and the statistics store.
+///
+/// Each `*_rate` field is the change of one cumulative counter between the
+/// two newest points of the monitor history, divided by the time between
+/// the points. The sampler in the kernel writes a point on a timer, so the
+/// rate covers one sampling window. Before two points exist, and after
+/// `DELETE /monitor`, every rate reads zero because no window has passed.
+/// Fields without kernel tracking stay out, never zero: durable gauges,
+/// persistence, validation, transformation and action rates plus
+/// `license_quota`, `shared_subscriptions` and `sessions_hist_hwmark`.
 ///
 /// Never paged; always succeeds when the node is up. The query string is
 /// not read, so unknown query parameters are ignored instead of rejected.
@@ -75,24 +66,39 @@ pub async fn monitor_current(State(state): State<ApiState>) -> Response {
 }
 
 /// Shared snapshot read for `GET /monitor_current` and its node-scoped
-/// twin below. Combines live counters with the newest history point in
-/// constant time; no sampling work is added to the message path.
+/// twin below. Combines live gauges with the rates of the newest history
+/// window in constant time; no sampling work is added to the message path.
 fn current_snapshot_value(state: &ApiState) -> serde_json::Value {
-    let now = now_epoch_secs();
+    use crate::v5::monitor::rate_per_sec;
     let live = live_counters(state);
-    let mut sample = crate::v5::monitor::MonitorSample::from_live(now, live);
-    if let Some(prev) = state.monitor.latest() {
-        sample.subscriptions_durable = prev.subscriptions_durable;
-        sample.disconnected_durable_sessions = prev.disconnected_durable_sessions;
-        sample.persisted = prev.persisted;
-        sample.validation_succeeded = prev.validation_succeeded;
-        sample.validation_failed = prev.validation_failed;
-        sample.transformation_succeeded = prev.transformation_succeeded;
-        sample.transformation_failed = prev.transformation_failed;
-        sample.actions_executed = prev.actions_executed;
-        sample.actions_messages = prev.actions_messages;
-    }
-    sample.to_json()
+    let (newest, previous) = state.monitor.newest_two();
+    let mut body = serde_json::Map::with_capacity(24);
+    let mut put = |key: &str, value: u64| {
+        body.insert(key.to_string(), serde_json::Value::from(value));
+    };
+    put("connections", live.connections);
+    put("live_connections", live.live_connections);
+    put("topics", live.topics);
+    put("subscriptions", live.subscriptions);
+    put("cluster_sessions", state.sessions.session_count() as u64);
+    put("retained_msg_count", state.stats.snapshot().retained);
+    // Rates need two points. Without them no window has passed.
+    // Only tracked counters get a rate. Untracked fields stay out.
+    let rate = |counter: fn(&crate::v5::monitor::MonitorSample) -> u64| -> u64 {
+        match (&newest, &previous) {
+            (Some(newer), Some(older)) => rate_per_sec(
+                counter(newer),
+                counter(older),
+                newer.time_stamp.saturating_sub(older.time_stamp),
+            ),
+            _ => 0,
+        }
+    };
+    put("received_msg_rate", rate(|s| s.received));
+    put("sent_msg_rate", rate(|s| s.sent));
+    put("dropped_msg_rate", rate(|s| s.dropped));
+    put("rules_matched_rate", rate(|s| s.rules_matched));
+    serde_json::Value::Object(body)
 }
 
 /// `GET /monitor_current/nodes/{node}`: node-scoped read of the same
@@ -100,7 +106,7 @@ fn current_snapshot_value(state: &ApiState) -> serde_json::Value {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same single-object shape as
 /// [`monitor_current`] (same numeric fields, same history carry-over),
@@ -111,7 +117,7 @@ pub async fn monitor_current_node(
     Path(node): Path<String>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -119,7 +125,14 @@ pub async fn monitor_current_node(
             .expect_err("node already checked as unknown")
             .into_response();
     }
-    (StatusCode::OK, Json(current_snapshot_value(&state))).into_response()
+    let mut body = current_snapshot_value(&state);
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "node_uptime".to_string(),
+            serde_json::Value::from(crate::v5::nodes::uptime_ms() / 1000),
+        );
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Documented `GET /stats` snapshot: aggregated resource and session statistics.
@@ -138,7 +151,7 @@ pub async fn get_stats(State(state): State<ApiState>) -> Response {
     if let Some(map) = snapshot.as_object_mut() {
         map.insert(
             "node".to_string(),
-            serde_json::Value::from(LEGACY_NODE_NAME),
+            serde_json::Value::from(local_node_name()),
         );
     }
     (StatusCode::OK, Json(vec![snapshot])).into_response()
@@ -157,12 +170,17 @@ pub async fn get_stats(State(state): State<ApiState>) -> Response {
 /// `channels`, `sessions` and `cluster_sessions` all read the connection
 /// gauge (single node: one channel and one session per bound connection);
 /// `suboptions` reads the subscription gauge (one options record per
-/// subscription); `subscribers` is bounded by both gauges (distinct
-/// subscriber clients can be neither more than bound connections nor more
-/// than subscription entries under active-only counting); `delayed` and
-/// `subscriptions.shared` read zero (no kernel tracking yet, shape stays
-/// stable and they rise once their subsystem records them).
-/// Management-plane only; never touched on fan-out or fan-in.
+/// subscription). `subscribers.count` and `subscribers.max` are left out:
+/// the kernel keeps no distinct-subscriber counter, and the session mirror
+/// stores shared entries under their inner filter, so no live scan can
+/// count distinct subscribers honestly. A constant would fake a
+/// measurement. `delayed.count` reads the live wheel length from the delayed
+/// scheduler. `delayed.max` and both `subscriptions.shared` keys are
+/// left out: the kernel keeps no high water mark for either, and the
+/// session mirror stores shared entries under their inner filter, so no
+/// live scan can count them honestly. A constant would fake a
+/// measurement. Management-plane only; never touched on fan-out or
+/// fan-in.
 fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
     let snap = state.stats.snapshot();
     let conns = snap.connections;
@@ -173,12 +191,11 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
     let topics_max = snap.topics_max;
     let retained = snap.retained;
     let retained_max = snap.retained_max;
-    let subscribers = conns.min(subs);
-    let subscribers_max = conns_max.min(subs_max);
+    let delayed = state.delayed.len() as u64;
     // Built as an explicit map instead of one large `json!` literal: the
     // macro recurses once per key and trips the compiler recursion limit
     // at this size, while a map insert per gauge stays flat.
-    let mut body = serde_json::Map::with_capacity(24);
+    let mut body = serde_json::Map::with_capacity(19);
     body.insert("channels.count".to_string(), serde_json::Value::from(conns));
     body.insert(
         "channels.max".to_string(),
@@ -192,8 +209,11 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
         "connections.max".to_string(),
         serde_json::Value::from(conns_max),
     );
-    body.insert("delayed.count".to_string(), serde_json::Value::from(0u64));
-    body.insert("delayed.max".to_string(), serde_json::Value::from(0u64));
+    // No high-water mark exists for delayed entries, so `delayed.max` stays out.
+    body.insert(
+        "delayed.count".to_string(),
+        serde_json::Value::from(delayed),
+    );
     body.insert(
         "live_connections.count".to_string(),
         serde_json::Value::from(conns),
@@ -231,14 +251,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
         "suboptions.max".to_string(),
         serde_json::Value::from(subs_max),
     );
-    body.insert(
-        "subscribers.count".to_string(),
-        serde_json::Value::from(subscribers),
-    );
-    body.insert(
-        "subscribers.max".to_string(),
-        serde_json::Value::from(subscribers_max),
-    );
+    // No distinct-subscriber counter exists, so both `subscribers` keys stay out.
     body.insert(
         "subscriptions.count".to_string(),
         serde_json::Value::from(subs),
@@ -247,14 +260,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
         "subscriptions.max".to_string(),
         serde_json::Value::from(subs_max),
     );
-    body.insert(
-        "subscriptions.shared.count".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "subscriptions.shared.max".to_string(),
-        serde_json::Value::from(0u64),
-    );
+    // Shared entries mirror under inner filters, so both shared keys stay out.
     body.insert("topics.count".to_string(), serde_json::Value::from(topics));
     body.insert(
         "topics.max".to_string(),
@@ -268,7 +274,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the single-object snapshot from
 /// [`stats_snapshot_value`] over the shared gauge-plus-high-water-mark
@@ -277,7 +283,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
 /// per-message path.
 pub async fn get_stats_node(State(state): State<ApiState>, Path(node): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -297,12 +303,48 @@ pub async fn get_stats_node(State(state): State<ApiState>, Path(node): Path<Stri
 /// copy of the counter block and adds no work to the per-message path.
 /// All increments already happen on the message path; this read only copies.
 ///
+/// Live rule-action fires: the sum of every rule's action counter.
+/// Management-plane only: one bounded rule-list scan per request; the
+/// fire path never touches this sum.
+fn actions_executed_total(state: &ApiState) -> u64 {
+    let mut total = 0u64;
+    for rule in state.engine.list_rules() {
+        total = total.saturating_add(
+            rule.actions_total_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+    total
+}
+
+/// Live transformation outcomes: the sums of every named step's
+/// succeeded and failed counters. Management-plane only: one bounded
+/// chain-map scan per request; the ingress path never touches this sum.
+fn transformation_totals(state: &ApiState) -> (u64, u64) {
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for record in state.engine.transform_metrics_snapshot().values() {
+        let (_, ok, err) = record.snapshot();
+        succeeded = succeeded.saturating_add(ok);
+        failed = failed.saturating_add(err);
+    }
+    (succeeded, failed)
+}
+
 /// Grouping follows the documented names: `bytes`, `packets`, `messages`,
-/// `delivery`, `client` and `session`. Fields with no kernel tracking yet
-/// (QoS 2 acknowledgement flows, unsubscribe/disconnect packet splits,
-/// delayed/retained message stores, session lifecycle) read zero so the
-/// shape stays stable; they rise once their subsystem records them.
-/// Management-plane only; never touched on fan-out or fan-in.
+/// `delivery`, `client`, `rules`, `actions` and transformation outcomes.
+/// Every key reads a true kernel counter (lock-free atomics, the delayed
+/// scheduler, or a bounded management-plane sum over rules and chain
+/// steps). `messages.sent` reads transport admission (`messages_forwarded`)
+/// while `messages.delivered` reads live deliveries (`delivered`), so the
+/// two never share one value. `client.connect` reads cumulative CONNECT
+/// packets while `client.connected` reads the current connection gauge.
+/// Keys with no kernel tracking (QoS 2 acknowledgement flows,
+/// unsubscribe/disconnect packet splits, retained writes, session and
+/// authentication lifecycles, validation splits) are left out: every
+/// documented field is optional, and a constant would fake a
+/// measurement. Management-plane only; never touched on fan-out or
+/// fan-in.
 fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
     let snap = state.metrics.snapshot();
     let packets_received = snap
@@ -330,7 +372,7 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
     // Built as an explicit map instead of one large `json!` literal: the
     // macro recurses once per key and trips the compiler recursion limit
     // at this size, while a map insert per counter stays flat.
-    let mut body = serde_json::Map::with_capacity(57);
+    let mut body = serde_json::Map::with_capacity(34);
     body.insert(
         "bytes.received".to_string(),
         serde_json::Value::from(snap.bytes_received),
@@ -372,60 +414,12 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
         serde_json::Value::from(snap.publish_sent),
     );
     body.insert(
-        "packets.publish.error".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.publish.auth_error".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.puback.received".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.puback.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.pubrec.received".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.pubrec.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.pubrel.received".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.pubrel.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.pubcomp.received".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.pubcomp.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
         "packets.subscribe.received".to_string(),
         serde_json::Value::from(snap.subscribe_received),
     );
     body.insert(
         "packets.suback.sent".to_string(),
         serde_json::Value::from(snap.suback_sent),
-    );
-    body.insert(
-        "packets.unsubscribe.received".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.unsuback.sent".to_string(),
-        serde_json::Value::from(0u64),
     );
     body.insert(
         "packets.pingreq.received".to_string(),
@@ -436,20 +430,12 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
         serde_json::Value::from(snap.pingresp_sent),
     );
     body.insert(
-        "packets.disconnect.received".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "packets.disconnect.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
         "messages.received".to_string(),
         serde_json::Value::from(snap.messages_received),
     );
     body.insert(
         "messages.sent".to_string(),
-        serde_json::Value::from(snap.delivered),
+        serde_json::Value::from(snap.messages_forwarded),
     );
     body.insert(
         "messages.dropped".to_string(),
@@ -459,14 +445,9 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
         "messages.delivered".to_string(),
         serde_json::Value::from(snap.delivered),
     );
-    body.insert("messages.acked".to_string(), serde_json::Value::from(0u64));
-    body.insert(
-        "messages.retained".to_string(),
-        serde_json::Value::from(0u64),
-    );
     body.insert(
         "messages.delayed".to_string(),
-        serde_json::Value::from(0u64),
+        serde_json::Value::from(state.delayed.scheduled_count()),
     );
     body.insert(
         "messages.qos0.received".to_string(),
@@ -479,18 +460,6 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
     body.insert(
         "messages.qos2.received".to_string(),
         serde_json::Value::from(snap.qos2_received),
-    );
-    body.insert(
-        "messages.qos0.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "messages.qos1.sent".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "messages.qos2.sent".to_string(),
-        serde_json::Value::from(0u64),
     );
     body.insert(
         "delivery.dropped".to_string(),
@@ -509,10 +478,6 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
         serde_json::Value::from(delivery_queue_full),
     );
     body.insert(
-        "delivery.dropped.expired".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
         "client.connect".to_string(),
         serde_json::Value::from(snap.connect_received),
     );
@@ -522,33 +487,28 @@ fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
     );
     body.insert(
         "client.connected".to_string(),
-        serde_json::Value::from(snap.connect_received),
-    );
-    body.insert(
-        "client.disconnected".to_string(),
-        serde_json::Value::from(0u64),
+        serde_json::Value::from(snap.connections_active.max(0) as u64),
     );
     body.insert(
         "client.subscribe".to_string(),
         serde_json::Value::from(snap.subscribe_received),
     );
     body.insert(
-        "client.unsubscribe".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert("session.created".to_string(), serde_json::Value::from(0u64));
-    body.insert(
-        "session.discarded".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert("session.resumed".to_string(), serde_json::Value::from(0u64));
-    body.insert(
-        "session.takenover".to_string(),
-        serde_json::Value::from(0u64),
+        "rules.matched".to_string(),
+        serde_json::Value::from(snap.rules_executed),
     );
     body.insert(
-        "session.terminated".to_string(),
-        serde_json::Value::from(0u64),
+        "actions.executed".to_string(),
+        serde_json::Value::from(actions_executed_total(state)),
+    );
+    let (transformed_ok, transformed_err) = transformation_totals(state);
+    body.insert(
+        "messages.transformation_succeeded".to_string(),
+        serde_json::Value::from(transformed_ok),
+    );
+    body.insert(
+        "messages.transformation_failed".to_string(),
+        serde_json::Value::from(transformed_err),
     );
     serde_json::Value::Object(body)
 }
@@ -563,12 +523,34 @@ pub async fn get_metrics(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(metrics_snapshot_value(&state))).into_response()
 }
 
+/// Metrics rows for the text exposition: the same object as
+/// [`get_metrics`], as a map. Values stay identical by construction.
+pub(crate) fn metrics_snapshot_for_exposition(
+    state: &ApiState,
+) -> serde_json::Map<String, serde_json::Value> {
+    match metrics_snapshot_value(state) {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// Stats rows for the text exposition: the same object as
+/// [`get_stats_node`], as a map. Values stay identical by construction.
+pub(crate) fn stats_snapshot_for_exposition(
+    state: &ApiState,
+) -> serde_json::Map<String, serde_json::Value> {
+    match stats_snapshot_value(state) {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
 /// `GET /nodes/{node}/metrics`: node-scoped read of the same snapshot
 /// as `GET /metrics`.
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same flat object of named
 /// numeric counters as [`get_metrics`] (same documented names, same
@@ -576,7 +558,7 @@ pub async fn get_metrics(State(state): State<ApiState>) -> Response {
 /// and no work on the per-message path.
 pub async fn get_metrics_node(State(state): State<ApiState>, Path(node): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -610,37 +592,42 @@ mod tests {
         (status, body)
     }
 
-    fn documented_fields() -> [&'static str; 18] {
+    fn documented_fields() -> [&'static str; 10] {
         [
-            "time_stamp",
             "connections",
             "live_connections",
             "topics",
             "subscriptions",
+            "cluster_sessions",
+            "retained_msg_count",
+            "received_msg_rate",
+            "sent_msg_rate",
+            "dropped_msg_rate",
+            "rules_matched_rate",
+        ]
+    }
+
+    fn omitted_fields() -> [&'static str; 11] {
+        [
             "subscriptions_durable",
             "disconnected_durable_sessions",
-            "received",
-            "sent",
-            "dropped",
-            "persisted",
-            "validation_succeeded",
-            "validation_failed",
-            "transformation_succeeded",
-            "transformation_failed",
-            "rules_matched",
-            "actions_executed",
-            "actions_messages",
+            "persisted_rate",
+            "actions_executed_rate",
+            "actions_messages_rate",
+            "validation_succeeded_rate",
+            "validation_failed_rate",
+            "transformation_succeeded_rate",
+            "transformation_failed_rate",
+            "license_quota",
+            "shared_subscriptions",
         ]
     }
 
     #[tokio::test]
     async fn current_snapshot_has_documented_numeric_fields() {
+        // Fresh state, no store writes: an empty broker honestly reads
+        // zero for every gauge and every rate.
         let state = standalone_state();
-        state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded_by(2);
-        state.metrics.inc_messages_dropped();
-        state.metrics.inc_rules_executed();
-        state.metrics.set_active_connections(1);
 
         let (status, body) = snapshot_body(monitor_current(State(state)).await).await;
         assert_eq!(status, StatusCode::OK);
@@ -655,124 +642,53 @@ mod tests {
                 "field {field} must be numeric, got: {body}"
             );
         }
-        assert!(body["time_stamp"].as_u64().expect("time stamp") > 0);
-        assert_eq!(body["received"], serde_json::json!(1));
-        assert_eq!(body["sent"], serde_json::json!(2));
-        assert_eq!(body["dropped"], serde_json::json!(1));
-        assert_eq!(body["rules_matched"], serde_json::json!(1));
+        assert_eq!(body["connections"], serde_json::json!(0));
+        // The cumulative counters are not part of the documented shape.
+        for field in ["received", "sent", "dropped", "time_stamp"] {
+            assert!(body.get(field).is_none(), "unexpected field {field}");
+        }
+        // Fields without kernel tracking stay out, never zero.
+        for field in omitted_fields() {
+            assert!(body.get(field).is_none(), "untracked field {field}");
+        }
     }
 
     #[tokio::test]
-    async fn current_snapshot_counters_are_non_decreasing() {
+    async fn rates_are_zero_before_two_points_exist() {
+        // Fresh state, no sampler writes: with no history window every
+        // rate reads zero. Window math itself is proved by
+        // `rate_per_sec_divides_delta_by_window` below, and the live
+        // sampler path is proved in broker-node
+        // `ap09_monitor_sampler_records_live_through_kernel_timer`.
         let state = standalone_state();
-
-        let (_, first) = snapshot_body(monitor_current(State(state.clone())).await).await;
-        state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded_by(3);
-        state.metrics.inc_rules_executed_by(2);
-        let (_, second) = snapshot_body(monitor_current(State(state.clone())).await).await;
-
-        for field in documented_fields() {
-            assert!(second.get(field).is_some(), "missing field {field}");
-            assert!(second[field].is_u64(), "field {field} must stay numeric");
-        }
-        for field in [
-            "received",
-            "sent",
-            "dropped",
-            "rules_matched",
-            "connections",
-            "live_connections",
-            "topics",
-            "subscriptions",
-        ] {
-            let before = first[field].as_u64().expect("first numeric");
-            let after = second[field].as_u64().expect("second numeric");
-            assert!(
-                after >= before,
-                "field {field} must not move backwards: {before} -> {after}"
-            );
-        }
-        assert!(second["received"].as_u64().expect("received") >= 1);
-        assert!(second["sent"].as_u64().expect("sent") >= 3);
-        assert!(second["rules_matched"].as_u64().expect("rules") >= 2);
-        assert!(
-            second["time_stamp"].as_u64().expect("stamp")
-                >= first["time_stamp"].as_u64().expect("first stamp")
-        );
+        let (_, empty) = snapshot_body(monitor_current(State(state)).await).await;
+        assert_eq!(empty["received_msg_rate"], serde_json::json!(0));
+        assert_eq!(empty["sent_msg_rate"], serde_json::json!(0));
+        assert_eq!(empty["dropped_msg_rate"], serde_json::json!(0));
+        assert_eq!(empty["rules_matched_rate"], serde_json::json!(0));
     }
 
     #[tokio::test]
-    async fn current_snapshot_carries_newest_history_point() {
-        let state = standalone_state();
-        let prev = crate::v5::monitor::MonitorSample {
-            time_stamp: 1_700_000_100,
-            connections: 0,
-            live_connections: 0,
-            topics: 0,
-            subscriptions: 0,
-            subscriptions_durable: 4,
-            disconnected_durable_sessions: 5,
-            received: 0,
-            sent: 0,
-            dropped: 0,
-            persisted: 6,
-            validation_succeeded: 7,
-            validation_failed: 8,
-            transformation_succeeded: 9,
-            transformation_failed: 10,
-            rules_matched: 0,
-            actions_executed: 11,
-            actions_messages: 12,
-        };
-        state.monitor.record(prev);
-        state.metrics.inc_messages_received();
-
-        let (status, body) = snapshot_body(monitor_current(State(state)).await).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["received"], serde_json::json!(1));
-        assert_eq!(body["subscriptions_durable"], serde_json::json!(4));
-        assert_eq!(body["disconnected_durable_sessions"], serde_json::json!(5));
-        assert_eq!(body["persisted"], serde_json::json!(6));
-        assert_eq!(body["validation_succeeded"], serde_json::json!(7));
-        assert_eq!(body["validation_failed"], serde_json::json!(8));
-        assert_eq!(body["transformation_succeeded"], serde_json::json!(9));
-        assert_eq!(body["transformation_failed"], serde_json::json!(10));
-        assert_eq!(body["actions_executed"], serde_json::json!(11));
-        assert_eq!(body["actions_messages"], serde_json::json!(12));
+    async fn rate_per_sec_divides_delta_by_window() {
+        // Pure window math, no broker state: 500 events in 10 seconds
+        // read as 50 per second, rounded to the nearest whole event.
+        use crate::v5::monitor::rate_per_sec;
+        assert_eq!(rate_per_sec(600, 100, 10), 50);
+        assert_eq!(rate_per_sec(1200, 200, 10), 100);
+        assert_eq!(rate_per_sec(5, 5, 7), 0);
+        // A zero window counts as one second; a backwards counter
+        // (owner restart) reads as no events.
+        assert_eq!(rate_per_sec(30, 10, 0), 20);
+        assert_eq!(rate_per_sec(10, 30, 5), 0);
     }
 
     #[tokio::test]
     async fn node_snapshot_returns_same_shape_as_global() {
+        // Fresh state, no sampler writes: both routes read the same
+        // live gauges and the same empty window.
         let state = standalone_state();
-        state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded_by(2);
-        state.metrics.inc_messages_dropped();
-        state.metrics.inc_rules_executed();
-        state.metrics.set_active_connections(1);
-        let prev = crate::v5::monitor::MonitorSample {
-            time_stamp: 1_700_000_100,
-            connections: 0,
-            live_connections: 0,
-            topics: 0,
-            subscriptions: 0,
-            subscriptions_durable: 4,
-            disconnected_durable_sessions: 5,
-            received: 0,
-            sent: 0,
-            dropped: 0,
-            persisted: 6,
-            validation_succeeded: 7,
-            validation_failed: 8,
-            transformation_succeeded: 9,
-            transformation_failed: 10,
-            rules_matched: 0,
-            actions_executed: 11,
-            actions_messages: 12,
-        };
-        state.monitor.record(prev);
         let (_, global) = snapshot_body(monitor_current(State(state.clone())).await).await;
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response =
                 monitor_current_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
@@ -788,20 +704,17 @@ mod tests {
                     "field {field} must be numeric, got: {body}"
                 );
             }
-            // Same live counters and history carry-over as the global read.
-            assert_eq!(body["received"], global["received"]);
-            assert_eq!(body["sent"], global["sent"]);
-            assert_eq!(body["dropped"], global["dropped"]);
-            assert_eq!(body["rules_matched"], global["rules_matched"]);
-            assert_eq!(body["subscriptions_durable"], serde_json::json!(4));
-            assert_eq!(body["actions_messages"], serde_json::json!(12));
+            assert!(body["node_uptime"].is_u64(), "node route adds node_uptime");
+            assert_eq!(body["received_msg_rate"], serde_json::json!(0));
+            for field in documented_fields() {
+                assert_eq!(body[field], global[field], "field {field}");
+            }
         }
     }
 
     #[tokio::test]
     async fn node_snapshot_unknown_node_is_not_found() {
         let state = standalone_state();
-        state.metrics.inc_messages_received();
         let response = monitor_current_node(State(state), Path("no-such-node".to_string())).await;
         let (status, body) = snapshot_body(response).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -813,7 +726,7 @@ mod tests {
         );
     }
 
-    fn documented_metric_names() -> [&'static str; 28] {
+    fn documented_metric_names() -> [&'static str; 34] {
         [
             "bytes.received",
             "bytes.sent",
@@ -833,28 +746,33 @@ mod tests {
             "messages.sent",
             "messages.dropped",
             "messages.delivered",
+            "messages.delayed",
             "messages.qos0.received",
             "messages.qos1.received",
             "messages.qos2.received",
             "delivery.dropped",
             "delivery.dropped.no_subscribers",
+            "delivery.dropped.qos0_msg",
             "delivery.dropped.queue_full",
             "client.connect",
             "client.connack",
             "client.connected",
             "client.subscribe",
+            "rules.matched",
+            "actions.executed",
+            "messages.transformation_succeeded",
+            "messages.transformation_failed",
         ]
     }
 
     #[tokio::test]
     async fn node_metrics_match_global_names_and_stay_numeric() {
+        // Fresh state, no counter writes: both routes read the same
+        // snapshot, so every served key matches and stays numeric.
         let state = standalone_state();
-        state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded();
-        state.metrics.inc_messages_dropped();
         let (_, global) = snapshot_body(get_metrics(State(state.clone())).await).await;
         let global_map = global.as_object().expect("global metrics is a flat object");
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_metrics_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
@@ -877,9 +795,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_serve_true_counters_and_omit_untracked() {
+        // Fresh state, no counter writes: every served key is present
+        // and numeric (zero is the true count), and keys with no
+        // kernel counter stay out, never as zero. Movement by true
+        // amounts is proved through broker entries in
+        // `metrics_and_stats_move_through_broker_entries` below, with
+        // delivery and delayed scheduling proved in broker-node
+        // `ap09_stats_and_metrics_read_true_broker_values` and in
+        // `tests/api_conformance/cases/stats.json`.
+        let state = standalone_state();
+        let (status, body) = snapshot_body(get_metrics(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        for name in documented_metric_names() {
+            let value = body
+                .get(name)
+                .unwrap_or_else(|| panic!("missing served key {name}: {body}"));
+            assert!(value.is_number(), "{name} is numeric: {value:?}");
+        }
+        // Sums over an empty rule set read zero, honestly.
+        assert_eq!(
+            body["messages.transformation_succeeded"],
+            serde_json::json!(0)
+        );
+        assert_eq!(body["messages.transformation_failed"], serde_json::json!(0));
+        assert_eq!(body["actions.executed"], serde_json::json!(0));
+        assert_eq!(body["messages.delayed"], serde_json::json!(0));
+        // Keys with no kernel counter stay out, never as zero.
+        for missing in [
+            "packets.publish.error",
+            "packets.publish.auth_error",
+            "packets.puback.received",
+            "packets.puback.sent",
+            "packets.pubrec.received",
+            "packets.pubrel.received",
+            "packets.pubcomp.sent",
+            "packets.unsubscribe.received",
+            "packets.unsuback.sent",
+            "packets.disconnect.received",
+            "packets.disconnect.sent",
+            "messages.acked",
+            "messages.retained",
+            "messages.qos0.sent",
+            "messages.qos1.sent",
+            "messages.qos2.sent",
+            "delivery.dropped.expired",
+            "client.disconnected",
+            "client.unsubscribe",
+            "session.created",
+            "session.discarded",
+            "session.resumed",
+            "session.takenover",
+            "session.terminated",
+        ] {
+            assert!(
+                body.get(missing).is_none(),
+                "{missing} must be omitted, got: {body}"
+            );
+        }
+        // The node twin reads the same true values.
+        let response = get_metrics_node(State(state), Path(local_node_name().to_string())).await;
+        let (status, node) = snapshot_body(response).await;
+        assert_eq!(status, StatusCode::OK);
+        for name in documented_metric_names() {
+            assert_eq!(&node[name], &body[name], "{name} matches the node read");
+        }
+    }
+
+    async fn publish_entry(state: &ApiState, entry: serde_json::Value) -> Response {
+        let body = bytes::Bytes::from(serde_json::to_vec(&entry).expect("publish body is JSON"));
+        crate::v5::clients::publish_message(State(state.clone()), body).await
+    }
+
+    async fn subscribe_entry(state: &ApiState, client_id: &str, topic: &str) -> Response {
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"topic": topic, "qos": 0}))
+                .expect("subscribe body is JSON"),
+        );
+        crate::v5::clients::client_subscribe(
+            State(state.clone()),
+            Path(client_id.to_string()),
+            body,
+        )
+        .await
+    }
+
+    /// Attach one live subscriber through the broker: a session from
+    /// the session plane, a mailbox in the delivery table, and a
+    /// subscription through the subscribe entry. Returns the state so
+    /// the test then publishes through the publish entry.
+    fn state_with_live_subscriber() -> (
+        ApiState,
+        tokio::sync::mpsc::UnboundedReceiver<brokerlink::BrokerFrame>,
+    ) {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("ap09-mon-sub", false);
+        state.sessions.bind_session(&session, 9101);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<brokerlink::BrokerFrame>();
+        state.conns.register(9101, tx);
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn metrics_and_stats_move_through_broker_entries() {
+        // Goes through the broker, not only the store: one session
+        // subscribes through the subscribe entry, two publishes go
+        // through the publish entry, and the monitoring reads observe
+        // the true amounts. No direct counter mutation here. Delivery
+        // and delayed scheduling are proved in broker-node
+        // `ap09_stats_and_metrics_read_true_broker_values` and in
+        // `tests/api_conformance/cases/stats.json`.
+        let (state, _rx) = state_with_live_subscriber();
+        let response = subscribe_entry(&state, "ap09-mon-sub", "ap09/mon/#").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = publish_entry(
+            &state,
+            serde_json::json!({
+                "topic": "ap09/mon/data",
+                "payload": "hello",
+                "qos": 0,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = publish_entry(
+            &state,
+            serde_json::json!({
+                "topic": "ap09/mon/kept",
+                "payload": "hello",
+                "qos": 0,
+                "retain": true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (status, after) = snapshot_body(get_metrics(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        // Both publishes drove ingress accounting by the true amount.
+        assert_eq!(after["messages.received"], serde_json::json!(2));
+        assert_eq!(after["packets.publish.received"], serde_json::json!(2));
+        assert_eq!(after["messages.qos0.received"], serde_json::json!(2));
+        // Both fanned out to the live subscriber, so sent and
+        // delivered each moved by two, never sharing one value with
+        // ingress by accident.
+        assert_eq!(after["messages.sent"], serde_json::json!(2));
+        assert_eq!(after["messages.delivered"], serde_json::json!(2));
+        // Keys with no kernel counter stay out, never as zero.
+        assert!(after.get("messages.acked").is_none());
+        // The node twin reads the same true values.
+        let response =
+            get_metrics_node(State(state.clone()), Path(local_node_name().to_string())).await;
+        let (status, node) = snapshot_body(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(node["messages.received"], serde_json::json!(2));
+        assert_eq!(node["messages.sent"], serde_json::json!(2));
+        assert_eq!(node["messages.delivered"], serde_json::json!(2));
+
+        let (_, stats) = snapshot_body(
+            get_stats_node(State(state.clone()), Path(local_node_name().to_string())).await,
+        )
+        .await;
+        // The retained publish landed in the store through the entry,
+        // so the gauge reads the true count.
+        assert_eq!(stats["retained.count"], serde_json::json!(1));
+        // Nothing scheduled a delayed entry through these entries, so
+        // the live wheel honestly reads zero here; the delayed proof
+        // lives in the broker-node test named above.
+        assert_eq!(stats["delayed.count"], serde_json::json!(0));
+        for missing in [
+            "delayed.max",
+            "subscribers.count",
+            "subscribers.max",
+            "subscriptions.shared.count",
+            "subscriptions.shared.max",
+        ] {
+            assert!(
+                stats.get(missing).is_none(),
+                "{missing} must be omitted, got: {stats}"
+            );
+        }
+
+        let (_, current) = snapshot_body(monitor_current(State(state)).await).await;
+        // The gauges come from the live session directory: one bound
+        // session with one subscription on one filter. No history
+        // window exists yet, so every rate reads zero.
+        assert_eq!(current["cluster_sessions"], serde_json::json!(1));
+        assert_eq!(current["subscriptions"], serde_json::json!(1));
+        assert_eq!(current["topics"], serde_json::json!(1));
+        assert_eq!(current["received_msg_rate"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn unmatched_publish_reports_no_match_and_sends_nothing() {
+        // Goes through the broker with no subscriber: the publish
+        // entry answers 202, ingress still counts the message, and
+        // sent and delivered honestly stay at zero instead of
+        // mirroring ingress.
+        let state = standalone_state();
+        let response = publish_entry(
+            &state,
+            serde_json::json!({
+                "topic": "ap09/mgmt/one",
+                "payload": "hello",
+                "qos": 0,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let (status, after) = snapshot_body(get_metrics(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after["messages.received"], serde_json::json!(1));
+        assert_eq!(after["packets.publish.received"], serde_json::json!(1));
+        assert_eq!(after["messages.qos0.received"], serde_json::json!(1));
+        assert_eq!(after["messages.sent"], serde_json::json!(0));
+        assert_eq!(after["messages.delivered"], serde_json::json!(0));
+        assert!(after.get("messages.acked").is_none());
+        // The node twin reads the same true values.
+        let response = get_metrics_node(State(state), Path(local_node_name().to_string())).await;
+        let (status, node) = snapshot_body(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(node["messages.received"], serde_json::json!(1));
+        assert_eq!(node["messages.sent"], serde_json::json!(0));
+        assert_eq!(node["messages.delivered"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
     async fn node_metrics_unknown_node_is_not_found() {
         let state = standalone_state();
-        state.metrics.inc_messages_received();
         let response = get_metrics_node(State(state), Path("no-such-node".to_string())).await;
         let (status, body) = snapshot_body(response).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -891,14 +1034,13 @@ mod tests {
         );
     }
 
-    fn documented_stat_names() -> [&'static str; 24] {
+    fn documented_stat_names() -> [&'static str; 19] {
         [
             "channels.count",
             "channels.max",
             "connections.count",
             "connections.max",
             "delayed.count",
-            "delayed.max",
             "live_connections.count",
             "live_connections.max",
             "cluster_sessions.count",
@@ -909,25 +1051,22 @@ mod tests {
             "sessions.max",
             "suboptions.count",
             "suboptions.max",
-            "subscribers.count",
-            "subscribers.max",
             "subscriptions.count",
             "subscriptions.max",
-            "subscriptions.shared.count",
-            "subscriptions.shared.max",
             "topics.count",
             "topics.max",
         ]
     }
 
     #[tokio::test]
-    async fn node_stats_returns_documented_numeric_fields_from_store() {
+    async fn node_stats_returns_documented_numeric_fields() {
+        // Fresh state, no gauge writes: every served key is present
+        // and numeric, and keys with no kernel counter stay out.
+        // Movement by true amounts is proved through broker entries
+        // in `metrics_and_stats_move_through_broker_entries` and
+        // `retained_maximum_holds_through_clear_entry`.
         let state = standalone_state();
-        state.stats.set_connections(3);
-        state.stats.set_subscriptions(7);
-        state.stats.set_topics(2);
-        state.stats.set_retained(1);
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_stats_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
@@ -945,17 +1084,21 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing {name} for node {known}"));
                 assert!(value.is_number(), "{name} is numeric: {value:?}");
             }
-            // Tracked gauges read the store snapshot exactly.
-            assert_eq!(body["connections.count"], serde_json::json!(3));
-            assert_eq!(body["live_connections.count"], serde_json::json!(3));
-            assert_eq!(body["channels.count"], serde_json::json!(3));
-            assert_eq!(body["sessions.count"], serde_json::json!(3));
-            assert_eq!(body["cluster_sessions.count"], serde_json::json!(3));
-            assert_eq!(body["subscriptions.count"], serde_json::json!(7));
-            assert_eq!(body["suboptions.count"], serde_json::json!(7));
-            assert_eq!(body["topics.count"], serde_json::json!(2));
-            assert_eq!(body["retained.count"], serde_json::json!(1));
-            assert_eq!(body["subscriptions.shared.count"], serde_json::json!(0));
+            // Keys with no kernel counter stay out, never as zero.
+            for missing in [
+                "delayed.max",
+                "subscribers.count",
+                "subscribers.max",
+                "subscriptions.shared.count",
+                "subscriptions.shared.max",
+            ] {
+                assert!(
+                    body.get(missing).is_none(),
+                    "{missing} must be omitted, got: {body}"
+                );
+            }
+            // An empty broker honestly reads zero everywhere, and no
+            // high-water mark sits below its gauge.
             assert_eq!(body["delayed.count"], serde_json::json!(0));
             // High-water marks come from the store and never sit below
             // their gauge.
@@ -977,38 +1120,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_stats_maxima_come_from_store_and_never_fall() {
-        let state = standalone_state();
-        state.stats.set_connections(5);
-        state.stats.set_subscriptions(7);
-        state.stats.set_topics(3);
-        state.stats.set_retained(2);
-        let response = get_stats_node(State(state.clone()), Path("indra-node-1".to_string())).await;
-        let (_, peak) = snapshot_body(response).await;
-        assert_eq!(peak["connections.max"], serde_json::json!(5));
-        assert_eq!(peak["subscriptions.max"], serde_json::json!(7));
-        // Gauges fall; maxima stay at the true peak from the store.
-        state.stats.set_connections(2);
-        state.stats.set_subscriptions(0);
-        state.stats.set_topics(1);
-        state.stats.set_retained(0);
-        let response = get_stats_node(State(state), Path("indra-node-1".to_string())).await;
-        let (status, body) = snapshot_body(response).await;
+    async fn retained_maximum_holds_through_clear_entry() {
+        // Goes through the broker, not only the store: a retained
+        // publish through the publish entry sets the gauge and its
+        // high-water mark, then an empty retained publish clears the
+        // message while the mark holds the true peak. No direct gauge
+        // writes here.
+        let (state, _rx) = state_with_live_subscriber();
+        let response = subscribe_entry(&state, "ap09-mon-sub", "ap09/mon/#").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = publish_entry(
+            &state,
+            serde_json::json!({
+                "topic": "ap09/mon/kept",
+                "payload": "hello",
+                "qos": 0,
+                "retain": true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, full) = snapshot_body(
+            get_stats_node(State(state.clone()), Path(local_node_name().to_string())).await,
+        )
+        .await;
+        assert_eq!(full["retained.count"], serde_json::json!(1));
+        assert_eq!(full["retained.max"], serde_json::json!(1));
+        // An empty retained publish clears the stored message.
+        let response = publish_entry(
+            &state,
+            serde_json::json!({
+                "topic": "ap09/mon/kept",
+                "payload": "",
+                "qos": 0,
+                "retain": true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (status, cleared) =
+            snapshot_body(get_stats_node(State(state), Path(local_node_name().to_string())).await)
+                .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["connections.count"], serde_json::json!(2));
-        assert_eq!(body["connections.max"], serde_json::json!(5));
-        assert_eq!(body["subscriptions.count"], serde_json::json!(0));
-        assert_eq!(body["subscriptions.max"], serde_json::json!(7));
-        assert_eq!(body["topics.count"], serde_json::json!(1));
-        assert_eq!(body["topics.max"], serde_json::json!(3));
-        assert_eq!(body["retained.count"], serde_json::json!(0));
-        assert_eq!(body["retained.max"], serde_json::json!(2));
+        assert_eq!(cleared["retained.count"], serde_json::json!(0));
+        assert_eq!(cleared["retained.max"], serde_json::json!(1));
     }
 
     #[tokio::test]
     async fn node_stats_unknown_node_is_not_found() {
         let state = standalone_state();
-        state.stats.set_connections(1);
         let response = get_stats_node(State(state), Path("no-such-node".to_string())).await;
         let (status, body) = snapshot_body(response).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1021,36 +1181,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_stats_returns_aggregated_numeric_fields_from_store() {
+    async fn global_stats_returns_aggregated_numeric_fields() {
+        // Fresh state, no gauge writes: one row, the local node name,
+        // every served key numeric, untracked keys absent.
         let state = standalone_state();
-        state.stats.set_connections(2);
-        state.stats.set_subscriptions(4);
-        state.stats.set_topics(3);
-        state.stats.set_retained(1);
         let (status, body) = snapshot_body(get_stats(State(state)).await).await;
         assert_eq!(status, StatusCode::OK);
         let rows = body.as_array().expect("global stats is an array");
         assert_eq!(rows.len(), 1, "aggregated snapshot has one row: {body}");
         let row = &rows[0];
-        assert_eq!(row["node"], serde_json::json!(LEGACY_NODE_NAME));
+        assert_eq!(row["node"], serde_json::json!(local_node_name()));
         for name in documented_stat_names() {
             let value = row
                 .get(name)
                 .unwrap_or_else(|| panic!("missing {name}: {body}"));
             assert!(value.is_number(), "{name} is numeric: {value:?}");
         }
-        // Session-related fields reflect the live store, not a fresh scan.
-        assert_eq!(row["connections.count"], serde_json::json!(2));
-        assert_eq!(row["live_connections.count"], serde_json::json!(2));
-        assert_eq!(row["channels.count"], serde_json::json!(2));
-        assert_eq!(row["sessions.count"], serde_json::json!(2));
-        assert_eq!(row["cluster_sessions.count"], serde_json::json!(2));
-        assert!(row["sessions.count"].as_u64().expect("sessions") >= 1);
-        assert_eq!(row["subscriptions.count"], serde_json::json!(4));
-        assert_eq!(row["suboptions.count"], serde_json::json!(4));
-        assert_eq!(row["topics.count"], serde_json::json!(3));
-        assert_eq!(row["retained.count"], serde_json::json!(1));
-        assert_eq!(row["subscriptions.shared.count"], serde_json::json!(0));
+        for missing in [
+            "delayed.max",
+            "subscribers.count",
+            "subscribers.max",
+            "subscriptions.shared.count",
+            "subscriptions.shared.max",
+        ] {
+            assert!(
+                row.get(missing).is_none(),
+                "{missing} must be omitted, got: {body}"
+            );
+        }
+        // An empty broker honestly reads zero everywhere.
         assert_eq!(row["delayed.count"], serde_json::json!(0));
         for (count, max) in [
             ("connections.count", "connections.max"),
@@ -1069,47 +1228,16 @@ mod tests {
 
     #[tokio::test]
     async fn global_stats_matches_node_stats_snapshot() {
+        // Fresh state, no gauge writes: the aggregated row carries the
+        // same documented names as the per-node read.
         let state = standalone_state();
-        state.stats.set_connections(3);
-        state.stats.set_subscriptions(7);
-        state.stats.set_topics(2);
-        state.stats.set_retained(1);
         let (_, global) = snapshot_body(get_stats(State(state.clone())).await).await;
         let row = &global.as_array().expect("global stats is an array")[0];
         let (_, node) =
-            snapshot_body(get_stats_node(State(state), Path(LEGACY_NODE_NAME.to_string())).await)
+            snapshot_body(get_stats_node(State(state), Path(local_node_name().to_string())).await)
                 .await;
         for name in documented_stat_names() {
             assert_eq!(&row[name], &node[name], "{name} matches the node read");
         }
-    }
-
-    #[tokio::test]
-    async fn global_stats_maxima_come_from_store_and_never_fall() {
-        let state = standalone_state();
-        state.stats.set_connections(5);
-        state.stats.set_subscriptions(7);
-        state.stats.set_topics(3);
-        state.stats.set_retained(2);
-        let (_, first) = snapshot_body(get_stats(State(state.clone())).await).await;
-        let peak = &first.as_array().expect("global stats is an array")[0];
-        assert_eq!(peak["connections.max"], serde_json::json!(5));
-        assert_eq!(peak["subscriptions.max"], serde_json::json!(7));
-        // Gauges fall; maxima stay at the true peak from the store.
-        state.stats.set_connections(2);
-        state.stats.set_subscriptions(0);
-        state.stats.set_topics(1);
-        state.stats.set_retained(0);
-        let (status, body) = snapshot_body(get_stats(State(state)).await).await;
-        assert_eq!(status, StatusCode::OK);
-        let row = &body.as_array().expect("global stats is an array")[0];
-        assert_eq!(row["connections.count"], serde_json::json!(2));
-        assert_eq!(row["connections.max"], serde_json::json!(5));
-        assert_eq!(row["subscriptions.count"], serde_json::json!(0));
-        assert_eq!(row["subscriptions.max"], serde_json::json!(7));
-        assert_eq!(row["topics.count"], serde_json::json!(1));
-        assert_eq!(row["topics.max"], serde_json::json!(3));
-        assert_eq!(row["retained.count"], serde_json::json!(0));
-        assert_eq!(row["retained.max"], serde_json::json!(2));
     }
 }

@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-dbauth-cache-ttl-secs",
+  "match": "--dbauth-cache-ttl-secs",
+  "output": "      --dbauth-cache-ttl-secs <DBAUTH_CACHE_TTL_SECS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

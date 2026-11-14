@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "status",
+    "--help"
+  ],
+  "item": "cmd-ctl-status",
+  "match": "status",
+  "output": "Show node status (reports whether the running node is up)\nUsage: indra ctl status",
+  "output_bytes": 118,
+  "returncode": 0,
+  "verified": true
+}

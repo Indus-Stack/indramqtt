@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-ldap-user-filter",
+  "match": "--ldap-user-filter",
+  "output": "      --ldap-user-filter <LDAP_USER_FILTER>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

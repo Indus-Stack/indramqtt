@@ -14,8 +14,20 @@ name = "indra"
 path = "src/indra.rs"
 
 [[test]]
+name = "docs_examples"
+path = "tests/docs_examples.rs"
+
+[[test]]
+name = "docs_dx01"
+path = "tests/docs_dx01.rs"
+
+[[test]]
 name = "e2e_integration"
 path = "../../tests/e2e_integration.rs"
+
+[[test]]
+name = "mc04_messaging_tools"
+path = "../../tests/mc04_messaging_tools.rs"
 
 [[test]]
 name = "soak_chaos_suite"
@@ -24,6 +36,14 @@ path = "../../tests/soak_chaos_suite.rs"
 [[test]]
 name = "mt_publish_bench"
 path = "../../tests/mt_publish_bench.rs"
+
+[[test]]
+name = "listener_conformance"
+path = "tests/listener_conformance.rs"
+
+[[test]]
+name = "reconnect_storm"
+path = "tests/reconnect_storm.rs"
 
 [dependencies]
 brokerlink = { workspace = true }
@@ -38,6 +58,7 @@ broker-rules-enterprise = { workspace = true }
 broker-connectors = { workspace = true }
 broker-cluster = { workspace = true }
 broker-api = { workspace = true }
+broker-delayed = { workspace = true }
 broker-observability = { workspace = true }
 broker-gateway = { workspace = true }
 bytes = { workspace = true }
@@ -55,12 +76,34 @@ toml = { workspace = true }
 # broker-auth and broker-connectors.
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
+# Enable std so PEM errors convert to Box. Keeps error texts.
+rustls-pki-types = { version = "1", features = ["std"] }
+# TLS PSK for the native PSK listener path only. The certificate
+# TLS listener keeps rustls. Versions already in the workspace
+# lock file. Licences: Apache-2.0 (openssl), MIT OR Apache-2.0
+# (tokio-openssl).
+openssl = { version = "0.10" }
+tokio-openssl = { version = "0.6" }
+# Client certificate field pull (CN, subject, SANs) for tenant rules.
+# Licence: MIT OR Apache-2.0.
+x509-parser = { version = "0.16" }
+# MQTT over WebSocket on the kernel listener. Version 0.24 is already
+# in the workspace lock file (via axum). Licence: MIT OR Apache-2.0.
+tokio-tungstenite = { version = "0.24" }
+# HTTP types for the WebSocket upgrade check. Version 1 is already in
+# the workspace lock file (via axum). Licence: MIT OR Apache-2.0.
+http = { version = "1" }
+# Stream and sink traits for the WebSocket transport.
+# Licence: MIT OR Apache-2.0.
+futures = { workspace = true }
 
 [features]
 # Each feature adds one connector kind to the build. With a feature off,
 # the registration of that kind fails with an error that names the
 # feature. `full` is the set for release builds and for the image.
+# Default build: light sinks only (no vendor SDK). The soak suite's
+# Kafka legs need the community `kafka` feature (X1-10); a feature build
+# (or `--all-features`) restores them.
 default = []
 s3 = ["broker-api/s3"]
 aws_iot = ["broker-api/aws_iot"]
@@ -70,6 +113,17 @@ azure_iot = ["broker-api/azure_iot"]
 bigquery = ["broker-api/bigquery"]
 dynamodb = ["broker-api/dynamodb"]
 gcp_iot = ["broker-api/gcp_iot"]
+clickhouse = ["broker-api/clickhouse"]
+kafka = ["broker-api/kafka"]
+elasticsearch = ["broker-api/elasticsearch"]
+rabbitmq = ["broker-api/rabbitmq"]
+cassandra = ["broker-api/cassandra"]
+confluent = ["broker-api/confluent"]
+couchbase = ["broker-api/couchbase"]
+mongodb = ["broker-api/mongodb"]
+gcp_pubsub = ["broker-api/gcp_pubsub"]
+kinesis = ["broker-api/kinesis"]
+opc_ua = ["broker-api/opc_ua"]
 full = [
     "s3",
     "aws_iot",
@@ -79,15 +133,26 @@ full = [
     "bigquery",
     "dynamodb",
     "gcp_iot",
+    "clickhouse",
+    "kafka",
+    "elasticsearch",
+    "rabbitmq",
+    "cassandra",
+    "confluent",
+    "couchbase",
+    "mongodb",
+    "gcp_pubsub",
+    "kinesis",
+    "opc_ua",
 ]
 
 [dev-dependencies]
 flate2 = { workspace = true }
-yamldap = "0.2"
 tempfile = "3"
+serde = { workspace = true }
+serde_norway = "0.9"
 base64 = { workspace = true }
 rand = { workspace = true }
-rsa = { workspace = true }
 jsonwebtoken = { workspace = true }
 ring = "0.17"
 picky-krb = "0.12"

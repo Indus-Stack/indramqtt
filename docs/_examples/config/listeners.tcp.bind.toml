@@ -1,0 +1,25 @@
+[example]
+area = "config"
+item = "listeners.tcp.bind"
+kind = "setting"
+expect = "connected"
+expected = "The broker binds the configured address and one client connects."
+source = "`crates/broker-node/src/main.rs` binds each enabled listener from the file, and `crates/broker-node/src/native.rs` serves MQTT on it."
+action = "Connect one client to the configured bind."
+config = '''
+[listeners.tcp]
+bind = "127.0.0.1:${MQTT_PORT}"
+
+[auth]
+allow_anonymous = true
+'''
+display_config = '''
+[listeners.tcp]
+bind = "127.0.0.1:1883"
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("tcp-bind-client", v5=True)
+disconnect(sock)
+print("connected")
+'''

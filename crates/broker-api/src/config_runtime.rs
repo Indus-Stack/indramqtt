@@ -180,6 +180,9 @@ async fn apply_candidate(
     if let Err(err) = state.config.validate_whole_snapshot(candidate) {
         return Err(Box::new(bad_request(err.to_string())));
     }
+    if let Err(err) = validate_connector_io_settings(candidate) {
+        return Err(Box::new(bad_request(err)));
+    }
     let previous = state.config.snapshot();
     // An empty administrator list restores the default account and its
     // default password. Refuse a candidate that removes all the
@@ -221,8 +224,18 @@ async fn apply_candidate(
             "admin_users backend refused: {err}"
         ))));
     }
-    let (connector_undo, pending_live) =
-        apply_connectors_live(&state.engine, &previous, candidate).await;
+    let _sink_guard = state.action_sink_lock.lock().await;
+    let (connector_undo, pending_live) = apply_connectors_live(
+        &state.engine,
+        &previous,
+        candidate,
+        &state.connectors.data_dir(),
+    )
+    .await;
+    // Default-zone knobs (AP-03): apply to the live session manager so a
+    // reload carrying kept knobs keeps bounding new sessions. The setters
+    // never fail; a later commit failure rolls them back below.
+    apply_zone_live(&state.sessions, &candidate.global_zone);
 
     // 3. Single whole commit: validate again, swap, version, persist.
     // A failure rolls every live owner back to the previous snapshot.
@@ -230,12 +243,36 @@ async fn apply_candidate(
         Ok(version) => {
             // Keep the observable v5 connector list in step with the
             // committed snapshot (reference form, redacted at read time);
-            // removals drop, additions/updates upsert.
-            super::v5::rules::reconcile_connectors_store(
-                &previous.connectors,
-                &candidate.connectors,
-            )
-            .await;
+            // removals drop, additions/updates upsert. Reconcile before
+            // the action rebuild so the rebuild reads the new connector
+            // document, never the previous one.
+            state
+                .connectors
+                .reconcile(&previous.connectors, &candidate.connectors)
+                .await;
+            // MV-01/SB-03: bring every stored action's owned sink back
+            // in step with the committed connectors (dependent actions
+            // rebuilt from the applied settings, sinks dropped when the
+            // target connector is gone). Runs after the commit, so the
+            // old generation never half-swaps; a rebuild failure keeps
+            // the previous sink and reports through the alarm.
+            let replaced = crate::v5::action_sinks::rebuild_all_action_sinks(
+                &state.engine,
+                &state.connectors,
+                &state.actions,
+                &state.alarms,
+            );
+            // Probe the rebuilt sinks before the reload answers. A down
+            // target reads `disconnected` from a real attempt.
+            crate::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |_| true)
+                .await;
+            // Drain each replaced generation so a buffered batch still
+            // reaches the old target after the swap.
+            for old in replaced {
+                let _ = old.flush().await;
+            }
+            // A kept pending record stays visible and raises its alarm.
+            state.raise_unavailable_stored_kinds();
             Ok(ReloadResult {
                 version,
                 diff,
@@ -247,7 +284,9 @@ async fn apply_candidate(
             let _ = state.engine.apply_snapshot_conf(&previous.rules);
             let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
             undo_connectors_live(&state.engine, &connector_undo);
+            apply_zone_live(&state.sessions, &previous.global_zone);
             let _ = ensure_history_truncated(&state.config, history_len_before);
+            state.raise_unavailable_stored_kinds();
             Err(Box::new(apply_failed(format!(
                 "config commit failed: {err}"
             ))))
@@ -276,6 +315,9 @@ async fn apply_restore(
     if let Err(err) = state.config.validate_whole_snapshot(&candidate) {
         return Err(Box::new(bad_request(err.to_string())));
     }
+    if let Err(err) = validate_connector_io_settings(&candidate) {
+        return Err(Box::new(bad_request(err)));
+    }
     let previous = state.config.snapshot();
     let diff = state.config.diff(&previous, &candidate);
     if let Err(err) = state.auth.apply_snapshot_conf(&candidate.mqtt_users) {
@@ -299,15 +341,48 @@ async fn apply_restore(
             "admin_users backend refused: {err}"
         ))));
     }
-    let (connector_undo, pending_live) =
-        apply_connectors_live(&state.engine, &previous, &candidate).await;
+    let _sink_guard = state.action_sink_lock.lock().await;
+    let (connector_undo, pending_live) = apply_connectors_live(
+        &state.engine,
+        &previous,
+        &candidate,
+        &state.connectors.data_dir(),
+    )
+    .await;
+    // Default-zone knobs (AP-03): same live apply as a reload, with the
+    // same rollback when the restore fails to commit.
+    apply_zone_live(&state.sessions, &candidate.global_zone);
     match state.config.history_restore(id, actor) {
         Ok(version) => {
-            super::v5::rules::reconcile_connectors_store(
-                &previous.connectors,
-                &candidate.connectors,
-            )
-            .await;
+            // Reconcile before the action rebuild so the rebuild reads
+            // the restored connector document, never the previous one.
+            state
+                .connectors
+                .reconcile(&previous.connectors, &candidate.connectors)
+                .await;
+            // MV-01/SB-03: bring every stored action's owned sink back
+            // in step with the committed connectors (dependent actions
+            // rebuilt from the applied settings, sinks dropped when the
+            // target connector is gone). Runs after the commit, so the
+            // old generation never half-swaps; a rebuild failure keeps
+            // the previous sink and reports through the alarm.
+            let replaced = crate::v5::action_sinks::rebuild_all_action_sinks(
+                &state.engine,
+                &state.connectors,
+                &state.actions,
+                &state.alarms,
+            );
+            // Probe the rebuilt sinks before the restore answers. A down
+            // target reads `disconnected` from a real attempt.
+            crate::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |_| true)
+                .await;
+            // Drain each replaced generation so a buffered batch still
+            // reaches the old target after the swap.
+            for old in replaced {
+                let _ = old.flush().await;
+            }
+            // A kept pending record stays visible and raises its alarm.
+            state.raise_unavailable_stored_kinds();
             Ok(ReloadResult {
                 version,
                 diff,
@@ -319,6 +394,8 @@ async fn apply_restore(
             let _ = state.engine.apply_snapshot_conf(&previous.rules);
             let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
             undo_connectors_live(&state.engine, &connector_undo);
+            apply_zone_live(&state.sessions, &previous.global_zone);
+            state.raise_unavailable_stored_kinds();
             Err(Box::new(apply_failed(format!(
                 "config commit failed: {err}"
             ))))
@@ -377,6 +454,25 @@ fn resolve_connector_params(entry: &broker_config::ConnectorEntry) -> Option<ser
     Some(params)
 }
 
+/// Refuse a document-store connector entry that carries an unsupported
+/// pool, pipelining, inactivity or TLS field. The create and update
+/// paths refuse these fields before a write. The file, reload, restore
+/// and boot paths call this check so an entry cannot be stored and then
+/// ignored.
+fn validate_connector_io_settings(snapshot: &FullSnapshot) -> Result<(), String> {
+    for entry in &snapshot.connectors.connectors {
+        let kind = crate::v5::action_sinks::canonical_action_kind(&entry.connector_type);
+        if !matches!(kind, "mongodb" | "couchbase" | "elasticsearch") {
+            continue;
+        }
+        let Some(params) = resolve_connector_params(entry) else {
+            continue;
+        };
+        crate::v5::action_sinks::validate_connector_io_bounds(&params, &entry.id, "config file")?;
+    }
+    Ok(())
+}
+
 fn resolve_params_secrets_in_place(
     value: &mut serde_json::Value,
 ) -> Result<(), broker_config::ConfigError> {
@@ -421,6 +517,7 @@ async fn apply_connectors_live(
     engine: &broker_rules::RuleEngine,
     previous: &Arc<FullSnapshot>,
     candidate: &FullSnapshot,
+    data_dir: &std::path::Path,
 ) -> (ConnectorLiveUndo, Vec<String>) {
     let mut undo = ConnectorLiveUndo {
         removed: Vec::new(),
@@ -467,33 +564,55 @@ async fn apply_connectors_live(
                 take_live_sink_alias(engine, &entry.connector_type, &entry.id, &mut undo);
             }
         }
+        // KC-00: a kind whose capability state is not `ready` never goes
+        // live; the stored record stays readable and the id is reported in
+        // `pending_live` without a probe dial.
+        if crate::v5::rules::kind_refusal(&entry.connector_type).is_some() {
+            pending_live.push(entry.id.clone());
+            continue;
+        }
         let Some(params) = resolve_connector_params(entry) else {
             pending_live.push(entry.id.clone());
             continue;
         };
+        let kind = crate::v5::action_sinks::canonical_action_kind(&entry.connector_type);
+        if matches!(kind, "mongodb" | "couchbase" | "elasticsearch") {
+            if let Err(error) = crate::v5::action_sinks::validate_connector_io_bounds(
+                &params,
+                &entry.id,
+                "config file",
+            ) {
+                tracing::warn!(connector = %entry.id, "{error}");
+                pending_live.push(entry.id.clone());
+                continue;
+            }
+        }
         if !super::v5::rules::probe_connector_reachable(&params).await {
             pending_live.push(entry.id.clone());
             continue;
         }
-        // A disabled Cargo feature fails closed here: the entry stays
-        // persist-only and the missing feature is logged naming it.
-        if let Err(feature_error) = super::v5::rules::try_register_live_sink(
+        // A refused build fails closed here: the entry stays
+        // persist-only and the error is logged naming it.
+        if let Err(register_error) = super::v5::rules::try_register_live_sink(
             engine,
             &entry.connector_type,
             &entry.id,
             &params,
+            data_dir,
         )
         .await
         {
             tracing::warn!(
                 connector = %entry.id,
                 kind = %entry.connector_type,
-                "{feature_error}"
+                "{register_error}"
             );
             pending_live.push(entry.id.clone());
             continue;
         }
-        if engine.connectors().get(&entry.id).is_some() {
+        if let Some(sink) = engine.connectors().get(&entry.id) {
+            // Reconcile the connector health before the reload answers.
+            let _ = sink.probe().await;
             undo.added.push(entry.id.clone());
             undo.added
                 .push(format!("{}:{}", entry.connector_type, entry.id));
@@ -567,6 +686,18 @@ fn undo_connectors_live(engine: &broker_rules::RuleEngine, undo: &ConnectorLiveU
     }
 }
 
+/// Apply one snapshot's default-zone knobs to the live session manager
+/// (AP-03). New sessions inherit them. Infallible by construction: the
+/// setters floor and store only.
+fn apply_zone_live(
+    sessions: &Arc<broker_session::SessionManager>,
+    zone: &broker_config::GlobalZoneConf,
+) {
+    sessions.set_max_qos1_inflight(zone.max_inflight as usize);
+    sessions.set_max_offline_queue(zone.max_mqueue_len.map(|len| len as usize));
+    sessions.set_max_topic_alias(zone.max_topic_alias);
+}
+
 /// Reload the broker from a candidate snapshot: validate whole, show the
 /// diff, apply every root, version the change, and persist.
 ///
@@ -599,8 +730,28 @@ pub async fn list_history(State(state): State<ApiState>) -> Json<serde_json::Val
     }))
 }
 
-/// Fetch one version with its (redacted) snapshot.
-pub async fn get_history_version(State(state): State<ApiState>, Path(id): Path<u64>) -> Response {
+/// Fetch one version with its (redacted) snapshot. The query
+/// `secrets=raw` returns the stored snapshot with its secrets as stored
+/// (references stay references). Only `backup export` asks for it, so an
+/// import restores the secrets. A caller that is not a full administrator
+/// gets 403.
+pub async fn get_history_version(
+    State(state): State<ApiState>,
+    Path(id): Path<u64>,
+    full_admin: Option<axum::Extension<crate::api_auth::FullAdministrator>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let raw = query.get("secrets").map(String::as_str) == Some("raw");
+    if raw && !full_admin.is_some_and(|flag| flag.0 .0) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "FORBIDDEN",
+                "message": "secrets=raw needs a full administrator: the administrator role with no scope list"
+            })),
+        )
+            .into_response();
+    }
     match state.config.history_get(id) {
         Some(version) => (
             StatusCode::OK,
@@ -610,7 +761,11 @@ pub async fn get_history_version(State(state): State<ApiState>, Path(id): Path<u
                 "timestamp_secs": version.timestamp_secs,
                 "summary": version.summary,
                 "changes": version.changes,
-                "snapshot": redact_snapshot(&version.snapshot),
+                "snapshot": if raw {
+                    serde_json::to_value(&version.snapshot).unwrap_or(serde_json::Value::Null)
+                } else {
+                    redact_snapshot(&version.snapshot)
+                },
             })),
         )
             .into_response(),
@@ -639,7 +794,9 @@ pub async fn restore_history_version(
 /// by file name, environment variable by name, flag) or report defaults
 /// when no layer set them. Registry keys (`mqtt_users.users.<name>`,
 /// `rules.rules.<id>`, `connectors.connectors.<id>`,
-/// `admin_users.users.<name>`, `mqtt_users.acls`) report the current
+/// `admin_users.users.<name>`, `mqtt_users.acls`,
+/// `mqtt_users.tenants.<tenant>.users.<name>`,
+/// `mqtt_users.tenants.<tenant>.acls`) report the current
 /// runtime version. Secret values render as
 /// `<redacted:file:...>` / `<redacted:env:...>` markers, never plaintext.
 pub async fn explain_config(
@@ -722,6 +879,23 @@ fn registry_key_to_diff_setting(key: &str) -> String {
             return format!("{root}[{name}]");
         }
     }
+    // Per-tenant keys (TM-01): `mqtt_users.tenants.<tenant>.users.<name>`
+    // maps to `mqtt_users.tenants[<tenant>].users[<name>]`, and
+    // `mqtt_users.tenants.<tenant>.acls` to
+    // `mqtt_users.tenants[<tenant>].acls`. Best effort on dotted names:
+    // the split runs on the `.users.` marker and the `.acls` suffix.
+    if let Some(rest) = key.strip_prefix("mqtt_users.tenants.") {
+        if let Some(tenant) = rest.strip_suffix(".acls") {
+            return format!("mqtt_users.tenants[{tenant}].acls");
+        }
+        if let Some(pos) = rest.find(".users.") {
+            let (tenant, name) = rest.split_at(pos);
+            return format!(
+                "mqtt_users.tenants[{tenant}].users[{}]",
+                &name[".users.".len()..]
+            );
+        }
+    }
     key.to_string()
 }
 
@@ -745,6 +919,32 @@ fn registry_value(snapshot: &Arc<FullSnapshot>, key: &str) -> Option<String> {
         let mut value = serde_json::to_value(&snapshot.mqtt_users.acls).ok()?;
         redact_json_in_place(&mut value);
         return serde_json::to_string(&value).ok();
+    }
+    // Per-tenant tables (TM-01): `mqtt_users.tenants.<tenant>.acls`
+    // renders one tenant ACL list; `mqtt_users.tenants.<tenant>.users.<name>`
+    // renders one tenant user. Secrets stay redacted. Dotted tenant ids
+    // match by prefix against the stored tables.
+    if let Some(rest) = key.strip_prefix("mqtt_users.tenants.") {
+        for table in &snapshot.mqtt_users.tenants {
+            let Some(suffix) = rest
+                .strip_prefix(table.tenant.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+            else {
+                continue;
+            };
+            if let Some(name) = suffix.strip_prefix("users.") {
+                let user = table.users.iter().find(|entry| entry.username == name)?;
+                let mut value = serde_json::to_value(user).ok()?;
+                redact_json_in_place(&mut value);
+                return serde_json::to_string(&value).ok();
+            }
+            if suffix == "acls" {
+                let mut value = serde_json::to_value(&table.acls).ok()?;
+                redact_json_in_place(&mut value);
+                return serde_json::to_string(&value).ok();
+            }
+        }
+        return None;
     }
     if let Some(id) = key.strip_prefix("rules.rules.") {
         let rule = snapshot.rules.rules.iter().find(|entry| entry.id == id)?;
@@ -818,24 +1018,7 @@ fn redact_snapshot(snapshot: &FullSnapshot) -> serde_json::Value {
 }
 
 fn redact_json_in_place(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => {
-            if secrets::is_secret_ref(text.trim()) {
-                *text = secrets::redact_value(text.trim());
-            }
-        }
-        serde_json::Value::Array(entries) => {
-            for entry in entries {
-                redact_json_in_place(entry);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (_, entry) in map.iter_mut() {
-                redact_json_in_place(entry);
-            }
-        }
-        _ => {}
-    }
+    secrets::mask_secrets(value);
 }
 
 #[cfg(test)]
@@ -1009,6 +1192,9 @@ mod tests {
         broker_config::RuleEntry {
             id: id.to_string(),
             name: id.to_string(),
+            description: String::new(),
+            metadata: serde_json::json!({}),
+            tenant: "default".to_string(),
             topic_filter: filter.to_string(),
             sql_query: None,
             enabled: true,
@@ -1150,6 +1336,10 @@ mod tests {
             role: "viewer".to_string(),
             description: String::new(),
             must_change_password: false,
+            mfa_secret: String::new(),
+            mfa_enabled: false,
+            mfa_last_step: None,
+            scopes: None,
         });
         snapshot
             .connectors
@@ -1163,6 +1353,9 @@ mod tests {
         snapshot.rules.rules.push(broker_config::RuleEntry {
             id: "dangling".to_string(),
             name: "dangling".to_string(),
+            description: String::new(),
+            metadata: serde_json::json!({}),
+            tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: None,
             enabled: true,
@@ -1195,6 +1388,65 @@ mod tests {
         assert!(harness.state.engine.list_rules().is_empty());
         assert_eq!(harness.state.config.history_list().len(), history_len);
 
+        let dir = harness.state.config.dir().to_path_buf();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file or reload entry for a document store refuses an
+    /// unsupported pool, pipelining, inactivity or TLS field. The
+    /// whole reload is rejected before the store changes.
+    #[tokio::test]
+    async fn reload_refuses_document_store_io_settings_from_a_file_entry() {
+        let harness = Harness::start().await;
+        let token = harness.login_as_admin().await;
+        let before = (*harness.state.config.snapshot()).clone();
+        for (kind, config) in [
+            (
+                "mongodb",
+                json!({"server": "127.0.0.1:27017", "database": "db"}),
+            ),
+            (
+                "couchbase",
+                json!({"server": "127.0.0.1:11210", "username": "u"}),
+            ),
+            ("elasticsearch", json!({"server": "127.0.0.1:9200"})),
+        ] {
+            for (field, value) in [
+                ("ssl", json!(true)),
+                ("pool_size", json!(8)),
+                ("pipelining", json!(true)),
+                ("enable_pipelining", json!(true)),
+                ("max_inactive", json!(8)),
+            ] {
+                let mut snapshot = before.clone();
+                let mut connector = config.clone();
+                connector[field] = value;
+                snapshot
+                    .connectors
+                    .connectors
+                    .push(broker_config::ConnectorEntry {
+                        id: format!("mv02c-file-{kind}-{field}"),
+                        connector_type: kind.to_string(),
+                        enable: true,
+                        config: connector.to_string(),
+                    });
+                let (status, body) = harness
+                    .post_auth(
+                        "/api/v1/config/reload",
+                        json!({"snapshot": snapshot}),
+                        &token,
+                    )
+                    .await;
+                assert_eq!(status, 400, "{kind} {field} must refuse: {body}");
+                let error = body["error"].as_str().unwrap_or("");
+                assert!(error.contains(field), "{kind} {field}: {error}");
+                assert_eq!(
+                    harness.state.config.snapshot().connectors.connectors.len(),
+                    before.connectors.connectors.len(),
+                    "{kind} {field} must not enter the store"
+                );
+            }
+        }
         let dir = harness.state.config.dir().to_path_buf();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1900,5 +2152,294 @@ mod tests {
 
         std::fs::remove_dir_all(&config_dir).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// SB-27 reload keeps a stored pending record and raises its alarm.
+    /// The reload, a rolled-back bad change and a history restore all
+    /// keep the record. The API and the alarm name it.
+    #[tokio::test]
+    async fn sb27_reload_keeps_pending_mysql_and_restores_history() {
+        let harness = Harness::start().await;
+        let token = harness.login_as_admin().await;
+        let mut snapshot = (*harness.state.config.snapshot()).clone();
+        snapshot
+            .connectors
+            .connectors
+            .push(broker_config::ConnectorEntry {
+                id: "sb27-mysql".to_string(),
+                connector_type: "timescaledb".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            });
+        let (status, body) = harness
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": snapshot, "actor": "tester", "summary": "add pending timescaledb"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "reload keeps pending record: {body}");
+        let pending = body["pending_live"].as_array().expect("pending list");
+        assert!(pending.iter().any(|id| id == "sb27-mysql"), "{body:?}");
+        let (status, connectors) = harness.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let row = connectors
+            .as_array()
+            .expect("connector list")
+            .iter()
+            .find(|row| row["id"] == json!("sb27-mysql"))
+            .expect("pending record stays listed");
+        assert_eq!(row["status"], json!("disconnected"));
+        let (status, alarms) = harness.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:sb27-mysql"),
+            "{names:?}"
+        );
+        let history_len = harness.state.config.history_list().len();
+        let mut bad = (*harness.state.config.snapshot()).clone();
+        bad.connectors
+            .connectors
+            .push(broker_config::ConnectorEntry {
+                id: "sb27-bad".to_string(),
+                connector_type: "not-a-connector".to_string(),
+                enable: true,
+                config: String::new(),
+            });
+        let (status, _) = harness
+            .post_auth("/api/v1/config/reload", json!({"snapshot": bad}), &token)
+            .await;
+        assert_eq!(status, 400, "bad change rolls back");
+        assert!(
+            harness
+                .state
+                .config
+                .snapshot()
+                .connectors
+                .connectors
+                .iter()
+                .any(|entry| entry.id == "sb27-mysql"),
+            "rollback keeps the pending record"
+        );
+        assert_eq!(harness.state.config.history_list().len(), history_len);
+        let (status, history) = harness.get_auth("/api/v1/config/history", &token).await;
+        assert_eq!(status, 200);
+        let id = history["versions"]
+            .as_array()
+            .expect("versions")
+            .first()
+            .expect("one version")
+            .get("id")
+            .and_then(|id| id.as_u64())
+            .expect("version id");
+        let (status, body) = harness
+            .post_auth(
+                &format!("/api/v1/config/history/{id}/restore"),
+                json!({"actor": "tester"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "restore keeps pending record: {body}");
+        assert!(
+            harness
+                .state
+                .config
+                .snapshot()
+                .connectors
+                .connectors
+                .iter()
+                .any(|entry| entry.id == "sb27-mysql"),
+            "restored snapshot keeps the record"
+        );
+        let (status, alarms) = harness.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:sb27-mysql"),
+            "{names:?}"
+        );
+        let dir = harness.state.config.dir().to_path_buf();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reload that cannot rebuild an action sink keeps the previous
+    /// registered sink and its delivery. The reload still commits the
+    /// connector document.
+    #[tokio::test]
+    async fn reload_rebuild_failure_keeps_the_previous_action_sink() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("receiver binds");
+        let address = listener.local_addr().expect("receiver address");
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&delivered);
+        let receiver = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    loop {
+                        let mut byte = [0_u8; 1];
+                        if socket.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())
+                        })
+                        .flatten()
+                        .unwrap_or(0);
+                    let mut body = vec![0_u8; length];
+                    let _ = socket.read_exact(&mut body).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    count.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let harness = Harness::start().await;
+        let token = harness.login_as_admin().await;
+        let secret_dir = unique_dir("mv01-reload-secret");
+        std::fs::create_dir_all(&secret_dir).expect("secret dir");
+        let secret = secret_dir.join("url");
+        std::fs::write(&secret, format!("http://{address}")).expect("secret file");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/connectors",
+                json!({
+                    "name": "mv01-reload-link",
+                    "type": "webhook",
+                    "url": format!("file:{}", secret.display()),
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "connector create: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/actions",
+                json!({
+                    "name": "mv01-reload-action",
+                    "type": "webhook",
+                    "connector": "mv01-reload-link",
+                    "parameters": {"path": "/reload"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "action create: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "mv01-reload-rule",
+                    "sql": "SELECT * FROM \"mv01/reload\"",
+                    "actions": ["mv01-reload-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule create: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "mv01/reload", "payload": "one"}),
+                &token,
+            )
+            .await;
+        assert!(status == 200 || status == 202, "publish: {body}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while delivered.load(Ordering::SeqCst) < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the old sink delivers before the reload"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut snapshot = (*harness.state.config.snapshot()).clone();
+        // The v5 rule names the action dispatch key, which the whole-config
+        // validator does not list as a connector. Remove it for the reload
+        // and create it again through the API after the reload.
+        snapshot
+            .rules
+            .rules
+            .retain(|rule| rule.id != "mv01-reload-rule");
+        std::fs::remove_file(&secret).expect("remove the secret");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": snapshot}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "the reload itself commits: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "mv01-reload-rule",
+                    "sql": "SELECT * FROM \"mv01/reload\"",
+                    "actions": ["mv01-reload-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule re-create: {body}");
+        let (status, body) = harness
+            .get_auth("/api/v5/actions/mv01-reload-action", &token)
+            .await;
+        assert_eq!(status, 200, "the action stays readable: {body}");
+        assert_eq!(
+            body["status"], "disconnected",
+            "the rebuild failure reports the missing reference: {body}"
+        );
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "mv01/reload", "payload": "two"}),
+                &token,
+            )
+            .await;
+        assert!(status == 200 || status == 202, "publish: {body}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while delivered.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the previous sink still delivers after the failed rebuild"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        receiver.abort();
+        std::fs::remove_dir_all(&secret_dir).ok();
     }
 }

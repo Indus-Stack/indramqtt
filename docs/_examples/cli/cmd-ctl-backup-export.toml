@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-backup-export"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "backup"]
+match = "export"

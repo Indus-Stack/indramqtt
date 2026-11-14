@@ -775,6 +775,11 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 1);
         let err = sink.flush().await.expect_err("500 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
+        // The failure must engage real backoff from the broker.
+        assert!(
+            sink.backoff.lock().retry_after.is_some(),
+            "500 must engage backoff"
+        );
         // Buffer retained, backoff engaged: immediate retry fails fast
         // without a second HTTP round-trip.
         assert_eq!(sink.buffered_rows(), 1);

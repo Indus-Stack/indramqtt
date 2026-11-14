@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "kinesis"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-kinesis",
+        "name": "dx2-action-kinesis",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "kinesis"
+      },
+      "name": "dx2-action-kinesis",
+      "status": 201,
+      "type": "kinesis"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-kinesis\" already exists"
+      },
+      "name": "dx2-action-kinesis",
+      "status": 400,
+      "type": "kinesis"
+    }
+  ],
+  "item": "action-kinesis",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

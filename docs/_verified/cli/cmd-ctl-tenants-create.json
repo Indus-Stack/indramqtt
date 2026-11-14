@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "tenants",
+    "--help"
+  ],
+  "item": "cmd-ctl-tenants-create",
+  "match": "create",
+  "output": "Tenant namespaces: list, show, create, delete\n  create  Create one tenant namespace",
+  "output_bytes": 520,
+  "returncode": 0,
+  "verified": true
+}

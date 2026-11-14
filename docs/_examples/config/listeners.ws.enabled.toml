@@ -1,0 +1,36 @@
+[example]
+area = "config"
+item = "listeners.ws.enabled"
+kind = "setting"
+expect = "refused"
+expected = "With the WebSocket listener off, plain MQTT serves but the WebSocket port refuses."
+source = "`crates/broker-node/src/main.rs` skips a disabled listener at boot, and `crates/broker-api/src/v5/listeners.rs` stores the enable flag."
+action = "Stop the WebSocket listener and dial its port."
+config = '''
+[listeners.ws]
+enabled = false
+bind = "127.0.0.1:${COAP_PORT}"
+
+[auth]
+allow_anonymous = true
+'''
+display_config = '''
+[listeners.ws]
+enabled = false
+bind = "127.0.0.1:8083"
+'''
+script = '''
+from config_probe import *
+import os
+import socket
+sock, ack, props = connect("ws-off-tcp-client", v5=True)
+disconnect(sock)
+ws_port = int(os.environ["COAP_PORT"])
+try:
+    probe = socket.create_connection(("127.0.0.1", ws_port), timeout=3)
+except OSError:
+    print("refused")
+else:
+    probe.close()
+    raise AssertionError("the disabled WebSocket listener answered")
+'''

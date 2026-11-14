@@ -111,9 +111,14 @@ impl InfluxDbSinkConfig {
     }
 }
 
-/// Escape commas and spaces in measurement names.
+/// Escape commas, spaces, newlines and carriage returns in names.
+/// Reason: a raw newline splits one line into two records.
 fn escape_measurement(value: &str) -> String {
-    value.replace(',', "\\,").replace(' ', "\\ ")
+    value
+        .replace(',', "\\,")
+        .replace(' ', "\\ ")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Escape commas, equal signs and spaces in tag keys/values.
@@ -123,11 +128,40 @@ fn escape_tag(value: &str) -> String {
         .replace(',', "\\,")
         .replace('=', "\\=")
         .replace(' ', "\\ ")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
-/// Escape double quotes and backslashes in string field values.
+/// Escape double quotes, backslashes, newlines and carriage returns in
+/// string field values. A raw newline or carriage return splits one
+/// line-protocol row into two records. A backslash or quote would be
+/// misread by the line-protocol parser. A backslash that already
+/// introduces an `\n` or `\r` sequence (for example inside a JSON
+/// payload) is copied unchanged instead of doubled, so the sequence is
+/// not corrupted.
 fn escape_field_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\\' => {
+                if matches!(chars.peek(), Some('n' | 'r')) {
+                    // An already-escaped newline or carriage return (for
+                    // example inside a JSON payload): copy it unchanged
+                    // instead of doubling the backslash.
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                } else {
+                    out.push_str("\\\\");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn timestamp_for(precision: &str) -> i64 {
@@ -392,6 +426,11 @@ mod tests {
     }
 
     #[test]
+    fn sb27_measurement_escapes_newline_and_carriage_return() {
+        assert_eq!(escape_measurement("a\nb\rc,d e"), "a\\nb\\rc\\,d\\ e");
+    }
+
+    #[test]
     fn test_config_validation() {
         let mut config = test_config("http://influx:8086");
         assert!(config.validate().is_ok());
@@ -586,6 +625,41 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 1);
         assert!(sink.flush().await.is_err());
         assert_eq!(sink.sent_batches(), 0);
+    }
+
+    #[tokio::test]
+    async fn sb27_measurement_escape_goes_through_manager() {
+        // Broker path (publish, deliver): ConnectorManager::send ->
+        // Sink::send -> POST /api/v2/write against the loopback server.
+        // A measurement with newline and carriage return arrives
+        // escaped on the wire.
+        use crate::ConnectorManager;
+        let captured = Arc::new(Captured::default());
+        let port = serve_captured(captured.clone()).await;
+        let mut config = test_config(&format!("http://127.0.0.1:{port}"));
+        config.batch_size = 1;
+        config.measurement_template = "a\nb\rc,d e".to_string();
+        let sink = Arc::new(InfluxDbSink::new(config, test_client()).unwrap());
+        let manager = ConnectorManager::new();
+        manager.register("sb27-influx", sink.clone());
+
+        let topic = Topic::new("sensors/t1").unwrap();
+        manager
+            .send(
+                "sb27-influx",
+                &topic,
+                &Bytes::from_static(b"on"),
+                QoS::AtMostOnce,
+            )
+            .await
+            .expect("broker send delivers");
+        assert_eq!(sink.sent_batches(), 1);
+        let body = captured.body.lock().unwrap().clone();
+        assert_eq!(body.lines().count(), 1);
+        assert!(
+            body.starts_with("a\\nb\\rc\\,d\\ e,topic=sensors/t1 "),
+            "escaped measurement on the wire: {body}"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,39 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "id": "5f2a"
+      },
+      "projected": {
+        "m": "5f2a"
+      },
+      "sql": "SELECT msgid() AS m FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "m": null
+      },
+      "sql": "SELECT msgid() AS m FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "id": 5
+      },
+      "projected": {
+        "m": 5
+      },
+      "sql": "SELECT msgid() AS m FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-msgid",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

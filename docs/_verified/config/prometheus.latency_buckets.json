@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a custom bucket list and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus]\nlatency_buckets = \"5ms, 50ms\"\n",
+  "item": "prometheus.latency_buckets",
+  "kind": "setting",
+  "output": "buckets=5ms, 50ms",
+  "returncode": 0,
+  "verified": true
+}

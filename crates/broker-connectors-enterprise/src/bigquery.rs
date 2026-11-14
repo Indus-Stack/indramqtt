@@ -10,10 +10,8 @@
 //!
 //! The write path runs on the maintained `gcp-bigquery-client` driver
 //! ([`SdkBigQueryTransport`] below): `TableDataInsertAllRequest` framing
-//! plus `tabledata().insertAll` over OAuth2 Bearer. The legacy
-//! hand-written [`HttpBigQueryTransport`] is retained for endpoint
-//! overrides and offline unit tests only; production wiring uses the
-//! driver transport.
+//! plus `tabledata().insertAll` over OAuth2 Bearer. Production wiring
+//! uses the driver transport.
 //!
 //! Partial failures requeue selectively: only rows whose `insertErrors`
 //! carry transient reasons (`backendError`, `rateLimitExceeded`)
@@ -28,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::gcp_pubsub::{GcpAuth, GcpTokenCache};
+use crate::gcp_pubsub::GcpAuth;
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
 };
@@ -339,30 +337,6 @@ pub struct BigQueryRowEntry {
     pub json: serde_json::Value,
 }
 
-/// Render a JSON value with object keys in sorted order, so the exact
-/// wire assertion holds regardless of Cargo feature unification
-/// (`serde_json/preserve_order` switches objects from sorted `BTreeMap`
-/// to insertion-order `IndexMap`).
-fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<&str, serde_json::Value> = map
-                .iter()
-                .map(|(key, val)| (key.as_str(), sorted_json(val)))
-                .collect();
-            let mut ordered = serde_json::Map::with_capacity(sorted.len());
-            for (key, val) in sorted {
-                ordered.insert(key.to_string(), val);
-            }
-            serde_json::Value::Object(ordered)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(sorted_json).collect())
-        }
-        _ => value.clone(),
-    }
-}
-
 /// Render the `insertAll` JSON body.
 pub fn render_insert_body(
     ignore_unknown: bool,
@@ -382,7 +356,7 @@ pub fn render_insert_body(
         body.push_str("{\"insertId\":");
         body.push_str(&serde_json::to_string(&row.insert_id).unwrap_or_default());
         body.push_str(",\"json\":");
-        body.push_str(&sorted_json(&row.json).to_string());
+        body.push_str(&row.json.to_string());
         body.push('}');
     }
     body.push_str("]}");
@@ -539,125 +513,6 @@ impl BigQueryTransport for MockBigQueryTransport {
                 Err(ConnectorError::Connection(message))
             }
         }
-    }
-}
-
-/// Production transport: `POST {insert-url}` with the rows body.
-/// Service-account tokens resolve through the shared [`GcpTokenCache`].
-/// The loopback fake tests below drive this path end to end.
-/// Flag defaults mirror the `insertAll` REST contract (`ignoreUnknownValues`
-/// defaults true, `skipInvalidRows` defaults false) and are read from
-/// [`BigQuerySinkConfig`] so management configuration drives the wire.
-pub struct HttpBigQueryTransport {
-    base: String,
-    token_cache: Option<Arc<GcpTokenCache>>,
-    static_bearer: Option<String>,
-    client: reqwest::Client,
-    timeout: Duration,
-    ignore_unknown_values: bool,
-    skip_invalid_rows: bool,
-}
-
-impl HttpBigQueryTransport {
-    pub fn new(config: &BigQuerySinkConfig, client: reqwest::Client) -> Result<Self> {
-        config.validate()?;
-        let (token_cache, static_bearer) = match &config.auth {
-            GcpAuth::None => (None, None),
-            GcpAuth::AccessToken { token } => (None, Some(format!("Bearer {token}"))),
-            GcpAuth::ServiceAccountKey {
-                client_email,
-                private_key_pem,
-            } => (
-                Some(Arc::new(GcpTokenCache::new(
-                    client_email.clone(),
-                    private_key_pem.clone(),
-                    client.clone(),
-                ))),
-                None,
-            ),
-        };
-        Ok(Self {
-            base: config.base_url(),
-            token_cache,
-            static_bearer,
-            client,
-            timeout: config.timeout(),
-            ignore_unknown_values: config.ignore_unknown_values,
-            skip_invalid_rows: config.skip_invalid_rows,
-        })
-    }
-
-    /// Test hook proving `new` stores the configured base URL; the
-    /// production path uses `self.base` in `insert_all` above.
-    #[cfg(test)]
-    fn base(&self) -> &str {
-        &self.base
-    }
-
-    /// Flags under test: proves the sink config (not a hardcoded constant)
-    /// drives the `insertAll` body.
-    #[cfg(test)]
-    fn flags(&self) -> (bool, bool) {
-        (self.ignore_unknown_values, self.skip_invalid_rows)
-    }
-}
-
-#[async_trait]
-impl BigQueryTransport for HttpBigQueryTransport {
-    async fn insert_all(
-        &self,
-        project: &str,
-        dataset: &str,
-        table: &str,
-        rows: Vec<BigQueryRowEntry>,
-        _token: &str,
-    ) -> Result<BigQueryInsertResponse> {
-        let bearer = match &self.token_cache {
-            Some(cache) => Some(format!("Bearer {}", cache.bearer_token().await?)),
-            None => self.static_bearer.clone(),
-        };
-        // Flags ride the sink config in production; the transport
-        // reads them from `BigQuerySinkConfig` (wired in `new` above) so a
-        // management change reaches the wire without code edits.
-        let url = format!(
-            "{}/projects/{}/datasets/{}/tables/{}/insertAll",
-            self.base, project, dataset, table
-        );
-        let mut request = self
-            .client
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .timeout(self.timeout)
-            .body(render_insert_body(
-                self.ignore_unknown_values,
-                self.skip_invalid_rows,
-                &rows,
-            ));
-        if let Some(bearer) = bearer {
-            request = request.header(reqwest::header::AUTHORIZATION, bearer);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("bigquery insert failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || (500..=504).contains(&status) {
-            return Err(ConnectorError::Connection(format!(
-                "bigquery throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "bigquery insert failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("bigquery read failed: {e}")))?;
-        Ok(BigQueryInsertResponse {
-            failed_indices: classify_insert_errors(&bytes)?,
-        })
     }
 }
 
@@ -1206,6 +1061,17 @@ mod tests {
         let transport = Arc::new(MockBigQueryTransport::new());
         let sink = Arc::new(BigQuerySink::new(config, transport.clone()).unwrap());
         (sink, transport)
+    }
+
+    #[test]
+    fn mv00_row_json_keeps_projection_and_nested_order() {
+        let row = BigQueryRowEntry {
+            insert_id: "order-1".to_string(),
+            json: serde_json::from_str(r#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#)
+                .expect("ordered row"),
+        };
+        let bytes = render_insert_body(false, false, &[row]);
+        assert_eq!(bytes, br#"{"kind":"bigquery#tableDataInsertAllRequest","ignoreUnknownValues":false,"skipInvalidRows":false,"rows":[{"insertId":"order-1","json":{"b":2,"a":1,"obj":{"z":3,"a":4}}}]}"#);
     }
 
     #[test]
@@ -1837,97 +1703,6 @@ mod tests {
         assert!(matches!(slow_err, ConnectorError::Connection(_)));
     }
 
-    #[tokio::test]
-    async fn test_http_transport_insert_all_against_fake() {
-        // The retained hand-written transport stays wired: it posts the
-        // legacy body to `{base}/projects/.../insertAll` with the
-        // configured timeout and the sink-config flags (no hardcoded
-        // `ignoreUnknownValues` / `skipInvalidRows`).
-        use axum::{extract::State, http::StatusCode, routing::post, Router};
-        #[derive(Default)]
-        struct CapturedHttp {
-            path: parking_lot::Mutex<String>,
-            body: parking_lot::Mutex<String>,
-        }
-        async fn handler(
-            State(captured): State<Arc<CapturedHttp>>,
-            uri: axum::http::Uri,
-            body: String,
-        ) -> (StatusCode, String) {
-            *captured.path.lock() = uri.path().to_string();
-            *captured.body.lock() = body;
-            (StatusCode::OK, "{}".to_string())
-        }
-        let captured = Arc::new(CapturedHttp::default());
-        let app = Router::new()
-            .route("/*rest", post(handler))
-            .with_state(captured.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve");
-        });
-        let mut config = test_config();
-        config.endpoint = Some(format!("http://127.0.0.1:{port}"));
-        config.timeout_ms = Some(5_000);
-        let transport =
-            HttpBigQueryTransport::new(&config, reqwest::Client::new()).expect("http transport");
-        assert_eq!(transport.base(), config.base_url());
-        let rows = vec![BigQueryRowEntry {
-            insert_id: "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
-            json: serde_json::json!({"device_id": "sensor-101"}),
-        }];
-        let response = transport
-            .insert_all("my-iot-project", "telemetry", "sensor_logs", rows, "")
-            .await
-            .expect("http fake insert");
-        assert!(response.failed_indices.is_empty());
-        assert!(
-            captured.path.lock().ends_with(
-                "/projects/my-iot-project/datasets/telemetry/tables/sensor_logs/insertAll"
-            ),
-            "unexpected {}",
-            captured.path.lock()
-        );
-        assert!(captured.body.lock().contains("sensor-101"));
-        assert_eq!(transport.flags(), (true, false));
-        assert!(captured
-            .body
-            .lock()
-            .contains("\"ignoreUnknownValues\":true"));
-        assert!(captured.body.lock().contains("\"skipInvalidRows\":false"));
-
-        // Flipped flags also reach the wire (proves no hardcoded constants).
-        let mut flipped_config = test_config();
-        flipped_config.endpoint = Some(config.endpoint.clone().expect("endpoint"));
-        flipped_config.ignore_unknown_values = false;
-        flipped_config.skip_invalid_rows = true;
-        let flipped =
-            HttpBigQueryTransport::new(&flipped_config, reqwest::Client::new()).expect("flipped");
-        assert_eq!(flipped.flags(), (false, true));
-        let flipped_rows = vec![BigQueryRowEntry {
-            insert_id: "00000000-0000-0000-0000-000000000000".to_string(),
-            json: serde_json::json!({"device_id": "sensor-102"}),
-        }];
-        flipped
-            .insert_all(
-                "my-iot-project",
-                "telemetry",
-                "sensor_logs",
-                flipped_rows,
-                "",
-            )
-            .await
-            .expect("flipped fake insert");
-        assert!(captured
-            .body
-            .lock()
-            .contains("\"ignoreUnknownValues\":false"));
-        assert!(captured.body.lock().contains("\"skipInvalidRows\":true"));
-    }
-
     fn qual_env(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.trim().is_empty())
     }
@@ -1949,11 +1724,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a real BigQuery server (see BIGQUERY_* env)"]
     async fn test_qualify_driver_write_path() {
-        let project = qual_env("BIGQUERY_PROJECT").unwrap_or_default();
-        if project.is_empty() {
-            eprintln!("BIGQUERY_PROJECT is empty; skipping qualification");
-            return;
-        }
+        let project = qual_env("BIGQUERY_PROJECT").unwrap_or_else(|| {
+            panic!("BIGQUERY_PROJECT must name the qual project; failing closed")
+        });
         let dataset_id = qual_env("BIGQUERY_DATASET").unwrap_or_else(|| "bq_qual_b306".to_string());
         let table_id = qual_env("BIGQUERY_TABLE").unwrap_or_else(|| "qual_rows".to_string());
         let sa_key_file = qual_env("GOOGLE_APPLICATION_CREDENTIALS")
@@ -1961,9 +1734,45 @@ mod tests {
             .unwrap_or_default();
         let endpoint = qual_env("BIGQUERY_ENDPOINT");
         if sa_key_file.is_empty() && endpoint.is_none() {
-            eprintln!("no service-account key and no BIGQUERY_ENDPOINT; skipping qualification");
-            return;
+            panic!(
+                "GOOGLE_APPLICATION_CREDENTIALS or BIGQUERY_SA_KEY_FILE or BIGQUERY_ENDPOINT must point at the qual server; failing closed"
+            );
         }
+        // Read the key file for the sink credential.
+        // The driver uses the file path.
+        // The sink uses the email and key values.
+        let sink_auth = if endpoint.is_some() {
+            // Loopback server checks no credential.
+            GcpAuth::None
+        } else {
+            let key_text = std::fs::read_to_string(&sa_key_file).unwrap_or_else(|e| {
+                panic!(
+                    "service-account key file {sa_key_file} must be readable for qualification: {e}"
+                )
+            });
+            let key_json: serde_json::Value = serde_json::from_str(&key_text).unwrap_or_else(|e| {
+                panic!("service-account key file {sa_key_file} must hold JSON: {e}")
+            });
+            let client_email = key_json
+                .get("client_email")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let private_key_pem = key_json
+                .get("private_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if client_email.trim().is_empty() || private_key_pem.trim().is_empty() {
+                panic!(
+                    "service-account key file {sa_key_file} must hold client_email and private_key; failing closed"
+                );
+            }
+            GcpAuth::ServiceAccountKey {
+                client_email,
+                private_key_pem,
+            }
+        };
 
         let driver_client: gcp_bigquery_client::Client = if sa_key_file.is_empty() {
             let auth: std::sync::Arc<dyn gcp_bigquery_client::auth::Authenticator> =
@@ -2038,7 +1847,7 @@ mod tests {
             dataset_id: dataset_id.clone(),
             table_template: table_id.clone(),
             endpoint: endpoint.clone(),
-            auth: GcpAuth::None,
+            auth: sink_auth,
             ignore_unknown_values: true,
             skip_invalid_rows: false,
             template_suffix: None,

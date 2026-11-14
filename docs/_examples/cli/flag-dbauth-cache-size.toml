@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-dbauth-cache-size"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--dbauth-cache-size"

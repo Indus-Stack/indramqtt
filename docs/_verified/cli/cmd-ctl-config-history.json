@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "config",
+    "--help"
+  ],
+  "item": "cmd-ctl-config-history",
+  "match": "history",
+  "output": "Configuration: validate, diff, explain, reload, history\n  history   List versions (no id), show one version (id), or restore one version (`--restore`; destructive: requires `--yes` or an interactive confirm)",
+  "output_bytes": 684,
+  "returncode": 0,
+  "verified": true
+}

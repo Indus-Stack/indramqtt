@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-dbauth-cache-size",
+  "match": "--dbauth-cache-size",
+  "output": "      --dbauth-cache-size <DBAUTH_CACHE_SIZE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

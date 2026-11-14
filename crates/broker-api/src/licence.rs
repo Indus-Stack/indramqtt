@@ -473,8 +473,7 @@ mod tests {
 
     fn signing_key(seed: u8) -> SigningKey {
         let bytes = [seed; 32];
-        let field = p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
-        SigningKey::from_bytes(&field).expect("seed")
+        SigningKey::from_slice(&bytes).expect("seed")
     }
 
     fn mint(

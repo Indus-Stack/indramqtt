@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-topic-alias-maximum"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--topic-alias-maximum"

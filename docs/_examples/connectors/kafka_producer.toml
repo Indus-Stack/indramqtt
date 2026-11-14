@@ -1,0 +1,14 @@
+[example]
+area = "connectors"
+item = "kafka_producer"
+kind = "connector-create"
+
+[[case]]
+name = "kafka-producer-normal"
+bootstrap_hosts = "127.0.0.1:9092"
+expect_status = 201
+
+[[case]]
+name = "kafka-producer-edge-empty-hosts"
+bootstrap_hosts = ""
+expect_status = 400

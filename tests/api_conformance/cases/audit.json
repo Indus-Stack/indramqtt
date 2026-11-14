@@ -1,0 +1,129 @@
+[
+  {
+    "body": null,
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-audit-live-1"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "GET /audit",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "mqtt_connect": {
+          "clientid": "conf-audit-live-1"
+        }
+      }
+    ]
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /audit",
+    "path_params": {},
+    "query": {
+      "limit": 1,
+      "page": 1
+    },
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /audit",
+    "path_params": {},
+    "query": {
+      "unknown_param": "1"
+    },
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/api_key/conf-audit-a"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/api_key/conf-audit-b"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "GET /audit",
+    "path_params": {},
+    "query": {
+      "operation_result": "success",
+      "operation_type": "api_key"
+    },
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "name": "conf-audit-a"
+          },
+          "method": "POST",
+          "path": "/api_key"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "conf-audit-b"
+          },
+          "method": "POST",
+          "path": "/api_key"
+        }
+      }
+    ]
+  },
+  {
+    "body": null,
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/api_key/conf-audit-t"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "GET /audit",
+    "path_params": {},
+    "query": {
+      "gte_created_at": "4102444800000000"
+    },
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "name": "conf-audit-t"
+          },
+          "method": "POST",
+          "path": "/api_key"
+        }
+      }
+    ]
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "GET /audit",
+    "path_params": {},
+    "query": {
+      "operation_result": "bogus"
+    },
+    "setup": []
+  }
+]

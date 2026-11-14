@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-ldap-group-attribute",
+  "match": "--ldap-group-attribute",
+  "output": "      --ldap-group-attribute <LDAP_GROUP_ATTRIBUTE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

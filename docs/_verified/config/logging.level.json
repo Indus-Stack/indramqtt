@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker and read its log file.",
+  "config": "[logging]\nlevel = \"info\"\n",
+  "item": "logging.level",
+  "kind": "setting",
+  "output": "info line",
+  "returncode": 0,
+  "verified": true
+}

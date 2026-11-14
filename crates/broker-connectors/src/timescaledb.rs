@@ -14,8 +14,7 @@
 //!
 //! Batching, restore-on-failure and backoff reuse the shared
 //! [`super::BatchQueue`] / [`super::BackoffState`] helpers.
-//! [`TcpTimescaleTransport`] is the hand-written framing retained for
-//! offline unit tests only; production wiring uses the driver transport.
+//! Production wiring uses the driver transport.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -25,10 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, rfc3339_millis, BackoffState, BatchQueue, ConnectorError, PgBatch, PgTransport,
-    Result, Sink, TcpPgTransport,
-};
+use super::{now_millis, rfc3339_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 fn default_time_column() -> String {
     "time".to_string()
@@ -199,48 +195,15 @@ impl TimescaleDbTransport for MockTimescaleTransport {
     }
 }
 
-/// TCP transport delegating batches to the shared PostgreSQL extended
-/// protocol driver (same wire format TimescaleDB expects). Retained for
-/// offline unit tests only; production wiring uses
-/// [`DriverTimescaleDbTransport`] on the maintained `tokio-postgres`
-/// driver.
-pub struct TcpTimescaleTransport {
-    inner: TcpPgTransport,
-}
-
-impl TcpTimescaleTransport {
-    pub fn new(url: &str, pool_size: usize) -> Result<Self> {
-        Ok(Self {
-            inner: TcpPgTransport::new(url, pool_size)?,
-        })
-    }
-}
-
-#[async_trait]
-impl TimescaleDbTransport for TcpTimescaleTransport {
-    async fn execute_batch(&self, batch: &TimescaleBatch) -> Result<()> {
-        PgTransport::execute_batch(
-            &self.inner,
-            &PgBatch {
-                sql: batch.sql.clone(),
-                rows: batch.rows.clone(),
-            },
-        )
-        .await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Production transport on the maintained `tokio-postgres` driver.
 // ---------------------------------------------------------------------------
 
-/// Checkout timeout for one driver connection: 5 s matches the legacy
-/// [`TcpPgTransport`] dial timeout (the protocol requirement is a
-/// bounded handshake, not a specific value).
+/// Checkout timeout for one driver connection: 5 s bounds the handshake
+/// (the protocol requires a bound, not a specific value).
 const TS_DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Per-batch statement timeout: 10 s matches the legacy `read_msg`
-/// timeout on the same path.
+/// Per-batch statement timeout: 10 s bounds each exchange.
 const TS_DRIVER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Split `postgresql://[user[:password]@]host[:port][/dbname][?params]`
@@ -647,9 +610,8 @@ impl tokio_postgres::types::ToSql for TsMetricsParam {
 /// MD5 and SCRAM-SHA-256 authentication and the extended query protocol
 /// (Parse/Bind/Describe/Execute/Sync) all run inside the driver;
 /// parameters travel bound (`$1` time, `$2` device id, `$3` topic,
-/// `$4` metrics JSONB), so values stay out-of-band exactly as on the
-/// legacy path. The legacy [`TcpTimescaleTransport`] stays for offline
-/// unit tests only; production wiring uses this transport.
+/// `$4` metrics JSONB), so values stay out-of-band. Production wiring
+/// uses this transport.
 ///
 /// Bound: the pool holds at most `pool_size` driver clients plus the
 /// sink buffer in front of it; no background queue. `pool_size`

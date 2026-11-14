@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "temperature": 72.5
+      },
+      "sql": "SELECT temperature FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "humidity": null
+      },
+      "sql": "SELECT humidity FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "clause-select",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

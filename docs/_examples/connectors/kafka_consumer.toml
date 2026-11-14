@@ -1,0 +1,16 @@
+[example]
+area = "connectors"
+item = "kafka_consumer"
+kind = "connector-create"
+
+[[case]]
+name = "kafka-consumer-normal"
+bootstrap_hosts = "127.0.0.1:9092"
+topic = "events"
+expect_status = 201
+
+[[case]]
+name = "kafka-consumer-edge-empty-hosts"
+bootstrap_hosts = ""
+topic = "events"
+expect_status = 400

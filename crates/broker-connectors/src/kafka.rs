@@ -9,28 +9,25 @@
 //! The production write path runs on the maintained `rdkafka` driver
 //! ([`RdkafkaKafkaTransport`] below): Kafka Produce protocol (RecordBatch
 //! v2 framing, murmur2 partitioning, acks, idempotence where configured)
-//! through `FutureProducer` futures. The hand-written
-//! [`TcpKafkaTransport`] (Produce/ApiVersions framing over TCP) is
-//! retained for offline unit tests only; production wiring uses the
-//! driver transport.
+//! through `FutureProducer` futures. Production wiring uses the driver
+//! transport.
 //!
 //! The [`KafkaTransport`] boundary keeps unit tests broker-free
-//! ([`MemoryKafkaTransport`]); [`TcpKafkaTransport`] speaks the legacy
-//! framing over TCP.
+//! ([`MemoryKafkaTransport`]).
 
 use super::{BackoffState, ConnectorError, Result, Sink};
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock as AsyncRwLock;
+
+/// One short TCP handshake per publish bounds the down check to 1 s.
+// A closed listener fails closed even when an old producer still lives.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn default_partitions() -> u32 {
     1
@@ -49,6 +46,12 @@ pub struct KafkaSinkConfig {
     pub bootstrap_servers: String,
     pub topic_template: String,
     pub partition_key_field: Option<String>,
+    /// Key template (`${topic}`, `${payload}`, `${payload.<field>}`,
+    /// `${client_id}` from the payload object). It wins over
+    /// `partition_key_field` when set. Reason: the reference
+    /// `message.key` action field.
+    #[serde(default)]
+    pub key_template: Option<String>,
     #[serde(default = "default_partitions")]
     pub partitions: u32,
     pub client_id: String,
@@ -57,6 +60,36 @@ pub struct KafkaSinkConfig {
     pub batch_max_records: usize,
     #[serde(default = "default_batch_max_bytes")]
     pub batch_max_bytes: usize,
+    /// Partition strategy of the action: false hashes the key
+    /// (`key_dispatch`), true spreads keyless and keyed rows at
+    /// random. Reason: the reference default is `random`.
+    #[serde(default)]
+    pub random_partition: bool,
+    /// Single headers template (rendered per event, then parsed as a
+    /// JSON object or array of key/value pairs). Reason: the reference
+    /// `kafka_headers` action field, which must render to an object or
+    /// an array of key/value pairs.
+    #[serde(default)]
+    pub headers_template: Option<String>,
+    /// Extra record headers: each pair is a header name plus a value
+    /// template (`${topic}`, `${payload}`). Reason: the reference
+    /// `kafka_ext_headers` action field.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Value encoding of the headers: `none` sends raw bytes, `json`
+    /// sends each value JSON-encoded. Reason: the reference
+    /// `kafka_header_value_encode_mode` action field.
+    #[serde(default)]
+    pub header_encode_mode: KafkaHeaderEncodeMode,
+}
+
+/// Encoding of extra header values on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaHeaderEncodeMode {
+    #[default]
+    None,
+    Json,
 }
 
 impl KafkaSinkConfig {
@@ -88,6 +121,13 @@ impl KafkaSinkConfig {
             return Err(ConnectorError::Dispatch(
                 "kafka batch limits must be >= 1".to_string(),
             ));
+        }
+        if let Some(template) = &self.key_template {
+            render_key_template(template, "dummy/topic", b"{}").map(|_| ())?;
+        }
+        if let Some(template) = &self.headers_template {
+            let rendered = render_header_template(template, "dummy/topic", b"{}");
+            parse_rendered_headers(&rendered).map(|_| ())?;
         }
         Ok(())
     }
@@ -171,6 +211,114 @@ pub fn partition_for_key(key: Option<&[u8]>, partitions: u32) -> i32 {
         Some(key) => ((murmur2(key) & 0x7fffffff) % partitions) as i32,
         None => 0,
     }
+}
+
+/// Render one header value template: `${topic}` takes the event
+/// topic, `${payload}` takes the raw event bytes as text.
+pub fn render_header_template(template: &str, topic: &str, payload: &[u8]) -> String {
+    template
+        .replace("${topic}", topic)
+        .replace("${payload}", &String::from_utf8_lossy(payload))
+}
+
+/// Encode one rendered header value: `none` sends raw bytes, `json`
+/// sends the value JSON-encoded (a string gains quotes).
+pub fn encode_header_value(rendered: &str, mode: KafkaHeaderEncodeMode) -> Bytes {
+    match mode {
+        KafkaHeaderEncodeMode::None => Bytes::from(rendered.to_string()),
+        KafkaHeaderEncodeMode::Json => {
+            Bytes::from(serde_json::Value::String(rendered.to_string()).to_string())
+        }
+    }
+}
+
+/// Parse one rendered `kafka_headers` template: a JSON object of
+/// string templates, or an array of `{key, value}` pairs. Anything
+/// else is a dispatch error. Non-string scalars render with their
+/// JSON text.
+pub fn parse_rendered_headers(rendered: &str) -> Result<Vec<(String, String)>> {
+    let value: serde_json::Value = serde_json::from_str(rendered).map_err(|error| {
+        ConnectorError::Dispatch(format!(
+            "kafka_headers template rendered invalid JSON: {error}"
+        ))
+    })?;
+    if let Some(map) = value.as_object() {
+        let mut out = Vec::with_capacity(map.len());
+        for (key, entry) in map {
+            let text = match entry {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Null => continue,
+                scalar => scalar.to_string(),
+            };
+            out.push((key.clone(), text));
+        }
+        return Ok(out);
+    }
+    if let Some(items) = value.as_array() {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let key = item.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                ConnectorError::Dispatch(
+                    "kafka_headers array entries need string `key` and `value`".to_string(),
+                )
+            })?;
+            let text = match item.get("value") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Null) | None => continue,
+                Some(scalar) => scalar.to_string(),
+            };
+            out.push((key.to_string(), text));
+        }
+        return Ok(out);
+    }
+    Err(ConnectorError::Dispatch(
+        "kafka_headers template must render a JSON object or an array of key/value pairs"
+            .to_string(),
+    ))
+}
+
+/// Render one key template: `${topic}` takes the event topic,
+/// `${payload}` takes the raw event bytes, `${payload.<field>}`
+/// takes one payload JSON field, `${client_id}` (and `${.clientid}`)
+/// takes the payload `client_id` field. An empty result reads as no
+/// key; an unknown or unclosed `${...}` variable is a dispatch error.
+pub fn render_key_template(template: &str, topic: &str, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unclosed template variable in key template {template:?}"
+            )));
+        };
+        let name = &after[..end];
+        let value = if name == "topic" {
+            topic.to_string()
+        } else if name == "payload" {
+            String::from_utf8_lossy(payload).into_owned()
+        } else if name == "client_id" || name == ".clientid" {
+            extract_json_field(payload, "client_id")
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        } else if let Some(field) = name.strip_prefix("payload.") {
+            extract_json_field(payload, field)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        } else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unknown template variable {name:?} in key template {template:?}"
+            )));
+        };
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out.into_bytes()))
 }
 
 fn now_millis() -> i64 {
@@ -334,324 +482,6 @@ impl KafkaTransport for MemoryKafkaTransport {
     }
 }
 
-pub fn encode_request_header(
-    api_key: i16,
-    api_version: i16,
-    correlation: i32,
-    client_id: &str,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&api_key.to_be_bytes());
-    out.extend_from_slice(&api_version.to_be_bytes());
-    out.extend_from_slice(&correlation.to_be_bytes());
-    out.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
-    out.extend_from_slice(client_id.as_bytes());
-    out
-}
-
-fn encode_string(s: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(s.len() as i16).to_be_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-pub async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| ConnectorError::Connection("kafka response timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("kafka read failed: {e}")))?;
-    let len = i32::from_be_bytes(len_buf) as usize;
-    if len > 8 * 1024 * 1024 {
-        return Err(ConnectorError::Connection(format!(
-            "kafka response too large: {len}"
-        )));
-    }
-    let mut body = vec![0u8; len];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut body))
-        .await
-        .map_err(|_| ConnectorError::Connection("kafka response timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("kafka read failed: {e}")))?;
-    Ok(body)
-}
-
-pub async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Result<()> {
-    let mut prefixed = (frame.len() as i32).to_be_bytes().to_vec();
-    prefixed.append(&mut frame);
-    stream
-        .write_all(&prefixed)
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("kafka write failed: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("kafka flush failed: {e}")))?;
-    Ok(())
-}
-
-/// Minimal ApiVersions v0 exchange: proves the peer speaks Kafka and
-/// surfaces broker-side errors early.
-pub fn encode_api_versions_request(correlation: i32, client_id: &str) -> Vec<u8> {
-    encode_request_header(18, 0, correlation, client_id)
-}
-
-pub fn decode_api_versions_response(body: &[u8], correlation: i32) -> Result<()> {
-    if body.len() < 6 {
-        return Err(ConnectorError::Connection(
-            "truncated ApiVersions response".to_string(),
-        ));
-    }
-    let echoed = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-    if echoed != correlation {
-        return Err(ConnectorError::Connection(format!(
-            "ApiVersions correlation mismatch: {echoed} != {correlation}"
-        )));
-    }
-    let error = i16::from_be_bytes([body[4], body[5]]);
-    if error != 0 {
-        return Err(ConnectorError::Connection(format!(
-            "ApiVersions broker error {error}"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn encode_produce_body(
-    acks: i16,
-    grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
-) -> Vec<u8> {
-    let mut frame = Vec::new();
-    frame.extend_from_slice(&(-1i16).to_be_bytes()); // transactional_id = null
-    frame.extend_from_slice(&acks.to_be_bytes());
-    frame.extend_from_slice(&30_000i32.to_be_bytes()); // timeout ms
-    frame.extend_from_slice(&(grouped.len() as i32).to_be_bytes());
-    for ((topic, partition), records) in grouped {
-        encode_string(topic, &mut frame);
-        frame.extend_from_slice(&1i32.to_be_bytes()); // one partition entry
-        frame.extend_from_slice(&partition.to_be_bytes());
-        let batch = encode_record_batch_v2(records);
-        frame.extend_from_slice(&(batch.len() as i32).to_be_bytes());
-        frame.extend_from_slice(&batch);
-    }
-    frame
-}
-
-/// Produce v3 request for pre-grouped `(topic, partition) -> records`.
-pub fn encode_produce_request(
-    correlation: i32,
-    client_id: &str,
-    acks: i16,
-    grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
-) -> Vec<u8> {
-    let mut frame = encode_request_header(0, 3, correlation, client_id);
-    frame.extend_from_slice(&encode_produce_body(acks, grouped));
-    frame
-}
-
-pub fn parse_acks(acks: &str) -> Result<i16> {
-    match acks {
-        "all" | "-1" => Ok(-1),
-        "1" => Ok(1),
-        "0" => Ok(0),
-        other => Err(ConnectorError::Dispatch(format!(
-            "kafka acks must be one of all/-1/1/0, got {other:?}"
-        ))),
-    }
-}
-
-/// TCP transport speaking real Produce/ApiVersions framing. Connects
-/// lazily on first use; reconnects once per failed request.
-pub struct TcpKafkaTransport {
-    endpoint: String,
-    client_id: String,
-    acks: i16,
-    conn: AsyncMutex<Option<TcpKafkaConn>>,
-}
-
-struct TcpKafkaConn {
-    stream: TcpStream,
-    correlation: i32,
-}
-
-impl TcpKafkaTransport {
-    pub fn new(
-        endpoint: impl Into<String>,
-        client_id: impl Into<String>,
-        acks: &str,
-    ) -> Result<Self> {
-        Ok(Self {
-            endpoint: endpoint.into(),
-            client_id: client_id.into(),
-            acks: parse_acks(acks)?,
-            conn: AsyncMutex::new(None),
-        })
-    }
-
-    async fn roundtrip(&self, api_key: i16, api_version: i16, body: Vec<u8>) -> Result<Vec<u8>> {
-        // Serialize requests: one in-flight exchange at a time.
-        let mut guard = self.conn.lock().await;
-        for attempt in 0..2 {
-            if guard.is_none() {
-                *guard = Some(self.dial().await?);
-            }
-            let conn = guard.as_mut().expect("connected");
-            let correlation = conn.correlation;
-            conn.correlation = conn.correlation.wrapping_add(1);
-            let mut frame =
-                encode_request_header(api_key, api_version, correlation, &self.client_id);
-            frame.extend_from_slice(&body);
-            let exchange = async {
-                send_frame(&mut conn.stream, frame).await?;
-                read_response(&mut conn.stream).await
-            };
-            match exchange.await {
-                Ok(mut response) => {
-                    if response.len() < 4 {
-                        *guard = None;
-                        if attempt == 0 {
-                            continue;
-                        }
-                        return Err(ConnectorError::Connection(
-                            "truncated kafka response".to_string(),
-                        ));
-                    }
-                    let echoed =
-                        i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-                    if echoed != correlation {
-                        *guard = None;
-                        if attempt == 0 {
-                            continue;
-                        }
-                        return Err(ConnectorError::Connection(format!(
-                            "kafka correlation mismatch: {echoed} != {correlation}"
-                        )));
-                    }
-                    response.drain(..4);
-                    return Ok(response);
-                }
-                Err(_) if attempt == 0 => {
-                    *guard = None;
-                    continue;
-                }
-                Err(e) => {
-                    *guard = None;
-                    return Err(e);
-                }
-            }
-        }
-        Err(ConnectorError::Connection(
-            "kafka exchange failed".to_string(),
-        ))
-    }
-
-    async fn dial(&self) -> Result<TcpKafkaConn> {
-        let stream =
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.endpoint))
-                .await
-                .map_err(|_| {
-                    ConnectorError::Connection(format!("kafka connect timeout: {}", self.endpoint))
-                })?
-                .map_err(|e| {
-                    ConnectorError::Connection(format!(
-                        "kafka connect to {} failed: {e}",
-                        self.endpoint
-                    ))
-                })?;
-        let mut conn = TcpKafkaConn {
-            stream,
-            correlation: 1,
-        };
-        // Prove framing against the broker before producing.
-        let frame = encode_api_versions_request(0, &self.client_id);
-        send_frame(&mut conn.stream, frame).await?;
-        let response = read_response(&mut conn.stream).await?;
-        decode_api_versions_response(&response, 0)?;
-        conn.correlation = 1;
-        Ok(conn)
-    }
-
-    async fn produce_grouped(
-        &self,
-        grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
-    ) -> Result<()> {
-        if grouped.is_empty() {
-            return Ok(());
-        }
-        let body = encode_produce_body(self.acks, grouped);
-        let response = self.roundtrip(0, 3, body).await?;
-        // Response: [topics]: name, [partitions]: index, error, base_offset,
-        // log_append_time, log_start_offset, throttle.
-        let mut cursor = response.as_slice();
-        let topics = read_i32(&mut cursor)?;
-        for _ in 0..topics {
-            let name_len = read_i16(&mut cursor)? as usize;
-            if cursor.len() < name_len {
-                return Err(ConnectorError::Connection(
-                    "truncated produce response".to_string(),
-                ));
-            }
-            let name = String::from_utf8_lossy(&cursor[..name_len]).to_string();
-            cursor = &cursor[name_len..];
-            let partitions = read_i32(&mut cursor)?;
-            for _ in 0..partitions {
-                let _index = read_i32(&mut cursor)?;
-                let error = read_i16(&mut cursor)?;
-                if error != 0 {
-                    return Err(ConnectorError::Dispatch(format!(
-                        "kafka produce to {name} failed with error {error}"
-                    )));
-                }
-                if cursor.len() < 8 + 8 + 8 + 4 {
-                    return Err(ConnectorError::Connection(
-                        "truncated produce response".to_string(),
-                    ));
-                }
-                cursor = &cursor[8 + 8 + 8 + 4..];
-            }
-        }
-        Ok(())
-    }
-}
-
-fn read_i16(cursor: &mut &[u8]) -> Result<i16> {
-    if cursor.len() < 2 {
-        return Err(ConnectorError::Connection(
-            "truncated kafka response".to_string(),
-        ));
-    }
-    let value = i16::from_be_bytes([cursor[0], cursor[1]]);
-    *cursor = &cursor[2..];
-    Ok(value)
-}
-
-fn read_i32(cursor: &mut &[u8]) -> Result<i32> {
-    if cursor.len() < 4 {
-        return Err(ConnectorError::Connection(
-            "truncated kafka response".to_string(),
-        ));
-    }
-    let value = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-    *cursor = &cursor[4..];
-    Ok(value)
-}
-
-#[async_trait]
-impl KafkaTransport for TcpKafkaTransport {
-    async fn publish(&self, records: Vec<KafkaRecord>) -> Result<()> {
-        let mut grouped: BTreeMap<(String, i32), Vec<KafkaRecord>> = BTreeMap::new();
-        for record in records {
-            grouped
-                .entry((record.topic.clone(), record.partition))
-                .or_default()
-                .push(record);
-        }
-        self.produce_grouped(&grouped).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Maintained driver transport (`rdkafka`).
-// ---------------------------------------------------------------------------
-
 /// Build the maintained `rdkafka` client configuration for plain Apache
 /// Kafka endpoints: the configured bootstrap servers and client id, the
 /// configured acks as `request.required.acks`, and a 30 s
@@ -794,6 +624,32 @@ impl KafkaTransport for RdkafkaKafkaTransport {
         if records.is_empty() {
             return Ok(());
         }
+        // Probe the listener before reusing the cached producer. A
+        // refused port clears the cache and fails closed. It skips the
+        // 30 s send timeout and the 200-attempt retry, so the action
+        // counts one failed forward fast. The error is terminal, so
+        // `KafkaSink::flush` does not retry it.
+        let probe_target = self
+            .config
+            .bootstrap_servers
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !probe_target.is_empty() {
+            let reachable =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(probe_target))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .is_some();
+            if !reachable {
+                *self.producer.write().await = None;
+                return Err(ConnectorError::Dispatch(format!(
+                    "kafka broker unreachable: {probe_target}"
+                )));
+            }
+        }
         let producer = self.producer().await?;
         // 30 s per record: matches `message.timeout.ms` above so a
         // delivery future never outlives the driver's own deadline.
@@ -876,36 +732,69 @@ impl KafkaSink {
         self.buffer.lock().records.len()
     }
 
-    fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> KafkaRecord {
+    fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<KafkaRecord> {
         let rendered = render_topic_template(&self.config.topic_template, topic.as_str());
-        let key = self
-            .config
-            .partition_key_field
-            .as_deref()
-            .and_then(|field| extract_json_field(payload, field))
-            .map(Bytes::from);
-        let partition = partition_for_key(key.as_deref(), self.config.partitions);
-        KafkaRecord {
+        let key = match &self.config.key_template {
+            Some(template) => {
+                render_key_template(template, topic.as_str(), payload)?.map(Bytes::from)
+            }
+            None => self
+                .config
+                .partition_key_field
+                .as_deref()
+                .and_then(|field| extract_json_field(payload, field))
+                .map(Bytes::from),
+        };
+        // One means unconfigured. Pass -1 so the driver assigns
+        // the partition from real broker Metadata. Explicit counts
+        // stay for offline unit tests with fixed topics.
+        let partition = if self.config.partitions <= 1 {
+            -1
+        } else if self.config.random_partition {
+            (rand::random::<u32>() % self.config.partitions.max(1)) as i32
+        } else {
+            partition_for_key(key.as_deref(), self.config.partitions)
+        };
+        let mut headers = vec![
+            (
+                "mqtt.topic".to_string(),
+                Bytes::from(topic.as_str().to_string()),
+            ),
+            (
+                "mqtt.qos".to_string(),
+                Bytes::from(u8::from(qos).to_string()),
+            ),
+            (
+                "mqtt.timestamp".to_string(),
+                Bytes::from(now_millis().to_string()),
+            ),
+        ];
+        for (name, template) in &self.config.extra_headers {
+            headers.push((
+                name.clone(),
+                encode_header_value(
+                    &render_header_template(template, topic.as_str(), payload),
+                    self.config.header_encode_mode,
+                ),
+            ));
+        }
+        if let Some(template) = &self.config.headers_template {
+            let rendered = render_header_template(template, topic.as_str(), payload);
+            for (name, value) in parse_rendered_headers(&rendered)? {
+                headers.push((
+                    name,
+                    encode_header_value(&value, self.config.header_encode_mode),
+                ));
+            }
+        }
+        Ok(KafkaRecord {
             topic: rendered,
             partition,
             key,
             value: payload.clone(),
-            headers: vec![
-                (
-                    "mqtt.topic".to_string(),
-                    Bytes::from(topic.as_str().to_string()),
-                ),
-                (
-                    "mqtt.qos".to_string(),
-                    Bytes::from(u8::from(qos).to_string()),
-                ),
-                (
-                    "mqtt.timestamp".to_string(),
-                    Bytes::from(now_millis().to_string()),
-                ),
-            ],
+            headers,
             timestamp_ms: now_millis(),
-        }
+        })
     }
 
     /// Flush buffered records (no-op when empty). Retryable driver
@@ -995,7 +884,7 @@ fn extract_json_field(payload: &[u8], field: &str) -> Option<Vec<u8>> {
 #[async_trait]
 impl Sink for KafkaSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> super::Result<()> {
-        let record = self.build_record(topic, payload, qos);
+        let record = self.build_record(topic, payload, qos)?;
         let should_flush = {
             let mut buffer = self.buffer.lock();
             buffer.bytes += record.value.len() + record.key.as_ref().map(|k| k.len()).unwrap_or(0);
@@ -1017,18 +906,22 @@ impl Sink for KafkaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_config() -> KafkaSinkConfig {
         KafkaSinkConfig {
             bootstrap_servers: "127.0.0.1:9092".to_string(),
             topic_template: "kafka-telemetry-${topic}".to_string(),
             partition_key_field: Some("device_id".to_string()),
+            key_template: None,
             partitions: 12,
             client_id: "indra-test".to_string(),
             acks: "all".to_string(),
             batch_max_records: 500,
             batch_max_bytes: 256 * 1024,
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: KafkaHeaderEncodeMode::None,
         }
     }
 
@@ -1146,6 +1039,24 @@ mod tests {
     }
 
     #[test]
+    fn test_key_template_renders_topic_payload_and_client_id() {
+        let payload = Bytes::from_static(br#"{ "client_id": "edge-7", "k": "v7" }"#);
+        let rendered =
+            render_key_template("dev-${payload.k}", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"dev-v7".to_vec()));
+        let rendered = render_key_template("${.clientid}", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"edge-7".to_vec()));
+        let rendered = render_key_template("static", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"static".to_vec()));
+        // A missing field renders empty, which reads as no key.
+        let rendered =
+            render_key_template("dev-${payload.nope}", "sensors/t", &payload).expect("renders");
+        assert_eq!(rendered, Some(b"dev-".to_vec()));
+        // An unknown variable fails closed.
+        assert!(render_key_template("dev-${nope}", "sensors/t", &payload).is_err());
+    }
+
+    #[test]
     fn test_record_headers_and_serialization() {
         let transport = Arc::new(MemoryKafkaTransport::new());
         // Batching raised so nothing auto-flushes before the explicit call.
@@ -1227,106 +1138,6 @@ mod tests {
         assert_eq!(transport.batches()[0].len(), 3);
         assert_eq!(sink.buffered_records(), 0);
         assert_eq!(sink.sent_batches(), 1);
-    }
-
-    /// In-process fake Kafka broker: scripted ApiVersions + Produce
-    /// exchange over raw TCP, capturing the produced bytes.
-    #[tokio::test]
-    async fn test_tcp_transport_produce_against_fake_broker() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let captured_rx = captured.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // 1) ApiVersions v0 request -> canned success, no APIs listed.
-            let frame = read_frame(&mut stream).await;
-            assert_eq!(&frame[..6], &[0, 18, 0, 0, 0, 0]);
-            write_frame(&mut stream, &[0, 0, 0, 0, 0, 0, 0, 0]).await;
-            // 2) Produce request -> capture, canned v3 success.
-            let frame = read_frame(&mut stream).await;
-            // api_key 0 (Produce), version 3.
-            assert_eq!(&frame[..4], &[0, 0, 0, 3]);
-            captured_rx.lock().extend_from_slice(&frame);
-            // ProduceResponse v3: [topics=1][name][partitions=1][index,
-            // error, base_offset, log_append_time, log_start_offset,
-            // throttle], echoing the request correlation id.
-            let mut response = vec![0, 0, 0, 0];
-            response.extend_from_slice(&[0, 0, 0, 1]); // topics
-            response.extend_from_slice(&[0, 4]); // name len
-            response.extend_from_slice(b"test");
-            response.extend_from_slice(&[0, 0, 0, 1]); // partitions
-            response.extend_from_slice(&[0, 0, 0, 0]); // index
-            response.extend_from_slice(&[0, 0]); // error = 0
-            response.extend_from_slice(&[0u8; 8 + 8 + 8]); // offsets/times
-            response.extend_from_slice(&[0, 0, 0, 0]); // throttle
-            response[0..4].copy_from_slice(&frame[4..8]);
-            write_frame(&mut stream, &response).await;
-        });
-
-        // Batch of one: every send flushes straight through TCP.
-        let mut config = test_config();
-        config.batch_max_records = 1;
-        let sink = KafkaSink::new(
-            config,
-            Arc::new(
-                TcpKafkaTransport::new(format!("127.0.0.1:{port}"), "indra-fake-test", "all")
-                    .expect("valid transport"),
-            ),
-        )
-        .expect("valid sink");
-
-        let topic = Topic::new("sensors/temp").unwrap();
-        sink.send(
-            &topic,
-            &Bytes::from_static(br#"{ "device_id": "d7" }"#),
-            QoS::AtMostOnce,
-        )
-        .await
-        .expect("produce over TCP");
-        assert_eq!(sink.sent_batches(), 1);
-
-        // The transport returns once bytes hit the kernel; poll until the
-        // fake broker has consumed the produce request.
-        let mut finished = false;
-        for _ in 0..500 {
-            if server.is_finished() {
-                finished = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(finished, "fake broker never consumed the produce");
-        server.await.expect("fake broker task");
-        let wire = captured.lock().clone();
-        assert!(wire.windows(4).any(|w| w == b"test"), "topic on the wire");
-        assert!(wire.windows(2).any(|w| w == b"d7"), "key on the wire");
-        assert!(
-            wire.windows(10).any(|w| w == b"mqtt.topic"),
-            "headers on the wire"
-        );
-        assert!(
-            wire.windows(br#"{ "device_id": "d7" }"#.len())
-                .any(|w| w == br#"{ "device_id": "d7" }"#),
-            "payload on the wire"
-        );
-    }
-
-    async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.expect("read len");
-        let len = i32::from_be_bytes(len_buf) as usize;
-        let mut frame = vec![0u8; len];
-        stream.read_exact(&mut frame).await.expect("read frame");
-        frame
-    }
-
-    async fn write_frame(stream: &mut TcpStream, body: &[u8]) {
-        let mut prefixed = (body.len() as i32).to_be_bytes().to_vec();
-        prefixed.extend_from_slice(body);
-        stream.write_all(&prefixed).await.expect("write frame");
     }
 
     #[test]
@@ -1457,11 +1268,16 @@ mod tests {
             bootstrap_servers: bootstrap.clone(),
             topic_template: topic.clone(),
             partition_key_field: Some("device_id".to_string()),
+            key_template: None,
             partitions: PARTITIONS,
             client_id: "indra-qual-b324-admin".to_string(),
             acks: "all".to_string(),
             batch_max_records: 500,
             batch_max_bytes: 256 * 1024,
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: KafkaHeaderEncodeMode::None,
         };
         let admin: rdkafka::admin::AdminClient<rdkafka::client::DefaultClientContext> =
             rdkafka_client_config(&admin_config)
@@ -1497,11 +1313,16 @@ mod tests {
             bootstrap_servers: bootstrap.clone(),
             topic_template: topic.clone(),
             partition_key_field: Some("device_id".to_string()),
+            key_template: None,
             partitions: PARTITIONS,
             client_id: "indra-qual-b324".to_string(),
             acks: "all".to_string(),
             batch_max_records: 500,
             batch_max_bytes: 256 * 1024,
+            random_partition: false,
+            headers_template: None,
+            extra_headers: Vec::new(),
+            header_encode_mode: KafkaHeaderEncodeMode::None,
         };
         config.validate().expect("qual config validates");
         let transport = Arc::new(RdkafkaKafkaTransport::new(&config).expect("qual transport"));

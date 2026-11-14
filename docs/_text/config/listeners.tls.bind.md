@@ -1,0 +1,1 @@
+`listeners.tls.bind` sets the address of the secure MQTT listener. The default is `0.0.0.0:8883`. Use `127.0.0.1:8883` to keep the port on loopback. Boot fails when the value is not a valid host and port.

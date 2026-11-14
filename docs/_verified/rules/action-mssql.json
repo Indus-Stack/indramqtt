@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "mssql"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-mssql",
+        "name": "dx2-action-mssql",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "mssql"
+      },
+      "name": "dx2-action-mssql",
+      "status": 201,
+      "type": "mssql"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-mssql\" already exists"
+      },
+      "name": "dx2-action-mssql",
+      "status": 400,
+      "type": "mssql"
+    }
+  ],
+  "item": "action-mssql",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

@@ -18,10 +18,14 @@ check() { if [ "$2" = 0 ]; then echo "ok   $1"; else echo "FAIL $1"; failures=$(
 [ "$(docker exec "$CONTAINER" id -un)" != root ]
 check "the broker does not run as root" $?
 
-docker exec "$CONTAINER" sh -c 'ps -eo args | grep -q "[b]eam"'
-check "the edge runs in the container" $?
+# The image has no ps. Read /proc: the broker process must be visible,
+# and no Erlang (beam) process may run.
+docker exec "$CONTAINER" sh -c 'grep -qa "[i]ndramqtt" /proc/[0-9]*/cmdline && ! grep -qa "[b]eam" /proc/[0-9]*/cmdline'
+check "no Erlang process runs in the container" $?
 
-# The compose file sets INDRA_LOGGING__LEVEL=debug. The file sets info.
+# The compose file sets INDRA_LOGGING__LEVEL=debug, and the image file has
+# no logging.level, so the default is info. The broker writes one DEBUG line
+# at start, which appears only when the variable is applied.
 [ "$(docker logs "$CONTAINER" 2>&1 | grep -c DEBUG)" -gt 0 ]
 check "the INDRA_* variable overrides logging.level from the file" $?
 

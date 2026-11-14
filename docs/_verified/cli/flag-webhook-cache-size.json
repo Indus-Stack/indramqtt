@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-webhook-cache-size",
+  "match": "--webhook-cache-size",
+  "output": "      --webhook-cache-size <WEBHOOK_CACHE_SIZE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

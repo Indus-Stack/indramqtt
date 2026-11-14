@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-delivery_dropped"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT reason FROM "$events/delivery_dropped"'
+topic = "$events/delivery_dropped"
+payload = '{"reason": "route-failure"}'
+expect_matched = true
+expect_projected = '{"reason": "route-failure"}'
+
+[[case]]
+sql = 'SELECT reason FROM "$events/delivery_dropped"'
+topic = "sensors/kitchen"
+payload = '{"reason": "route-failure"}'
+expect_matched = false

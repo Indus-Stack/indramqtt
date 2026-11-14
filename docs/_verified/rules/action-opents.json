@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "opents"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-opents",
+        "name": "dx2-action-opents",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "opents"
+      },
+      "name": "dx2-action-opents",
+      "status": 201,
+      "type": "opents"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-opents\" already exists"
+      },
+      "name": "dx2-action-opents",
+      "status": 400,
+      "type": "opents"
+    }
+  ],
+  "item": "action-opents",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

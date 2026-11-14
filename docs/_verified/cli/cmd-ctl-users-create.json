@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "users",
+    "--help"
+  ],
+  "item": "cmd-ctl-users-create",
+  "match": "create",
+  "output": "Authentication users: list, show, create, delete\n  create  Create one user. Prefer `--password-file`: a value passed with `--password` stays in shell history",
+  "output_bytes": 449,
+  "returncode": 0,
+  "verified": true
+}

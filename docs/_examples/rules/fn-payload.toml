@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-payload"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT payload() AS p FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"a": 1}'
+expect_matched = true
+expect_projected = '{"p": {"a": 1}}'
+
+[[case]]
+sql = "SELECT payload('x') AS p FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"a": 1}'
+expect_matched = true
+expect_projected = '{"p": null}'

@@ -1,5 +1,7 @@
 # API conformance baseline — 2026-09-19 (T-14)
 
+Note on the stack: the recorded run used the old two-process stack (kernel plus edge). The next baseline run uses the kernel listener only.
+
 First live run of `tests/api_conformance` against a real kernel. This is the
 number to improve against. No broker code was changed for this baseline.
 
@@ -150,3 +152,314 @@ and fail closed on all later mutations. Repro on a fresh stack: create the
 same connector name twice, then any connector mutation 500s. The committed
 cases avoid tripping this (delete-before-create in setup); the second live
 run above (31 pass) is unaffected by it.
+
+## Known defects of the specification
+
+These rows fail the checker because the specification is wrong. The broker
+follows the real behaviour that the management console proves. The checker
+is not changed.
+
+- `GET /api_key`, response 200. The specification declares one JSON object
+  (the schema of one key record). The management console reads a bare
+  array: `const data: APIKey[] = await http.get('/api_key')` in the API module of the console (`loadAPIKeyList`),
+  and it maps over that array. The broker returns a bare array of key
+  records, so the checker reports a type error for this row.
+
+- `GET /audit`, response 200. The specification declares an array whose
+  items are objects with the keys `data` and `meta`. The management
+  console reads one object with `data` and `meta`:
+  `queryAuditLogs` in the API module of the console returns
+  `ListDataWithPagination<AuditLogItem>`, and the audit page reads
+  `res.data`. The broker returns the documented array with one page
+  object, so the checker accepts the shape. The console page keeps its
+  own reader.
+- `GET /rule_events`, response 200. The specification declares one object
+  (the schema of one event). The management console reads an array of
+  events: `const events: RuleEvent[] = await http.get('/rule_events')` in
+  the rule input selector, and it filters and maps that array. The broker
+  returns a bare array of event records, so the checker reports a type
+  error for this row.
+- `GET /message_transformations`, response 200. The specification declares
+  an array of arrays of transformations. The management console reads a
+  flat array: `getMessageTransforms` returns `MessageTransform[]`. The
+  broker returns a flat array of transformation records, so the checker
+  reports a type error for this row.
+- `GET /message_transformations/transformation/{name}`, response 200. The
+  specification declares an array of transformations. The management
+  console reads one object: `getMessageTransformDetail` returns one
+  `MessageTransform`. The broker returns one transformation record, so the
+  checker reports a type error for this row.
+- `GET /schemas/{name}`, response 200. The specification declares a string.
+  The management console reads a JSON object: the schema form loader in the
+  console (`useSchemaForm`) fetches `/schemas/connectors` and
+  `/schemas/actions`, strips the label keys and reads paths inside the
+  object. The broker returns the schema object, so the checker reports a
+  type error for this row.
+- `GET /queues`, response 200. The specification declares a bare array.
+  The management console reads one object with `data` and `meta`:
+  `getMessageQueues` in the API module of the console returns
+  `ListDataWithCursor<MessageQueue>`, and the queue page reads
+  `res?.data`. The broker has no queues, so it returns the documented
+  empty array. The console falls back to its own empty list.
+- `GET /streams`, response 200. The specification declares a bare array.
+  The management console reads one object with `data` and `meta`:
+  `getMessageStreamList` in the API module of the console returns
+  `ListDataWithCursor<MessageStreamItem>`, and the stream page reads
+  `res?.data`. The broker has no streams, so it returns the documented
+  empty array. The console falls back to its own empty list.
+- `GET /queues/config` and `GET /streams/config`, response 200. The
+  `auto_create.lastvalue` and `auto_create.regular` fields each declare
+  one object variant plus a second variant of enum `[false]` with type
+  `string`. No value matches the second variant. The management console
+  builds the object form with `limits` of `infinity`. The broker returns
+  the object form with the documented defaults, so the checker accepts
+  the row.
+- `GET /authentication/{id}/status`, response 200. The specification schema
+  types `node_error`, `node_metrics`, `node_resource_metrics` and
+  `node_status` as single objects. The specification example answers one
+  array per field with one object per node. The broker follows the
+  documented object shape: one object per field for the local node, with
+  live counters inside `node_metrics` and `node_resource_metrics` and
+  only the node name inside `node_error` (the broker tracks no per-node
+  error text). `status` and `node_status` stay omitted: the broker runs
+  no backend health probe. The management console reads arrays
+  (`node_status: Array<{node, status}>`,
+  `node_metrics: Array<...>`), so it renders empty rows for this route
+  until its reader accepts the documented shape.
+- `POST /authentication`, `GET /authentication/{id}` and
+  `GET /authentication`, `mongodb` variants. The specification example
+  for `password_based:mongodb` carries no `mongo_type`, but every
+  `authn.mongo_*` schema requires it. The management console always
+  sends `mongo_type` (`single`, `sharded` or `rs`). The broker stores
+  and reports the fields it receives, so the specification example on
+  its own matches no variant. The conformance cases use the console
+  form with `mongo_type`.
+- `POST /authentication`, `jwt` and `cinfo` variants. The documented
+  shapes carry no `backend`. The broker defaults a missing backend to
+  the mechanism name and reports it back as an extra field, which the
+  checker accepts. The management console sends the same backend-free
+  form.
+- `POST /sso/mfa/setup_info`, response 401. The specification documents
+  401 `UNAUTHORIZED` for an invalid or expired token. The management console
+  sends `backend`, `setup_token` and `username` and reads `secret` plus
+  `mechanism` (`postSSOmfaSetupInfo`). Single sign-on is unstable, so no
+  setup token verifies and the broker answers the documented 401. A body
+  without the three fields answers 400.
+- `GET /authorization/sources`, response 200. The specification declares
+  one object with `sources`. The broker returns one object with `sources`
+  in stored order.
+- `GET /authentication/{id}/status`, `GET /authorization/sources/{type}/status`
+  and `GET /authorization/sources/{type}`, response 200. The broker omits
+  `status` and `node_status` plus rate and resource fields it does not
+  measure. Counters are live: each publish and subscribe verdict on the
+  built-in table attributes to the built-in allow and deny counters, and a
+  disabled or removed built-in source denies fail closed. The stored
+  evaluation order gates the next verdict.
+- `POST /trace`, `PUT /trace/{name}/stop` and `GET /trace`, response 200,
+  field `log_size`. The specification declares an array of objects. The
+  broker returns that array with one row per node. The generated console
+  types read the same array. One hand-written console type reads an object
+  keyed by node name instead. That type is stale. The broker follows the
+  specification.
+- `GET /data/files/{filename}`, response 200. The specification declares
+  a JSON string with the single value `binary`. The management console
+  reads a file body. Its backup download call requests the path with a
+  blob response type. The broker serves the raw file bytes as
+  `application/octet-stream`, so the checker reports a type error for
+  this row.
+- `POST /listeners/{id}`, response 200. The specification has no such
+  operation (creates go to `POST /listeners`). The management console
+  sends creates there: `addListener` in the API module of the console
+  posts the full listener form to `/listeners/{id}`. The broker treats
+  it as a create with the path id, so the checker has no row for it.
+- `GET /listeners`, response 200. The specification declares no
+  top-level `current_connections` on list rows. The management console
+  reads it first: its listener table uses
+  `row.current_connections ?? row.status?.current_connections ?? 0`.
+  The broker returns the live count in both places, so the checker sees
+  one extra field and the table shows the count.
+- `POST /listeners` and `PUT /listeners/{id}`, request `bind`. The
+  specification types `bind` as a string with the numeric default
+  `1883`. The management console sends a bare port as a number. The
+  broker accepts a string or a number and stores the string form, so the
+  checker sees no error and the console create succeeds.
+- `GET /action_types` and `GET /source_types`, response 200. The
+  specification declares the full name enum. The management console
+  reads a bare string array (`getActionTypes`) and offers creation
+  forms only for installed types. The broker returns the documented
+  names limited to the runtimes in this build, so the checker sees a
+  shorter array and each listed name still validates against the enum.
+- `GET /actions/{id}`, `GET /sources/{id}` and `GET /connectors/{id}`,
+  path `id`. The specification shows the `{type}:{name}` key. The
+  management console builds that key client side (`getBridgeKey`) and
+  sends it encoded in the path. The broker accepts the key and the
+  bare name, stores the bare name, and returns the bare `id` with the
+  bare `name`, so the checker validates the key-form read and the
+  console derives the same key back.
+- `GET /actions/{id}` and `GET /sources/{id}`, response 200, fields
+  `status` and `node_status`. The specification declares health rows
+  per node. The management console renders those rows in the detail
+  pages. The broker runs no health probe for actions or sources, so it
+  derives the rows from the stored enable flag (`connected` while
+  enabled, `disconnected` while stopped) on the local node, instead of
+  a constant or a missing field.
+- `POST /schema_registry` and `GET /schema_registry/{name}`, fields
+  `source` and `schema`. The specification declares `source` text. The
+  management console form posts the document and reads it back for
+  editing. The broker accepts `source` or `schema` on write and
+  returns both (`source` as text, `schema` parsed), so the checker
+  validates the documented field and historic bodies keep working.
+- `PUT /configs`, request body. The specification declares `text/plain`
+  (a configuration text). The management console sends JSON:
+  `putConfigs` in the API module of the console puts the object with
+  `Content-Type: application/json`. The broker accepts a JSON object
+  keyed by root, so the checker sends JSON and the console write
+  succeeds.
+- `GET /mqtt/delayed/messages`, response 200, field `meta`. The
+  specification declares `count`, `limit` and `page`. The management
+  console reads `data` and `meta.count` for the delayed table. The
+  broker returns the shared page `meta` with one extra field
+  (`hasnext`), as the retained list does, and clamps `limit` to
+  `1..=1000` while the specification allows `10000`, so the checker
+  sees the extra field and large limits page earlier.
+- `GET /mqtt/delayed/messages/{node}/{msgid}`, response 200. The
+  specification declares the shape without `payload`. The management
+  console reads `detail?.payload` for the payload dialog and shows a
+  placeholder when it is missing. The broker follows the specification
+  and omits `payload`, so the checker validates the row and the dialog
+  shows the placeholder.
+- `GET /mqtt/delayed/messages`, field `msgid`. The specification types
+  it as an integer. The management console types it as a string but
+  passes it through to the path unchanged. The broker returns an
+  integer, so the checker validates the row and the console read works.
+- `PUT /mqtt/delayed`, request body. The specification marks no field
+  required. The management console always sends `enable` and
+  `max_delayed_messages` together. The broker keeps the current value
+  of a missing field, so the checker sends full bodies and partial
+  writes never clear a setting.
+- `POST /mqtt/topic_metrics2`, response 400, field `code`. The
+  specification lists `BAD_NAME` and `BAD_TOPIC_FILTER`. The broker
+  keeps no per-filter counters, so each create fails with `BAD_REQUEST`
+  and a message that the function is not available. The checker flags
+  the code while the status stays documented.
+- `/mqtt/topic_metrics` and `/mqtt/topic_metrics/{topic}`. The
+  specification carries no operation on these paths. The management
+  console still ships helpers for them, but the topic-metrics view
+  calls only the `topic_metrics2` operations. The broker keeps no
+  route there and answers 404.
+- `PUT /mqtt/topic_rewrite`, field `dest_topic`. The specification
+  fills `${clientid}` and `${username}` per client. The router has no
+  client context on the match path yet, so the broker stores the
+  template and renders `$1` captures only, leaving those placeholders
+  literal. Plain capture templates rewrite exactly.
+- `GET /clients/{clientid}/authorization/cache`, response 200. The
+  specification declares one object with `access`, `result`, `topic` and
+  `updated_time`. The broker returns a bare list of such objects, one per
+  cached decision. One object cannot hold a cache with many decisions. The
+  management console has no caller for this route, so no console read
+  decides it. The broker keeps the list so no decision is lost, and the
+  checker reports a type error for this row.
+- `GET /clients/{clientid}/authorization/cache`, response 200, field
+  `result`. The specification declares enum `["allow", "denny"]`. The
+  word `denny` is a spelling error. The broker returns `deny` for a
+  denied decision. The checker reports a type error for a denied row.
+- `PUT /clients/{clientid}/keepalive`. The published specification file
+  has no such path. The broker serves it as a hidden route. It takes
+  `{interval: 0..65535}` and answers the full client detail, the same
+  shape as `GET /clients/{clientid}`. An unknown id answers 404
+  `CLIENTID_NOT_FOUND`. The checker exercises this row through
+  `cases/keepalive.json`. A HTTP test in `crates/broker-api` proves it.
+- `GET /clients/{clientid}/inflight_messages`, response 200. The
+  specification lists `from_clientid` and `from_username` on each entry.
+  The broker omits both. The queue tracker keeps no publisher name, so no
+  true value exists. Recording one needs new publish-path allocation, and
+  no bench numbers allow it. The management console reads the list
+  (`loadInflightMsgs` in the API module of the console, the message list
+  dialog) and shows a placeholder for a missing name. The checker reports
+  missing fields for this row.
+- `GET /clients/{clientid}/mqueue_messages`, response 200. The
+  specification lists `from_clientid` and `from_username` on each entry.
+  The broker omits both. The queue keeps no publisher name, so no true
+  value exists. Recording one needs new publish-path allocation, and no
+  bench numbers allow it. The broker omits `mqueue_priority`. The queue
+  keeps no priority, so no true value exists. The
+  management console reads the list (`loadMsgQueue` in the API module of
+  the console, the message list dialog) and shows a placeholder for a
+  missing name. The checker reports missing fields for this row.
+- `GET /clients/{clientid}/mqueue_messages`, response 200, field `msgid`.
+  The specification types it as an optional string. The queue entry holds
+  no message identifier, so the broker omits it. The inflight list keeps
+  the downlink packet id as `msgid`. No identifier was added to the queue:
+  stamping one where the kernel queues the message would add work on the
+  publish path. The    checker reports a missing field for this row.
+- `GET /stats` and `GET /nodes/{node}/stats`, fields `delayed.max`,
+  `subscribers.count`, `subscribers.max`, `subscriptions.shared.count` and
+  `subscriptions.shared.max`. The specification lists them as optional. The
+  broker omits them: it keeps no high water mark for delayed entries, no
+  distinct-subscriber counter and no shared-entry counter,
+  and the session mirror stores shared entries under their inner filter.
+  The management console tolerates the absence: its node detail reads
+  `stats['subscriptions.shared.count'] ?? 0`.
+- `GET /metrics` and `GET /nodes/{node}/metrics`, omitted keys. The
+  specification lists every key as optional. The broker serves each key
+  it truly counts (packet families, byte counts, QoS splits, delivery
+  drops, `rules.matched`, `actions.executed`, `messages.delayed`,
+  transformation outcomes) and omits the rest (QoS 2 splits,
+  unsubscribe/disconnect splits, retained writes, session and
+  authentication lifecycles, validation splits). A constant would fake
+  a measurement. The management console reads the served keys only.
+- `GET /prometheus/*` area routes (`auth`, `data_integration`,
+  `message_transformation`, `namespaced_stats`, `schema_validation`,
+  `topic_metrics`). The specification declares one text exposition per
+  area. One node holds every counter, so each route serves the same
+  text: the true counters of `GET /metrics` and `GET /stats`, one line
+  per key. The management console scrapes only `/prometheus/stats`
+  (its generated scrape config points there) and never parses an area
+  split, so the shared body keeps every scrape target working.
+- `GET /prometheus/*`, query `mode`, `ns` and `only_global`. The
+  specification offers node and aggregate modes plus namespace
+  filters. One node holds every counter, so each mode reads the same
+  values; the broker accepts the keys and ignores them. The management
+  console sends no such query.
+- `PUT /prometheus`, legacy body. The specification accepts the legacy
+  shape or the recommend shape and answers the recommend shape. The
+  broker maps each legacy field onto the recommend field
+  (`push_gateway_server` to `push_gateway.url`, `vm_*_collector` to
+  `collectors.*`, top-level `enable`, `interval`, `job_name` and
+  `headers` to the push target) and answers the recommend shape. A mix
+  of both shapes fails closed with `BAD_REQUEST`.
+- `GET /prometheus`, field `enable_basic_auth`. The specification
+  defaults it to true and documents public scrape endpoints while it
+  is false. The broker stores and returns the flag honestly, but the
+  scrape routes stay behind credentials either way: opening them would
+  fail open, and the rulebook fails closed. The management console
+   reads and writes the flag through the settings form.
+- `POST /rules` and `PUT /rules/{id}`, request body. The specification
+  documents no `id` field in the request schema (`rule_creation`). The management console sends `id` when it
+  creates a rule (`createRules` in the copy dialog sends
+  `{ sql, enable, description, actions, id }`), so the broker accepts `id`
+  and keeps `name` as the fallback. The cases that create a rule send `id`
+  for this reason, because a case needs a known id to clean up. A create
+  with neither `id` nor `name` gets an assigned id of 8 lowercase hex
+  chars, the form the documented example shows.
+- `POST /rules`, `PUT /rules/{id}`, response, field `actions`. The specification declares
+  `oneOf` for each item, but a `republish` or `console` item also matches the
+  schema `user_provided_function` (a string `function` and an object `args`).
+  The checker reports this overlap as a warning, not as an error.
+- `GET /clients/{clientid}/authorization/cache`, response 200. The specification declares one object with `access`, `result`, `topic` and `updated_time`. One session holds many decisions, one per topic and access type. The broker returns a bare array with one object per decision, oldest first. An empty cache returns an empty array. The checker reports a type error for this row.
+
+- `POST /users` and `PUT /users/{username}`, request field `scopes`, and
+  `GET /users`, response field `scopes`. The request descriptions accept
+  the literal string `unset` and a list equal to the role default as
+  "no explicit scopes". The response schema calls `unset` a legacy-only
+  sentinel. The management console decides the value. `CONSOLE/types/
+  systemModule.d.ts:9` defines `UnsetScopes = 'unset'`, and line 11
+  defines `DashboardScopes = string[] | UnsetScopes | null | undefined`.
+  `CONSOLE/types/systemModule.d.ts:125-127` lets a user update send
+  `string[] | UnsetScopes`. `CONSOLE/common/scopes.ts:7` defines the
+  same sentinel. The broker stores no explicit list for `unset` or for a
+  list equal to the role default. `GET /users` renders `unset` for that
+  state, and the write paths accept it again.
+- `POST /users`, responses 400 and 409. The specification lists only
+  200. The broker refuses duplicates with 409 and bad bodies with 400.
+  The checker accepts those statuses and checks `{code, message}`.

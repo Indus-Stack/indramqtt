@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-datalayers"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-datalayers"
+type = "datalayers"
+expect_status = 201
+expect_type = "datalayers"
+
+[[case]]
+name = "dx2-action-datalayers"
+type = "datalayers"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

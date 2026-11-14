@@ -1,0 +1,11 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "--help"
+  ],
+  "item": "bin-indra",
+  "output": "IndraMQTT operator CLI\n\nUsage: indra <COMMAND>\n",
+  "output_bytes": 372,
+  "returncode": 0,
+  "verified": true
+}

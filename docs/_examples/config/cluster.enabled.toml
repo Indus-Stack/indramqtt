@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "cluster.enabled"
+kind = "setting"
+expect = "ok"
+expected = "The broker starts in single-node mode with clustering switched off."
+source = "`crates/broker-config/src/schema.rs` documents `cluster.enabled` as refused when true, and `crates/broker-node/src/main.rs` refuses boot when it is true."
+action = "Start the broker and check that `/healthz` answers OK."
+config = '''
+[cluster]
+enabled = false
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

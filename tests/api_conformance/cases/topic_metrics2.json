@@ -1,0 +1,65 @@
+[
+  {
+    "operation": "GET /mqtt/topic_metrics2",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /mqtt/topic_metrics2",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-alpha",
+      "topic_filter": "conf/alpha/#"
+    },
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/topic_metrics2/{name}",
+    "path_params": {
+      "name": "conf-alpha"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /mqtt/topic_metrics2/{name}",
+    "path_params": {
+      "name": "conf-alpha"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/topic_metrics2/{name}/reset",
+    "path_params": {
+      "name": "conf-alpha"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /mqtt/topic_metrics2",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [],
+    "cleanup": []
+  }
+]

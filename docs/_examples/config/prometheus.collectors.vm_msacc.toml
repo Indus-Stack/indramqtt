@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "prometheus.collectors.vm_msacc"
+kind = "setting"
+expect = "vm_msacc=enabled"
+expected = "The broker stores enabled and shows it from the exporter settings."
+source = "`crates/broker-config/src/schema.rs` documents `prometheus.collectors.vm_msacc`, and `crates/broker-node/src/main.rs` copies the file value into the registry."
+action = "Start the broker with the collector on and read `GET /api/v5/prometheus`."
+config = '''
+[prometheus.collectors]
+vm_msacc = "enabled"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/api/v5/prometheus")
+assert status == 200, (status, body)
+assert body["collectors"]["vm_msacc"] == "enabled", body
+print("vm_msacc=enabled")
+'''

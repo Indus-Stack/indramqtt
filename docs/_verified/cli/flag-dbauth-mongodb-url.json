@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-dbauth-mongodb-url",
+  "match": "--dbauth-mongodb-url",
+  "output": "      --dbauth-mongodb-url <DBAUTH_MONGODB_URL>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

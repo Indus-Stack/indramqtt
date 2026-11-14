@@ -1,0 +1,39 @@
+[example]
+area = "rules"
+item = "fn-base64_encode"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT base64_encode('ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "YWI="}'
+
+[[case]]
+sql = "SELECT base64_encode('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": ""}'
+
+[[case]]
+sql = "SELECT base64_encode(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT base64_encode() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT base64_encode('ab', 'no_padding') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "YWI"}'

@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-flags"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT flags() AS f FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"flags": {"retain": true}}'
+expect_matched = true
+expect_projected = '{"f": {"retain": true}}'
+
+[[case]]
+sql = 'SELECT flags() AS f FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"f": {}}'

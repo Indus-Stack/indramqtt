@@ -1,0 +1,25 @@
+[example]
+area = "connectors"
+item = "redshift"
+kind = "connector-create"
+
+[[case]]
+name = "redshift-normal"
+database = "analytics"
+table_template = "sensor_events"
+workgroup_name = "iot-workgroup"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+timeout_ms = 5000
+expect_status = 201
+expect_type = "redshift"
+
+[[case]]
+name = "redshift-edge-empty-database"
+database = ""
+workgroup_name = "iot-workgroup"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+expect_status = 400

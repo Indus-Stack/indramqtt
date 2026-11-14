@@ -1,0 +1,1 @@
+`dbauth.mongodb_url` names the MongoDB source for database authentication. Empty disables the MongoDB source. Any configured source disables the open mode. An unreachable database denies access and never grants it.

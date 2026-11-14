@@ -1,0 +1,30 @@
+[example]
+area = "connectors"
+item = "s3_tables"
+kind = "connector-create"
+
+[[case]]
+name = "s3-tables-normal"
+table_bucket_arn = "arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry-bucket"
+namespace = "production_iot"
+table_name = "device_events"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+partition_spec = [{ source_name = "date", transform = "day" }, { source_name = "device_id", transform = "identity" }]
+target_format = "ndjsoncompressed"
+batch_size = 1
+linger_ms = 10
+timeout_ms = 5000
+expect_status = 201
+expect_type = "s3_tables"
+
+[[case]]
+name = "s3-tables-edge-bad-arn"
+table_bucket_arn = "not-an-arn"
+namespace = "production_iot"
+table_name = "device_events"
+region = "us-east-1"
+access_key_id = "AKID"
+secret_access_key = "secret"
+expect_status = 400

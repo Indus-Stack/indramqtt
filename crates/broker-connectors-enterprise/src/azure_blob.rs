@@ -160,7 +160,7 @@ impl AzureBlobSinkConfig {
         }
         // Strict template check with dummy values: unknown or unclosed
         // variables fail here, not on the hot path.
-        self.resolve_path(0, 0)?;
+        self.resolve_path("dummy/topic", 0, 0)?;
         if self.max_records_per_blob == Some(0) {
             return Err(ConnectorError::Dispatch(
                 "azure_blob max_records_per_blob must be >= 1".to_string(),
@@ -182,14 +182,21 @@ impl AzureBlobSinkConfig {
         }
     }
 
-    /// Render the blob path for one flush: `${date.year}` /
-    /// `${date.month}` / `${date.day}` / `${date.hour}` come from
-    /// `millis` (UTC), `${batch_id}` is the flush sequence number.
-    /// A leading `/` is rejected so paths stay relative.
-    pub fn resolve_path(&self, batch_id: u64, millis: i64) -> Result<String> {
+    /// Render the blob path for one flush.
+    /// `${topic}` uses path-safe characters.
+    /// Date parts come from `millis` (UTC).
+    /// `${batch_id}` is the flush number.
+    /// A leading `/` is rejected.
+    pub fn resolve_path(&self, topic: &str, batch_id: u64, millis: i64) -> Result<String> {
+        if topic.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "azure_blob path requires a non-empty topic".to_string(),
+            ));
+        }
         let (year, month, day) = ymd_from_millis(millis);
         let (hour, _, _, _) = hms_milli_from_millis(millis);
         let vars = [
+            ("topic", sanitize_topic(topic)),
             ("date.year", format!("{year:04}")),
             ("date.month", format!("{month:02}")),
             ("date.day", format!("{day:02}")),
@@ -281,15 +288,75 @@ fn validate_container_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Keep hierarchy separators.
+/// Map outside `[A-Za-z0-9._-/]` to `_`.
+fn sanitize_topic(topic: &str) -> String {
+    topic
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Azure Storage Shared Key signing (documented Blob service 2021-08-06
 // REST: `StringToSign` + `Authorization: SharedKey`, HMAC-SHA256 on
 // the maintained `hmac` + `sha2` crates).
 // ---------------------------------------------------------------------------
 
-/// Canonicalized resource for one blob PUT.
-pub fn canonicalized_resource(account: &str, container: &str, blob_path: &str) -> String {
-    format!("/{account}/{container}/{blob_path}")
+/// Path prefix of the configured endpoint, without a trailing slash.
+///
+/// Host style (`https://{account}.blob.core.windows.net`) has no path,
+/// so this returns empty. Path style
+/// (`http://host:10000/{account}`) returns `/{account}`. The request
+/// path is this prefix plus container and blob.
+fn endpoint_path_prefix(endpoint: &str) -> String {
+    let after_scheme = match endpoint.find("://") {
+        Some(i) => &endpoint[i + 3..],
+        None => endpoint,
+    };
+    let path = match after_scheme.find('/') {
+        Some(i) => &after_scheme[i..],
+        None => "",
+    };
+    let path = match path.find(['?', '#']) {
+        Some(i) => &path[..i],
+        None => path,
+    };
+    path.trim_end_matches('/').to_string()
+}
+
+/// Request path as sent on the wire for one blob PUT.
+pub fn blob_request_path(endpoint: &str, container: &str, blob_path: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        endpoint_path_prefix(endpoint),
+        container,
+        blob_path.trim_start_matches('/')
+    )
+}
+
+/// Request path as sent on the wire for one container create.
+pub fn container_request_path(endpoint: &str, container: &str) -> String {
+    format!(
+        "{endpoint_prefix}/{container}",
+        endpoint_prefix = endpoint_path_prefix(endpoint)
+    )
+}
+
+/// Canonicalized resource from the documented rule: a slash, the
+/// account name, then the encoded path of the request URI.
+pub fn canonicalized_resource(account: &str, request_path: &str) -> String {
+    if request_path.starts_with('/') {
+        format!("/{account}{request_path}")
+    } else {
+        format!("/{account}/{request_path}")
+    }
 }
 
 /// Build the Shared Key `StringToSign` for `PUT /{container}/{path}`.
@@ -297,10 +364,11 @@ pub fn canonicalized_resource(account: &str, container: &str, blob_path: &str) -
 /// ```text
 /// PUT\n\n\n{content_length}\n\n{content_type}\n\n\n\n\n\n\n
 /// x-ms-blob-type:BlockBlob\nx-ms-date:{date}\nx-ms-version:2021-08-06\n
-/// /{account}/{container}/{blob_path}
+/// /{account}{request_path}
 /// ```
 pub fn string_to_sign(
     account: &str,
+    endpoint: &str,
     container: &str,
     blob_path: &str,
     content_length: usize,
@@ -313,7 +381,7 @@ pub fn string_to_sign(
          x-ms-date:{date}\n\
          x-ms-version:{AZURE_STORAGE_VERSION}\n\
          {}",
-        canonicalized_resource(account, container, blob_path)
+        canonicalized_resource(account, &blob_request_path(endpoint, container, blob_path))
     )
 }
 
@@ -347,6 +415,7 @@ pub fn shared_key_authorization(
 /// One buffered ndjson line.
 #[derive(Debug, Clone)]
 struct AzureBlobRow {
+    topic: String,
     line: String,
 }
 
@@ -364,7 +433,10 @@ fn render_row(topic: &Topic, payload: &Bytes, qos: QoS, millis: i64) -> Result<A
         "timestamp": broker_connectors::rfc3339_millis(millis),
     })
     .to_string();
-    Ok(AzureBlobRow { line })
+    Ok(AzureBlobRow {
+        topic: topic.as_str().to_string(),
+        line,
+    })
 }
 
 fn gzip_bytes(raw: &[u8]) -> Result<Vec<u8>> {
@@ -518,17 +590,23 @@ impl AzureBlobTransport for MockAzureBlobTransport {
 /// `PUT /{container}?restype=container` (idempotent container create).
 ///
 /// ```text
-/// PUT\n\n\n0\n\n\n\n\n\n\n\n\n
+/// PUT\n\n\n\n\n\n\n\n\n\n\n\n
 /// x-ms-date:{date}\nx-ms-version:2021-08-06\n
-/// /{account}/{container}\nrestype:container
+/// /{account}{request_path}\nrestype:container
 /// ```
-pub fn container_string_to_sign(account: &str, container: &str, date: &str) -> String {
+pub fn container_string_to_sign(
+    account: &str,
+    endpoint: &str,
+    container: &str,
+    date: &str,
+) -> String {
     format!(
-        "PUT\n\n\n0\n\n\n\n\n\n\n\n\n\
+        "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
          x-ms-date:{date}\n\
          x-ms-version:{AZURE_STORAGE_VERSION}\n\
-         /{account}/{container}\n\
-         restype:container"
+         {}\n\
+         restype:container",
+        canonicalized_resource(account, &container_request_path(endpoint, container))
     )
 }
 
@@ -582,6 +660,7 @@ impl HttpAzureBlobTransport {
                 account_key,
                 &container_string_to_sign(
                     &self.config.account_name,
+                    &self.config.base_endpoint(),
                     &self.config.container_name,
                     date,
                 ),
@@ -751,9 +830,10 @@ impl AzureBlobSink {
         self.buffer.lock().bytes
     }
 
-    /// Flush buffered rows as one block blob (no-op when empty). While
-    /// backing off, fails fast without touching the transport. Any
-    /// failure restores rows + byte count, engages backoff, propagates.
+    /// Flush buffered rows as one blob per key.
+    /// Do nothing when empty.
+    /// Fail fast while backing off.
+    /// Restore rows and back off on failure.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {
@@ -767,48 +847,32 @@ impl AzureBlobSink {
         }
         let batch_id = self.batch_seq.fetch_add(1, Ordering::SeqCst);
         let millis = now_millis();
-        let path = self
-            .config
-            .resolve_path(batch_id, millis)
-            .unwrap_or_else(|_| format!("unkeyed/{batch_id}.ndjson"));
-        let mut raw = String::new();
+        // Group by key with the same `batch_id` and `millis`.
+        // Keep first-seen group order.
+        // Send bad keys to `unkeyed/{batch_id}.ndjson`.
+        let unkeyed_key = format!("unkeyed/{batch_id}.ndjson");
+        let mut group_keys: Vec<String> = Vec::new();
+        let mut group_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut row_group: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
-            raw.push_str(&row.line);
-            raw.push('\n');
+            let key = match self.config.resolve_path(&row.topic, batch_id, millis) {
+                Ok(key) => key,
+                Err(_) => unkeyed_key.clone(),
+            };
+            if let Some(&gi) = group_index.get(&key) {
+                row_group.push(gi);
+            } else {
+                let gi = group_keys.len();
+                group_keys.push(key.clone());
+                group_index.insert(key, gi);
+                row_group.push(gi);
+            }
         }
-        let (body, content_encoding, content_type) = match self.config.compression {
-            AzureBlobCompression::None => (raw.into_bytes(), None, "application/x-ndjson"),
-            AzureBlobCompression::Gzip => (
-                gzip_bytes(raw.as_bytes())?,
-                Some("gzip"),
-                "application/octet-stream",
-            ),
-        };
-        let date = crate::oci_streaming::rfc1123_date(millis);
-        let authorization = match &self.config.auth {
-            AzureBlobAuth::SharedKey { account_key } => Some(shared_key_authorization(
-                &self.config.account_name,
-                account_key,
-                &string_to_sign(
-                    &self.config.account_name,
-                    &self.config.container_name,
-                    &path,
-                    body.len(),
-                    content_type,
-                    &date,
-                ),
-            )?),
-            AzureBlobAuth::BearerToken { token } => Some(format!("Bearer {token}")),
-            AzureBlobAuth::SasToken { .. } => None,
-        };
-        let put = AzureBlobPut {
-            url: self.config.blob_url(&path),
-            path,
-            body,
-            content_type,
-            content_encoding,
-        };
-        let record_count = rows.len() as u64;
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_keys.len()];
+        for (ri, gi) in row_group.iter().enumerate() {
+            members[*gi].push(ri);
+        }
         if let Err(e) = self.transport.ensure_container().await {
             let mut buffer = self.buffer.lock();
             buffer.queue.restore(rows, oldest);
@@ -816,25 +880,74 @@ impl AzureBlobSink {
             self.backoff.lock().failure();
             return Err(e);
         }
-        match self
-            .transport
-            .put_blob(&put, &date, authorization.as_deref())
-            .await
-        {
-            Ok(()) => {
-                self.backoff.lock().success();
-                self.sent_blobs.fetch_add(1, Ordering::Relaxed);
-                self.sent_records.fetch_add(record_count, Ordering::Relaxed);
-                Ok(())
+        let date = crate::oci_streaming::rfc1123_date(millis);
+        for (gi, path) in group_keys.iter().enumerate() {
+            let mut raw = String::new();
+            for &ri in &members[gi] {
+                raw.push_str(&rows[ri].line);
+                raw.push('\n');
             }
-            Err(e) => {
-                let mut buffer = self.buffer.lock();
-                buffer.queue.restore(rows, oldest);
-                buffer.bytes = buffer.bytes.saturating_add(taken_bytes);
-                self.backoff.lock().failure();
-                Err(e)
+            let (body, content_encoding, content_type) = match self.config.compression {
+                AzureBlobCompression::None => (raw.into_bytes(), None, "application/x-ndjson"),
+                AzureBlobCompression::Gzip => (
+                    gzip_bytes(raw.as_bytes())?,
+                    Some("gzip"),
+                    "application/octet-stream",
+                ),
+            };
+            let authorization = match &self.config.auth {
+                AzureBlobAuth::SharedKey { account_key } => Some(shared_key_authorization(
+                    &self.config.account_name,
+                    account_key,
+                    &string_to_sign(
+                        &self.config.account_name,
+                        &self.config.base_endpoint(),
+                        &self.config.container_name,
+                        path,
+                        body.len(),
+                        content_type,
+                        &date,
+                    ),
+                )?),
+                AzureBlobAuth::BearerToken { token } => Some(format!("Bearer {token}")),
+                AzureBlobAuth::SasToken { .. } => None,
+            };
+            let put = AzureBlobPut {
+                url: self.config.blob_url(path),
+                path: path.clone(),
+                body,
+                content_type,
+                content_encoding,
+            };
+            let record_count = members[gi].len() as u64;
+            match self
+                .transport
+                .put_blob(&put, &date, authorization.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    self.sent_blobs.fetch_add(1, Ordering::Relaxed);
+                    self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let mut unsent = Vec::new();
+                    let mut unsent_bytes = 0usize;
+                    for (ri, row) in rows.into_iter().enumerate() {
+                        if row_group[ri] >= gi {
+                            unsent_bytes = unsent_bytes.saturating_add(row.line.len() + 1);
+                            unsent.push(row);
+                        }
+                    }
+                    let mut buffer = self.buffer.lock();
+                    buffer.queue.restore(unsent, oldest);
+                    buffer.bytes = buffer.bytes.saturating_add(unsent_bytes);
+                    self.backoff.lock().failure();
+                    return Err(e);
+                }
             }
         }
+        self.backoff.lock().success();
+        Ok(())
     }
 
     /// Validate + buffer one event. Returns true when the batch is
@@ -862,6 +975,17 @@ impl AzureBlobSink {
 #[async_trait]
 impl Sink for AzureBlobSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        // A failed flush restores its rows. The buffer can hold one
+        // restored batch when the next row arrives. Flush the restored
+        // rows first, then accept the new row. The flush fails fast
+        // while backing off and fails closed while the server is down.
+        // The runtime counts that failure. Without this step, the
+        // restored row blocks every later send: the action buffer holds
+        // one batch and no flush worker runs.
+        let full = self.buffer.lock().queue.len() >= self.config.effective_buffer();
+        if full {
+            self.flush().await?;
+        }
         if self.buffer_row(topic, payload, qos)? {
             self.flush().await?;
         }
@@ -956,6 +1080,7 @@ mod tests {
     fn test_string_to_sign_builder() {
         let sts = string_to_sign(
             "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
             "telemetry",
             "telemetry/year=2026/month=09/day=12/0.json",
             17,
@@ -973,6 +1098,86 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_key_signing_both_endpoint_styles() {
+        // Host style: request URL is
+        // `https://mydeviceblobs.blob.core.windows.net/telemetry/telemetry/0.json`.
+        // Request path is `/telemetry/telemetry/0.json`.
+        // Resource is `/mydeviceblobs` plus the request path.
+        let host_sts = string_to_sign(
+            "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
+            "telemetry",
+            "telemetry/0.json",
+            17,
+            "application/x-ndjson",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            host_sts,
+            "PUT\n\n\n17\n\napplication/x-ndjson\n\n\n\n\n\n\n\
+             x-ms-blob-type:BlockBlob\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /mydeviceblobs/telemetry/telemetry/0.json"
+        );
+        // Host style container: request path is `/telemetry`.
+        // Resource is `/mydeviceblobs/telemetry`.
+        let host_container = container_string_to_sign(
+            "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
+            "telemetry",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            host_container,
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /mydeviceblobs/telemetry\n\
+             restype:container"
+        );
+        // Path style: request URL is
+        // `http://127.0.0.1:10000/devstoreaccount1/qual-b303/qual/0.json`.
+        // Request path is `/devstoreaccount1/qual-b303/qual/0.json`.
+        // Resource is `/devstoreaccount1` plus the request path.
+        // The old code misses the prefix and signs the wrong text.
+        let path_sts = string_to_sign(
+            "devstoreaccount1",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "qual-b303",
+            "qual/0.json",
+            17,
+            "application/x-ndjson",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            path_sts,
+            "PUT\n\n\n17\n\napplication/x-ndjson\n\n\n\n\n\n\n\
+             x-ms-blob-type:BlockBlob\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /devstoreaccount1/devstoreaccount1/qual-b303/qual/0.json"
+        );
+        // Path style container: request path is
+        // `/devstoreaccount1/qual-b303`.
+        // Resource is `/devstoreaccount1/devstoreaccount1/qual-b303`.
+        let path_container = container_string_to_sign(
+            "devstoreaccount1",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "qual-b303",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            path_container,
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /devstoreaccount1/devstoreaccount1/qual-b303\n\
+             restype:container"
+        );
+    }
+
+    #[test]
     fn test_shared_key_known_answer() {
         // Independent Python (hmac/hashlib/base64) vector over the
         // StringToSign above with key b"0123456789abcdef"*2.
@@ -981,6 +1186,7 @@ mod tests {
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
             &string_to_sign(
                 "mydeviceblobs",
+                "https://mydeviceblobs.blob.core.windows.net",
                 "telemetry",
                 "telemetry/year=2026/month=09/day=12/0.json",
                 17,
@@ -999,15 +1205,22 @@ mod tests {
     fn test_blob_path_template_resolution() {
         let config = test_config();
         // 2026-09-12T11:18:09.123Z.
-        let path = config.resolve_path(0, 1_789_211_889_123).unwrap();
+        let path = config
+            .resolve_path("dummy/topic", 0, 1_789_211_889_123)
+            .unwrap();
         assert_eq!(path, "telemetry/year=2026/month=09/day=12/hour=11/0.json");
-        let next = config.resolve_path(41, 0).unwrap();
+        let next = config.resolve_path("dummy/topic", 41, 0).unwrap();
         assert_eq!(next, "telemetry/year=1970/month=01/day=01/hour=00/41.json");
 
         // Leading slashes are rejected (paths stay relative).
         let mut absolute = test_config();
         absolute.blob_path_template = "/abs/${batch_id}.json".to_string();
-        assert!(absolute.resolve_path(0, 0).is_err());
+        assert!(absolute.resolve_path("dummy/topic", 0, 0).is_err());
+        // A topic variable renders from the event topic.
+        let mut topical = test_config();
+        topical.blob_path_template = "events/${topic}/${batch_id}.json".to_string();
+        let topical_path = topical.resolve_path("mv02d/azure", 0, 0).unwrap();
+        assert_eq!(topical_path, "events/mv02d/azure/0.json");
     }
 
     #[test]
@@ -1063,6 +1276,27 @@ mod tests {
         assert_eq!(value["topic"], "sensors/t1");
         assert_eq!(value["payload"], serde_json::json!({"v": 1}));
         assert_eq!(value["timestamp"], "2026-09-12T11:18:09.123Z");
+    }
+
+    #[test]
+    fn test_endpoint_path_prefix_strips_query_and_fragment() {
+        // `?` and `#` start a query or fragment, never a path.
+        assert_eq!(
+            endpoint_path_prefix("http://127.0.0.1:10000/devstoreaccount1?sv=2021#frag"),
+            "/devstoreaccount1"
+        );
+        assert_eq!(
+            endpoint_path_prefix("https://acct.blob.core.windows.net?sv=1"),
+            ""
+        );
+        assert_eq!(
+            blob_request_path(
+                "http://127.0.0.1:10000/devstoreaccount1?sv=1#frag",
+                "telemetry",
+                "events/0.json"
+            ),
+            "/devstoreaccount1/telemetry/events/0.json"
+        );
     }
 
     #[test]
@@ -1270,12 +1504,13 @@ mod tests {
         // Documented Create Container StringToSign over REST.
         let sts = container_string_to_sign(
             "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
             "telemetry",
             "Sat, 12 Sep 2026 11:18:09 GMT",
         );
         assert_eq!(
             sts,
-            "PUT\n\n\n0\n\n\n\n\n\n\n\n\n\
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
              x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
              x-ms-version:2021-08-06\n\
              /mydeviceblobs/telemetry\n\
@@ -1521,12 +1756,22 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs Azurite (see AZURE_BLOB_* env)"]
     async fn test_qualify_rest_write_path() {
-        fn get_sign(account: &str, container: &str, rest: &str, date: &str) -> String {
+        fn get_sign(
+            account: &str,
+            endpoint: &str,
+            container: &str,
+            rest: &str,
+            date: &str,
+        ) -> String {
+            let resource = canonicalized_resource(
+                account,
+                &format!("{}{rest}", container_request_path(endpoint, container)),
+            );
             format!(
                 "GET\n\n\n\n\n\n\n\n\n\n\n\n\
                  x-ms-date:{date}\n\
                  x-ms-version:{AZURE_STORAGE_VERSION}\n\
-                 /{account}/{container}{rest}"
+                 {resource}"
             )
         }
 
@@ -1581,8 +1826,9 @@ mod tests {
 
         let endpoint = qual_env("AZURE_BLOB_ENDPOINT").unwrap_or_default();
         if endpoint.is_empty() {
-            eprintln!("AZURE_BLOB_ENDPOINT is empty; skipping qualification");
-            return;
+            panic!(
+                "missing AZURE_BLOB_ENDPOINT; cannot run qualification without a server endpoint"
+            );
         }
         let account =
             qual_env("AZURE_BLOB_ACCOUNT").unwrap_or_else(|| "devstoreaccount1".to_string());
@@ -1653,6 +1899,7 @@ mod tests {
         );
         let list_sts = get_sign(
             &account,
+            &base,
             &container,
             &format!("\ncomp:list\nmaxresults:100\nprefix:{prefix}\nrestype:container"),
             &date,
@@ -1667,7 +1914,7 @@ mod tests {
         for name in &names {
             let date = crate::oci_streaming::rfc1123_date(now_millis());
             let get_url = format!("{base}/{container}/{name}");
-            let get_sts = get_sign(&account, &container, &format!("/{name}"), &date);
+            let get_sts = get_sign(&account, &base, &container, &format!("/{name}"), &date);
             let bytes =
                 signed_get(&client, &get_url, &account, &key, &get_sts, &date, timeout).await;
             let text = std::str::from_utf8(&bytes).expect("qual utf8");
@@ -1694,6 +1941,8 @@ mod tests {
             .expect("qual retry send");
         let err = retry_sink.flush().await.expect_err("429 must fail first");
         assert!(matches!(err, ConnectorError::Connection(_)));
+        // Reset backoff and retry flush.
+        *retry_sink.backoff.lock() = BackoffState::default();
         retry_sink.flush().await.expect("429 retry must succeed");
         assert_eq!(retry_sink.sent_records(), 1);
         eprintln!("qual 429 retry asserted: first=Connection retry=success");
@@ -1704,11 +1953,15 @@ mod tests {
         for name in &names {
             let date = crate::oci_streaming::rfc1123_date(now_millis());
             let del_url = format!("{base}/{container}/{name}");
+            let del_resource = canonicalized_resource(
+                account.as_str(),
+                &blob_request_path(&base, &container, name),
+            );
             let del_sts = format!(
                 "DELETE\n\n\n\n\n\n\n\n\n\n\n\n\
                  x-ms-date:{date}\n\
                  x-ms-version:{AZURE_STORAGE_VERSION}\n\
-                 /{account}/{container}/{name}"
+                 {del_resource}"
             );
             let auth =
                 shared_key_authorization(&account, &key, &del_sts).expect("qual signs DELETE");

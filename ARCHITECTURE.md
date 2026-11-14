@@ -2,37 +2,35 @@
 
 **IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is a distributed MQTT messaging and streaming platform for cloud deployments and industrial edge systems.
 
-This document details the internal design, concurrency models, data flows, and layer decoupling of IndraMQTT. Routing and rule evaluation are measured by in-process microbenchmarks in `crates/broker-node/benches/broker_throughput.rs`: `bench_router_match_throughput` reports ~3.05M hit-path lookups/sec across 1,000 installed filters (3 targets) and ~7.80M fast-miss lookups/sec single-threaded, and `bench_sql_ingress_throughput` reports ~4.77M events/sec single-threaded with 100 percent sink delivery; these are hardware-dependent function-call rates (re-run with `cargo test --release --bench broker_throughput -- --nocapture` on your own hardware), not end-to-end network throughput (end-to-end loopback measurements, with the CPU, memory, OS and network in the `environment` block, live in `benchmark_suite/benchmark_results_v5.json`). Restart immunity (the edge holds the client socket in `await_core` and rebinds without a disconnect) is proven only for a single loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms recovery budget); no multi-client restart rate is claimed. No idle-RSS benchmark is committed in-tree, so no idle footprint figure is claimed here.
+This document describes the internal design of IndraMQTT. It describes concurrency models, data flows and layer decoupling.
+
+In-process microbenchmarks measure routing and rule evaluation. File `crates/broker-node/benches/broker_throughput.rs` contains these microbenchmarks:
+
+- `bench_router_match_throughput` reports hit-path lookups at ~3.05M per second. It uses 1000 installed filters with 3 targets.
+- `bench_router_match_throughput` reports fast-miss lookups at ~7.80M per second. It runs single-threaded.
+- `bench_sql_ingress_throughput` reports ingress events at ~4.77M per second. It runs single-threaded with 100 percent sink delivery.
+- These rates are hardware-dependent function-call rates. They are not end-to-end network throughput.
+- Re-run them on your hardware with `cargo test --release --bench broker_throughput -- --nocapture`.
+- File `benchmark_suite/benchmark_results_v5.json` contains end-to-end loopback results. It contains CPU, memory, OS and network in the `environment` block.
+
+When the kernel stops, it closes the client sockets. Clients connect again. The broker claims no restart immunity. No idle-RSS benchmark exists in-tree. This document claims no idle footprint figure.
 
 ---
 
 ## 1. High-Level Architecture Overview
 
-IndraMQTT separates the networking edge from the broker kernel through a clean 3-tier decoupled model:
+IndraMQTT runs as one Rust process. The kernel holds the client sockets and does the broker work.
 
 ```mermaid
 graph TB
-    subgraph Clients[MQTT Edge Clients]
+    subgraph Clients[MQTT Clients]
         TCP_CLI[MQTT Clients :1883]
         TLS_CLI[MQTTS Clients :8883]
-        WS_CLI[WebSocket Test Console :18083 /ws/mqtt]
+        WS_CLI[WebSocket Clients :8083 /ws/mqtt]
     end
 
-    subgraph BEAM[Layer 1: BEAM Network Appliance - Erlang/OTP 26+]
-        ACCEPTOR[Socket Acceptors & TLS Term]
-        FRAMING[MQTT Framing & Packet Codec]
-        KEEPALIVE[Keep-Alive Timers & Backpressure]
-        STATE_MIRROR[Hot QoS Mirror]
-        REBIND[Core Re-bind State Machine]
-    end
-
-    subgraph IPC[Layer 2: Multi-Lane BrokerLink IPC]
-        UDS[Unix Domain Socket / Memory Stream]
-        LANE_HASH[Consistent Hashing: conn_id % num_lanes]
-        PROTO_FRAMING[Zero-Copy Binary Framing]
-    end
-
-    subgraph Core[Layer 3: Rust Core Engine - Community MIT / Apache-2.0]
+    subgraph Core[Layer 1: Rust Kernel - MIT / Apache-2.0]
+        LISTEN[MQTT Listeners: TCP, TLS, WS, WSS]
         ROUTER[Radix Trie Router - ahash / Arc str]
         SESSION[Canonical Session Manager]
         STORAGE[Segmented Log & Cursor Persistence]
@@ -43,7 +41,7 @@ graph TB
         REST[Axum REST API & Web Dashboard :18083]
     end
 
-    subgraph Enterprise[Layer 4: Distributed Clustering]
+    subgraph Enterprise[Layer 2: Distributed Clustering]
         QUIC[QUIC Multiplexed Data Plane]
         SWIM[SWIM Gossip Failure Detection]
         RAFT[Raft Metadata Consensus]
@@ -51,9 +49,7 @@ graph TB
         INDUSTRIAL[Industrial Protocols: Sparkplug B, OPC-UA]
     end
 
-    Clients --> BEAM
-    BEAM --> IPC
-    IPC --> Core
+    Clients --> Core
     Core --> Enterprise
 ```
 
@@ -61,49 +57,38 @@ graph TB
 
 ## 2. Core Architectural Invariants
 
-### 1. Connection != Session (Core Restart Immunity)
+### 1. Connection != Session (Restart Behaviour)
 In some legacy broker designs, a broker node restart or software upgrade tears down all client TCP sockets, triggering massive "reconnect storms" and thundering-herd issues on downstream authentication backends.
 
 In IndraMQTT:
-- The **BEAM Network Appliance** (Erlang/OTP) owns client sockets, TLS sessions, packet framing, and keepalives. It has no business logic, no distributed database, and no rule engine.
-- The **Rust Core Engine** owns the canonical session, subscription state, inflight QoS tracking, offline queues, and rule engines.
-- **Protocol scope**: the edge speaks MQTT v3.1.1 only on every listener (TCP, TLS, `ws`, `wss`): `decode_connect` in `beam/src/indra_mqtt_codec.erl` accepts protocol level 4 and rejects level 5 as `unsupported_protocol`; MQTT v5 is not supported yet. TLS is the edge `ssl` transport (proven by `tls_connect_connack_test` in `beam/test/indra_listener_tests.erl`). MQTT-over-WebSocket is served by the edge listeners (`beam/src/indra_ws_listener.erl`: plaintext `ws` enabled by default, `wss` opt-in disabled by default and failing closed without cert/key; proven by `beam/test/indra_ws_tests.erl` and `beam/test/indra_wss_tests.erl`), alongside a separate dashboard test console on the API port (`/ws/mqtt` in `crates/broker-api/src/ws.rs`, test console only).
-- If the Rust core restarts or upgrades, the BEAM edge buffers uncommitted frames, maintains open client TCP/TLS sockets, and re-binds active sessions upon core resumption. Recovery within 500 ms without a client TCP disconnect is proven only for a single loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl`; this is not a multi-client production restart measurement.
+- The **Rust kernel** owns client sockets, TLS sessions, packet framing, and keepalives. It also owns the canonical session, subscription state, inflight QoS tracking, offline queues, and rule engines.
+- **Protocol scope**: the kernel listeners accept MQTT 3.1, 3.1.1 and 5 on TCP, TLS, WebSocket and secure WebSocket. They support UNSUBSCRIBE, QoS 0, 1 and 2, retained messages, will, shared subscriptions, topic alias, subscription identifiers and options, PSK and client certificates.
+- If the kernel restarts, it closes the client sockets. Clients connect again. Durable sessions resume from the offline store when it keeps them. Clean sessions subscribe again.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Client as MQTT Client
-    participant BEAM as BEAM Edge Appliance
-    participant Rust as Rust Broker Kernel
+    participant Kernel as Rust Kernel
 
-    Client->>BEAM: TCP Handshake + TLS
-    Client->>BEAM: CONNECT
-    BEAM->>Rust: BrokerLink::Connect(client_id, clean_start)
-    Rust-->>BEAM: BrokerLink::ConnAck(SessionPresent=false, RC=0)
-    BEAM-->>Client: CONNACK (200 OK)
+    Client->>Kernel: TCP Handshake + TLS
+    Client->>Kernel: CONNECT
+    Kernel-->>Client: CONNACK
 
-    Note over Rust: Kernel Upgrade / Restart Initiated
-    Rust->>Rust: Process Exits
-    Note over BEAM: Sockets held open, edge enters await_core state
-    Client->>BEAM: PUBLISH (QoS 1)
-    BEAM->>BEAM: Buffer frame in edge ring buffer
-
-    Note over Rust: Rust Kernel Resumed (500 ms test budget)
-    BEAM->>Rust: BrokerLink::RebindAllSessions()
-    Rust-->>BEAM: BrokerLink::RebindAck()
-    BEAM->>Rust: Flush buffered PUBLISH frames
-    Rust-->>BEAM: BrokerLink::PubAck
-    BEAM-->>Client: PUBACK
+    Note over Kernel: Kernel Restart Initiated
+    Kernel->>Client: TCP Close (v5: DISCONNECT 0x8B)
+    Note over Client: Clients connect again
+    Client->>Kernel: CONNECT (clean_start false for resume)
+    Kernel-->>Client: CONNACK (session_present flag)
 ```
 
 ---
 
-### 2. Multi-Lane BrokerLink IPC
-Communication between the BEAM edge and Rust core occurs over **BrokerLink**, a custom high-performance binary protocol:
-* **Multi-Lane Affinity**: Erlang hashes connection IDs across $N$ parallel IPC lanes (`conn_id % num_lanes`). This guarantees strict per-client FIFO message ordering while completely eliminating cross-client head-of-line blocking.
+### 2. MQTT Listeners of the Kernel
+Clients connect to the kernel directly over TCP, TLS, WebSocket and secure WebSocket:
+* **Direct accept**: the kernel binds each enabled listener and runs the MQTT state machine in the connection task.
 * **Opaque Payloads**: Payloads remain zero-copy opaque byte buffers until evaluated by the rules engine.
-* **Credit-Based Flow Control**: Prevents memory exhaustion during massive ingress spikes.
+* **Bounded egress**: a slow subscriber sheds QoS 0 past its backlog bound so one client cannot grow memory without limit.
 
 ---
 

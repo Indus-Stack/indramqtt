@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "reason": "route-failure"
+      },
+      "projected": {
+        "reason": "route-failure"
+      },
+      "sql": "SELECT reason FROM \"$events/delivery_dropped\"",
+      "topic": "$events/delivery_dropped"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "reason": "route-failure"
+      },
+      "projected": null,
+      "sql": "SELECT reason FROM \"$events/delivery_dropped\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-delivery_dropped",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

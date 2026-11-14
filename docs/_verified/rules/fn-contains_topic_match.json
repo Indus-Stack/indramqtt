@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "filters": [
+          "sensors/+"
+        ]
+      },
+      "projected": {
+        "c": true
+      },
+      "sql": "SELECT contains_topic_match(filters, 'sensors/kitchen') AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "filters": [
+          "other/+"
+        ]
+      },
+      "projected": {
+        "c": false
+      },
+      "sql": "SELECT contains_topic_match(filters, 'sensors/kitchen') AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-contains_topic_match",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

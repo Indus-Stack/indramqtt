@@ -9,9 +9,8 @@
 //! plus an optional private CA from configuration). IAM
 //! database authentication uses a short-lived OAuth2 access token as the
 //! PostgreSQL password, refreshed from Application Default Credentials via
-//! `google-cloud-auth`. The legacy hand-written `TcpAlloydbTransport` is
-//! retained for offline unit tests only; production wiring uses
-//! `PgDriverAlloydbTransport` below.
+//! `google-cloud-auth`. Production wiring uses `PgDriverAlloydbTransport`
+//! below.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -22,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use broker_connectors::pg_numbers::{coerce_scalar_value, PgScalarValue};
 use broker_connectors::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
 
 const PG_MAX_BIND_PARAMS: usize = 65535;
@@ -489,191 +489,18 @@ pub fn extract_alloydb_row(
 #[async_trait]
 pub trait AlloydbTransport: Send + Sync {
     async fn execute(&self, query: &str, params: &[AlloydbValue]) -> Result<AlloydbQueryResult>;
-}
 
-fn format_alloydb_value(v: &AlloydbValue) -> String {
-    match v {
-        AlloydbValue::Null => "NULL".to_string(),
-        AlloydbValue::Boolean(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        AlloydbValue::Integer(i) => i.to_string(),
-        AlloydbValue::Number(n) => n.to_string(),
-        AlloydbValue::String(s) => format!("'{}'", s.replace('\'', "''")),
-    }
-}
-
-async fn read_alloydb_pg_msg(
-    stream: &mut tokio::net::TcpStream,
-    timeout: Duration,
-) -> Result<(u8, Vec<u8>)> {
-    use tokio::io::AsyncReadExt;
-    let mut header = [0u8; 5];
-    tokio::time::timeout(timeout, stream.read_exact(&mut header))
-        .await
-        .map_err(|_| ConnectorError::Connection("alloydb read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("alloydb read failed: {e}")))?;
-    let tag = header[0];
-    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if !(4..=16 * 1024 * 1024).contains(&len) {
-        return Err(ConnectorError::Connection(format!(
-            "alloydb bad message length: {len}"
-        )));
-    }
-    let mut body = vec![0u8; len - 4];
-    tokio::time::timeout(timeout, stream.read_exact(&mut body))
-        .await
-        .map_err(|_| ConnectorError::Connection("alloydb read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("alloydb read failed: {e}")))?;
-    Ok((tag, body))
-}
-
-/// Native TCP transport connecting to Google Cloud AlloyDB.
-pub struct TcpAlloydbTransport {
-    host: String,
-    port: u16,
-    database: String,
-    username: String,
-    password: Option<String>,
-    timeout: Duration,
-}
-
-impl TcpAlloydbTransport {
-    pub fn new(config: &AlloydbConfig) -> Self {
-        let password = match &config.auth {
-            AlloydbAuth::Password { password } => Some(password.clone()),
-            AlloydbAuth::IamToken { token } => Some(token.clone()),
-            AlloydbAuth::IamAuto { .. } => None,
-        };
-        Self {
-            host: config.host.clone(),
-            port: config.port,
-            database: config.database.clone(),
-            username: config.username.clone(),
-            password,
-            timeout: config.timeout(),
-        }
-    }
-}
-
-#[async_trait]
-impl AlloydbTransport for TcpAlloydbTransport {
-    async fn execute(&self, query: &str, params: &[AlloydbValue]) -> Result<AlloydbQueryResult> {
-        use tokio::io::AsyncWriteExt;
-        let mut full_sql = query.to_string();
-        for (idx, p) in params.iter().enumerate() {
-            let placeholder = format!("${}", idx + 1);
-            full_sql = full_sql.replace(&placeholder, &format_alloydb_value(p));
-        }
-
-        let addr = format!("{}:{}", self.host, self.port);
-        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("alloydb connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("alloydb connect failed: {e}")))?;
-
-        // Send StartupMessage
-        let mut params_buf = Vec::new();
-        params_buf.extend_from_slice(b"user\0");
-        params_buf.extend_from_slice(self.username.as_bytes());
-        params_buf.push(0);
-        params_buf.extend_from_slice(b"database\0");
-        params_buf.extend_from_slice(self.database.as_bytes());
-        params_buf.push(0);
-        params_buf.push(0);
-
-        let mut startup_body = Vec::new();
-        startup_body.extend_from_slice(&0x0003_0000u32.to_be_bytes());
-        startup_body.extend_from_slice(&params_buf);
-        let len = (startup_body.len() + 4) as u32;
-        let mut startup_msg = Vec::new();
-        startup_msg.extend_from_slice(&len.to_be_bytes());
-        startup_msg.extend_from_slice(&startup_body);
-        stream.write_all(&startup_msg).await.map_err(|e| {
-            ConnectorError::Connection(format!("alloydb startup write failed: {e}"))
-        })?;
-
-        // Drain until 'Z' (ReadyForQuery)
-        loop {
-            let (tag, body) = read_alloydb_pg_msg(&mut stream, self.timeout).await?;
-            if tag == b'Z' {
-                break;
-            } else if tag == b'R' {
-                let auth_type = if body.len() >= 4 {
-                    i32::from_be_bytes([body[0], body[1], body[2], body[3]])
-                } else {
-                    0
-                };
-                if auth_type == 3 {
-                    // CleartextPassword
-                    let pass = self.password.as_deref().unwrap_or("");
-                    let p_bytes = pass.as_bytes();
-                    let p_len = (p_bytes.len() + 5) as u32;
-                    let mut p_msg = Vec::with_capacity(p_len as usize + 1);
-                    p_msg.push(b'p');
-                    p_msg.extend_from_slice(&p_len.to_be_bytes());
-                    p_msg.extend_from_slice(p_bytes);
-                    p_msg.push(0);
-                    stream.write_all(&p_msg).await.map_err(|e| {
-                        ConnectorError::Connection(format!("alloydb password write failed: {e}"))
-                    })?;
-                }
-            } else if tag == b'E' {
-                let msg = String::from_utf8_lossy(&body).into_owned();
-                return Err(ConnectorError::Connection(format!(
-                    "alloydb startup error: {msg}"
-                )));
-            }
-        }
-
-        // Send Simple Query ('Q')
-        let sql_bytes = full_sql.as_bytes();
-        let q_len = (sql_bytes.len() + 5) as u32;
-        let mut q_msg = Vec::with_capacity(q_len as usize + 1);
-        q_msg.push(b'Q');
-        q_msg.extend_from_slice(&q_len.to_be_bytes());
-        q_msg.extend_from_slice(sql_bytes);
-        q_msg.push(0);
-        stream
-            .write_all(&q_msg)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("alloydb query write failed: {e}")))?;
-
-        let mut rows_affected = 1;
-        let mut error_msg = None;
-        loop {
-            let (tag, body) = read_alloydb_pg_msg(&mut stream, self.timeout).await?;
-            if tag == b'C' {
-                let s = String::from_utf8_lossy(&body);
-                if let Some(cnt_str) = s.split_whitespace().last() {
-                    if let Ok(cnt) = cnt_str.trim_matches('\0').parse::<usize>() {
-                        rows_affected = cnt;
-                    }
-                }
-            } else if tag == b'E' {
-                let s = String::from_utf8_lossy(&body).into_owned();
-                error_msg = Some(s);
-            } else if tag == b'Z' {
-                break;
-            }
-        }
-
-        if let Some(err) = error_msg {
-            return Err(ConnectorError::Dispatch(format!(
-                "alloydb query error: {err}"
-            )));
-        }
-
-        Ok(AlloydbQueryResult {
-            rows_affected,
-            status: "SUCCESS".into(),
-            sqlstate: None,
-            error_message: None,
-        })
+    /// Execute with column names in parameter order. The default runs
+    /// [`AlloydbTransport::execute`]; the driver transport prepares the
+    /// statement and converts each value by its declared type.
+    async fn execute_typed(
+        &self,
+        query: &str,
+        columns: &[String],
+        params: &[AlloydbValue],
+    ) -> Result<AlloydbQueryResult> {
+        let _ = columns;
+        self.execute(query, params).await
     }
 }
 
@@ -696,6 +523,10 @@ pub fn alloydb_connect_config(config: &AlloydbConfig, password: &str) -> tokio_p
 ///
 /// `Null` becomes `None::<String>` so the driver binds SQL NULL; numbers,
 /// integers, booleans and strings keep their native PostgreSQL types.
+///
+/// Kept for offline paths; the driver transport binds through
+/// [`coerce_alloydb_params_for_types`] instead, which converts each value
+/// by the declared parameter type that `prepare` reports.
 pub fn alloydb_value_to_boxed(
     value: &AlloydbValue,
 ) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
@@ -706,6 +537,55 @@ pub fn alloydb_value_to_boxed(
         AlloydbValue::Number(n) => Box::new(*n),
         AlloydbValue::Boolean(b) => Box::new(*b),
     }
+}
+
+/// Read one [`AlloydbValue`] as the shared scalar binding value.
+fn alloydb_scalar(value: &AlloydbValue) -> PgScalarValue {
+    match value {
+        AlloydbValue::Null => PgScalarValue::Null,
+        AlloydbValue::Boolean(b) => PgScalarValue::Boolean(*b),
+        AlloydbValue::Integer(i) => PgScalarValue::Integer(*i),
+        AlloydbValue::Number(n) => PgScalarValue::Float(*n),
+        AlloydbValue::String(s) => PgScalarValue::Text(s.clone()),
+    }
+}
+
+/// Convert each value by the declared parameter type from `prepare`.
+///
+/// `columns` lists each chunk column once; `params` runs row-major over
+/// it. Errors name the column; a missing name falls back to the
+/// parameter index, so the error still names the parameter.
+pub fn coerce_alloydb_params_for_types(
+    params: &[AlloydbValue],
+    columns: &[String],
+    pg_types: &[tokio_postgres::types::Type],
+) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync>>> {
+    if params.len() != pg_types.len() {
+        return Err(ConnectorError::Dispatch(format!(
+            "alloydb bind parameter count {} does not match declared type count {}",
+            params.len(),
+            pg_types.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(params.len());
+    for (index, value) in params.iter().enumerate() {
+        // Parameters run row-major over `columns`, so position `index`
+        // belongs to `columns[index % len]`; multi-row chunks repeat the
+        // same column types per row.
+        let column_name: std::borrow::Cow<'_, str> = columns
+            .get(index % columns.len().max(1))
+            .map(String::as_str)
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(format!("parameter {}", index + 1)));
+        let boxed = coerce_scalar_value(
+            alloydb_scalar(value),
+            &pg_types[index],
+            column_name.as_ref(),
+            "alloydb",
+        )?;
+        out.push(boxed);
+    }
+    Ok(out)
 }
 
 /// Map a `tokio-postgres` error onto [`ConnectorError`], preserving the
@@ -776,18 +656,17 @@ fn alloydb_extra_ca_pems(config: &AlloydbConfig) -> Result<Vec<String>> {
 }
 
 fn alloydb_certs_from_pem(pem: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
-        .map_err(|e| ConnectorError::Dispatch(format!("alloydb CA bundle read failed: {e}")))?;
+    use rustls::pki_types::pem::PemObject as _;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| ConnectorError::Dispatch(format!("alloydb CA bundle read failed: {e}")))?;
     if certs.is_empty() {
         return Err(ConnectorError::Dispatch(
             "alloydb CA bundle has no certificate section".into(),
         ));
     }
-    Ok(certs
-        .into_iter()
-        .map(rustls::pki_types::CertificateDer::from)
-        .collect())
+    Ok(certs)
 }
 
 /// Root store for AlloyDB TLS: the OS system trust store plus the
@@ -900,13 +779,36 @@ impl PgDriverAlloydbTransport {
 #[async_trait]
 impl AlloydbTransport for PgDriverAlloydbTransport {
     async fn execute(&self, query: &str, params: &[AlloydbValue]) -> Result<AlloydbQueryResult> {
+        // Without column names the errors name the parameter index.
+        let columns: Vec<String> = (0..params.len())
+            .map(|i| format!("parameter {}", i + 1))
+            .collect();
+        self.execute_typed(query, &columns, params).await
+    }
+
+    async fn execute_typed(
+        &self,
+        query: &str,
+        columns: &[String],
+        params: &[AlloydbValue],
+    ) -> Result<AlloydbQueryResult> {
         let password = resolve_alloydb_password(&self.config).await?;
         let client = self.connect_client(&password).await?;
-        let owned: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            params.iter().map(alloydb_value_to_boxed).collect();
+        // `prepare` asks the server for the declared parameter types,
+        // so each value binds as the column type expects. This adds one
+        // server round trip per flush (not per message); the batch still
+        // rides one statement.
+        // PERF(parity): the fast version caches the prepared statement
+        // per query text instead of preparing on every flush.
+        let statement = tokio::time::timeout(self.config.timeout(), client.prepare(query))
+            .await
+            .map_err(|_| ConnectorError::Connection("alloydb query timeout".to_string()))?
+            .map_err(|e| map_driver_error(&e))?;
+        let pg_types: Vec<tokio_postgres::types::Type> = statement.params().to_vec();
+        let owned = coerce_alloydb_params_for_types(params, columns, &pg_types)?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             owned.iter().map(|b| b.as_ref() as _).collect();
-        let rows = tokio::time::timeout(self.config.timeout(), client.execute(query, &refs))
+        let rows = tokio::time::timeout(self.config.timeout(), client.execute(&statement, &refs))
             .await
             .map_err(|_| ConnectorError::Connection("alloydb query timeout".to_string()))?
             .map_err(|e| map_driver_error(&e))?;
@@ -1174,7 +1076,11 @@ impl AlloydbSink {
                 }
             }
 
-            match self.transport.execute(&query, &params).await {
+            match self
+                .transport
+                .execute_typed(&query, &columns, &params)
+                .await
+            {
                 Ok(_) => {
                     self.sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
                     idx = end;
@@ -1221,7 +1127,11 @@ impl AlloydbSink {
                                 .unwrap_or(AlloydbValue::Null);
                             single_params.push(val);
                         }
-                        match self.transport.execute(&single_query, &single_params).await {
+                        match self
+                            .transport
+                            .execute_typed(&single_query, &columns, &single_params)
+                            .await
+                        {
                             Ok(_) => {
                                 self.sent.fetch_add(1, Ordering::Relaxed);
                                 row_idx += 1;
@@ -1476,6 +1386,102 @@ mod tests {
             json_to_alloydb_value(&serde_json::json!("alloy-db")),
             AlloydbValue::String("alloy-db".into())
         );
+    }
+
+    #[test]
+    fn test_integer_and_float_json_bind_to_float_column() {
+        use tokio_postgres::types::{ToSql, Type};
+        // The defect: the old path boxes the integer directly, and the
+        // driver accepts that binding for INT8 only, so it refuses a
+        // DOUBLE PRECISION parameter before the statement reaches the
+        // server.
+        let old: Box<dyn ToSql + Send + Sync> = Box::new(20i64);
+        assert!(old
+            .to_sql_checked(&Type::FLOAT8, &mut bytes::BytesMut::new())
+            .is_err());
+
+        // The production path: the same coercion the driver transport
+        // runs after `prepare` reports the declared parameter types. An
+        // integer JSON number and a float JSON number both reach one
+        // DOUBLE PRECISION column.
+        let columns = vec!["temp".to_string()];
+        let types = vec![Type::FLOAT8];
+        for payload in [serde_json::json!(20), serde_json::json!(20.5)] {
+            let value = json_to_alloydb_value(&payload);
+            let boxed = coerce_alloydb_params_for_types(&[value], &columns, &types)
+                .expect("number binds to float column");
+            boxed[0]
+                .to_sql_checked(&Type::FLOAT8, &mut bytes::BytesMut::new())
+                .expect("driver accepts the coerced binding");
+        }
+        // The integer keeps its value through the float binding.
+        let boxed = coerce_alloydb_params_for_types(&[AlloydbValue::Integer(20)], &columns, &types)
+            .expect("integer binds");
+        let mut out = bytes::BytesMut::new();
+        boxed[0]
+            .to_sql_checked(&Type::FLOAT8, &mut out)
+            .expect("driver accepts");
+        let got = f64::from_be_bytes(out[..8].try_into().expect("8 float bytes"));
+        assert!(
+            (got - 20.0).abs() < 0.001,
+            "integer keeps its value, got {got}"
+        );
+    }
+
+    #[test]
+    fn test_numbers_bind_to_float_numeric_and_text_columns() {
+        use tokio_postgres::types::Type;
+        // The production coercion reaches every documented target: an
+        // integer JSON number binds to FLOAT4, NUMERIC and TEXT.
+        let columns = vec!["temp".to_string()];
+        let int_value = json_to_alloydb_value(&serde_json::json!(20));
+        for ty in [Type::FLOAT4, Type::NUMERIC, Type::TEXT] {
+            let boxed = coerce_alloydb_params_for_types(
+                std::slice::from_ref(&int_value),
+                &columns,
+                std::slice::from_ref(&ty),
+            )
+            .expect("integer binds");
+            boxed[0]
+                .to_sql_checked(&ty, &mut bytes::BytesMut::new())
+                .expect("driver accepts the coerced binding");
+        }
+    }
+
+    #[test]
+    fn test_integer_out_of_range_names_the_column() {
+        use tokio_postgres::types::Type;
+        // An integer past the INT4 range is a permanent error that names
+        // the column, never a panic and never a silent cut.
+        let columns = vec!["temp".to_string()];
+        let types = vec![Type::INT4];
+        let err = coerce_alloydb_params_for_types(
+            &[AlloydbValue::Integer(3_000_000_000)],
+            &columns,
+            &types,
+        )
+        .expect_err("out-of-range integer must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "range error is permanent, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("temp"),
+            "range error names the column, got {err}"
+        );
+        // The error carries the out-of-range SQLSTATE, so the sink
+        // counts the row rejected instead of restoring it forever.
+        assert_eq!(
+            classify_alloydb_error(&err.to_string()),
+            AlloydbErrorClassification::DataRejected
+        );
+        // The boundary still binds.
+        assert!(coerce_alloydb_params_for_types(
+            &[AlloydbValue::Integer(i32::MAX as i64)],
+            &columns,
+            &types,
+        )
+        .is_ok());
     }
 
     const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
@@ -2105,8 +2111,7 @@ mod tests {
         let username = std::env::var("ALLOYDB_USER").unwrap_or_else(|_| "postgres".into());
         let password = std::env::var("ALLOYDB_PASSWORD").unwrap_or_default();
         if password.is_empty() {
-            eprintln!("ALLOYDB_PASSWORD is empty; skipping qualification");
-            return;
+            panic!("missing ALLOYDB_PASSWORD; cannot run qualification without a password");
         }
         let table = std::env::var("ALLOYDB_TABLE").unwrap_or_else(|_| "alloydb_qual_b301".into());
         let use_tls = std::env::var("ALLOYDB_TLS")

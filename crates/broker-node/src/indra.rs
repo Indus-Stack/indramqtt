@@ -48,7 +48,11 @@
 //! `/api/v1/config/*`, `/api/v1/licence/*`); `backup export` reads the
 //! latest versioned config snapshot and `backup import` applies a snapshot
 //! file through the config reload path, so no new server behaviour was
-//! needed. Destructive commands (every `delete`, `config history
+//! needed. Tenant scope (TM-03): `tenants` maps 1:1 onto the `/api/v5/mt`
+//! namespace routes, `users` and the new `acls` take `--tenant` to select
+//! one credential table (`/api/v1/auth/users`, `/api/v1/auth/acls`);
+//! without `--tenant` they use the exact paths they used before, so the
+//! default tenant behaves as before. Destructive commands (every `delete`, `config history
 //! --restore`, `licence install`, `backup import`) require `--yes` or an
 //! interactive confirm. Secrets stay references end to end: no command
 //! prints, logs or exports a secret value (the server redacts `file:` /
@@ -237,6 +241,16 @@ enum CtlCommand {
         #[command(subcommand)]
         command: UsersCommand,
     },
+    /// Tenant namespaces: list, show, create, delete.
+    Tenants {
+        #[command(subcommand)]
+        command: TenantsCommand,
+    },
+    /// Per-tenant ACL rules: list, create, delete.
+    Acls {
+        #[command(subcommand)]
+        command: AclsCommand,
+    },
     /// Configuration: validate, diff, explain, reload, history.
     Config {
         #[command(subcommand)]
@@ -278,6 +292,8 @@ enum ClientsCommand {
 }
 
 /// Rule governance: every verb maps 1:1 onto `/api/v1/rules`.
+/// `--tenant` selects the owning tenant; without it the command
+/// creates in the default tenant, as before.
 #[derive(Subcommand, Debug)]
 enum RulesCommand {
     /// List routing rules.
@@ -316,6 +332,9 @@ enum RulesCommand {
         /// Append a republish action as TOPIC:QOS (repeatable).
         #[arg(long)]
         republish: Vec<String>,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Delete one rule. Destructive: requires `--yes` or an interactive
     /// confirm.
@@ -373,14 +392,23 @@ enum ConnectorsCommand {
 
 /// Authentication user governance: every verb maps 1:1 onto
 /// `/api/v1/auth/users` (passwords are write-only and never listed).
+/// `--tenant` selects one credential table; without it the command uses
+/// the exact path it used before (the default tenant).
 #[derive(Subcommand, Debug)]
 enum UsersCommand {
     /// List authentication users.
-    List,
+    List {
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// Show one user.
     Show {
         /// Username.
         username: String,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Create one user. Prefer `--password-file`: a value passed with
     /// `--password` stays in shell history.
@@ -394,6 +422,9 @@ enum UsersCommand {
         /// File holding the password (first line, trimmed).
         #[arg(long)]
         password_file: Option<String>,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
         /// Maximum concurrent connections (absent means unlimited).
         #[arg(long)]
         max_connections: Option<u32>,
@@ -409,6 +440,85 @@ enum UsersCommand {
     Delete {
         /// Username.
         username: String,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Confirm without prompting. Required when stdin is not a terminal.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+}
+
+/// Tenant namespace governance (TM-03): every verb maps 1:1 onto the
+/// `/api/v5/mt` namespace routes. The CLI holds no tenant state; each
+/// command performs one management API call with the operator token.
+#[derive(Subcommand, Debug)]
+enum TenantsCommand {
+    /// List managed tenant namespaces (one bounded page).
+    List {
+        /// Rows to read (clamped 1..=1000).
+        #[arg(long, default_value_t = DEFAULT_LIMIT)]
+        limit: u32,
+    },
+    /// Show one tenant namespace (its stored config).
+    Show {
+        /// Namespace id.
+        ns: String,
+    },
+    /// Create one tenant namespace.
+    Create {
+        /// Namespace id.
+        ns: String,
+    },
+    /// Delete one tenant namespace. Destructive: requires `--yes` or an
+    /// interactive confirm. The server first kicks the tenant clients,
+    /// then drops its credential rows.
+    Delete {
+        /// Namespace id.
+        ns: String,
+        /// Confirm without prompting. Required when stdin is not a terminal.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+}
+
+/// ACL governance (TM-03): every verb maps 1:1 onto `/api/v1/auth/acls`
+/// (first match wins within the tenant). `--tenant` selects one rule
+/// table; without it the command uses the default tenant.
+#[derive(Subcommand, Debug)]
+enum AclsCommand {
+    /// List ACL rules of one tenant.
+    List {
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Append one ACL rule (first match wins within the tenant).
+    Create {
+        /// Client id pattern (`*` matches every client).
+        #[arg(long)]
+        client_pattern: String,
+        /// Action: `publish`, `subscribe` or `all`.
+        #[arg(long)]
+        action: String,
+        /// MQTT topic filter the rule matches.
+        #[arg(long)]
+        topic_pattern: String,
+        /// Allow the match (without it the rule denies).
+        #[arg(long, default_value_t = false)]
+        allow: bool,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Delete one ACL rule by its index in the tenant list.
+    /// Destructive: requires `--yes` or an interactive confirm.
+    Delete {
+        /// Rule index in the tenant list.
+        id: usize,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
         /// Confirm without prompting. Required when stdin is not a terminal.
         #[arg(long, default_value_t = false)]
         yes: bool,
@@ -863,6 +973,18 @@ fn encode_query_value(raw: &str) -> String {
     out
 }
 
+/// Tenant query suffix for the v1 user and ACL routes: empty when no
+/// scope is set, so calls without `--tenant` use the exact paths they
+/// used before (the default tenant). A set scope rides as
+/// `?tenant=<id>`; the server validates the id and names a bad one, so
+/// the CLI passes it through instead of judging it here.
+fn tenant_query(tenant: Option<&str>) -> String {
+    match tenant.map(str::trim) {
+        None | Some("") => String::new(),
+        Some(id) => format!("?tenant={}", encode_query_value(id)),
+    }
+}
+
 /// One-line human summary of a rule action object from the API wire form.
 fn describe_action(action: &serde_json::Value) -> String {
     let kind = action.get("type").and_then(|v| v.as_str()).unwrap_or("?");
@@ -884,11 +1006,21 @@ fn describe_action(action: &serde_json::Value) -> String {
 }
 
 async fn cmd_status(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
-    let (_, body) = request(ctl, key, reqwest::Method::GET, "/api/v5/status", None).await?;
+    // `GET /status` is public health. Verify the key first.
+    // `GET /nodes` needs authentication. A wrong key fails here.
+    request(ctl, key, reqwest::Method::GET, "/api/v5/nodes", None).await?;
+    let (_, body) = request(
+        ctl,
+        key,
+        reqwest::Method::GET,
+        "/api/v5/status?format=json",
+        None,
+    )
+    .await?;
     if ctl.json {
         return Ok(render_json(&body));
     }
-    Ok(format!("status: {}\n", cell(body.get("status"))))
+    Ok(format!("status: {}\n", cell(body.get("app_status"))))
 }
 
 async fn cmd_clients_list(
@@ -1069,13 +1201,13 @@ async fn cmd_listeners(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlE
         .map(|row| {
             vec![
                 cell(row.get("id")),
-                cell(row.get("protocol")),
+                cell(row.get("type")),
                 cell(row.get("bind")),
-                cell(row.get("enabled")),
+                cell(row.get("enable")),
             ]
         })
         .collect();
-    Ok(render_table(&["ID", "PROTOCOL", "BIND", "ENABLED"], &rows))
+    Ok(render_table(&["ID", "TYPE", "BIND", "ENABLE"], &rows))
 }
 
 async fn cmd_rules_list(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
@@ -1172,6 +1304,7 @@ async fn cmd_rules_create(
     log: bool,
     forwards: &[String],
     republishes: &[String],
+    tenant: Option<&str>,
 ) -> Result<String, CtlError> {
     if name.trim().is_empty() {
         return Err(CtlError::validation("rule name must not be empty"));
@@ -1216,6 +1349,7 @@ async fn cmd_rules_create(
         "sql_query": sql,
         "enabled": !disable,
         "actions": actions,
+        "tenant": tenant.unwrap_or(""),
     });
     let (_, response) =
         request(ctl, key, reqwest::Method::POST, "/api/v1/rules", Some(body)).await?;
@@ -1249,6 +1383,7 @@ async fn cmd_connectors_list(ctl: &CtlArgs, key: &SecretString) -> Result<String
     if ctl.json {
         return Ok(render_json(&body));
     }
+    // The API returns a bare array of connectors.
     let data = body.as_array().cloned().unwrap_or_default();
     let rows: Vec<Vec<String>> = data
         .iter()
@@ -1371,12 +1506,19 @@ async fn cmd_connectors_delete(
     Ok(format!("deleted {id}\n"))
 }
 
-async fn cmd_users_list(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
-    let (_, body) = request(ctl, key, reqwest::Method::GET, "/api/v1/auth/users", None).await?;
+async fn cmd_users_list(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    tenant: Option<&str>,
+) -> Result<String, CtlError> {
+    let path = format!("/api/v1/auth/users{}", tenant_query(tenant));
+    let (_, body) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
     if ctl.json {
         return Ok(render_json(&body));
     }
     let data = body.as_array().cloned().unwrap_or_default();
+    // The API returns no tenant field, so the table shows what the API
+    // returns (username, quotas) and omits what it does not track.
     let rows: Vec<Vec<String>> = data
         .iter()
         .map(|row| vec![cell(row.get("username")), cell(row.get("quotas"))])
@@ -1388,11 +1530,13 @@ async fn cmd_users_show(
     ctl: &CtlArgs,
     key: &SecretString,
     username: &str,
+    tenant: Option<&str>,
 ) -> Result<String, CtlError> {
     if username.trim().is_empty() {
         return Err(CtlError::validation("username must not be empty"));
     }
-    let (_, body) = request(ctl, key, reqwest::Method::GET, "/api/v1/auth/users", None).await?;
+    let path = format!("/api/v1/auth/users{}", tenant_query(tenant));
+    let (_, body) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
     let found = body
         .as_array()
         .and_then(|list| {
@@ -1423,6 +1567,7 @@ async fn cmd_users_create(
     username: &str,
     password: Option<&str>,
     password_file: Option<&str>,
+    tenant: Option<&str>,
     max_connections: Option<u32>,
     max_publish_rate: Option<u32>,
     max_publish_burst: Option<u32>,
@@ -1451,14 +1596,8 @@ async fn cmd_users_create(
         "password": secret,
         "quotas": quotas,
     });
-    let (_, response) = request(
-        ctl,
-        key,
-        reqwest::Method::POST,
-        "/api/v1/auth/users",
-        Some(body),
-    )
-    .await?;
+    let path = format!("/api/v1/auth/users{}", tenant_query(tenant));
+    let (_, response) = request(ctl, key, reqwest::Method::POST, &path, Some(body)).await?;
     if ctl.json {
         return Ok(render_json(&response));
     }
@@ -1469,19 +1608,192 @@ async fn cmd_users_delete(
     ctl: &CtlArgs,
     key: &SecretString,
     username: &str,
+    tenant: Option<&str>,
     yes: bool,
 ) -> Result<String, CtlError> {
     if username.trim().is_empty() {
         return Err(CtlError::validation("username must not be empty"));
     }
     confirm_destructive(yes, &format!("Delete user {username:?}?"))?;
-    let path = format!("/api/v1/auth/users/{username}");
+    let path = format!("/api/v1/auth/users/{username}{}", tenant_query(tenant));
     request(ctl, key, reqwest::Method::DELETE, &path, None).await?;
     if ctl.json {
         let body = serde_json::json!({"username": username, "result": "deleted"});
         return Ok(render_json(&body));
     }
     Ok(format!("deleted {username}\n"))
+}
+
+/// List one bounded page of managed tenant namespaces (TM-03).
+///
+/// Bound: `limit` defaults to 100 rows and clamps to 1..=1000.
+/// Reason: the console pages at 100 rows, so the default serves one
+/// page with one bounded response; 1000 bounds one response near
+/// hundreds of KiB. The server applies the same default and clamp, so
+/// both sides agree without a second call.
+/// TODO(parity): does `tenants list` also show the default tenant and
+/// tenants that hold users but have no managed entry? The rulebook
+/// does not decide the union rule; the current choice lists managed
+/// namespaces only (one call to `managed_ns_list`).
+async fn cmd_tenants_list(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    limit: u32,
+) -> Result<String, CtlError> {
+    let path = format!("/api/v5/mt/managed_ns_list?limit={}", clamp_limit(limit));
+    let (_, body) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
+    if ctl.json {
+        return Ok(render_json(&body));
+    }
+    let data = body.as_array().cloned().unwrap_or_default();
+    let rows: Vec<Vec<String>> = data.iter().map(|name| vec![cell(Some(name))]).collect();
+    Ok(render_table(&["NAMESPACE"], &rows))
+}
+
+/// Show one tenant namespace: its stored config (TM-03).
+async fn cmd_tenants_show(ctl: &CtlArgs, key: &SecretString, ns: &str) -> Result<String, CtlError> {
+    if ns.trim().is_empty() {
+        return Err(CtlError::validation("namespace id must not be empty"));
+    }
+    let path = format!("/api/v5/mt/ns/{ns}/config");
+    let (_, body) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
+    if ctl.json {
+        return Ok(render_json(&body));
+    }
+    let mut out = format!("namespace: {ns}\n");
+    for (name, value) in body.as_object().cloned().unwrap_or_default() {
+        out.push_str(&format!("{name}: {}\n", cell(Some(&value))));
+    }
+    Ok(out)
+}
+
+/// Create one tenant namespace (TM-03).
+async fn cmd_tenants_create(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    ns: &str,
+) -> Result<String, CtlError> {
+    if ns.trim().is_empty() {
+        return Err(CtlError::validation("namespace id must not be empty"));
+    }
+    let path = format!("/api/v5/mt/ns/{ns}");
+    request(ctl, key, reqwest::Method::POST, &path, None).await?;
+    if ctl.json {
+        let body = serde_json::json!({"ns": ns, "result": "created"});
+        return Ok(render_json(&body));
+    }
+    Ok(format!("created {ns}\n"))
+}
+
+/// Delete one tenant namespace (TM-03). The server kicks the tenant
+/// clients first, then drops its credential rows.
+async fn cmd_tenants_delete(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    ns: &str,
+    yes: bool,
+) -> Result<String, CtlError> {
+    if ns.trim().is_empty() {
+        return Err(CtlError::validation("namespace id must not be empty"));
+    }
+    confirm_destructive(yes, &format!("Delete tenant {ns:?}?"))?;
+    let path = format!("/api/v5/mt/ns/{ns}");
+    request(ctl, key, reqwest::Method::DELETE, &path, None).await?;
+    if ctl.json {
+        let body = serde_json::json!({"ns": ns, "result": "deleted"});
+        return Ok(render_json(&body));
+    }
+    Ok(format!("deleted {ns}\n"))
+}
+
+/// List the ACL rules of one tenant (TM-03). One server response holds
+/// the whole ordered table; the server bounds it (at most 10_000 rules
+/// per tenant), so the CLI needs no second call.
+async fn cmd_acls_list(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    tenant: Option<&str>,
+) -> Result<String, CtlError> {
+    let path = format!("/api/v1/auth/acls{}", tenant_query(tenant));
+    let (_, body) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
+    if ctl.json {
+        return Ok(render_json(&body));
+    }
+    let data = body.as_array().cloned().unwrap_or_default();
+    // The API returns no tenant field, so the table shows what the API
+    // returns and omits what it does not track.
+    let rows: Vec<Vec<String>> = data
+        .iter()
+        .map(|row| {
+            vec![
+                cell(row.get("client_pattern")),
+                cell(row.get("action")),
+                cell(row.get("topic_pattern")),
+                cell(row.get("allow")),
+            ]
+        })
+        .collect();
+    Ok(render_table(&["CLIENT", "ACTION", "TOPIC", "ALLOW"], &rows))
+}
+
+/// Append one ACL rule to one tenant (TM-03). The server validates the
+/// action and the filter and names a bad one; the CLI checks only for
+/// empty patterns before the single call.
+async fn cmd_acls_create(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    client_pattern: &str,
+    action: &str,
+    topic_pattern: &str,
+    allow: bool,
+    tenant: Option<&str>,
+) -> Result<String, CtlError> {
+    if client_pattern.trim().is_empty() {
+        return Err(CtlError::validation("client pattern must not be empty"));
+    }
+    if action.trim().is_empty() {
+        return Err(CtlError::validation("action must not be empty"));
+    }
+    if topic_pattern.trim().is_empty() {
+        return Err(CtlError::validation("topic pattern must not be empty"));
+    }
+    let body = serde_json::json!({
+        "client_pattern": client_pattern,
+        "action": action,
+        "topic_pattern": topic_pattern,
+        "allow": allow,
+    });
+    let path = format!("/api/v1/auth/acls{}", tenant_query(tenant));
+    let (_, response) = request(ctl, key, reqwest::Method::POST, &path, Some(body)).await?;
+    if ctl.json {
+        return Ok(render_json(&response));
+    }
+    // The create answer carries no action field, so the human form
+    // shows the returned fields only and invents nothing.
+    Ok(format!(
+        "created {} -> {} (allow: {})\n",
+        cell(response.get("client_pattern")),
+        cell(response.get("topic_pattern")),
+        cell(response.get("allow")),
+    ))
+}
+
+/// Delete one ACL rule by index within its tenant list (TM-03).
+async fn cmd_acls_delete(
+    ctl: &CtlArgs,
+    key: &SecretString,
+    id: usize,
+    tenant: Option<&str>,
+    yes: bool,
+) -> Result<String, CtlError> {
+    confirm_destructive(yes, &format!("Delete ACL rule {id}?"))?;
+    let path = format!("/api/v1/auth/acls/{id}{}", tenant_query(tenant));
+    request(ctl, key, reqwest::Method::DELETE, &path, None).await?;
+    if ctl.json {
+        let body = serde_json::json!({"id": id, "result": "deleted"});
+        return Ok(render_json(&body));
+    }
+    Ok(format!("deleted {id}\n"))
 }
 
 async fn cmd_config_validate(
@@ -1825,14 +2137,15 @@ async fn cmd_backup_export(
         .and_then(|versions| versions.first())
         .and_then(|row| row.get("id").and_then(|v| v.as_u64()))
         .ok_or_else(|| CtlError::server("config history has no versions"))?;
-    let path = format!("/api/v1/config/history/{latest}");
+    let path = format!("/api/v1/config/history/{latest}?secrets=raw");
     let (_, version) = request(ctl, key, reqwest::Method::GET, &path, None).await?;
     let snapshot = version
         .get("snapshot")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    // The server redacts secret references in this snapshot; the file
-    // therefore holds references (restorable markers), never values.
+    // The backup route returns the stored snapshot. Secrets stay as
+    // stored (inline values or `file:`/`env:` references), so an import
+    // restores them. Treat the file as a secret.
     let text = if format == "json" {
         serde_json::to_string_pretty(&snapshot)
             .map_err(|e| CtlError::server(format!("cannot encode backup: {e}")))?
@@ -1920,6 +2233,7 @@ async fn run_ctl(ctl: &CtlArgs) -> Result<String, CtlError> {
                 log,
                 forward,
                 republish,
+                tenant,
             } => {
                 cmd_rules_create(
                     ctl,
@@ -1932,6 +2246,7 @@ async fn run_ctl(ctl: &CtlArgs) -> Result<String, CtlError> {
                     *log,
                     forward,
                     republish,
+                    tenant.as_deref(),
                 )
                 .await
             }
@@ -1963,12 +2278,15 @@ async fn run_ctl(ctl: &CtlArgs) -> Result<String, CtlError> {
             }
         },
         CtlCommand::Users { command } => match command {
-            UsersCommand::List => cmd_users_list(ctl, &key).await,
-            UsersCommand::Show { username } => cmd_users_show(ctl, &key, username).await,
+            UsersCommand::List { tenant } => cmd_users_list(ctl, &key, tenant.as_deref()).await,
+            UsersCommand::Show { username, tenant } => {
+                cmd_users_show(ctl, &key, username, tenant.as_deref()).await
+            }
             UsersCommand::Create {
                 username,
                 password,
                 password_file,
+                tenant,
                 max_connections,
                 max_publish_rate,
                 max_publish_burst,
@@ -1979,14 +2297,47 @@ async fn run_ctl(ctl: &CtlArgs) -> Result<String, CtlError> {
                     username,
                     password.as_deref(),
                     password_file.as_deref(),
+                    tenant.as_deref(),
                     *max_connections,
                     *max_publish_rate,
                     *max_publish_burst,
                 )
                 .await
             }
-            UsersCommand::Delete { username, yes } => {
-                cmd_users_delete(ctl, &key, username, *yes).await
+            UsersCommand::Delete {
+                username,
+                tenant,
+                yes,
+            } => cmd_users_delete(ctl, &key, username, tenant.as_deref(), *yes).await,
+        },
+        CtlCommand::Tenants { command } => match command {
+            TenantsCommand::List { limit } => cmd_tenants_list(ctl, &key, *limit).await,
+            TenantsCommand::Show { ns } => cmd_tenants_show(ctl, &key, ns).await,
+            TenantsCommand::Create { ns } => cmd_tenants_create(ctl, &key, ns).await,
+            TenantsCommand::Delete { ns, yes } => cmd_tenants_delete(ctl, &key, ns, *yes).await,
+        },
+        CtlCommand::Acls { command } => match command {
+            AclsCommand::List { tenant } => cmd_acls_list(ctl, &key, tenant.as_deref()).await,
+            AclsCommand::Create {
+                client_pattern,
+                action,
+                topic_pattern,
+                allow,
+                tenant,
+            } => {
+                cmd_acls_create(
+                    ctl,
+                    &key,
+                    client_pattern,
+                    action,
+                    topic_pattern,
+                    *allow,
+                    tenant.as_deref(),
+                )
+                .await
+            }
+            AclsCommand::Delete { id, tenant, yes } => {
+                cmd_acls_delete(ctl, &key, *id, tenant.as_deref(), *yes).await
             }
         },
         CtlCommand::Config { command } => match command {
@@ -2032,10 +2383,21 @@ async fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
-            // Clap usage errors exit 2 by default; remap to the validation
-            // code so 2 keeps meaning authentication failure only.
-            error.print().expect("clap error renders");
-            std::process::exit(EXIT_VALIDATION);
+            // Clap reports help and version as errors. Show the text.
+            // Exit with success for help and version.
+            // Remap other usage errors to the validation code.
+            // Code 2 keeps its authentication meaning.
+            use clap::error::ErrorKind;
+            match error.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    error.print().expect("clap error renders");
+                    std::process::exit(EXIT_OK);
+                }
+                _ => {
+                    error.print().expect("clap error renders");
+                    std::process::exit(EXIT_VALIDATION);
+                }
+            }
         }
     };
     let TopCommand::Ctl(ctl) = cli.command;
@@ -2054,11 +2416,16 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broker_protocol::{QoS, TopicFilter};
+    use broker_protocol::{QoS, Topic, TopicFilter};
     use broker_router::Subscription;
     use std::sync::Arc;
 
     const TEST_KEY: &str = "ctl-test-key-0001";
+
+    /// Per-call bound for the live test API. Reason: a loaded CI host can
+    /// stall the persistence fsync for tens of seconds. This bound only
+    /// stops a hang; the assertions remain unchanged.
+    const LIVE_TEST_TIMEOUT_SECS: u64 = 60;
 
     /// Live management API over loopback backed by real broker state.
     ///
@@ -2123,9 +2490,13 @@ mod tests {
                 });
             if let Some(listeners) = listeners {
                 state.listeners = Arc::new(listeners);
+                // Mirror the custom bind in the live store.
+                state
+                    .listener_store
+                    .reset_from_config(state.listeners.as_ref());
             }
             state
-                .api_keys
+                .operator_api_keys
                 .insert(TEST_KEY)
                 .expect("test key inserts under the cap");
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2190,9 +2561,52 @@ mod tests {
                 api_key: Some(TEST_KEY.to_string()),
                 api_key_file: None,
                 json,
-                timeout: 5,
+                timeout: LIVE_TEST_TIMEOUT_SECS,
                 command,
             }
+        }
+
+        /// Same as [`LiveApi::ctl`] with an explicit credential (an admin
+        /// or viewer token for role checks).
+        fn ctl_with_key(&self, key: &str, json: bool, command: CtlCommand) -> CtlArgs {
+            CtlArgs {
+                endpoint: self.base.clone(),
+                api_key: Some(key.to_string()),
+                api_key_file: None,
+                json,
+                timeout: LIVE_TEST_TIMEOUT_SECS,
+                command,
+            }
+        }
+
+        /// Simulate a live edge connection inside one tenant, the way the
+        /// kernel bind path does: tenant-scoped session record plus bound
+        /// connection plus a registered delivery mailbox standing in for
+        /// the edge task.
+        fn connect_client_in_tenant(
+            &self,
+            tenant: &str,
+            client_id: &str,
+            conn_id: u64,
+        ) -> tokio::sync::mpsc::UnboundedReceiver<brokerlink::BrokerFrame> {
+            let (session, _) = self
+                .state
+                .sessions
+                .get_or_create_in_tenant(tenant, client_id, true);
+            self.state.sessions.bind_session(&session, conn_id);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            self.state.conns.register(conn_id, tx);
+            rx
+        }
+
+        /// Subscribe one tenant connection through the router with a
+        /// tenant-scoped subscription, as the kernel subscribe path does.
+        fn subscribe_in_tenant(&self, tenant: &str, client_id: &str, conn_id: u64, filter: &str) {
+            let filter = TopicFilter::new(filter).expect("valid filter");
+            self.state.router.subscribe(
+                &filter,
+                Subscription::new_in_tenant(client_id, conn_id, QoS::AtLeastOnce, tenant),
+            );
         }
     }
 
@@ -2203,15 +2617,18 @@ mod tests {
         let human = run_ctl(&api.ctl(false, CtlCommand::Status))
             .await
             .expect("status succeeds");
-        assert!(human.contains("up"), "human form reports up: {human}");
+        assert!(
+            human.contains("running"),
+            "human form reports running: {human}"
+        );
         let json = run_ctl(&api.ctl(true, CtlCommand::Status))
             .await
             .expect("status --json succeeds");
         let body: serde_json::Value =
             serde_json::from_str(&json).expect("--json output parses as JSON");
-        assert_eq!(body["status"], serde_json::json!("up"));
+        assert_eq!(body["app_status"], serde_json::json!("running"));
         assert!(
-            human.contains("up") && body["status"] == serde_json::json!("up"),
+            human.contains("running") && body["app_status"] == serde_json::json!("running"),
             "both forms report the same running state"
         );
     }
@@ -2479,12 +2896,15 @@ mod tests {
     #[tokio::test]
     async fn publish_json_returns_stable_id_key() {
         let api = LiveApi::start().await;
+        // Publish needs a live subscriber. Else it reports 202.
+        let _rx = api.connect_client("ctl-json-sub", 7033);
+        api.subscribe("ctl-json-sub", 7033, "ctl/json/t");
         let json = run_ctl(&api.ctl(
             true,
             CtlCommand::Publish {
                 topic: "ctl/json/t".to_string(),
                 payload: "p".to_string(),
-                qos: 0,
+                qos: 1,
                 retain: false,
             },
         ))
@@ -2525,7 +2945,7 @@ mod tests {
             by_id("tcp:default")["bind"],
             serde_json::json!("127.0.0.1:11883")
         );
-        assert_eq!(by_id("ws:default")["enabled"], serde_json::json!(true));
+        assert_eq!(by_id("ws:default")["enable"], serde_json::json!(true));
     }
 
     #[tokio::test]
@@ -2537,7 +2957,12 @@ mod tests {
             api_key_file: None,
             json: false,
             timeout: 5,
-            command: CtlCommand::Status,
+            // `status` needs no authentication, so a protected command
+            // checks the key.
+            command: CtlCommand::Topics {
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            },
         };
         let error = run_ctl(&wrong).await.expect_err("wrong key fails");
         assert_eq!(error.code, EXIT_AUTH);
@@ -2711,7 +3136,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Unique suffix so parallel tests never share a rule, connector or
-    /// user identity (the v5 connector directory is process-global).
+    /// user identity (each live API holds its own connector directory).
     static GOV_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn gov_id(prefix: &str) -> String {
@@ -2776,6 +3201,7 @@ mod tests {
                     log: false,
                     forward: Vec::new(),
                     republish: Vec::new(),
+                    tenant: None,
                 },
             },
         ))
@@ -2842,6 +3268,7 @@ mod tests {
                     log: true,
                     forward: Vec::new(),
                     republish: vec!["gov/out:1".to_string()],
+                    tenant: None,
                 },
             },
         ))
@@ -2937,7 +3364,7 @@ mod tests {
         assert!(
             listed
                 .as_array()
-                .expect("list is an array")
+                .expect("the connector list is a bare array")
                 .iter()
                 .any(|row| row["id"] == serde_json::json!(id)),
             "list contains the new connector"
@@ -3011,6 +3438,7 @@ mod tests {
                     username: username.clone(),
                     password: Some("gov-secret-pw".to_string()),
                     password_file: None,
+                    tenant: None,
                     max_connections: None,
                     max_publish_rate: None,
                     max_publish_burst: None,
@@ -3024,7 +3452,7 @@ mod tests {
         let json = run_ctl(&api.ctl(
             true,
             CtlCommand::Users {
-                command: UsersCommand::List,
+                command: UsersCommand::List { tenant: None },
             },
         ))
         .await
@@ -3047,6 +3475,7 @@ mod tests {
             CtlCommand::Users {
                 command: UsersCommand::Show {
                     username: username.clone(),
+                    tenant: None,
                 },
             },
         ))
@@ -3086,6 +3515,7 @@ mod tests {
                     username: username.clone(),
                     password: Some("pw".to_string()),
                     password_file: None,
+                    tenant: None,
                     max_connections: None,
                     max_publish_rate: None,
                     max_publish_burst: None,
@@ -3099,6 +3529,7 @@ mod tests {
             CtlCommand::Users {
                 command: UsersCommand::Delete {
                     username: username.clone(),
+                    tenant: None,
                     yes: false,
                 },
             },
@@ -3111,6 +3542,7 @@ mod tests {
             CtlCommand::Users {
                 command: UsersCommand::Delete {
                     username: username.clone(),
+                    tenant: None,
                     yes: true,
                 },
             },
@@ -3122,12 +3554,782 @@ mod tests {
             CtlCommand::Users {
                 command: UsersCommand::Show {
                     username: username.clone(),
+                    tenant: None,
                 },
             },
         ))
         .await
         .expect_err("show after delete fails");
         assert_eq!(error.code, EXIT_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tenants_create_show_list_delete_go_through_cli() {
+        let api = LiveApi::start().await;
+        let tenant_a = gov_id("tm03-ten-a");
+        let tenant_b = gov_id("tm03-ten-b");
+        let ghost = gov_id("tm03-ghost");
+        // Create two tenants through the CLI: one human, one --json.
+        let human = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Create {
+                    ns: tenant_a.clone(),
+                },
+            },
+        ))
+        .await
+        .expect("tenants create succeeds");
+        assert!(human.contains(&tenant_a), "human confirms: {human}");
+        let json = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Create {
+                    ns: tenant_b.clone(),
+                },
+            },
+        ))
+        .await
+        .expect("tenants create --json succeeds");
+        let created: serde_json::Value =
+            serde_json::from_str(&json).expect("--json output parses as JSON");
+        assert_eq!(created["ns"], serde_json::json!(tenant_b));
+        assert_eq!(created["result"], serde_json::json!("created"));
+        // A duplicate create fails closed instead of overwriting.
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Create {
+                    ns: tenant_a.clone(),
+                },
+            },
+        ))
+        .await
+        .expect_err("duplicate create fails");
+        assert_eq!(error.code, EXIT_VALIDATION);
+        // Show returns each tenant through the CLI.
+        for ns in [&tenant_a, &tenant_b] {
+            let show = run_ctl(&api.ctl(
+                true,
+                CtlCommand::Tenants {
+                    command: TenantsCommand::Show { ns: ns.clone() },
+                },
+            ))
+            .await
+            .expect("tenants show succeeds");
+            let body: serde_json::Value = serde_json::from_str(&show).expect("show JSON parses");
+            assert!(body.is_object(), "show reads the stored config: {body}");
+        }
+        // An unknown tenant misses with not-found.
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Show { ns: ghost.clone() },
+            },
+        ))
+        .await
+        .expect_err("unknown show fails");
+        assert_eq!(error.code, EXIT_NOT_FOUND);
+        // List shows both tenants in both forms.
+        let list = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Tenants {
+                command: TenantsCommand::List { limit: 100 },
+            },
+        ))
+        .await
+        .expect("tenants list --json succeeds");
+        let body: serde_json::Value = serde_json::from_str(&list).expect("list JSON parses");
+        let items = body.as_array().expect("list is an array");
+        assert!(
+            items.contains(&serde_json::json!(tenant_a)),
+            "list shows the first tenant: {items:?}"
+        );
+        assert!(
+            items.contains(&serde_json::json!(tenant_b)),
+            "list shows the second tenant: {items:?}"
+        );
+        let human_list = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::List { limit: 100 },
+            },
+        ))
+        .await
+        .expect("tenants list succeeds");
+        assert!(
+            human_list.contains(&tenant_a) && human_list.contains(&tenant_b),
+            "human list names both tenants: {human_list}"
+        );
+        // Delete without --yes fails closed on a non-interactive stdin.
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Delete {
+                    ns: tenant_a.clone(),
+                    yes: false,
+                },
+            },
+        ))
+        .await
+        .expect_err("delete without --yes fails");
+        assert_eq!(error.code, EXIT_VALIDATION);
+        // Delete removes one tenant and keeps the other.
+        let out = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Delete {
+                    ns: tenant_a.clone(),
+                    yes: true,
+                },
+            },
+        ))
+        .await
+        .expect("tenants delete succeeds");
+        assert!(out.contains(&tenant_a), "delete confirms: {out}");
+        let after = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Tenants {
+                command: TenantsCommand::List { limit: 100 },
+            },
+        ))
+        .await
+        .expect("list after delete succeeds");
+        let items = serde_json::from_str::<serde_json::Value>(&after)
+            .expect("list JSON parses")
+            .as_array()
+            .expect("list is an array")
+            .clone();
+        assert!(
+            !items.contains(&serde_json::json!(tenant_a)),
+            "deleted tenant is gone: {items:?}"
+        );
+        assert!(
+            items.contains(&serde_json::json!(tenant_b)),
+            "other tenant stays: {items:?}"
+        );
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Show {
+                    ns: tenant_a.clone(),
+                },
+            },
+        ))
+        .await
+        .expect_err("show after delete fails");
+        assert_eq!(error.code, EXIT_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn users_create_with_tenant_isolates_same_username() {
+        let api = LiveApi::start().await;
+        let tenant_a = gov_id("tm03-aten");
+        let tenant_b = gov_id("tm03-bten");
+        let username = gov_id("tm03-sam");
+        // Passwords the broker cannot know: unique to this test, they
+        // travel only inside the CLI creation calls below.
+        let password_a = format!("{username}-pw-a-7x");
+        let password_b = format!("{username}-pw-b-9q");
+        // The same username in two tenants creates two identities.
+        for (tenant, password) in [(&tenant_a, &password_a), (&tenant_b, &password_b)] {
+            let out = run_ctl(&api.ctl(
+                false,
+                CtlCommand::Users {
+                    command: UsersCommand::Create {
+                        username: username.clone(),
+                        password: Some(password.clone()),
+                        password_file: None,
+                        tenant: Some(tenant.clone()),
+                        max_connections: None,
+                        max_publish_rate: None,
+                        max_publish_burst: None,
+                    },
+                },
+            ))
+            .await
+            .expect("tenant user creates");
+            assert!(out.contains(&username), "create confirms: {out}");
+        }
+        // One more user lives in the first tenant only.
+        let only_a = gov_id("tm03-only-a");
+        run_ctl(&api.ctl(
+            false,
+            CtlCommand::Users {
+                command: UsersCommand::Create {
+                    username: only_a.clone(),
+                    password: Some(format!("{only_a}-pw-3z")),
+                    password_file: None,
+                    tenant: Some(tenant_a.clone()),
+                    max_connections: None,
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                },
+            },
+        ))
+        .await
+        .expect("tenant-scoped user creates");
+        // Each tenant list shows its own users only.
+        let list_a = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Users {
+                command: UsersCommand::List {
+                    tenant: Some(tenant_a.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("tenant list succeeds");
+        let rows_a = serde_json::from_str::<serde_json::Value>(&list_a)
+            .expect("list JSON parses")
+            .as_array()
+            .expect("list is an array")
+            .clone();
+        assert!(
+            rows_a
+                .iter()
+                .any(|row| row["username"] == serde_json::json!(only_a)),
+            "first tenant lists its own user: {rows_a:?}"
+        );
+        let list_b = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Users {
+                command: UsersCommand::List {
+                    tenant: Some(tenant_b.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("other tenant list succeeds");
+        let rows_b = serde_json::from_str::<serde_json::Value>(&list_b)
+            .expect("list JSON parses")
+            .as_array()
+            .expect("list is an array")
+            .clone();
+        assert!(
+            !rows_b
+                .iter()
+                .any(|row| row["username"] == serde_json::json!(only_a)),
+            "second tenant never sees the first tenant user: {rows_b:?}"
+        );
+        // Show finds the shared name in each tenant, but the scoped name
+        // misses in the other tenant.
+        run_ctl(&api.ctl(
+            true,
+            CtlCommand::Users {
+                command: UsersCommand::Show {
+                    username: username.clone(),
+                    tenant: Some(tenant_b.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("shared name shows in each tenant");
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Users {
+                command: UsersCommand::Show {
+                    username: only_a.clone(),
+                    tenant: Some(tenant_b.clone()),
+                },
+            },
+        ))
+        .await
+        .expect_err("scoped name misses in the other tenant");
+        assert_eq!(error.code, EXIT_NOT_FOUND);
+        // Through the broker: each password opens only its own tenant.
+        use broker_auth::Authenticator as _;
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_a,
+                "device-a",
+                Some(&username),
+                Some(password_a.as_bytes())
+            )
+            .await
+            .is_ok());
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_b,
+                "device-b",
+                Some(&username),
+                Some(password_b.as_bytes())
+            )
+            .await
+            .is_ok());
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_a,
+                "device-a",
+                Some(&username),
+                Some(password_b.as_bytes())
+            )
+            .await
+            .is_err());
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_b,
+                "device-b",
+                Some(&username),
+                Some(password_a.as_bytes())
+            )
+            .await
+            .is_err());
+        // The default tenant works with no change: no flag, no scope.
+        let base = gov_id("tm03-base");
+        run_ctl(&api.ctl(
+            false,
+            CtlCommand::Users {
+                command: UsersCommand::Create {
+                    username: base.clone(),
+                    password: Some("tm03-base-pw-5z".to_string()),
+                    password_file: None,
+                    tenant: None,
+                    max_connections: None,
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                },
+            },
+        ))
+        .await
+        .expect("default user creates with no flag");
+        assert!(api
+            .state
+            .auth
+            .authenticate("device-base", Some(&base), Some(b"tm03-base-pw-5z"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn acls_create_list_delete_go_through_cli_with_tenant() {
+        let api = LiveApi::start().await;
+        let tenant = gov_id("tm03-acl-ten");
+        // The tenant table starts empty.
+        let empty = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Acls {
+                command: AclsCommand::List {
+                    tenant: Some(tenant.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("acl list succeeds");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&empty).expect("list JSON parses"),
+            serde_json::json!([]),
+            "tenant table starts empty"
+        );
+        // Append one publish and one subscribe rule through the CLI.
+        for action in ["publish", "subscribe"] {
+            let out = run_ctl(&api.ctl(
+                false,
+                CtlCommand::Acls {
+                    command: AclsCommand::Create {
+                        client_pattern: "*".to_string(),
+                        action: action.to_string(),
+                        topic_pattern: "tm03/acl/#".to_string(),
+                        allow: true,
+                        tenant: Some(tenant.clone()),
+                    },
+                },
+            ))
+            .await
+            .expect("acl create succeeds");
+            assert!(out.contains("tm03/acl/#"), "create confirms: {out}");
+        }
+        // A bad action fails closed and names the field.
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Acls {
+                command: AclsCommand::Create {
+                    client_pattern: "*".to_string(),
+                    action: "forward".to_string(),
+                    topic_pattern: "tm03/acl/#".to_string(),
+                    allow: true,
+                    tenant: Some(tenant.clone()),
+                },
+            },
+        ))
+        .await
+        .expect_err("bad action fails");
+        assert_eq!(error.code, EXIT_VALIDATION);
+        // List shows both rules with action and verdict in both forms.
+        let human = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Acls {
+                command: AclsCommand::List {
+                    tenant: Some(tenant.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("acl list succeeds");
+        assert!(
+            human.contains("publish") && human.contains("subscribe"),
+            "human list shows both actions: {human}"
+        );
+        let json = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Acls {
+                command: AclsCommand::List {
+                    tenant: Some(tenant.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("acl list --json succeeds");
+        let rows = serde_json::from_str::<serde_json::Value>(&json)
+            .expect("list JSON parses")
+            .as_array()
+            .expect("list is an array")
+            .clone();
+        assert_eq!(rows.len(), 2, "both rules are stored: {rows:?}");
+        assert!(rows
+            .iter()
+            .any(|row| row["action"] == serde_json::json!("publish")
+                && row["allow"] == serde_json::json!(true)));
+        // The default tenant table stays empty: no leak across tenants.
+        let default_list = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Acls {
+                command: AclsCommand::List { tenant: None },
+            },
+        ))
+        .await
+        .expect("default acl list succeeds");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&default_list).expect("list JSON parses"),
+            serde_json::json!([]),
+            "default table stays empty"
+        );
+        // Delete without --yes fails closed.
+        let error = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Acls {
+                command: AclsCommand::Delete {
+                    id: 0,
+                    tenant: Some(tenant.clone()),
+                    yes: false,
+                },
+            },
+        ))
+        .await
+        .expect_err("delete without --yes fails");
+        assert_eq!(error.code, EXIT_VALIDATION);
+        // Delete by index removes one rule and keeps the other.
+        let out = run_ctl(&api.ctl(
+            false,
+            CtlCommand::Acls {
+                command: AclsCommand::Delete {
+                    id: 0,
+                    tenant: Some(tenant.clone()),
+                    yes: true,
+                },
+            },
+        ))
+        .await
+        .expect("acl delete succeeds");
+        assert!(out.contains('0'), "delete confirms the index: {out}");
+        let after = run_ctl(&api.ctl(
+            true,
+            CtlCommand::Acls {
+                command: AclsCommand::List {
+                    tenant: Some(tenant.clone()),
+                },
+            },
+        ))
+        .await
+        .expect("list after delete succeeds");
+        let rows = serde_json::from_str::<serde_json::Value>(&after)
+            .expect("list JSON parses")
+            .as_array()
+            .expect("list is an array")
+            .clone();
+        assert_eq!(rows.len(), 1, "one rule stays: {rows:?}");
+        assert_eq!(rows[0]["action"], serde_json::json!("subscribe"));
+        // Through the broker: no publish rule stays, so the publish
+        // verdict for the tenant is denied.
+        let topic = Topic::new("tm03/acl/data").expect("topic parses");
+        assert!(api
+            .state
+            .auth
+            .authorize_publish_in_tenant(&tenant, "any-client", &topic)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn viewer_reads_but_cannot_write_through_cli() {
+        use broker_api::admin_users::AdminRole;
+        let api = LiveApi::start().await;
+        api.state
+            .admin_users
+            .create(
+                "tm03-admin",
+                "Adm1n-tm03-pass!",
+                AdminRole::Administrator,
+                "",
+            )
+            .expect("admin creates");
+        api.state
+            .admin_users
+            .create("tm03-viewer", "V13wer-tm03-pass!", AdminRole::Viewer, "")
+            .expect("viewer creates");
+        let admin = api
+            .state
+            .tokens
+            .issue("tm03-admin", AdminRole::Administrator);
+        let viewer = api.state.tokens.issue("tm03-viewer", AdminRole::Viewer);
+        let ns = gov_id("tm03-view-ns");
+        // The administrator creates one tenant through the CLI.
+        run_ctl(&api.ctl_with_key(
+            &admin,
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Create { ns: ns.clone() },
+            },
+        ))
+        .await
+        .expect("admin creates the tenant");
+        // The viewer reads through the CLI.
+        let list = run_ctl(&api.ctl_with_key(
+            &viewer,
+            true,
+            CtlCommand::Tenants {
+                command: TenantsCommand::List { limit: 100 },
+            },
+        ))
+        .await
+        .expect("viewer lists tenants");
+        assert!(list.contains(&ns), "viewer reads the tenant: {list}");
+        run_ctl(&api.ctl_with_key(
+            &viewer,
+            false,
+            CtlCommand::Tenants {
+                command: TenantsCommand::Show { ns: ns.clone() },
+            },
+        ))
+        .await
+        .expect("viewer shows the tenant");
+        run_ctl(&api.ctl_with_key(
+            &viewer,
+            true,
+            CtlCommand::Users {
+                command: UsersCommand::List { tenant: None },
+            },
+        ))
+        .await
+        .expect("viewer lists users");
+        run_ctl(&api.ctl_with_key(
+            &viewer,
+            true,
+            CtlCommand::Acls {
+                command: AclsCommand::List { tenant: None },
+            },
+        ))
+        .await
+        .expect("viewer lists ACLs");
+        // The viewer cannot write through the CLI: each write exits
+        // with authentication failure, never with success.
+        let writes = [
+            CtlCommand::Tenants {
+                command: TenantsCommand::Create {
+                    ns: gov_id("tm03-view-try"),
+                },
+            },
+            CtlCommand::Tenants {
+                command: TenantsCommand::Delete {
+                    ns: ns.clone(),
+                    yes: true,
+                },
+            },
+            CtlCommand::Users {
+                command: UsersCommand::Create {
+                    username: gov_id("tm03-view-user"),
+                    password: Some("tm03-view-pw-4x".to_string()),
+                    password_file: None,
+                    tenant: None,
+                    max_connections: None,
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                },
+            },
+            CtlCommand::Users {
+                command: UsersCommand::Delete {
+                    username: "nobody".to_string(),
+                    tenant: None,
+                    yes: true,
+                },
+            },
+            CtlCommand::Acls {
+                command: AclsCommand::Create {
+                    client_pattern: "*".to_string(),
+                    action: "publish".to_string(),
+                    topic_pattern: "tm03/view/#".to_string(),
+                    allow: true,
+                    tenant: None,
+                },
+            },
+            CtlCommand::Acls {
+                command: AclsCommand::Delete {
+                    id: 0,
+                    tenant: None,
+                    yes: true,
+                },
+            },
+        ];
+        for command in writes {
+            let error = run_ctl(&api.ctl_with_key(&viewer, false, command))
+                .await
+                .expect_err("viewer write fails");
+            assert_eq!(
+                error.code, EXIT_AUTH,
+                "viewer write exits auth: {}",
+                error.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_tenants_publish_stays_in_tenant_through_cli_and_broker() {
+        let api = LiveApi::start().await;
+        let tenant_a = gov_id("tm03-iso-a");
+        let tenant_b = gov_id("tm03-iso-b");
+        // Two tenants come from the CLI.
+        for tenant in [&tenant_a, &tenant_b] {
+            run_ctl(&api.ctl(
+                false,
+                CtlCommand::Tenants {
+                    command: TenantsCommand::Create { ns: tenant.clone() },
+                },
+            ))
+            .await
+            .expect("tenant creates through the CLI");
+        }
+        // One user in each tenant with a password the broker cannot
+        // know, plus publish and subscribe rules on the same filter.
+        let username = gov_id("tm03-iso-user");
+        let password_a = format!("{username}-pw-a-4x");
+        let password_b = format!("{username}-pw-b-8q");
+        for (tenant, password) in [(&tenant_a, &password_a), (&tenant_b, &password_b)] {
+            run_ctl(&api.ctl(
+                false,
+                CtlCommand::Users {
+                    command: UsersCommand::Create {
+                        username: username.clone(),
+                        password: Some(password.clone()),
+                        password_file: None,
+                        tenant: Some(tenant.clone()),
+                        max_connections: None,
+                        max_publish_rate: None,
+                        max_publish_burst: None,
+                    },
+                },
+            ))
+            .await
+            .expect("tenant user creates through the CLI");
+            for action in ["publish", "subscribe"] {
+                run_ctl(&api.ctl(
+                    false,
+                    CtlCommand::Acls {
+                        command: AclsCommand::Create {
+                            client_pattern: "*".to_string(),
+                            action: action.to_string(),
+                            topic_pattern: "tm03/iso/#".to_string(),
+                            allow: true,
+                            tenant: Some(tenant.clone()),
+                        },
+                    },
+                ))
+                .await
+                .expect("tenant ACL creates through the CLI");
+            }
+        }
+        // Each password opens only its own tenant (CONNECT verdict).
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_a,
+                "iso-client",
+                Some(&username),
+                Some(password_a.as_bytes())
+            )
+            .await
+            .is_ok());
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_b,
+                "iso-client",
+                Some(&username),
+                Some(password_b.as_bytes())
+            )
+            .await
+            .is_ok());
+        assert!(api
+            .state
+            .auth
+            .authenticate_in_tenant(
+                &tenant_a,
+                "iso-client",
+                Some(&username),
+                Some(password_b.as_bytes())
+            )
+            .await
+            .is_err());
+        // Connect one client per tenant under the same client id: two
+        // sessions, one per tenant.
+        let _rx_a = api.connect_client_in_tenant(&tenant_a, "iso-client", 8101);
+        let _rx_b = api.connect_client_in_tenant(&tenant_b, "iso-client", 8102);
+        assert!(api
+            .state
+            .sessions
+            .get_in_tenant(&tenant_a, "iso-client")
+            .is_some());
+        assert!(api
+            .state
+            .sessions
+            .get_in_tenant(&tenant_b, "iso-client")
+            .is_some());
+        // Subscribe the same filter in both tenants.
+        api.subscribe_in_tenant(&tenant_a, "iso-client", 8101, "tm03/iso/#");
+        api.subscribe_in_tenant(&tenant_b, "iso-client", 8102, "tm03/iso/#");
+        // A publish in the first tenant matches only its subscriber:
+        // the broker itself counts the other tenant as skipped.
+        let topic = Topic::new("tm03/iso/data").expect("topic parses");
+        let (matched_a, skipped_a) = api
+            .state
+            .router
+            .matches_in_tenant_counted(&topic, None, &tenant_a);
+        let conns_a: Vec<u64> = matched_a.iter().map(|sub| sub.conn_id).collect();
+        assert_eq!(conns_a, vec![8101], "publish in A reaches A only");
+        assert_eq!(skipped_a, 1, "publish in A skips B");
+        // A publish in the second tenant matches only its subscriber.
+        let (matched_b, skipped_b) = api
+            .state
+            .router
+            .matches_in_tenant_counted(&topic, None, &tenant_b);
+        let conns_b: Vec<u64> = matched_b.iter().map(|sub| sub.conn_id).collect();
+        assert_eq!(conns_b, vec![8102], "publish in B reaches B only");
+        assert_eq!(skipped_b, 1, "publish in B skips A");
+        // The default tenant sees neither subscription.
+        let (matched_default, _) = api
+            .state
+            .router
+            .matches_in_tenant_counted(&topic, None, "default");
+        assert!(matched_default.is_empty(), "default tenant sees nothing");
     }
 
     #[tokio::test]
@@ -3457,6 +4659,7 @@ mod tests {
                     username: username.clone(),
                     password: Some("backup-pw".to_string()),
                     password_file: None,
+                    tenant: None,
                     max_connections: None,
                     max_publish_rate: None,
                     max_publish_burst: None,
@@ -3477,6 +4680,7 @@ mod tests {
                     log: false,
                     forward: Vec::new(),
                     republish: Vec::new(),
+                    tenant: None,
                 },
             },
         ))
@@ -3555,7 +4759,7 @@ mod tests {
         let users = run_ctl(&scratch.ctl(
             false,
             CtlCommand::Users {
-                command: UsersCommand::List,
+                command: UsersCommand::List { tenant: None },
             },
         ))
         .await

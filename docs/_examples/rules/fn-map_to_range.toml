@@ -1,0 +1,46 @@
+[example]
+area = "rules"
+item = "fn-map_to_range"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT map_to_range(5, 0, 99) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 5}'
+
+[[case]]
+sql = "SELECT map_to_range('AB', 0, 99) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 6}'
+
+[[case]]
+sql = "SELECT map_to_range(300, 0, 99) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 0}'
+
+[[case]]
+sql = "SELECT map_to_range('', 0, 99) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT map_to_range(5, 99, 0) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT map_to_range(5, 0) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-kerberos-clock-skew-secs",
+  "match": "--kerberos-clock-skew-secs",
+  "output": "      --kerberos-clock-skew-secs <KERBEROS_CLOCK_SKEW_SECS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,33 @@
+# Local copy of the pinned rekuiper-sql manifest. Only the zstd requirement
+# changes, to the release that the advisory database lists as patched. The
+# source is the pinned revision and is not changed.
+[package]
+name = "rekuiper-sql"
+version = "1.0.0-rc4"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Streaming SQL parser, planner, and evaluator with windowing functions for rekuiper"
+repository = "https://github.com/Indus-Stack/rekuiper"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+indexmap = { version = "2.6", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+regex = "1.10"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+md-5 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+crc32fast = "1.5"
+sha1 = "0.10"
+rekuiper-core = { git = "https://github.com/Indus-Stack/rekuiper.git", rev = "afffe8c4154d458410940307c2b96f0495d5c031" }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+zstd = "0.14.3"
+chrono-tz = { version = "0.9", features = ["serde"] }
+
+[workspace]

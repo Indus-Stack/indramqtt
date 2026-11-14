@@ -1,0 +1,1 @@
+`listeners.tls.cert_file` points to the PEM server certificate. The listener needs it when `enabled` is true and PSK is off. The file must hold at least one certificate. Boot fails when the file is missing or empty.

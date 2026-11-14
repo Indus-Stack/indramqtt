@@ -1994,8 +1994,7 @@ mod tests {
     async fn test_qualify_driver_write_path() {
         let contact_points = qual_env("CASSANDRA_CONTACT_POINTS");
         let Some(contact_points) = contact_points else {
-            eprintln!("CASSANDRA_CONTACT_POINTS is empty; skipping qualification");
-            return;
+            panic!("missing CASSANDRA_CONTACT_POINTS; cannot run qualification without a server endpoint");
         };
         let contact_points: Vec<String> = contact_points
             .split(',')
@@ -2003,8 +2002,7 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
         if contact_points.is_empty() {
-            eprintln!("CASSANDRA_CONTACT_POINTS has no entries; skipping qualification");
-            return;
+            panic!("empty CASSANDRA_CONTACT_POINTS; cannot run qualification without a server endpoint");
         }
         let keyspace =
             qual_env("CASSANDRA_KEYSPACE").unwrap_or_else(|| "cassandra_qual_b307".to_string());
@@ -2178,5 +2176,147 @@ mod tests {
             .await
             .expect("qual drop keyspace");
         eprintln!("qual done: version={version} rows=2010 cleaned table {keyspace}.{table}");
+    }
+
+    /// SB-27 rule-path qualification against a real Apache Cassandra
+    /// server on docker hub through the broker path.
+    ///
+    /// Run with e.g.:
+    /// `CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
+    ///  cargo test -p broker-connectors-enterprise --lib cassandra::tests::sb27_cassandra_rule_path_qualifies_through_manager -- --ignored --nocapture`
+    ///
+    /// Registers the sink with the shared manager on the rule engine path.
+    /// Delivers one row through `ConnectorManager::send` (never `sink.send`), flushes, and asserts the exact count and payload from the server.
+    /// The environment being absent panics; it never skips.
+    #[tokio::test]
+    #[ignore = "needs a real Apache Cassandra / ScyllaDB server (see CASSANDRA_* env)"]
+    async fn sb27_cassandra_rule_path_qualifies_through_manager() {
+        use broker_connectors::ConnectorManager;
+        let contact_points = qual_env("CASSANDRA_CONTACT_POINTS").unwrap_or_else(|| {
+            panic!("missing CASSANDRA_CONTACT_POINTS; cannot run qualification without a server endpoint")
+        });
+        let contact_points: Vec<String> = contact_points
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if contact_points.is_empty() {
+            panic!("empty CASSANDRA_CONTACT_POINTS; cannot run qualification without a server endpoint");
+        }
+        let keyspace =
+            qual_env("CASSANDRA_KEYSPACE").unwrap_or_else(|| "cassandra_qual_sb27".to_string());
+        let table = qual_env("CASSANDRA_TABLE").unwrap_or_else(|| "qual_rule_path".to_string());
+        let username = qual_env("CASSANDRA_USERNAME");
+        let password = qual_env("CASSANDRA_PASSWORD").unwrap_or_default();
+
+        let mut builder =
+            scylla::client::session_builder::SessionBuilder::new().known_nodes(&contact_points);
+        if let Some(username) = username.clone() {
+            builder = builder.user(username, password.clone());
+        }
+        let session = builder.build().await.expect("qual connect");
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE KEYSPACE IF NOT EXISTS {keyspace} \
+                     WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '1'}}"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create keyspace");
+        session
+            .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{table}"), &[])
+            .await
+            .expect("qual drop stale table");
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE TABLE {keyspace}.{table} \
+                     (device_id text, bucket_hour text, event_time bigint, payload text, \
+                      PRIMARY KEY ((device_id), bucket_hour, event_time))"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create table");
+
+        let cql = format!(
+            "INSERT INTO {keyspace}.{table} \
+             (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)"
+        );
+        let config = CassandraSinkConfig {
+            contact_points: contact_points.clone(),
+            keyspace: keyspace.clone(),
+            table_template: table.clone(),
+            auth: match username {
+                Some(username) => CassandraAuth::Password { username, password },
+                None => CassandraAuth::None,
+            },
+            consistency: CqlConsistency::One,
+            partition_key_template: "${client_id}".to_string(),
+            cql_statement_template: cql,
+            ttl_secs: None,
+            batch_size: Some(1),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(10_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(ScyllaCassandraTransport::new(&config).expect("qual transport"));
+        let sink = Arc::new(CassandraSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "cassandra");
+        let manager = ConnectorManager::new();
+        manager.register("sb27-cass", sink.clone());
+
+        let topic = Topic::new("sb27/cass").unwrap();
+        let payload =
+            Bytes::from_static(br#"{"client_id":"sb27-one","device_id":"sb27-one","seq":1}"#);
+        manager
+            .send("sb27-cass", &topic, &payload, QoS::AtLeastOnce)
+            .await
+            .expect("qual manager send delivers one row");
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 1);
+
+        let count_row = session
+            .query_unpaged(format!("SELECT COUNT(*) FROM {keyspace}.{table}"), &[])
+            .await
+            .expect("qual count")
+            .into_rows_result()
+            .expect("qual count rows");
+        let count: i64 = count_row.single_row::<(i64,)>().expect("qual count row").0;
+        assert_eq!(count, 1);
+
+        let sample = session
+            .query_unpaged(
+                format!(
+                    "SELECT device_id, payload FROM {keyspace}.{table} \
+                     WHERE device_id = 'sb27-one' LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual sample")
+            .into_rows_result()
+            .expect("qual sample rows");
+        let (device, body): (String, String) = sample
+            .single_row::<(String, String)>()
+            .expect("qual sample row");
+        assert_eq!(device, "sb27-one");
+        assert!(body.contains("sb27-one"));
+
+        session
+            .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{table}"), &[])
+            .await
+            .expect("qual drop table");
+        session
+            .query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), &[])
+            .await
+            .expect("qual drop keyspace");
+        eprintln!("QUAL_RESULT 0");
     }
 }

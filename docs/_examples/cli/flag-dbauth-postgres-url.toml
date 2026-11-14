@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-dbauth-postgres-url"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--dbauth-postgres-url"

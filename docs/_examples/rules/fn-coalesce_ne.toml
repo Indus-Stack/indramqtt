@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-coalesce_ne"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT coalesce_ne(a, 'dflt') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"a": null}'
+expect_matched = true
+expect_projected = '{"v": "dflt"}'
+
+[[case]]
+sql = "SELECT coalesce_ne(a, b) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"a": null, "b": ""}'
+expect_matched = true
+expect_projected = '{"v": null}'

@@ -11,7 +11,7 @@
 //! Production transport runs on the maintained `reqwest` driver
 //! ([`HttpOciStreamingTransport`] below): signed `POST
 //! {messages-url}` with driver-owned connection pooling, and the
-//! signature itself built only on maintained crates (`rsa` for
+//! signature itself built only on maintained crates (`aws-lc-rs` for
 //! PKCS#1v15 RSA-SHA256, `sha2` for the `x-content-sha256` hash,
 //! `base64` for framing) — no hand-rolled cryptography. The spec's
 //! `oci-rust-sdk` alternative is an unofficial crate under AGPL-3.0,
@@ -39,8 +39,6 @@ use async_trait::async_trait;
 use base64::Engine;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
-use rsa::pkcs1v15::SigningKey;
-use rsa::signature::SignatureEncoding;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -390,13 +388,30 @@ impl OciStreamingSinkConfig {
 // ---------------------------------------------------------------------------
 
 /// Parse a PKCS#1 or PKCS#8 RSA private key PEM via the maintained
-/// `rsa` crate (never hand-rolled ASN.1/DER).
-pub fn parse_rsa_key(pem: &str) -> Result<rsa::RsaPrivateKey> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
-    rsa::RsaPrivateKey::from_pkcs1_pem(pem)
-        .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
-        .map_err(|e| ConnectorError::Dispatch(format!("oci RSA key rejected: {e}")))
+/// TLS provider (`aws-lc-rs`, constant-time, never hand-rolled ASN.1/DER).
+pub fn parse_rsa_key(pem: &str) -> Result<aws_lc_rs::rsa::KeyPair> {
+    use rustls::pki_types::pem::PemObject as _;
+    let mut keys = rustls::pki_types::PrivateKeyDer::pem_slice_iter(pem.as_bytes());
+    let key = keys
+        .next()
+        .transpose()
+        .map_err(|e| ConnectorError::Dispatch(format!("oci RSA key rejected: {e}")))?
+        .ok_or_else(|| {
+            ConnectorError::Dispatch("oci RSA key rejected: no private key".to_string())
+        })?;
+    match key {
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key) => {
+            aws_lc_rs::rsa::KeyPair::from_pkcs8(key.secret_pkcs8_der())
+                .map_err(|e| ConnectorError::Dispatch(format!("oci RSA key rejected: {e}")))
+        }
+        rustls::pki_types::PrivateKeyDer::Pkcs1(key) => {
+            aws_lc_rs::rsa::KeyPair::from_der(key.secret_pkcs1_der())
+                .map_err(|e| ConnectorError::Dispatch(format!("oci RSA key rejected: {e}")))
+        }
+        _ => Err(ConnectorError::Dispatch(
+            "oci RSA key rejected: not an RSA key".to_string(),
+        )),
+    }
 }
 
 /// RFC 1123 IMF-fixdate for the `date` header (`Fri, 12 Sep 2026
@@ -443,15 +458,20 @@ pub fn signing_string(
 }
 
 /// RSA-SHA256 sign the signing string (deterministic PKCS#1v15 via
-/// the maintained `rsa` + `sha2` crates; never hand-rolled crypto).
+/// the maintained TLS provider (`aws-lc-rs`, constant-time) plus `sha2`
+/// for the body hash; never hand-rolled crypto).
 pub fn rsa_sign(private_key_pem: &str, signing_string: &str) -> Result<String> {
     let key = parse_rsa_key(private_key_pem)?;
-    let signing_key = SigningKey::<Sha256>::new(key);
-    use rsa::signature::Signer;
-    let signature = signing_key
-        .try_sign(signing_string.as_bytes())
-        .map_err(|e| ConnectorError::Dispatch(format!("oci RSA signing failed: {e}")))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()))
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let mut signature = vec![0u8; key.public_modulus_len()];
+    key.sign(
+        &aws_lc_rs::signature::RSA_PKCS1_SHA256,
+        &rng,
+        signing_string.as_bytes(),
+        &mut signature,
+    )
+    .map_err(|e| ConnectorError::Dispatch(format!("oci RSA signing failed: {e}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(signature))
 }
 
 /// Full `Authorization` header value for one request.
@@ -1290,8 +1310,8 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
         body: &[u8],
         expected_key_id: &str,
     ) -> std::result::Result<(), String> {
-        use rsa::pkcs1v15::{Signature, VerifyingKey};
-        use rsa::signature::Verifier;
+        use aws_lc_rs::encoding::AsDer as _;
+        use aws_lc_rs::signature::KeyPair as _;
         let header = |name: &str| {
             headers
                 .get(name)
@@ -1333,14 +1353,19 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             body.len(),
         );
         let private = parse_rsa_key(OCI_TEST_KEY).map_err(|e| e.to_string())?;
-        let verifying = VerifyingKey::<Sha256>::new(rsa::RsaPublicKey::from(&private));
+        let public_der = private
+            .public_key()
+            .as_der()
+            .map_err(|e| format!("RSA-SHA256 verification failed: {e}"))?;
+        let public_key = aws_lc_rs::signature::UnparsedPublicKey::new(
+            &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256,
+            public_der.as_ref(),
+        );
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(signature_b64)
             .map_err(|e| format!("signature is not base64: {e}"))?;
-        let signature =
-            Signature::try_from(bytes.as_slice()).map_err(|e| format!("bad signature: {e}"))?;
-        verifying
-            .verify(signing.as_bytes(), &signature)
+        public_key
+            .verify(signing.as_bytes(), &bytes)
             .map_err(|e| format!("RSA-SHA256 verification failed: {e}"))
     }
 

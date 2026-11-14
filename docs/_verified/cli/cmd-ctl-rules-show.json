@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "rules",
+    "--help"
+  ],
+  "item": "cmd-ctl-rules-show",
+  "match": "show",
+  "output": "Routing rules: list, show, create, delete\n  show    Show one rule",
+  "output_bytes": 564,
+  "returncode": 0,
+  "verified": true
+}

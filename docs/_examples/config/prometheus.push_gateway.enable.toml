@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "prometheus.push_gateway.enable"
+kind = "setting"
+expect = "push_enable=true"
+expected = "The broker stores true and shows it from the exporter settings."
+source = "`crates/broker-config/src/schema.rs` documents `prometheus.push_gateway.enable`, and `crates/broker-node/src/main.rs` copies the file value into the registry."
+action = "Start the broker with push intent on and read `GET /api/v5/prometheus`."
+config = '''
+[prometheus.push_gateway]
+enable = true
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/api/v5/prometheus")
+assert status == 200, (status, body)
+assert body["push_gateway"]["enable"] is True, body
+print("push_enable=true")
+'''

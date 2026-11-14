@@ -8,10 +8,8 @@
 //! The write path runs on the maintained `aws-sdk-dynamodb` driver
 //! ([`SdkDynamoDbTransport`] below): typed `AttributeValue` maps
 //! with driver-owned SigV4 (static access-key credentials, session
-//! token when configured, endpoint override for local servers). The
-//! legacy hand-written [`HttpDynamoDbTransport`] (shared signer in
-//! `super`) is retained for endpoint overrides and offline unit
-//! tests only; production wiring uses the driver transport.
+//! token when configured, endpoint override for local servers).
+//! Production wiring uses the driver transport.
 //! Keys derive from templates, TTL attributes compute as
 //! `now + ttl_secs`, and whole JSON documents unpack into typed
 //! attributes (`S`, `N`, `BOOL`, `M`, `L`, `NULL`).
@@ -137,6 +135,36 @@ fn render_key_template(template: &str, vars: &[(String, String)]) -> Result<Stri
     render_template(template, &borrowed)
 }
 
+/// Dummy payload for build-time template checks. It carries every
+/// referenced `${payload.<field>}` as a number, so a template over a
+/// payload field renders non-empty here for both `S` and `N` key
+/// types. A missing field at runtime still renders empty and fails
+/// the write; unknown or unclosed variables still fail this check.
+fn validation_dummy_payload(templates: &[&str]) -> Vec<u8> {
+    let mut fields = std::collections::BTreeSet::new();
+    for template in templates {
+        let mut rest = *template;
+        while let Some(start) = rest.find("${payload.") {
+            let after = &rest[start + "${payload.".len()..];
+            if let Some(close) = after.find('}') {
+                fields.insert(after[..close].to_string());
+                rest = &after[close + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "client_id".to_string(),
+        serde_json::Value::String("dummy".to_string()),
+    );
+    for field in fields {
+        map.insert(field, serde_json::Value::Number(1.into()));
+    }
+    serde_json::Value::Object(map).to_string().into_bytes()
+}
+
 fn default_batch_size() -> Option<usize> {
     Some(25)
 }
@@ -192,6 +220,10 @@ pub struct DynamoDbSinkConfig {
     /// the whole JSON document into attributes.
     #[serde(default)]
     pub attributes_mapping: HashMap<String, String>,
+    /// Treat undefined variables as null instead of empty strings.
+    /// When true, a template that renders empty writes `{"NULL":true}`.
+    #[serde(default)]
+    pub undefined_vars_as_null: bool,
     /// Items per `BatchWriteItem` (default 25, API cap).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
@@ -253,21 +285,24 @@ impl DynamoDbSinkConfig {
             sort_key.validate("sort")?;
         }
         // Strict template checks with dummy values (syntax + key types).
-        self.partition_key.render(
-            "partition",
-            "dummy",
-            br#"{"client_id":"dummy"}"#,
-            QoS::AtMostOnce,
-            0,
-        )?;
+        // The dummy payload carries every referenced payload field, so a
+        // template over `${payload.<field>}` renders non-empty here and
+        // still fails at runtime when the field is absent. Unknown or
+        // unclosed variables still fail here.
+        let mut templates: Vec<&str> = vec![self.partition_key.template.as_str()];
         if let Some(sort_key) = &self.sort_key {
-            sort_key.render(
-                "sort",
-                "dummy",
-                br#"{"client_id":"dummy"}"#,
-                QoS::AtMostOnce,
-                0,
-            )?;
+            templates.push(sort_key.template.as_str());
+        }
+        for template in self.attributes_mapping.values() {
+            if template != "${payload}" {
+                templates.push(template.as_str());
+            }
+        }
+        let dummy_payload = validation_dummy_payload(&templates);
+        self.partition_key
+            .render("partition", "dummy", &dummy_payload, QoS::AtMostOnce, 0)?;
+        if let Some(sort_key) = &self.sort_key {
+            sort_key.render("sort", "dummy", &dummy_payload, QoS::AtMostOnce, 0)?;
         }
         for (name, template) in &self.attributes_mapping {
             if name.trim().is_empty() {
@@ -276,13 +311,7 @@ impl DynamoDbSinkConfig {
                 ));
             }
             if template != "${payload}" {
-                self.render_text(
-                    template,
-                    "dummy",
-                    br#"{"client_id":"dummy"}"#,
-                    QoS::AtMostOnce,
-                    0,
-                )?;
+                self.render_text(template, "dummy", &dummy_payload, QoS::AtMostOnce, 0)?;
             }
         }
         if self.batch_size == Some(0) {
@@ -360,16 +389,14 @@ pub fn dynamodb_attribute(value: &serde_json::Value) -> Result<String> {
             Ok(out)
         }
         serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
             let mut out = String::from("{\"M\":{");
-            for (index, key) in keys.iter().enumerate() {
+            for (index, (key, value)) in map.iter().enumerate() {
                 if index > 0 {
                     out.push(',');
                 }
                 out.push_str(&serde_json::to_string(key).unwrap_or_default());
                 out.push(':');
-                out.push_str(&dynamodb_attribute(&map[*key])?);
+                out.push_str(&dynamodb_attribute(value)?);
             }
             out.push_str("}}");
             Ok(out)
@@ -453,6 +480,12 @@ pub fn build_item_body(
             continue;
         }
         let rendered = config.render_text(template, topic, payload, qos, millis)?;
+        // An undefined variable renders empty; with the flag it is a
+        // null, otherwise it stays an empty string.
+        if rendered.is_empty() && config.undefined_vars_as_null {
+            unpacked.push((name.clone(), serde_json::Value::Null));
+            continue;
+        }
         // Rendered numbers/bools keep their DynamoDB types so payload
         // passthrough preserves N/BOOL (raw text stays S).
         let value = serde_json::from_str::<serde_json::Value>(&rendered)
@@ -461,7 +494,6 @@ pub fn build_item_body(
             .unwrap_or(serde_json::Value::String(rendered));
         unpacked.push((name.clone(), value));
     }
-    unpacked.sort_by(|a, b| a.0.cmp(&b.0));
     // Explicit mappings win: last write wins per key.
     let mut merged: Vec<(String, serde_json::Value)> = Vec::new();
     for (key, field) in unpacked {
@@ -649,105 +681,6 @@ impl DynamoDbTransport for MockDynamoDbTransport {
             )),
             Some(MockDynamoDbOutcome::Terminal(message)) => Err(ConnectorError::Dispatch(message)),
         }
-    }
-}
-
-/// Production transport: signed `POST {endpoint}/` with the JSON body.
-/// Unprocessed items map back to row indices by deep-matching item
-/// bodies against the sent batch (first-unmatched wins).
-pub struct HttpDynamoDbTransport {
-    endpoint: String,
-    host: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    client: reqwest::Client,
-}
-
-impl HttpDynamoDbTransport {
-    pub fn new(config: &DynamoDbSinkConfig, client: reqwest::Client) -> Result<Self> {
-        config.validate()?;
-        let endpoint = config.endpoint_url();
-        let host = endpoint
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        Ok(Self {
-            endpoint,
-            host,
-            region: config.region.clone(),
-            access_key_id: config.access_key_id.clone(),
-            secret_access_key: config.secret_access_key.clone(),
-            session_token: config.session_token.clone(),
-            client,
-        })
-    }
-}
-
-#[async_trait]
-impl DynamoDbTransport for HttpDynamoDbTransport {
-    async fn batch_write_item(&self, req: &DynamoDbBatchWriteRequest) -> Result<Vec<usize>> {
-        let bodies: Vec<String> = req.items.iter().map(|item| item.body.clone()).collect();
-        let body = render_batch_body(&req.table, &bodies);
-        let millis = now_millis();
-        let (auth, date) = sign_batch_write(
-            &self.access_key_id,
-            &self.secret_access_key,
-            self.session_token.as_deref(),
-            &self.region,
-            &self.host,
-            &body,
-            millis,
-        );
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header(reqwest::header::CONTENT_TYPE, DYNAMODB_CONTENT_TYPE)
-            .header("X-Amz-Target", DYNAMODB_TARGET)
-            .header("X-Amz-Date", date)
-            .header(reqwest::header::AUTHORIZATION, auth)
-            .body(body);
-        if let Some(token) = &self.session_token {
-            request = request.header("X-Amz-Security-Token", token.as_str());
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("dynamodb write failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || (500..=504).contains(&status) {
-            return Err(ConnectorError::Connection(format!(
-                "dynamodb throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "dynamodb write failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("dynamodb read failed: {e}")))?;
-        let unprocessed = parse_unprocessed(&req.table, &bytes)?;
-        // Map unprocessed bodies back to row indices (first match wins).
-        let mut used = vec![false; req.items.len()];
-        let mut indices = Vec::new();
-        for body in unprocessed {
-            if let Some(position) = req
-                .items
-                .iter()
-                .position(|item| !used[item.row_index] && item.body == body)
-            {
-                used[req.items[position].row_index] = true;
-                indices.push(req.items[position].row_index);
-            }
-        }
-        Ok(indices)
     }
 }
 
@@ -1233,6 +1166,7 @@ mod tests {
                 "temperature".to_string(),
                 "${payload.temperature}".to_string(),
             )]),
+            undefined_vars_as_null: false,
             batch_size: Some(25),
             batch_bytes: Some(1_048_576),
             linger_ms: Some(10),
@@ -1247,6 +1181,31 @@ mod tests {
         let transport = Arc::new(MockDynamoDbTransport::new());
         let sink = Arc::new(DynamoDbSink::new(config, transport.clone()).unwrap());
         (sink, transport)
+    }
+
+    #[test]
+    fn mv00_document_members_keep_projection_and_nested_order() {
+        let mut config = test_config();
+        config.partition_key.template = "device-1".to_string();
+        config.sort_key = None;
+        config.ttl_attribute = None;
+        config.ttl_secs = None;
+        config.attributes_mapping = HashMap::from([
+            ("_payload".to_string(), "${payload}".to_string()),
+            ("a".to_string(), "9".to_string()),
+        ]);
+        let body = build_item_body(&config, "order/in", br#"{"b":2,"a":1}"#, QoS::AtMostOnce, 0)
+            .expect("unpacked row");
+        assert_eq!(
+            body,
+            r#"{"device_id":{"S":"device-1"},"b":{"N":"2"},"a":{"N":"9"}}"#
+        );
+        let value =
+            serde_json::from_str(r#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#).expect("ordered document");
+        assert_eq!(
+            dynamodb_attribute(&value).expect("typed document"),
+            r#"{"M":{"b":{"N":"2"},"a":{"N":"1"},"obj":{"M":{"z":{"N":"3"},"a":{"N":"4"}}}}}"#
+        );
     }
 
     #[test]

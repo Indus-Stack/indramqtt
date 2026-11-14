@@ -15,6 +15,7 @@
 //! with its owner; this task only defines, validates and documents them.
 
 pub use crate::ConfigError;
+use crate::{AuthzSourcesConf, PrometheusConf};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// One row of the schema catalogue: the single place a setting's type,
-/// default, valid range and documentation string are stated together.
+/// default, valid range, restart need and documentation string live together.
 ///
 /// The struct definitions below mirror these rows; the `--help` text, the
 /// settings reference and the JSON Schema are generated from them.
@@ -38,6 +39,10 @@ pub struct FieldDoc {
     pub range: &'static str,
     /// Short documentation string (also used in `--help` output).
     pub doc: &'static str,
+    /// Restart need when known. None leaves the reference Restart cell
+    /// empty: the reload path never applies file settings live, and no
+    /// entry has proven otherwise. Deprecated settings stay None.
+    pub requires_restart: Option<bool>,
 }
 
 /// The full catalogue. Each entry's `doc` string is the canonical wording:
@@ -53,6 +58,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"indra-node-1\"",
                 range: "1..=64 chars, letters/digits/dots/dashes",
                 doc: "Unique identifier for this broker node within the cluster.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "node.data_dir",
@@ -60,13 +66,15 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"./data\"",
                 range: "non-empty path",
                 doc: "Directory holding kernel persistent state (state.toml). Created on boot when missing.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "node.brokerlink_bind",
                 setting_type: "socket address string",
                 default: "\"127.0.0.1:18883\"",
-                range: "valid host:port, port 1..=65535",
-                doc: "BrokerLink IPC listen address for edge clients (TCP loopback).",
+                range: "any string, ignored",
+                doc: "Deprecated. Ignored. The kernel serves clients directly.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.enabled",
@@ -74,6 +82,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the plaintext MQTT listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.bind",
@@ -81,6 +90,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:1883\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the plaintext MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.max_connections",
@@ -88,6 +98,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1000000",
                 range: "1..=10000000",
                 doc: "Maximum concurrent connections on the plaintext MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.backlog",
@@ -95,13 +106,15 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1024",
                 range: "1..=65536",
                 doc: "Listener accept backlog for the plaintext MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.native",
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.enabled",
@@ -109,6 +122,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure TLS MQTT listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.bind",
@@ -116,6 +130,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:8883\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the secure TLS MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.cert_file",
@@ -123,6 +138,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when TLS is enabled",
                 doc: "Path to the PEM server certificate for the TLS listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.key_file",
@@ -130,13 +146,79 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when TLS is enabled",
                 doc: "Path to the PEM private key for the TLS listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.native",
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.psk_enabled",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.psk_keys_file",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "file path; empty means no identities",
+                doc: "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.verify_client_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the TLS listener requests and verifies a client certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.verify",
+                setting_type: "string",
+                default: "\"verify_none\"",
+                range: "verify_none | verify_peer",
+                doc: "Client certificate chain check mode of the TLS listener.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.cacertfile",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "PEM file path; required when client verification is on",
+                doc: "CA file for client certificate checks of the TLS listener.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.fail_if_no_peer_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the TLS listener refuses a handshake without a certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.peer_cert_as_username",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind username from the client certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.tls.peer_cert_as_clientid",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind client identifier from the client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.enabled",
@@ -144,6 +226,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the MQTT-over-WebSocket listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.bind",
@@ -151,6 +234,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:8083\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the MQTT-over-WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.path",
@@ -158,6 +242,15 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving MQTT-over-WebSocket traffic.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.ws.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.enabled",
@@ -165,6 +258,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure WebSocket listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.bind",
@@ -172,6 +266,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:8084\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.path",
@@ -179,6 +274,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving secure WebSocket traffic.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.cert_file",
@@ -186,6 +282,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when secure WebSocket is enabled",
                 doc: "Path to the PEM server certificate for the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.key_file",
@@ -193,6 +290,63 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when secure WebSocket is enabled",
                 doc: "Path to the PEM private key for the secure WebSocket listener.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.verify_client_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the secure WebSocket listener requests and verifies a client certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.verify",
+                setting_type: "string",
+                default: "\"verify_none\"",
+                range: "verify_none | verify_peer",
+                doc: "Client certificate chain check mode of the secure WebSocket listener.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.cacertfile",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "PEM file path; required when client verification is on",
+                doc: "CA file for client certificate checks of the secure WebSocket listener.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.fail_if_no_peer_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.peer_cert_as_username",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind username from the client certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.peer_cert_as_clientid",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind client identifier from the client certificate.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "listeners.wss.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.api.enabled",
@@ -200,6 +354,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the management REST API and dashboard serve requests.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.api.bind",
@@ -207,6 +362,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:18083\"",
                 range: "valid host:port, port 1..=65535; empty disables the API",
                 doc: "Bind address for the management REST API. Empty disables the API.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.default_max_connections",
@@ -214,6 +370,31 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "10000",
                 range: "0..=1000000 (0 = unlimited opt-in)",
                 doc: "Default max connections per authenticated username (0 = unlimited).",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "quotas.max_connections_per_tenant",
+                setting_type: "u32",
+                default: "0",
+                range: "0..=1000000 (0 = unlimited opt-in)",
+                doc: "Default max live connections per tenant (0 = unlimited).",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "quotas.max_sessions_per_tenant",
+                setting_type: "u32",
+                default: "0",
+                range: "0..=100000 (0 = unlimited opt-in)",
+                doc: "Default max sessions per tenant (0 = unlimited).",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "quotas.max_retained_per_tenant",
+                setting_type: "u32",
+                default: "0",
+                range: "0..=100000 (0 = unlimited opt-in)",
+                doc: "Default max retained topics per tenant (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.default_max_publish_rate",
@@ -221,6 +402,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "50000",
                 range: "0..=10000000 msg/s (0 = unlimited opt-in)",
                 doc: "Default token-bucket publish rate limit in messages per second (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.burst_multiplier",
@@ -228,6 +410,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "2.0",
                 range: "1.0..=10.0",
                 doc: "Token bucket burst multiplier (allows bursts up to burst times rate).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_session_expiry_secs",
@@ -235,6 +418,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "86400",
                 range: "0..=2592000 seconds (0 = unlimited opt-in)",
                 doc: "Max session expiry interval in seconds.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_offline_queue",
@@ -242,6 +426,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "50000",
                 range: "1..=1000000",
                 doc: "Maximum queued offline messages per session.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_inflight_messages",
@@ -249,6 +434,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "65535",
                 range: "1..=65535",
                 doc: "Maximum inflight unacknowledged QoS 1 and QoS 2 messages.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_qos0_backlog",
@@ -256,6 +442,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1000",
                 range: "1..=100000",
                 doc: "Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.keep_alive_grace",
@@ -263,6 +450,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1.5",
                 range: "1.0..=5.0",
                 doc: "Keep-alive grace multiplier before disconnect.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "logging.level",
@@ -270,6 +458,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"info\"",
                 range: "trace | debug | info | warn | error",
                 doc: "Logging verbosity for the kernel (trace, debug, info, warn, error).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "rules_engine.window_channel_depth",
@@ -277,6 +466,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "65536",
                 range: "1..=1000000",
                 doc: "Ingress ring buffer channel depth for stateful window worker tasks.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "rules_engine.backpressure_policy",
@@ -284,6 +474,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"DropOldest\"",
                 range: "Block | DropNewest | DropOldest | SpillToDisk | RejectPublisher",
                 doc: "Default memory backpressure policy when the rule buffer is full.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.enabled",
@@ -291,6 +482,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether authentication checks apply to client connects.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.password_hash",
@@ -298,6 +490,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"sha256\"",
                 range: "sha256 | bcrypt",
                 doc: "Password hashing algorithm for stored credentials.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.allow_anonymous",
@@ -305,6 +498,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether anonymous connections are accepted while no users are configured.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.superusers",
@@ -312,13 +506,15 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "[\"admin\", \"root\"]",
                 range: "0..=100 entries",
                 doc: "Superuser usernames bypassing ACL rules.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.enabled",
                 setting_type: "bool",
                 default: "false",
-                range: "true | false",
-                doc: "Whether multi-node distributed clustering is enabled.",
+                range: "false only",
+                doc: "Refused clustering switch. The broker fails boot when true.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.bind",
@@ -326,27 +522,31 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"127.0.0.1:19883\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Cluster SWIM UDP bind address for peer discovery and membership.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.gossip_bind",
                 setting_type: "socket address string",
                 default: "\"0.0.0.0:7946\"",
                 range: "valid host:port, port 1..=65535",
-                doc: "Gossip membership bind address for peer discovery.",
+                doc: "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.quic_bind",
                 setting_type: "socket address string",
                 default: "\"0.0.0.0:9092\"",
                 range: "valid host:port, port 1..=65535",
-                doc: "Multiplexed data plane bind address for inter-broker message routing.",
+                doc: "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.seed_nodes",
                 setting_type: "string list",
                 default: "[]",
-                range: "0..=64 entries, each host:port",
-                doc: "Seed node addresses to join an existing cluster.",
+                range: "must stay empty",
+                doc: "Refused seed list. The broker fails boot when not empty.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.license_file",
@@ -354,6 +554,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/etc/indramqtt/license.key\"",
                 range: "any path; empty means none installed",
                 doc: "Path to the enterprise cryptographic license key file.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.license_key",
@@ -361,6 +562,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any string; empty means use stored token or environment",
                 doc: "Enterprise commercial license key for multi-node clustering.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.trusted_keys_path",
@@ -368,6 +570,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "JSON file or directory; empty trusts nothing",
                 doc: "Trusted licence-signing keys: a JSON file or directory of JSON files.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.request_out",
@@ -375,6 +578,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any path; empty disables request generation",
                 doc: "Write the installation licence request to this path and exit.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.install_file",
@@ -382,6 +586,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any path; empty disables licence installation",
                 doc: "Install the licence token read from this path and exit.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.expiry_warn_days",
@@ -389,6 +594,23 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "30",
                 range: "0..=365 days",
                 doc: "Days before expiry that the approaching-expiry alarm and log warning start.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "mcp.enabled",
+                setting_type: "bool",
+                default: "true",
+                range: "true | false",
+                doc: "Whether the MCP endpoint on the management listener serves tool calls.",
+            requires_restart: None,
+            },
+            FieldDoc {
+                path: "mcp.read_only",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "gateway.coap_bind",
@@ -396,6 +618,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "empty disables the gateway, else valid host:port",
                 doc: "CoAP gateway UDP listen address. Empty disables the gateway.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "persistence.stream_dir",
@@ -403,6 +626,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any directory; empty disables journaling",
                 doc: "Durable stream journal directory. Empty disables journaling.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.server_url",
@@ -410,6 +634,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "empty disables LDAP, else ldap:// or ldaps:// URL",
                 doc: "Directory server URL for LDAP authentication. Empty disables LDAP.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.base_dn",
@@ -417,6 +642,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any DN; required when LDAP is enabled",
                 doc: "Base DN under which directory users are searched.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.bind_dn",
@@ -424,6 +650,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any DN",
                 doc: "Service account DN used for the initial bind plus search.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.bind_password",
@@ -431,6 +658,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any string",
                 doc: "Service account password for the initial bind.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.user_filter",
@@ -438,6 +666,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"(uid={username})\"",
                 range: "must contain {username} when LDAP is enabled",
                 doc: "User search filter with a {username} placeholder, escaped per RFC 4515.",
+                requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.group_attribute",
@@ -445,6 +674,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"memberOf\"",
                 range: "non-empty when LDAP is enabled",
                 doc: "User-entry attribute listing directory groups.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.required_group",
@@ -452,6 +682,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any DN; empty disables the group check",
                 doc: "Required group DN: the entry must list this DN to connect.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.ca_cert_path",
@@ -459,6 +690,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; empty uses system roots",
                 doc: "Path to a PEM CA certificate for private directories.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.pool_size",
@@ -466,6 +698,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "8",
                 range: "1..=32",
                 doc: "Bound on concurrent directory authentications.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.connect_timeout_ms",
@@ -473,6 +706,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "5000",
                 range: "100..=60000 ms",
                 doc: "Timeout covering TCP connect plus TLS handshake.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.read_timeout_ms",
@@ -480,6 +714,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "5000",
                 range: "100..=60000 ms",
                 doc: "Timeout covering each directory bind/search round-trip.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.keytab_path",
@@ -487,6 +722,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "keytab v2 file; empty disables Kerberos",
                 doc: "Keytab file for Kerberos authentication. Empty disables Kerberos.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.service_principal",
@@ -494,6 +730,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "required when Kerberos is enabled",
                 doc: "Service principal name held in the keytab.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.realm",
@@ -501,6 +738,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any realm; empty disables the realm check",
                 doc: "Expected service realm. Empty disables the realm check on the service name.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.allowed_realms",
@@ -508,6 +746,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "[]",
                 range: "0..=32 entries",
                 doc: "Trusted client realms. Empty allows any realm that verifies.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.clock_skew_secs",
@@ -515,6 +754,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "300",
                 range: "1..=3600 seconds",
                 doc: "Clock-skew allowance in seconds for ticket validity and authenticator timestamps.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.role_map",
@@ -522,6 +762,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "comma-separated principal=role pairs; empty leaves every principal at user",
                 doc: "Comma-separated principal=role mappings for verified client principals.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.replay_max_entries",
@@ -529,39 +770,144 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1024",
                 range: "16..=8192",
                 doc: "Replay-cache bound for Kerberos authenticators.",
+            requires_restart: None,
             },
-            FieldDoc { path: "session.max_qos1_inflight", setting_type: "usize", default: "100", range: "1..=100000", doc: "Per-session QoS 1 inflight window bound." },
-            FieldDoc { path: "session.max_qos1_spill", setting_type: "usize", default: "1000", range: "1..=100000", doc: "Per-session QoS 1 spill bound past the window." },
-            FieldDoc { path: "session.topic_alias_maximum", setting_type: "u16", default: "10", range: "0..=65535", doc: "Inbound topic-alias maximum advertised in CONNACK." },
-            FieldDoc { path: "rules_engine.spill_dir", setting_type: "string", default: "\"\"", range: "empty or directory path", doc: "Rule ingress spill directory." },
-            FieldDoc { path: "delayed.max_secs", setting_type: "u64", default: "86400", range: "1..=86400", doc: "Upper bound for delayed deferrals in seconds." },
-            FieldDoc { path: "observability.monitor_sample_secs", setting_type: "u64", default: "10", range: "0..=3600", doc: "Monitor sampling interval in seconds." },
-            FieldDoc { path: "jwks.url", setting_type: "string", default: "\"\"", range: "empty or https URL", doc: "JWKS endpoint URL for JWT authentication." },
-            FieldDoc { path: "jwks.issuer", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT issuer." },
-            FieldDoc { path: "jwks.audience", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT audience." },
-            FieldDoc { path: "dbauth.postgres_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "PostgreSQL URL for database authentication." },
-            FieldDoc { path: "webhook.url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "HTTP webhook verdict endpoint." },
-            FieldDoc { path: "jwks.refresh_period_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds between background JWKS refreshes." },
-            FieldDoc { path: "jwks.fetch_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Timeout for one JWKS fetch in milliseconds." },
-            FieldDoc { path: "jwks.refresh_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Longest a CONNECT waits for a JWKS refresh in milliseconds." },
-            FieldDoc { path: "jwks.cache_max_keys", setting_type: "usize", default: "32", range: "1..=256", doc: "Most JWKS keys held in the cache." },
-            FieldDoc { path: "jwks.cache_ttl_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds a cached JWKS key stays valid." },
-            FieldDoc { path: "jwks.clock_skew_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Clock skew tolerated when checking token times, in seconds." },
-            FieldDoc { path: "jwks.ca_cert", setting_type: "string", default: "\"\"", range: "empty or path to a PEM file", doc: "Extra CA certificate trusted for the JWKS endpoint." },
-            FieldDoc { path: "dbauth.mysql_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MySQL URL for database authentication." },
-            FieldDoc { path: "dbauth.redis_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "Redis URL for database authentication." },
-            FieldDoc { path: "dbauth.mongodb_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MongoDB URL for database authentication." },
-            FieldDoc { path: "dbauth.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Connections kept per authentication database." },
-            FieldDoc { path: "dbauth.connect_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for connecting to an authentication database in milliseconds." },
-            FieldDoc { path: "dbauth.read_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for one authentication lookup in milliseconds." },
-            FieldDoc { path: "dbauth.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached database verdicts per source; 0 disables the cache." },
-            FieldDoc { path: "dbauth.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached database verdict stays valid." },
-            FieldDoc { path: "webhook.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Concurrent requests allowed to the webhook endpoint." },
-            FieldDoc { path: "webhook.timeout_ms", setting_type: "u64", default: "2000", range: "100..=60000", doc: "Timeout for one webhook request in milliseconds." },
-            FieldDoc { path: "webhook.breaker_threshold", setting_type: "u32", default: "5", range: "1..=100", doc: "Consecutive webhook failures that open the circuit breaker." },
-            FieldDoc { path: "webhook.breaker_reset_ms", setting_type: "u64", default: "30000", range: "1000..=600000", doc: "Milliseconds an open circuit breaker waits before retrying the webhook." },
-            FieldDoc { path: "webhook.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached webhook verdicts; 0 disables the cache." },
-            FieldDoc { path: "webhook.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached webhook verdict stays valid." },
+            FieldDoc { path: "session.max_qos1_inflight", setting_type: "usize", default: "100", range: "1..=100000", doc: "Per-session QoS 1 inflight window bound.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "session.max_qos1_spill", setting_type: "usize", default: "1000", range: "1..=100000", doc: "Per-session QoS 1 spill bound past the window.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "session.topic_alias_maximum", setting_type: "u16", default: "10", range: "0..=65535", doc: "Inbound topic-alias maximum advertised in CONNACK.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "session.max_packet_size", setting_type: "u32", default: "1048576", range: "1..=268435455", doc: "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "rules_engine.spill_dir", setting_type: "string", default: "\"\"", range: "empty or directory path", doc: "Rule ingress spill directory.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "delayed.max_secs", setting_type: "u64", default: "86400", range: "1..=86400", doc: "Upper bound for delayed deferrals in seconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "observability.monitor_sample_secs", setting_type: "u64", default: "10", range: "0..=3600", doc: "Monitor sampling interval in seconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.url", setting_type: "string", default: "\"\"", range: "empty or https URL", doc: "JWKS endpoint URL for JWT authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.issuer", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT issuer.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.audience", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT audience.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.postgres_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "PostgreSQL URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "HTTP webhook verdict endpoint.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.refresh_period_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds between background JWKS refreshes.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.fetch_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Timeout for one JWKS fetch in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.refresh_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Longest a CONNECT waits for a JWKS refresh in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.cache_max_keys", setting_type: "usize", default: "32", range: "1..=256", doc: "Most JWKS keys held in the cache.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.cache_ttl_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds a cached JWKS key stays valid.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.clock_skew_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Clock skew tolerated when checking token times, in seconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.ca_cert", setting_type: "string", default: "\"\"", range: "empty or path to a PEM file", doc: "Extra CA certificate trusted for the JWKS endpoint.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.mysql_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MySQL URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.redis_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "Redis URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.mongodb_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MongoDB URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Connections kept per authentication database.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.connect_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for connecting to an authentication database in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.read_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for one authentication lookup in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached database verdicts per source; 0 disables the cache.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached database verdict stays valid.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Concurrent requests allowed to the webhook endpoint.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.timeout_ms", setting_type: "u64", default: "2000", range: "100..=60000", doc: "Timeout for one webhook request in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.breaker_threshold", setting_type: "u32", default: "5", range: "1..=100", doc: "Consecutive webhook failures that open the circuit breaker.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.breaker_reset_ms", setting_type: "u64", default: "30000", range: "1000..=600000", doc: "Milliseconds an open circuit breaker waits before retrying the webhook.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached webhook verdicts; 0 disables the cache.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached webhook verdict stays valid.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.enable_basic_auth", setting_type: "bool", default: "true", range: "true | false", doc: "Require credentials on the scrape endpoints.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.latency_buckets", setting_type: "string", default: "\"10ms, 100ms, 1s, 5s, 30s\"", range: "comma-separated durations", doc: "Latency histogram buckets for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.enable", setting_type: "bool", default: "false", range: "true | false",                 doc: "Stored push intent. The broker runs no push client.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.url", setting_type: "string", default: "\"http://127.0.0.1:9091\"", range: "http(s) URL", doc: "Push target URL for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.interval", setting_type: "string", default: "\"15s\"", range: "duration text", doc: "Push interval for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.job_name", setting_type: "string", default: "\"${name}/instance/${name}~${host}\"", range: "template text", doc: "Job name template for each push.", requires_restart: None },
+            FieldDoc { path: "prometheus.push_gateway.method", setting_type: "string", default: "\"put\"", range: "put | post", doc: "Push method for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.mnesia", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_dist", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_memory", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_msacc", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_statistics", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_system_info", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
         ]
 }
 
@@ -719,7 +1065,7 @@ pub struct NodeConf {
     /// Directory holding kernel persistent state (state.toml). Created on boot when missing.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    /// BrokerLink IPC listen address for edge clients (TCP loopback).
+    /// BrokerLink IPC listen address (deprecated, ignored).
     #[serde(default = "default_brokerlink_bind")]
     pub brokerlink_bind: String,
 }
@@ -733,7 +1079,7 @@ fn default_node_id() -> String {
 fn default_data_dir() -> String {
     "./data".to_string()
 }
-// Reason: loopback IPC port keeps edge-to-kernel traffic off the network.
+// Reason: loopback IPC port kept so old files still load.
 fn default_brokerlink_bind() -> String {
     "127.0.0.1:18883".to_string()
 }
@@ -772,7 +1118,8 @@ impl NodeConf {
                 "must not be empty",
             ));
         }
-        check_bind("node.brokerlink_bind", &self.brokerlink_bind, false)?;
+        // `node.brokerlink_bind` is deprecated and ignored: no check.
+        // Any value loads, so old files still boot.
         Ok(())
     }
 }
@@ -792,7 +1139,7 @@ pub struct TcpListenerConf {
     /// Listener accept backlog for the plaintext MQTT listener.
     #[serde(default = "default_tcp_backlog")]
     pub backlog: u32,
-    /// Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.
+    /// Deprecated. Ignored. The kernel always serves this listener.
     #[serde(default = "default_false")]
     pub native: bool,
 }
@@ -860,9 +1207,52 @@ pub struct TlsListenerConf {
     /// Path to the PEM private key for the TLS listener.
     #[serde(default)]
     pub key_file: String,
-    /// Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.
+    /// Deprecated. Ignored. The kernel always serves this listener.
     #[serde(default = "default_false")]
     pub native: bool,
+    /// Whether the kernel TLS listener accepts pre-shared-key handshakes.
+    /// Off by default keeps certificate handshakes unchanged. On serves
+    /// PSK suites from the identity store with no certificate.
+    #[serde(default = "default_false")]
+    pub psk_enabled: bool,
+    /// Path to the PSK identity file of the kernel TLS listener.
+    /// Use it only when PSK is on. Empty keeps the store empty,
+    /// so every handshake fails closed.
+    #[serde(default)]
+    pub psk_keys_file: String,
+    /// Whether the TLS listener requests and verifies a client certificate.
+    #[serde(default = "default_false")]
+    pub verify_client_cert: bool,
+    /// Client certificate chain check mode.
+    #[serde(default = "default_tls_verify")]
+    pub verify: String,
+    /// Path to the PEM CA file for client certificate checks.
+    #[serde(default)]
+    pub cacertfile: String,
+    /// Whether the TLS listener refuses a handshake without a certificate.
+    #[serde(default = "default_false")]
+    pub fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_clientid: String,
+}
+
+// Reason: off by default keeps current handshakes unchanged; the operator opts into client certificates.
+fn default_verify_client_cert() -> bool {
+    false
+}
+
+// Reason: no check by default keeps current handshakes unchanged.
+fn default_tls_verify() -> String {
+    "verify_none".to_string()
+}
+
+// Reason: no mapping by default keeps CONNECT credentials unchanged.
+fn default_cert_as() -> String {
+    "disabled".to_string()
 }
 
 // Reason: the standard secure MQTT port.
@@ -878,6 +1268,14 @@ impl Default for TlsListenerConf {
             cert_file: String::new(),
             key_file: String::new(),
             native: false,
+            psk_enabled: false,
+            psk_keys_file: String::new(),
+            verify_client_cert: default_verify_client_cert(),
+            verify: default_tls_verify(),
+            cacertfile: String::new(),
+            fail_if_no_peer_cert: false,
+            peer_cert_as_username: default_cert_as(),
+            peer_cert_as_clientid: default_cert_as(),
         }
     }
 }
@@ -886,24 +1284,105 @@ impl TlsListenerConf {
     /// Validates the TLS listener.
     pub fn validate(&self) -> Result<(), ConfigError> {
         check_bind("listeners.tls.bind", &self.bind, false)?;
-        if self.enabled {
+        // A PSK-only listener carries no certificate. The pure PSK form
+        // needs no certificate files. Other forms still do.
+        let needs_cert = self.enabled && !self.psk_enabled;
+        if needs_cert {
             if self.cert_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.cert_file",
                     &self.cert_file,
-                    "is required when TLS is enabled",
+                    "is required when TLS is enabled without PSK",
                 ));
             }
             if self.key_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.key_file",
                     &self.key_file,
-                    "is required when TLS is enabled",
+                    "is required when TLS is enabled without PSK",
                 ));
             }
         }
+        validate_client_cert_opts(
+            "listeners.tls",
+            &self.verify,
+            &self.peer_cert_as_username,
+            &self.peer_cert_as_clientid,
+            self.fail_if_no_peer_cert,
+            self.verify_client_cert,
+            &self.cacertfile,
+        )?;
         Ok(())
     }
+}
+
+/// Validates client certificate options shared by TLS and secure WebSocket.
+/// Rejects unknown modes. Refuses `fail_if_no_peer_cert` without
+/// verification. Refuses identity mapping without verification.
+/// TODO(parity): which of `crt`, `pem`, `md5` sources does the broker
+/// support for `peer_cert_as_username` and `peer_cert_as_clientid`?
+/// The rulebook does not decide the set. Only `disabled`, `cn` and
+/// `dn` apply today. Other values fail closed at boot.
+fn validate_client_cert_opts(
+    prefix: &str,
+    verify: &str,
+    as_username: &str,
+    as_clientid: &str,
+    fail_if_no_peer_cert: bool,
+    legacy_verify: bool,
+    cacertfile: &str,
+) -> Result<(), ConfigError> {
+    if verify != "verify_none" && verify != "verify_peer" {
+        return Err(invalid(
+            &format!("{prefix}.verify"),
+            verify,
+            "must be verify_none or verify_peer",
+        ));
+    }
+    for (name, value) in [
+        ("peer_cert_as_username", as_username),
+        ("peer_cert_as_clientid", as_clientid),
+    ] {
+        if value != "disabled" && value != "cn" && value != "dn" {
+            if ["crt", "pem", "md5"].contains(&value) {
+                return Err(invalid(
+                    &format!("{prefix}.{name}"),
+                    value,
+                    "is not supported yet: use disabled, cn or dn",
+                ));
+            }
+            return Err(invalid(
+                &format!("{prefix}.{name}"),
+                value,
+                "must be disabled, cn or dn",
+            ));
+        }
+    }
+    let verify_on = verify == "verify_peer" || legacy_verify;
+    // The trust anchors for client certificates come from the operator
+    // only. No default set of public authorities applies.
+    if verify_on && cacertfile.trim().is_empty() {
+        return Err(invalid(
+            &format!("{prefix}.cacertfile"),
+            cacertfile,
+            "is required when client certificate verification is on",
+        ));
+    }
+    if fail_if_no_peer_cert && !verify_on {
+        return Err(invalid(
+            &format!("{prefix}.fail_if_no_peer_cert"),
+            "true",
+            "needs verify set to verify_peer",
+        ));
+    }
+    if (as_username != "disabled" || as_clientid != "disabled") && !verify_on {
+        return Err(invalid(
+            &format!("{prefix}.peer_cert_as_username"),
+            as_username,
+            "needs verify set to verify_peer",
+        ));
+    }
+    Ok(())
 }
 
 /// MQTT-over-WebSocket listener.
@@ -918,6 +1397,9 @@ pub struct WsListenerConf {
     /// HTTP path serving MQTT-over-WebSocket traffic.
     #[serde(default = "default_ws_path")]
     pub path: String,
+    /// Deprecated. Ignored. The kernel always serves this listener.
+    #[serde(default = "default_false")]
+    pub native: bool,
 }
 
 // Reason: keeps the dashboard test console reachable without extra setup.
@@ -935,6 +1417,7 @@ impl Default for WsListenerConf {
             enabled: true,
             bind: default_ws_bind(),
             path: default_ws_path(),
+            native: false,
         }
     }
 }
@@ -972,6 +1455,27 @@ pub struct WssListenerConf {
     /// Path to the PEM private key for the secure WebSocket listener.
     #[serde(default)]
     pub key_file: String,
+    /// Deprecated. Ignored. The kernel always serves this listener.
+    #[serde(default = "default_false")]
+    pub native: bool,
+    /// Whether the secure WebSocket listener requests and verifies a client certificate.
+    #[serde(default = "default_false")]
+    pub verify_client_cert: bool,
+    /// Client certificate chain check mode.
+    #[serde(default = "default_tls_verify")]
+    pub verify: String,
+    /// Path to the PEM CA file for client certificate checks.
+    #[serde(default)]
+    pub cacertfile: String,
+    /// Whether the secure WebSocket listener refuses a handshake without a certificate.
+    #[serde(default = "default_false")]
+    pub fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_clientid: String,
 }
 
 // Reason: TODO(parity): no canonical secure-WebSocket port is decided yet;
@@ -988,6 +1492,13 @@ impl Default for WssListenerConf {
             path: default_ws_path(),
             cert_file: String::new(),
             key_file: String::new(),
+            native: false,
+            verify_client_cert: false,
+            verify: default_tls_verify(),
+            cacertfile: String::new(),
+            fail_if_no_peer_cert: false,
+            peer_cert_as_username: default_cert_as(),
+            peer_cert_as_clientid: default_cert_as(),
         }
     }
 }
@@ -1019,6 +1530,15 @@ impl WssListenerConf {
                 ));
             }
         }
+        validate_client_cert_opts(
+            "listeners.wss",
+            &self.verify,
+            &self.peer_cert_as_username,
+            &self.peer_cert_as_clientid,
+            self.fail_if_no_peer_cert,
+            self.verify_client_cert,
+            &self.cacertfile,
+        )?;
         Ok(())
     }
 }
@@ -1103,6 +1623,15 @@ pub struct QuotasConf {
     /// Token bucket burst multiplier (allows bursts up to burst times rate).
     #[serde(default = "default_burst_multiplier")]
     pub burst_multiplier: f64,
+    /// Default max live connections per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_connections_per_tenant")]
+    pub max_connections_per_tenant: u32,
+    /// Default max sessions per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_sessions_per_tenant")]
+    pub max_sessions_per_tenant: u32,
+    /// Default max retained topics per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_retained_per_tenant")]
+    pub max_retained_per_tenant: u32,
 }
 
 // Reason: 10k connections per user fits a large tenant without letting one
@@ -1120,6 +1649,21 @@ fn default_quota_max_publish_rate() -> u32 {
 fn default_burst_multiplier() -> f64 {
     2.0
 }
+// Reason: no tenant holds a bound unless the operator sets one.
+// The listener bound stays the only default gate for connections.
+fn default_quota_max_connections_per_tenant() -> u32 {
+    0
+}
+// Reason: no tenant holds a bound unless the operator sets one.
+// A tenant with no quota setting stays unlimited.
+fn default_quota_max_sessions_per_tenant() -> u32 {
+    0
+}
+// Reason: no tenant holds a bound unless the operator sets one.
+// The global retained bound still caps total memory.
+fn default_quota_max_retained_per_tenant() -> u32 {
+    0
+}
 
 impl Default for QuotasConf {
     fn default() -> Self {
@@ -1127,6 +1671,9 @@ impl Default for QuotasConf {
             default_max_connections: default_quota_max_connections(),
             default_max_publish_rate: default_quota_max_publish_rate(),
             burst_multiplier: default_burst_multiplier(),
+            max_connections_per_tenant: default_quota_max_connections_per_tenant(),
+            max_sessions_per_tenant: default_quota_max_sessions_per_tenant(),
+            max_retained_per_tenant: default_quota_max_retained_per_tenant(),
         }
     }
 }
@@ -1145,6 +1692,24 @@ impl QuotasConf {
             u64::from(self.default_max_publish_rate),
             0,
             10_000_000,
+        )?;
+        check_range_u64(
+            "quotas.max_connections_per_tenant",
+            u64::from(self.max_connections_per_tenant),
+            0,
+            1_000_000,
+        )?;
+        check_range_u64(
+            "quotas.max_sessions_per_tenant",
+            u64::from(self.max_sessions_per_tenant),
+            0,
+            100_000,
+        )?;
+        check_range_u64(
+            "quotas.max_retained_per_tenant",
+            u64::from(self.max_retained_per_tenant),
+            0,
+            100_000,
         )?;
         if !(1.0..=10.0).contains(&self.burst_multiplier) {
             return Err(invalid(
@@ -1183,6 +1748,11 @@ pub struct SessionConf {
     /// Inbound topic-alias maximum advertised in CONNACK. Default 10; 0 disables inbound aliases.
     #[serde(default = "default_topic_alias_maximum")]
     pub topic_alias_maximum: u16,
+    /// Largest MQTT packet in bytes. Sets the TCP/TLS read limit and the
+    /// WS frame cap. Advertised in CONNACK. Default 1 MiB matches the
+    /// documented server limit; 268435455 is the wire ceiling.
+    #[serde(default = "default_max_packet_size")]
+    pub max_packet_size: u32,
     /// Keep-alive grace multiplier before disconnect.
     #[serde(default = "default_keep_alive_grace")]
     pub keep_alive_grace: f64,
@@ -1206,6 +1776,13 @@ fn default_qos1_spill() -> usize {
 // aliases.
 fn default_topic_alias_maximum() -> u16 {
     10
+}
+
+// Reason: 1 MiB matches the documented server limit and bounds one
+// connection near 1 MiB of read buffer plus one frame; 268435455 is the
+// wire ceiling for the range top.
+fn default_max_packet_size() -> u32 {
+    1_048_576
 }
 
 // Reason: one day covers durable sessions without pinning state forever;
@@ -1244,6 +1821,7 @@ impl Default for SessionConf {
             max_qos1_inflight: default_qos1_inflight_window(),
             max_qos1_spill: default_qos1_spill(),
             topic_alias_maximum: default_topic_alias_maximum(),
+            max_packet_size: default_max_packet_size(),
             keep_alive_grace: default_keep_alive_grace(),
         }
     }
@@ -1288,6 +1866,12 @@ impl SessionConf {
             u64::from(self.topic_alias_maximum),
             0,
             65_535,
+        )?;
+        check_range_u64(
+            "session.max_packet_size",
+            u64::from(self.max_packet_size),
+            1,
+            268_435_455,
         )?;
         if !(1.0..=5.0).contains(&self.keep_alive_grace) {
             return Err(invalid(
@@ -1561,7 +2145,7 @@ impl TenantsConf {
 /// Distributed clustering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterConf {
-    /// Whether multi-node distributed clustering is enabled.
+    /// Refused clustering switch. The broker fails boot when true.
     #[serde(default = "default_false")]
     pub enabled: bool,
     /// Cluster SWIM UDP bind address for peer discovery and membership.
@@ -1573,7 +2157,7 @@ pub struct ClusterConf {
     /// Multiplexed data plane bind address for inter-broker message routing.
     #[serde(default = "default_quic_bind")]
     pub quic_bind: String,
-    /// Seed node addresses to join an existing cluster.
+    /// Refused seed list. The broker fails boot when not empty.
     #[serde(default)]
     pub seed_nodes: Vec<String>,
 }
@@ -1605,23 +2189,27 @@ impl Default for ClusterConf {
 }
 
 impl ClusterConf {
-    /// Validates cluster addresses.
+    /// Validates the cluster entry.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        check_bind("cluster.bind", &self.bind, false)?;
-        check_bind("cluster.gossip_bind", &self.gossip_bind, false)?;
-        check_bind("cluster.quic_bind", &self.quic_bind, false)?;
-        if self.seed_nodes.len() > 64 {
+        // Clustering stays out of the MVP. The broker refuses its entry.
+        // Reason: the cluster path cannot keep tenants apart.
+        if self.enabled {
+            return Err(invalid(
+                "cluster.enabled",
+                "true",
+                "clustering is not in the MVP: remove the entry and run single-node",
+            ));
+        }
+        if !self.seed_nodes.is_empty() {
             return Err(invalid(
                 "cluster.seed_nodes",
                 &format!("{} entries", self.seed_nodes.len()),
-                "must hold at most 64 entries",
+                "clustering is not in the MVP: remove the entry and run single-node",
             ));
         }
-        for seed in &self.seed_nodes {
-            // TODO(parity): the canonical seed address form (host:port vs
-            // URL) is undecided; host:port is accepted conservatively.
-            check_bind("cluster.seed_nodes", seed, false)?;
-        }
+        check_bind("cluster.bind", &self.bind, false)?;
+        check_bind("cluster.gossip_bind", &self.gossip_bind, false)?;
+        check_bind("cluster.quic_bind", &self.quic_bind, false)?;
         Ok(())
     }
 }
@@ -2005,6 +2593,20 @@ pub struct BrokerConfig {
     /// Observability sampling.
     #[serde(default)]
     pub observability: ObservabilityConf,
+    /// MCP endpoint switch: `mcp.enabled` serves `POST /mcp`,
+    /// `mcp.read_only` refuses mutating tool calls.
+    #[serde(default)]
+    pub mcp: McpConf,
+    /// Metrics exporter file settings (AP-09). Only scalar settings
+    /// have a file home; push headers and the namespaced limiter stay
+    /// managed through the management API.
+    #[serde(default)]
+    pub prometheus: PrometheusConf,
+    /// Authorization source registry from the file layer. When a layer
+    /// sets it, boot persists the list before the registry replay; an
+    /// absent key keeps the stored order.
+    #[serde(default)]
+    pub authz_sources: AuthzSourcesConf,
 }
 
 /// Delayed-publish scheduler bounds.
@@ -2318,6 +2920,43 @@ impl Default for ObservabilityConf {
     }
 }
 
+/// MCP endpoint switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConf {
+    /// Whether the MCP endpoint on the management listener serves tool calls.
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+    /// Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.
+    #[serde(default = "default_mcp_read_only")]
+    pub read_only: bool,
+}
+
+// Reason: the endpoint stays on unless the operator turns it off, so automation works without setup.
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+// Reason: writes stay allowed unless the operator restricts the endpoint; read-only mode keeps every GET tool working.
+fn default_mcp_read_only() -> bool {
+    false
+}
+
+impl Default for McpConf {
+    fn default() -> Self {
+        Self {
+            enabled: default_mcp_enabled(),
+            read_only: default_mcp_read_only(),
+        }
+    }
+}
+
+impl McpConf {
+    /// Validates the MCP switch. Both flags accept only booleans, so a bool needs no range check.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
 impl BrokerConfig {
     /// Validates every section. Empty defaults are valid.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -2339,6 +2978,9 @@ impl BrokerConfig {
         self.jwks.validate()?;
         self.dbauth.validate()?;
         self.webhook.validate()?;
+        self.mcp.validate()?;
+        self.prometheus.validate()?;
+        self.authz_sources.validate()?;
         Ok(())
     }
 
@@ -2556,7 +3198,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 str_field(
                     "brokerlink_bind",
                     "127.0.0.1:18883",
-                    "BrokerLink IPC listen address for edge clients (TCP loopback).",
+                    "Deprecated. Ignored. The kernel serves clients directly.",
                 ),
             ],
         ),
@@ -2587,7 +3229,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     65_536,
                     "Listener accept backlog for the plaintext MQTT listener.",
                 ),
-                bool_field("tcp.native", false, "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them."),
+                bool_field("tcp.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
                 bool_field(
                     "tls.enabled",
                     false,
@@ -2608,7 +3250,50 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "",
                     "Path to the PEM private key for the TLS listener.",
                 ),
-                bool_field("tls.native", false, "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them."),
+                bool_field("tls.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
+                bool_field(
+                    "tls.psk_enabled",
+                    false,
+                    "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
+                ),
+                str_field(
+                    "tls.psk_keys_file",
+                    "",
+                    "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
+                ),
+                bool_field(
+                    "tls.verify_client_cert",
+                    false,
+                    "Whether the TLS listener requests and verifies a client certificate.",
+                ),
+                enum_field(
+                    "tls.verify",
+                    "verify_none",
+                    &["verify_none", "verify_peer"],
+                    "Client certificate chain check mode of the TLS listener.",
+                ),
+                str_field(
+                    "tls.cacertfile",
+                    "",
+                    "CA file for client certificate checks of the TLS listener.",
+                ),
+                bool_field(
+                    "tls.fail_if_no_peer_cert",
+                    false,
+                    "Whether the TLS listener refuses a handshake without a certificate.",
+                ),
+                enum_field(
+                    "tls.peer_cert_as_username",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind username from the client certificate.",
+                ),
+                enum_field(
+                    "tls.peer_cert_as_clientid",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind client identifier from the client certificate.",
+                ),
                 bool_field(
                     "ws.enabled",
                     true,
@@ -2624,6 +3309,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "/mqtt",
                     "HTTP path serving MQTT-over-WebSocket traffic.",
                 ),
+                bool_field("ws.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
                 bool_field(
                     "wss.enabled",
                     false,
@@ -2648,6 +3334,40 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "wss.key_file",
                     "",
                     "Path to the PEM private key for the secure WebSocket listener.",
+                ),
+                bool_field("wss.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
+                bool_field(
+                    "wss.verify_client_cert",
+                    false,
+                    "Whether the secure WebSocket listener requests and verifies a client certificate.",
+                ),
+                enum_field(
+                    "wss.verify",
+                    "verify_none",
+                    &["verify_none", "verify_peer"],
+                    "Client certificate chain check mode of the secure WebSocket listener.",
+                ),
+                str_field(
+                    "wss.cacertfile",
+                    "",
+                    "CA file for client certificate checks of the secure WebSocket listener.",
+                ),
+                bool_field(
+                    "wss.fail_if_no_peer_cert",
+                    false,
+                    "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+                ),
+                enum_field(
+                    "wss.peer_cert_as_username",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind username from the client certificate.",
+                ),
+                enum_field(
+                    "wss.peer_cert_as_clientid",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind client identifier from the client certificate.",
                 ),
                 bool_field(
                     "api.enabled",
@@ -2684,6 +3404,27 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     1.0,
                     10.0,
                     "Token bucket burst multiplier (allows bursts up to burst times rate).",
+                ),
+                int_field(
+                    "max_connections_per_tenant",
+                    0,
+                    0,
+                    1_000_000,
+                    "Default max live connections per tenant (0 = unlimited).",
+                ),
+                int_field(
+                    "max_sessions_per_tenant",
+                    0,
+                    0,
+                    100_000,
+                    "Default max sessions per tenant (0 = unlimited).",
+                ),
+                int_field(
+                    "max_retained_per_tenant",
+                    0,
+                    0,
+                    100_000,
+                    "Default max retained topics per tenant (0 = unlimited).",
                 ),
             ],
         ),
@@ -2739,6 +3480,13 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     65_535,
                     "Inbound topic-alias maximum advertised in CONNACK.",
                 ),
+                int_field(
+                    "max_packet_size",
+                    1_048_576,
+                    1,
+                    268_435_455,
+                    "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+                ),
                 num_field(
                     "keep_alive_grace",
                     1.5,
@@ -2776,7 +3524,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 str_field(
                     "spill_dir",
                     "",
-                    "Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total).",
+                    "Rule ingress spill directory.",
                 ),
             ],
         ),
@@ -2808,7 +3556,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 bool_field(
                     "enabled",
                     false,
-                    "Whether multi-node distributed clustering is enabled.",
+                    "Refused clustering switch. The broker fails boot when true.",
                 ),
                 str_field(
                     "bind",
@@ -2818,16 +3566,16 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 str_field(
                     "gossip_bind",
                     "0.0.0.0:7946",
-                    "Gossip membership bind address for peer discovery.",
+                    "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
                 ),
                 str_field(
                     "quic_bind",
                     "0.0.0.0:9092",
-                    "Multiplexed data plane bind address for inter-broker message routing.",
+                    "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
                 ),
                 list_field(
                     "seed_nodes",
-                    "Seed node addresses to join an existing cluster.",
+                    "Refused seed list. The broker fails boot when not empty.",
                 ),
             ],
         ),
@@ -3014,6 +3762,21 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
             )],
         ),
         (
+            "mcp",
+            vec![
+                bool_field(
+                    "enabled",
+                    true,
+                    "Whether the MCP endpoint on the management listener serves tool calls.",
+                ),
+                bool_field(
+                    "read_only",
+                    false,
+                    "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
+                ),
+            ],
+        ),
+        (
             "jwks",
             vec![
                 str_field(
@@ -3188,7 +3951,102 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
             ],
         ),
+        (
+            "prometheus",
+            vec![
+                bool_field(
+                    "enable_basic_auth",
+                    true,
+                    "Require credentials on the scrape endpoints.",
+                ),
+                str_field(
+                    "latency_buckets",
+                    "10ms, 100ms, 1s, 5s, 30s",
+                    "Latency histogram buckets for the exposition.",
+                ),
+                bool_field(
+                    "push_gateway.enable",
+                    false,
+                    "Stored push intent. The broker runs no push client.",
+                ),
+                str_field(
+                    "push_gateway.url",
+                    "http://127.0.0.1:9091",
+                    "Push target URL for the exposition.",
+                ),
+                str_field(
+                    "push_gateway.interval",
+                    "15s",
+                    "Push interval for the exposition.",
+                ),
+                str_field(
+                    "push_gateway.job_name",
+                    "${name}/instance/${name}~${host}",
+                    "Job name template for each push.",
+                ),
+                enum_field(
+                    "push_gateway.method",
+                    "put",
+                    &["put", "post"],
+                    "Push method for the exposition.",
+                ),
+                enum_field(
+                    "collectors.mnesia",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+                ),
+                enum_field(
+                    "collectors.vm_dist",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+                ),
+                enum_field(
+                    "collectors.vm_memory",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+                ),
+                enum_field(
+                    "collectors.vm_msacc",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+                ),
+                enum_field(
+                    "collectors.vm_statistics",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+                ),
+                enum_field(
+                    "collectors.vm_system_info",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+                ),
+            ],
+        ),
     ]
+}
+
+/// Overview group for one schema section in the settings diagram.
+///
+/// Every section maps to exactly one group. The coverage test below
+/// fails when a section lacks a group, so the diagram cannot stale.
+fn section_diagram_group(section: &str) -> Option<&'static str> {
+    match section {
+        "listeners" => Some("listeners"),
+        "session" | "quotas" => Some("session + quotas"),
+        "auth" | "licence" | "ldap" | "kerberos" | "jwks" | "dbauth" | "webhook" => {
+            Some("auth + user stores")
+        }
+        "rules_engine" | "delayed" => Some("rules + delayed"),
+        "node" | "cluster" | "logging" | "observability" | "prometheus" | "gateway"
+        | "persistence" | "mcp" => Some("node + operate"),
+        _ => None,
+    }
 }
 
 /// Renders the user-facing settings reference as Markdown.
@@ -3199,6 +4057,12 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
 #[must_use]
 pub fn settings_reference_markdown() -> String {
     let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str("title: \"Settings reference\"\n");
+    out.push_str("description: \"Every startup setting with type, default and range.\"\n");
+    out.push_str("sidebar:\n");
+    out.push_str("  order: 81\n");
+    out.push_str("---\n\n");
     out.push_str("# IndraMQTT settings reference\n\n");
     out.push_str(
         "<!-- GENERATED by `bash tools/gen_config_schema.sh`. Do not edit by hand. -->\n\n",
@@ -3207,6 +4071,22 @@ pub fn settings_reference_markdown() -> String {
         "Every setting has exactly one typed home in the configuration schema. \
          Wrong types and out-of-range values are startup errors naming the setting.\n\n",
     );
+    out.push_str("```mermaid\n");
+    out.push_str("flowchart LR\n");
+    let mut groups: Vec<&str> = Vec::new();
+    for (section, _) in schema_sections() {
+        let group = section_diagram_group(section)
+            .unwrap_or_else(|| panic!("diagram lacks a group for section {section}"));
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    for (index, group) in groups.iter().enumerate() {
+        out.push_str(&format!(
+            "    G{index}[\"{group}\"] -- \"set\" --> Kernel[\"kernel\"]\n"
+        ));
+    }
+    out.push_str("```\n\n");
     for (section, fields) in schema_sections() {
         out.push_str(&format!("## {section}\n\n"));
         out.push_str("| Setting | Type | Default | Range | Description |\n");
@@ -3290,7 +4170,7 @@ pub fn validate_json_sample(sample: &serde_json::Value) -> Result<(), String> {
             .map_err(|err| err.to_string())?;
         Ok(())
     };
-    check_bind_field("node", "brokerlink_bind", false)?;
+    // `node.brokerlink_bind` is deprecated and ignored: no check.
     check_bind_field("listeners", "tcp.bind", false)?;
     check_enum("logging", "level", KNOWN_LOG_LEVELS)?;
     check_enum(
@@ -3403,6 +4283,33 @@ mod tests {
         BrokerConfig::default()
             .validate()
             .expect("schema defaults must validate");
+    }
+
+    #[test]
+    fn schema_refuses_client_verification_without_ca_file() {
+        for (verify, legacy) in [("verify_peer", false), ("verify_none", true)] {
+            let mut config = BrokerConfig::default();
+            config.listeners.tls.verify = verify.to_string();
+            config.listeners.tls.verify_client_cert = legacy;
+            let text = config
+                .validate()
+                .expect_err("tls verification without a CA file must fail")
+                .to_string();
+            assert!(text.contains("listeners.tls.cacertfile"), "got: {text}");
+
+            let mut config = BrokerConfig::default();
+            config.listeners.wss.verify = verify.to_string();
+            config.listeners.wss.verify_client_cert = legacy;
+            let text = config
+                .validate()
+                .expect_err("wss verification without a CA file must fail")
+                .to_string();
+            assert!(text.contains("listeners.wss.cacertfile"), "got: {text}");
+        }
+        let mut config = BrokerConfig::default();
+        config.listeners.tls.verify = "verify_peer".to_string();
+        config.listeners.tls.cacertfile = "/etc/indramqtt/ca.pem".to_string();
+        config.validate().expect("a CA file makes it valid");
     }
 
     #[test]
@@ -3540,6 +4447,73 @@ mod tests {
     }
 
     #[test]
+    fn settings_reference_diagram_covers_every_section() {
+        let mut groups: Vec<&str> = Vec::new();
+        for (section, _) in schema_sections() {
+            let group = section_diagram_group(section)
+                .unwrap_or_else(|| panic!("diagram lacks a group for section {section}"));
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        let reference = settings_reference_markdown();
+        for group in &groups {
+            assert!(
+                reference.contains(group),
+                "reference diagram must show group {group}"
+            );
+        }
+        assert!(groups.len() <= 11, "diagram must stay readable");
+    }
+
+    #[test]
+    fn tls_psk_setting_parses_and_drives_validation() {
+        // Off by default keeps certificate handshakes unchanged.
+        assert!(!BrokerConfig::default().listeners.tls.psk_enabled);
+        assert!(BrokerConfig::default()
+            .listeners
+            .tls
+            .psk_keys_file
+            .is_empty());
+        // The file layer accepts the setting.
+        let parsed = BrokerConfig::parse_toml("[listeners.tls]\npsk_enabled = true\n")
+            .expect("psk setting parses");
+        assert!(parsed.listeners.tls.psk_enabled);
+        // The file layer accepts the keys file.
+        let parsed =
+            BrokerConfig::parse_toml("[listeners.tls]\npsk_keys_file = \"/etc/indra/psk.txt\"\n")
+                .expect("keys file parses");
+        assert_eq!(parsed.listeners.tls.psk_keys_file, "/etc/indra/psk.txt");
+        // A PSK-only listener needs no certificate files.
+        let mut psk = BrokerConfig::default();
+        psk.listeners.tls.enabled = true;
+        psk.listeners.tls.psk_enabled = true;
+        psk.validate().expect("psk needs no certificate");
+        // A certificate listener still needs them.
+        let mut cert = BrokerConfig::default();
+        cert.listeners.tls.enabled = true;
+        assert!(cert.validate().is_err(), "certificate needs files");
+    }
+
+    #[test]
+    fn schema_max_packet_size_default_is_bounded() {
+        // The packet cap default is 1 MiB with a finite wire-ceiling
+        // range. Through-the-broker proof lives in the kernel
+        // listener tests (connect, publish, deliver through sockets).
+        let config = BrokerConfig::default();
+        config.validate().expect("defaults validate");
+        assert_eq!(config.session.max_packet_size, 1_048_576);
+        let toml_text = config.to_toml().expect("defaults serialise");
+        let reparsed = BrokerConfig::parse_toml(&toml_text).expect("defaults round-trip");
+        assert_eq!(reparsed.session.max_packet_size, 1_048_576);
+        let parsed = BrokerConfig::parse_toml("[session]\nmax_packet_size = 4096\n")
+            .expect("packet size parses");
+        assert_eq!(parsed.session.max_packet_size, 4096);
+        let bad = BrokerConfig::parse_toml("[session]\nmax_packet_size = 0\n");
+        assert!(bad.is_err() || bad.is_ok_and(|c| c.validate().is_err()));
+    }
+
+    #[test]
     fn schema_qos0_backlog_default_is_bounded() {
         // The schema's QoS 0 backlog default bounds per-subscriber egress
         // memory: it must stay finite and agree with the delivery table.
@@ -3553,5 +4527,132 @@ mod tests {
         let toml_text = config.to_toml().expect("defaults serialise");
         let reparsed = BrokerConfig::parse_toml(&toml_text).expect("defaults round-trip");
         assert_eq!(reparsed.session.max_qos0_backlog, 1_000);
+    }
+
+    /// Drift test for the generated configuration page (DOC-02).
+    ///
+    /// The generator owns the page. This test runs it in check mode.
+    /// It then parses each `toml test` block through the production
+    /// file loader, so no example goes out of date.
+    #[test]
+    fn generated_configuration_page_matches_schema() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let output = std::process::Command::new("python3")
+            .arg("tools/gen_reference_docs.py")
+            .arg("--check")
+            .arg("config")
+            .current_dir(&root)
+            .output()
+            .expect("python3 runs the generator");
+        assert!(
+            output.status.success(),
+            "generator check failed:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let page =
+            std::fs::read_to_string(root.join("docs").join("reference").join("configuration.md"))
+                .expect("committed page exists");
+        // Each documented row names a catalogued setting.
+        let mut rows = 0;
+        for line in page.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let path = line.split('`').nth(1).expect("row carries a setting name");
+            assert!(
+                doc_for(path).is_some(),
+                "documented setting is catalogued: {path}"
+            );
+            rows += 1;
+        }
+        // Each catalogued setting owns one row.
+        for row in field_docs() {
+            assert!(page.contains(row.path), "page documents {}", row.path);
+        }
+        assert_eq!(
+            rows,
+            field_docs().len(),
+            "page documents each setting exactly once"
+        );
+        // Each row carries the restart need from the catalogue.
+        for line in page.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let path = line.split('`').nth(1).expect("row carries a setting name");
+            let row = field_docs()
+                .into_iter()
+                .find(|row| row.path == path)
+                .expect("documented setting is catalogued");
+            let want = match row.requires_restart {
+                Some(true) => "| yes |",
+                Some(false) => "| no |",
+                None => "|  |",
+            };
+            assert!(
+                line.trim_end().ends_with(want),
+                "row carries the restart need: {path}"
+            );
+        }
+        // Each catalogued setting owns one detail entry.
+        let mut headings = 0;
+        for line in page.lines() {
+            if line.starts_with("### `") && line.ends_with('`') {
+                let path = line.trim_start_matches("### `").trim_end_matches('`');
+                assert!(
+                    doc_for(path).is_some(),
+                    "detail entry is catalogued: {path}"
+                );
+                headings += 1;
+            }
+        }
+        assert_eq!(
+            headings,
+            field_docs().len(),
+            "page carries one detail entry per setting"
+        );
+        // Each configuration example loads through the file loader.
+        let mut blocks = 0;
+        let mut fenced = String::new();
+        let mut current: Option<String> = None;
+        for line in page.lines() {
+            if line.trim_start().starts_with("```toml") {
+                current = Some(String::new());
+                continue;
+            }
+            if line.trim_start().starts_with("```") {
+                if let Some(text) = current.take() {
+                    let parsed = BrokerConfig::parse_toml(&text).expect("page example parses");
+                    parsed.validate().expect("page example validates");
+                    fenced.push_str(&text);
+                    fenced.push('\n');
+                    blocks += 1;
+                }
+                continue;
+            }
+            if let Some(text) = current.as_mut() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        assert!(blocks >= 1, "page carries at least one tested example");
+        // Each example line sits in a fenced file, except
+        // `node.data_dir`: the file omits its relative default.
+        for row in field_docs() {
+            if row.path == "node.data_dir" {
+                continue;
+            }
+            let leaf = row.path.rsplit('.').next().expect("leaf");
+            let want = format!("{leaf} = ");
+            assert!(
+                fenced
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&want)),
+                "fenced file sets {}",
+                row.path
+            );
+        }
     }
 }

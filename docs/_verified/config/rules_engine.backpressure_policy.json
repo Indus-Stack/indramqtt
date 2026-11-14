@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a backpressure policy and read the live policy from `GET /api/v1/nodes`.",
+  "config": "[rules_engine]\nbackpressure_policy = \"Block\"\n",
+  "item": "rules_engine.backpressure_policy",
+  "kind": "setting",
+  "output": "policy=Block",
+  "returncode": 0,
+  "verified": true
+}

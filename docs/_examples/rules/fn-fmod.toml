@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-fmod"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT fmod(7.5, 2) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"v": 1.5}'
+
+[[case]]
+sql = 'SELECT fmod(1.0, 0) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = 'SELECT fmod(true, 2) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"v": 1.0}'

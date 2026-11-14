@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a custom push interval and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.push_gateway]\ninterval = \"30s\"\n",
+  "item": "prometheus.push_gateway.interval",
+  "kind": "setting",
+  "output": "push_interval=30s",
+  "returncode": 0,
+  "verified": true
+}

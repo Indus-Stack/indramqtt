@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-username"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT username() AS u FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"username": "alice"}'
+expect_matched = true
+expect_projected = '{"u": "alice"}'
+
+[[case]]
+sql = 'SELECT username() AS u FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"u": null}'
+
+[[case]]
+sql = 'SELECT username() AS u FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"username": 42}'
+expect_matched = true
+expect_projected = '{"u": 42}'

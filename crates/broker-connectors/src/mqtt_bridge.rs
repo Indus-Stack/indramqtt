@@ -20,9 +20,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
+
+/// One short TCP handshake per send bounds the down check. Reason: a
+/// closed listener fails closed even when an old connection still
+/// lives, and 1 s bounds the probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// MQTT protocol version for wire framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -99,7 +103,8 @@ fn default_true() -> bool {
 }
 
 fn default_keep_alive() -> u16 {
-    60
+    // Reference connector_mqtt defaults keepalive to 160 s.
+    160
 }
 
 fn default_max_inflight() -> Option<usize> {
@@ -129,7 +134,7 @@ pub struct MqttBridgeSinkConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    /// Keep-alive seconds (default 60).
+    /// Keep-alive seconds (default 160, the reference default).
     #[serde(default = "default_keep_alive")]
     pub keep_alive_secs: u16,
     /// Prefix prepended to remapped topics (e.g. `edge/station1/`).
@@ -138,6 +143,10 @@ pub struct MqttBridgeSinkConfig {
     /// Remap template with `${topic}` (default identity).
     #[serde(default)]
     pub topic_template: Option<String>,
+    /// Body template (`${topic}`, `${payload}`); `None` forwards the
+    /// raw event bytes. Reason: the reference `payload` action field.
+    #[serde(default)]
+    pub payload_template: Option<String>,
     /// Force outbound QoS (`None` preserves ingress).
     #[serde(default)]
     pub qos_override: Option<u8>,
@@ -157,6 +166,20 @@ pub struct MqttBridgeSinkConfig {
     /// Wire protocol version (default 3.1.1).
     #[serde(default)]
     pub protocol: MqttBridgeProtocol,
+}
+
+/// Render one bridge body template: `${topic}` takes the event
+/// topic, `${payload}` takes the raw event bytes as text.
+pub fn render_bridge_body(template: &str, topic: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let borrowed = [
+        ("topic", topic.to_string()),
+        ("payload", String::from_utf8_lossy(payload).into_owned()),
+    ];
+    let refs: Vec<(&str, String)> = borrowed
+        .iter()
+        .map(|(key, value)| (*key, value.clone()))
+        .collect();
+    render_template(template, &refs).map(String::into_bytes)
 }
 
 impl MqttBridgeSinkConfig {
@@ -181,6 +204,13 @@ impl MqttBridgeSinkConfig {
             return Err(ConnectorError::Dispatch(
                 "mqtt bridge max_batch_size must be >= 1".to_string(),
             ));
+        }
+        // The MQTT 5 driver refuses a keep-alive below five seconds.
+        if self.protocol == MqttBridgeProtocol::V50 && self.keep_alive_secs < 5 {
+            return Err(ConnectorError::Dispatch(format!(
+                "mqtt bridge field `keepalive` must be at least 5 seconds with proto_ver v5, got {}",
+                self.keep_alive_secs
+            )));
         }
         Ok(())
     }
@@ -417,58 +447,8 @@ pub fn decode_publish(frame: &[u8], v50: bool) -> Result<DecodedPublish> {
     })
 }
 
-/// Build a CONNECT frame (3.1.1 `MQTT`/4; 5.0 `MQTT`/5 with zero properties).
-fn encode_connect(
-    client_id: &str,
-    clean_start: bool,
-    keep_alive_secs: u16,
-    username: Option<&str>,
-    password: Option<&str>,
-    v50: bool,
-) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&[0x00, 0x04]);
-    body.extend_from_slice(b"MQTT");
-    body.push(if v50 { 5 } else { 4 });
-    let mut flags = 0x02; // clean session/start
-    if !clean_start {
-        flags &= !0x02;
-    }
-    if username.is_some() {
-        flags |= 0x80;
-    }
-    if password.is_some() {
-        flags |= 0x40;
-    }
-    body.push(flags);
-    body.extend_from_slice(&keep_alive_secs.to_be_bytes());
-    if v50 {
-        body.push(0x00); // connect properties: none
-    }
-    body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
-    body.extend_from_slice(client_id.as_bytes());
-    if let Some(username) = username {
-        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
-        body.extend_from_slice(username.as_bytes());
-    }
-    if let Some(password) = password {
-        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
-        body.extend_from_slice(password.as_bytes());
-    }
-    let mut frame = vec![0x10];
-    // CONNECT bodies are small; length always fits one byte here.
-    frame.push(body.len() as u8);
-    frame.extend_from_slice(&body);
-    frame
-}
-
-// ---------------------------------------------------------------------------
-// Transport.
-// ---------------------------------------------------------------------------
-
-/// One serialized outbound frame plus routing metadata. `bytes` is
-/// the tree-framed PUBLISH (used by the offline `Tcp` transport and
-/// the loopback tests); `payload` is the raw message body the
+/// the tree-framed PUBLISH (used by the loopback tests); `payload` is
+/// the raw message body the
 /// maintained driver transport publishes (it frames and assigns
 /// packet ids itself).
 #[derive(Debug, Clone)]
@@ -534,98 +514,6 @@ impl MqttBridgeTransport for MemoryMqttBridgeTransport {
     }
 }
 
-/// TCP transport: dials, exchanges CONNECT/CONNACK, writes frames.
-pub struct TcpMqttBridgeTransport {
-    endpoint: BridgeEndpoint,
-    client_id: String,
-    clean_start: bool,
-    username: Option<String>,
-    password: Option<String>,
-    keep_alive_secs: u16,
-    v50: bool,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
-}
-
-impl TcpMqttBridgeTransport {
-    pub fn new(config: &MqttBridgeSinkConfig) -> Result<Self> {
-        config.validate()?;
-        Ok(Self {
-            endpoint: config.endpoint()?,
-            client_id: config.resolve_client_id(0, now_millis())?,
-            clean_start: config.clean_start,
-            username: config.username.clone(),
-            password: config.password.clone(),
-            keep_alive_secs: config.keep_alive_secs,
-            v50: config.protocol == MqttBridgeProtocol::V50,
-            stream: tokio::sync::Mutex::new(None),
-        })
-    }
-}
-
-#[async_trait]
-impl MqttBridgeTransport for TcpMqttBridgeTransport {
-    async fn connect(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        if self.endpoint.tls {
-            return Err(ConnectorError::Dispatch(
-                "mqtts TLS transport not enabled in this build; use mqtt:// \
-                 or terminate TLS in a sidecar proxy"
-                    .to_string(),
-            ));
-        }
-        let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("mqtt bridge connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("mqtt bridge connect failed: {e}")))?;
-        let connect = encode_connect(
-            &self.client_id,
-            self.clean_start,
-            self.keep_alive_secs,
-            self.username.as_deref(),
-            self.password.as_deref(),
-            self.v50,
-        );
-        stream.write_all(&connect).await.map_err(|e| {
-            ConnectorError::Connection(format!("mqtt bridge connect write failed: {e}"))
-        })?;
-        let mut connack = [0u8; 4];
-        stream.read_exact(&mut connack).await.map_err(|e| {
-            ConnectorError::Connection(format!("mqtt bridge connack read failed: {e}"))
-        })?;
-        if connack[0] != 0x20 || connack[1] != 0x02 {
-            return Err(ConnectorError::Connection(
-                "mqtt bridge malformed CONNACK".to_string(),
-            ));
-        }
-        if connack[3] != 0x00 {
-            return Err(ConnectorError::Dispatch(format!(
-                "mqtt bridge connection refused: 0x{:02x}",
-                connack[3]
-            )));
-        }
-        *self.stream.lock().await = Some(stream);
-        Ok(())
-    }
-
-    async fn publish(&self, packet: &SerializedMqttPacket) -> Result<()> {
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("mqtt bridge not connected".to_string()))?;
-        stream
-            .write_all(&packet.bytes)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mqtt bridge publish failed: {e}")))?;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Driver transport on the maintained `rumqttc` client.
 // ---------------------------------------------------------------------------
@@ -685,8 +573,7 @@ enum RumqttcInner {
 /// TCP only in this build (`rumqttc` without its TLS feature):
 /// `mqtts://` endpoints fail closed with a clear error until a TLS
 /// backend lands (terminate TLS in a sidecar proxy meanwhile).
-/// The legacy [`TcpMqttBridgeTransport`] stays for offline unit
-/// tests only; production wiring uses this transport.
+/// Production wiring uses this transport.
 ///
 /// Bound: one driver request channel of [`driver_channel_cap`]
 /// entries plus the sink buffer in front of it; no background queue.
@@ -725,6 +612,24 @@ impl RumqttcMqttBridgeTransport {
 impl MqttBridgeTransport for RumqttcMqttBridgeTransport {
     async fn connect(&self) -> Result<()> {
         if self.state.lock().await.is_some() {
+            // The cached client queues behind a dead eventloop, so a
+            // downed broker reads as success. Probe the port first;
+            // a refused port clears the cache and fails closed, so
+            // the action counts one failed forward. One short TCP
+            // handshake per send bounds the check to 1s.
+            let probe = format!("{}:{}", self.endpoint.host, self.endpoint.port);
+            let reachable =
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&probe))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .is_some();
+            if !reachable {
+                *self.state.lock().await = None;
+                return Err(ConnectorError::Connection(format!(
+                    "mqtt bridge broker unreachable: {probe}"
+                )));
+            }
             return Ok(());
         }
         if self.endpoint.tls {
@@ -1000,6 +905,10 @@ impl MqttBridgeSink {
         let mapped = self.config.remap_topic(topic.as_str(), qos, millis)?;
         let out_qos = self.config.qos_override.unwrap_or_else(|| u8::from(qos));
         let retain = self.config.retain_override.unwrap_or(false);
+        let body = match &self.config.payload_template {
+            Some(template) => render_bridge_body(template, topic.as_str(), payload)?,
+            None => payload.to_vec(),
+        };
         let packet_id = if out_qos > 0 {
             self.next_packet_id()
         } else {
@@ -1007,7 +916,7 @@ impl MqttBridgeSink {
         };
         Ok(self.buffer.lock().push(BridgeRow {
             topic: mapped,
-            payload: payload.to_vec(),
+            payload: body,
             qos: out_qos,
             retain,
             packet_id,
@@ -1069,6 +978,7 @@ mod tests {
             keep_alive_secs: 60,
             topic_prefix: None,
             topic_template: None,
+            payload_template: None,
             qos_override: None,
             retain_override: None,
             max_inflight: Some(10_000),
@@ -1311,57 +1221,6 @@ mod tests {
         assert!(matches!(err, ConnectorError::Connection(_)));
     }
 
-    #[tokio::test]
-    async fn test_tcp_loopback_connect_and_publish() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // CONNECT: fixed header 0x10, single-byte length.
-            let mut head = [0u8; 2];
-            stream.read_exact(&mut head).await.expect("connect head");
-            assert_eq!(head[0], 0x10);
-            let mut body = vec![0u8; head[1] as usize];
-            stream.read_exact(&mut body).await.expect("connect body");
-            let needle = b"indra-bridge-loop";
-            assert!(body.windows(needle.len()).any(|w| w == needle));
-            // CONNACK accepted.
-            stream
-                .write_all(&[0x20, 0x02, 0x00, 0x00])
-                .await
-                .expect("connack");
-            // One PUBLISH frame follows.
-            let mut fixed = [0u8; 1];
-            stream.read_exact(&mut fixed).await.expect("pub head");
-            assert_eq!(fixed[0], 0x30);
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await.expect("pub len");
-            let mut rest = vec![0u8; len_buf[0] as usize];
-            stream.read_exact(&mut rest).await.expect("pub body");
-            assert!(rest.windows(9).any(|w| w == b"loopback/"));
-        });
-
-        let mut config = test_config(&format!("mqtt://127.0.0.1:{port}"));
-        config.client_id = "indra-bridge-loop".to_string();
-        config.max_batch_size = Some(1);
-        let transport = Arc::new(TcpMqttBridgeTransport::new(&config).unwrap());
-        let sink = MqttBridgeSink::new(config, transport).unwrap();
-        sink.send(
-            &Topic::new("loopback/t").unwrap(),
-            &Bytes::from("ping"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sink.sent_records(), 1);
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server done")
-            .expect("server task");
-    }
-
     fn qual_env(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.trim().is_empty())
     }
@@ -1500,6 +1359,7 @@ mod tests {
             keep_alive_secs: 30,
             topic_prefix: None,
             topic_template: Some(run_topic.clone()),
+            payload_template: None,
             qos_override: Some(1),
             retain_override: Some(false),
             max_inflight: Some(10_000),

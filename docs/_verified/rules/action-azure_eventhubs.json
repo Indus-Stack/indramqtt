@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "azure_eventhubs"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-azure_eventhubs",
+        "name": "dx2-action-azure_eventhubs",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "azure_eventhubs"
+      },
+      "name": "dx2-action-azure_eventhubs",
+      "status": 201,
+      "type": "azure_eventhubs"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-azure_eventhubs\" already exists"
+      },
+      "name": "dx2-action-azure_eventhubs",
+      "status": 400,
+      "type": "azure_eventhubs"
+    }
+  ],
+  "item": "action-azure_eventhubs",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

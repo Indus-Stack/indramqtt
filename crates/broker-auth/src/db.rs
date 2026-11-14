@@ -46,8 +46,7 @@
 //!
 //! Drivers (all maintained, all permissive licences):
 //! - `tokio-postgres` 0.7 (MIT): PostgreSQL wire protocol.
-//! - `mysql_async` 0.35 (MIT/Apache-2.0): MySQL wire protocol including
-//!   the default server auth plugin.
+//! - `mysql_async` 0.36 minimal-rust (MIT/Apache-2.0): MySQL wire protocol.
 //! - `redis` 0.27 (MIT, `tokio-comp`): RESP.
 //! - `mongodb` 3 (Apache-2.0): OP_MSG plus SCRAM.
 //!   No SQL, RESP frame or document is hand-rolled and no password hash is
@@ -164,22 +163,9 @@ fn topic_matches_row(pattern: &str, topic: &Topic) -> bool {
 }
 
 fn filter_covered_by_row(pattern: &str, filter: &TopicFilter) -> bool {
-    let pattern_levels: Vec<&str> = pattern.split('/').collect();
-    let request_levels: Vec<&str> = filter.as_str().split('/').collect();
-    let mut pi = 0;
-    for &req in request_levels.iter() {
-        match pattern_levels.get(pi) {
-            Some(&"#") => return true,
-            Some(&"+") => {
-                pi += 1;
-            }
-            Some(&pat) if pat == req => {
-                pi += 1;
-            }
-            _ => return false,
-        }
-    }
-    pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+    // Same cover test as the in-memory rules (SA-23): `+` never covers
+    // `#`, and `#`/`+` at the first level never reach `$` topics.
+    crate::filter_covered_by(pattern, filter.as_str())
 }
 
 fn publish_allowed(rows: &[AclRow], topic: &Topic) -> bool {

@@ -1,0 +1,9 @@
+{
+  "action": "Stop the TCP listener and dial the MQTT port.",
+  "config": "[listeners.tcp]\nenabled = false\n\n[auth]\nallow_anonymous = true\n",
+  "item": "listeners.tcp.enabled",
+  "kind": "setting",
+  "output": "refused",
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-greptimedb"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-greptimedb"
+type = "greptimedb"
+expect_status = 201
+expect_type = "greptimedb"
+
+[[case]]
+name = "dx2-action-greptimedb"
+type = "greptimedb"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

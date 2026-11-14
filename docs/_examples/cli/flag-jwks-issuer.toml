@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-jwks-issuer"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--jwks-issuer"

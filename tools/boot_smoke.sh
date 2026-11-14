@@ -1,45 +1,37 @@
 #!/usr/bin/env bash
 # Boot test for a built broker.
 #
-# This script starts the kernel and the edge as an operator does: from an
+# This script starts the kernel as an operator does: from an
 # indra.toml file and INDRA_* variables. It then examines the behaviour
 # through the sockets. It does not use internal functions.
 #
 # Usage:
-#   tools/boot_smoke.sh <dir with indramqtt and indra> <edge ebin dir>
+#   tools/boot_smoke.sh <dir with indramqtt and indra>
 #
-# Build the inputs first:
-#   cargo build -p broker-node --bins
-#   (cd beam && mkdir -p ebin && erlc -o ebin src/*.erl \
-#      && cp src/indra_edge.app.src ebin/indra_edge.app)
+# Build the input first:
+#   cargo build -p broker-node --features full --bins
 #
 # The script exits with 0 if all the checks are satisfactory. It prints
 # one line for each check.
 set -u
 
 BIN_DIR=${1:?give the directory that contains indramqtt and indra}
-EBIN=${2:?give the ebin directory of the edge}
-# The script starts the edge from a different directory. Thus it needs
+# The script starts the kernel from a different directory. Thus it needs
 # absolute paths.
 BIN_DIR=$(cd "$BIN_DIR" 2>/dev/null && pwd) || { echo "FAIL: $1 is not a directory"; exit 2; }
-EBIN=$(cd "$EBIN" 2>/dev/null && pwd) || { echo "FAIL: $2 is not a directory"; exit 2; }
 KERNEL=$BIN_DIR/indramqtt
 CTL=$BIN_DIR/indra
 
 for tool in "$KERNEL" "$CTL"; do
     [ -x "$tool" ] || { echo "FAIL: $tool is not an executable file"; exit 2; }
 done
-[ -f "$EBIN/indra_edge_sup.beam" ] || { echo "FAIL: $EBIN does not contain the edge"; exit 2; }
-command -v erl >/dev/null || { echo "FAIL: erl is not in PATH"; exit 2; }
 command -v python3 >/dev/null || { echo "FAIL: python3 is not in PATH"; exit 2; }
 
 ROOT=$(mktemp -d)
 KERNEL_PID=
-EDGE_PID=
 failures=0
 
 cleanup() {
-    [ -n "$EDGE_PID" ] && kill "$EDGE_PID" 2>/dev/null
     [ -n "$KERNEL_PID" ] && kill "$KERNEL_PID" 2>/dev/null
     wait 2>/dev/null
     rm -rf "$ROOT"
@@ -52,10 +44,10 @@ check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1"; fi; }
 
 # Get free ports. The checks use these ports and not the defaults. Thus
 # a check is satisfactory only if the broker reads the port from the file.
-read -r API_PORT LINK_PORT MQTT_PORT WS_PORT <<EOF
+read -r API_PORT MQTT_PORT TLS_PORT WS_PORT WSS_PORT <<EOF
 $(python3 - <<'PY'
 import socket
-socks = [socket.socket() for _ in range(4)]
+socks = [socket.socket() for _ in range(5)]
 for s in socks:
     s.bind(("127.0.0.1", 0))
 print(" ".join(str(s.getsockname()[1]) for s in socks))
@@ -65,21 +57,32 @@ PY
 )
 EOF
 
+# Test certificates for the secure WebSocket check. The same files
+# serve the TLS listener tests of the kernel.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+TREE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+WSS_CERT="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-cert.pem"
+WSS_KEY="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-key.pem"
+WSS_CA="$TREE_DIR/crates/broker-connectors-enterprise/testdata/ca-cert.pem"
+
 API_KEY_GOOD=boot-smoke-key-0001
-# With SMOKE_NATIVE=1 the kernel owns the plaintext MQTT listener
-# (listeners.tcp.native = true). Without it the edge owns the listener.
-# The MQTT checks are the same for the two modes.
-if [ "${SMOKE_NATIVE:-0}" = 1 ]; then NATIVE=true; else NATIVE=false; fi
+# The kernel serves every enabled listener. `native` is deprecated and
+# ignored, so the config sets no `native` key. The MQTT checks run in
+# one mode against the kernel listener in each run.
 mkdir -p "$ROOT/cfg" "$ROOT/data"
 cat > "$ROOT/cfg/indra.toml" <<EOF
 [node]
 id = "boot-smoke"
 data_dir = "$ROOT/data"
-brokerlink_bind = "127.0.0.1:$LINK_PORT"
 
 [listeners.tcp]
 bind = "127.0.0.1:$MQTT_PORT"
-native = $NATIVE
+
+[listeners.tls]
+bind = "127.0.0.1:$TLS_PORT"
+cert_file = "$WSS_CERT"
+key_file = "$WSS_KEY"
+enabled = true
 
 [listeners.ws]
 bind = "127.0.0.1:$WS_PORT"
@@ -91,9 +94,62 @@ bind = "127.0.0.1:$API_PORT"
 [logging]
 level = "warn"
 
+# The smoke clients connect without credentials: the smoke broker opts
+# into anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+# Exporter settings (AP-09). The kernel seeds the registry from these
+# file values at boot, so the settings read and the text exposition
+# observe them without any API write.
+[prometheus]
+latency_buckets = "7ms, 70ms, 700ms"
+
+[prometheus.push_gateway]
+url = "http://127.0.0.1:9199"
+interval = "31s"
+
+# Offline bound (MV-11c). The file value seeds the live cap at boot.
+# The smoke value differs from the default, so the check observes it.
+[session]
+max_offline_queue = 7
+
 # A client with a username goes into the tenant of that username.
 [[tenants.rules]]
 expression = "t-\${username}"
+
+# Listener-scoped rules. The default rule is first, so TCP
+# clients keep the default scope. Scoped rules stay to prove
+# scoping at connect does not break delivery.
+[[tenants.rules]]
+listener = "tls"
+expression = "t-tls-\${username}"
+
+[[tenants.rules]]
+listener = "tcp"
+expression = "t-tcp-\${username}"
+
+[[tenants.rules]]
+listener = "ws"
+expression = "t-ws-\${username}"
+
+[[tenants.rules]]
+listener = "wss"
+expression = "t-ws-\${username}"
+EOF
+
+# The secure WebSocket listener is always enabled. The test certificate
+# is the one of the kernel TLS tests.
+for cert in "$WSS_CERT" "$WSS_KEY" "$WSS_CA"; do
+    [ -f "$cert" ] || { echo "FAIL: test certificate $cert is missing"; exit 2; }
+done
+cat >> "$ROOT/cfg/indra.toml" <<EOF
+[listeners.wss]
+bind = "127.0.0.1:$WSS_PORT"
+path = "/smoke"
+cert_file = "$WSS_CERT"
+key_file = "$WSS_KEY"
+enabled = true
 EOF
 
 # --- 1. The kernel starts from the file and the credential variables ---
@@ -136,6 +192,47 @@ fi
     config explain --key node.id 2>/dev/null | grep -q 'boot-smoke'
 check "explain shows the value from indra.toml" $?
 
+# --- 2a. The MCP endpoint answers on the management listener ---
+# A key opens tools/list. No key gives 401. The list holds the status
+# tools (get_api_v5_status, get_status, broker_status, list_toolsets).
+# A disabled endpoint gives 404. Boot reads both from [mcp] in indra.toml.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+api, key = sys.argv[1:3]
+def post(body, headers):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}/mcp", method="POST",
+        headers={"Content-Type": "application/json", **headers},
+        data=json.dumps(body).encode())
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as err:
+        return err.code, json.loads(err.read().decode())
+status, listed = post({"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+                      {"Authorization": f"Bearer {key}"})
+assert status == 200, f"tools/list: {status}"
+names = [tool["name"] for tool in listed["result"]["tools"]]
+assert "get_api_v5_status" in names, "tools/list holds get_api_v5_status"
+assert "get_status" in names, "tools/list holds get_status"
+assert "broker_status" in names, "tools/list holds broker_status"
+assert "list_toolsets" in names, "tools/list holds list_toolsets"
+status, called = post({"jsonrpc": "2.0", "method": "tools/call",
+                       "params": {"name": "get_api_v5_status",
+                                  "arguments": {"query": {"format": "json"}}},
+                       "id": 2},
+                      {"Authorization": f"Bearer {key}"})
+assert status == 200, f"tools/call: {status}"
+assert "isError" not in called["result"], f"status call works: {called}"
+answer = json.loads(called["result"]["content"][0]["text"])
+assert answer["broker_status"] in ("started", "stopped"), f"status shape: {answer}"
+assert answer["rel_vsn"].startswith("v"), f"version shape: {answer}"
+status, _ = post({"jsonrpc": "2.0", "method": "ping", "id": 3}, {})
+assert status == 401, f"no key: {status}"
+print("the MCP endpoint lists tools for a key and refuses calls with no key")
+PY
+check "the MCP endpoint lists tools for a key and refuses calls with no key" $?
+
 # --- 3. Each setting in the schema is permitted in indra.toml ---
 python3 - "$ROOT" > "$ROOT/all.count" <<'PY'
 import json, os, sys
@@ -161,19 +258,27 @@ os.makedirs(f"{root}/all", exist_ok=True)
 open(f"{root}/all/indra.toml", "w").write("\n".join(lines))
 print(sum(1 for line in lines if " = " in line))
 PY
-"$KERNEL" --config-dir "$ROOT/all" --print-edge-args > "$ROOT/all.log" 2>&1
+"$KERNEL" --config-dir "$ROOT/all" --check-config > "$ROOT/all.log" 2>&1
 all_status=$?
 [ "$all_status" = 0 ] || head -3 "$ROOT/all.log"
 check "indra.toml accepts each setting in schemas/config-schema.json" "$all_status"
 
-# --- 4. The edge gets its listeners from the resolved configuration ---
-mapfile -t EDGE_ARGS < <("$KERNEL" --config-dir "$ROOT/cfg" --print-edge-args)
-[ "${#EDGE_ARGS[@]}" -gt 0 ]
-check "the kernel prints the edge arguments" $?
-(cd "$ROOT" && exec erl -noshell -noinput -pa "$EBIN" "${EDGE_ARGS[@]}" \
-    -eval '{ok, _} = application:ensure_all_started(indra_edge), timer:sleep(infinity).' \
-    > "$ROOT/edge.log" 2>&1) &
-EDGE_PID=$!
+# --- 3a. Client verification needs a CA file ---
+# A TLS listener with verification on and no CA file must not start.
+# This check runs the config validation only. It must fail.
+mkdir -p "$ROOT/badca"
+cat > "$ROOT/badca/indra.toml" <<EOF
+[listeners.tls]
+verify = "verify_peer"
+cacertfile = ""
+EOF
+"$KERNEL" --config-dir "$ROOT/badca" --check-config > "$ROOT/badca.log" 2>&1
+if [ $? = 0 ]; then fail "verification on without a CA file fails the config check"; else pass "verification on without a CA file fails the config check"; fi
+
+# --- 4. The kernel serves the listeners from the resolved configuration ---
+# The kernel already serves. This step starts no extra process.
+"$KERNEL" --config-dir "$ROOT/cfg" --check-config > "$ROOT/cfg.log" 2>&1
+check "the kernel validates the boot configuration" $?
 
 python3 - "$MQTT_PORT" "$WS_PORT" <<'PY'
 import base64, os, socket, struct, sys, time
@@ -185,7 +290,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", port), timeout=2)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port} from indra.toml")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port} from indra.toml")
 
 def packet(kind, body):
     return bytes([kind, len(body)]) + body
@@ -228,7 +333,7 @@ try:
     delivered = sub.recv(100)
 except OSError:
     delivered = b""
-report("a publish goes to a subscriber through the edge and the kernel",
+report("a publish goes to a subscriber through the kernel listener",
        suback[:1] == b"\x90" and delivered.endswith(b"smoke-ok"))
 
 # MQTT 5 delivery. Each MQTT 5 PUBLISH has a property length, also when
@@ -349,11 +454,1965 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4d. Exporter settings from indra.toml apply in operation ---
+# The kernel seeds the registry from the file at boot. This check reads
+# the settings and the text exposition over HTTP through the production
+# entries, proving the file values drive operation.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+port, key = sys.argv[1], sys.argv[2]
+
+def api(method, path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v5{path}",
+        method=method,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.headers.get_content_type(), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, "", e.read()
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+status, _, raw = api("GET", "/prometheus")
+try:
+    settings = json.loads(raw.decode())
+except ValueError:
+    settings = {}
+gateway = settings.get("push_gateway") or {}
+report("prometheus settings from indra.toml are the settings in operation",
+       status == 200
+       and settings.get("latency_buckets") == "7ms, 70ms, 700ms"
+       and gateway.get("url") == "http://127.0.0.1:9199"
+       and gateway.get("interval") == "31s")
+
+status, ctype, raw = api("GET", "/prometheus/stats")
+text = raw.decode(errors="replace")
+received = None
+for line in text.splitlines():
+    if line.startswith("indramqtt_messages_received_total "):
+        try:
+            received = int(line.rsplit(" ", 1)[1])
+        except ValueError:
+            pass
+# The smoke publishes above went through the kernel, so the live
+# exposition must count at least one received message.
+report("the metrics exposition serves live counters over HTTP",
+       status == 200 and ctype.startswith("text/plain")
+       and received is not None and received >= 1)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4d2. The file offline bound is in operation at boot ---
+# The file sets session.max_offline_queue to 7. The kernel installs
+# the value into the live manager at boot. The check reads
+# global_zone over HTTP. It proves the file value drives the live
+# cap.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request
+port, key = sys.argv[1], sys.argv[2]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def api(path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v5{path}",
+        headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=5) as res:
+        return res.status, json.loads(res.read().decode())
+status, body = api("/configs/global_zone")
+mqueue = (body.get("mqtt") or {}).get("max_mqueue_len")
+report("session.max_offline_queue from indra.toml is the live max_mqueue_len in global_zone",
+       status == 200 and mqueue == 7)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4e. A built-in rule action works through the production path ---
+# A rule is created with the management API. It republishes with the
+# built-in `republish` function: the topic is fixed and the payload is a
+# template that reads a field of the result. A real MQTT client publishes
+# a random value and another client receives it on the republish topic.
+# A user function in the same list is refused with 400.
+python3 - "$API_PORT" "$MQTT_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, urllib.request, urllib.error
+api_port, mqtt_port, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+def api(method, path, body=None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/api/v5{path}", data=data, method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+
+def field(data):
+    return struct.pack(">H", len(data)) + data
+
+def client(client_id):
+    sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+
+status, _ = api("POST", "/rules", {
+    "id": "smoke-republish",
+    "sql": 'SELECT v FROM "smoke/rule/in"',
+    "actions": [{"function": "republish",
+                 "args": {"topic": "smoke/rule/out", "payload": "got=${v}"}}],
+})
+report("a rule with the republish function is created through the API", status == 201)
+status, body = api("POST", "/rules", {
+    "id": "smoke-user-fn",
+    "sql": 'SELECT * FROM "smoke/rule/never"',
+    "actions": [{"function": "some_module:some_function", "args": {}}],
+})
+report("a rule with a user function is refused with 400", status == 400)
+
+sub, sub_ok = client(b"smoke-rule-sub")
+topic_out = b"smoke/rule/out"
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic_out) + b"\x00"))
+suback = sub.recv(5)
+pub, pub_ok = client(b"smoke-rule-pub")
+value = os.urandom(8).hex().encode()
+pub.sendall(packet(0x30, field(b"smoke/rule/in") + b'{"v":"' + value + b'"}'))
+sub.settimeout(5)
+try:
+    delivered = sub.recv(200)
+except OSError:
+    delivered = b""
+report("the republish rule delivers a random value to a subscriber of the republish topic",
+       sub_ok and pub_ok and suback[:1] == b"\x90"
+       and delivered.endswith(b"got=" + value))
+api("DELETE", "/rules/smoke-republish")
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4f. The built-in MCP endpoint answers on the management listener ---
+# The kernel boots with the default `[mcp]` settings, so the path serves.
+# An operator key calls `initialize`, `tools/list` and `tools/call
+# get_api_v5_status` through the production HTTP entry. The list also
+# holds the messaging tools: the publish operation and
+# `subscribe_collect`. A call with no key and a call with a wrong key
+# get 401. An unknown method gets -32601.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+api_port, key = sys.argv[1], sys.argv[2]
+
+def mcp(payload, auth):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/mcp", data=data, method="POST",
+        headers={"Content-Type": "application/json"})
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except ValueError:
+            return e.code, {}
+    except OSError:
+        return 0, {}
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+good_auth = f"Bearer {key}"
+status, body = mcp({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18",
+                               "capabilities": {},
+                               "clientInfo": {"name": "smoke", "version": "0"}}},
+                   good_auth)
+report("the MCP endpoint answers initialize with a server version",
+       status == 200
+       and body.get("result", {}).get("protocolVersion") == "2025-06-18")
+
+status, body = mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                    "params": {}},
+                   good_auth)
+tools = body.get("result", {}).get("tools", [])
+report("the MCP tool list holds get_api_v5_status",
+       status == 200
+       and any(tool.get("name") == "get_api_v5_status" for tool in tools)
+       and any(tool.get("name") == "get_status" for tool in tools))
+
+names = [tool.get("name") for tool in tools]
+report("the MCP tool list holds the messaging tools",
+       "post_api_v5_publish" in names and "subscribe_collect" in names)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "get_api_v5_status",
+                               "arguments": {"query": {"format": "json"}}}},
+                   good_auth)
+content = body.get("result", {}).get("content", [])
+text = content[0].get("text", "") if content else ""
+try:
+    detail = json.loads(text)
+except ValueError:
+    detail = {}
+report("the get_api_v5_status tool returns the HTTP status document",
+       status == 200
+       and detail.get("broker_status") in ("started", "stopped")
+       and isinstance(detail.get("rel_vsn"), str)
+       and detail.get("rel_vsn", "").startswith("v"))
+
+status, body = mcp({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}},
+                   None)
+report("the MCP endpoint refuses a call with no key with 401",
+       status == 401 and body.get("code") == "UNAUTHORIZED"
+       and "jsonrpc" not in body)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {}},
+                   "Bearer wrong-key-wrong-key")
+report("the MCP endpoint refuses a call with a wrong key with 401",
+       status == 401 and "jsonrpc" not in body)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 6, "method": "nope/method",
+                    "params": {}},
+                   good_auth)
+report("the MCP endpoint answers an unknown method with -32601",
+       status == 200 and body.get("error", {}).get("code") == -32601)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a. Unsubscribe on the kernel listener keeps the connection ---
+# A client subscribes, gets a message, unsubscribes, gets UNSUBACK,
+# and gets no more messages. It covers MQTT 3.1.1 and MQTT 5.
+python3 - "$MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def mqtt_connect(sock, client_id):
+    body = b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+sub = wait_port(mqtt_port)
+sub_ok = mqtt_connect(sub, b"smoke-unsub-sub")
+topic = b"smoke/unsub/check"
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+suback_ok = sub.recv(5)[:1] == b"\x90"
+pub = wait_port(mqtt_port)
+pub_ok = mqtt_connect(pub, b"smoke-unsub-pub")
+pub.sendall(packet(0x30, field(topic) + b"first"))
+first_ok = receive(sub, 5).endswith(b"first")
+sub.sendall(packet(0xA2, b"\x00\x02" + field(topic)))
+unsuback = receive(sub, 5)
+unsuback_ok = unsuback[:1] == b"\xB0" and unsuback[2:4] == b"\x00\x02"
+pub.sendall(packet(0x30, field(topic) + b"second"))
+second_got = receive(sub, 1)
+report("an unsubscribe stops delivery and keeps the connection",
+       sub_ok and suback_ok and pub_ok and first_ok and unsuback_ok and second_got == b"")
+def mqtt5_connect(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + field(client_id)))
+    ack = receive(sock, 5)
+    return len(ack) >= 4 and ack[0] == 0x20 and ack[3] == 0
+v5_sub = wait_port(mqtt_port)
+v5_ok = mqtt5_connect(v5_sub, b"smoke-unsub-v5")
+v5_topic = b"smoke/unsub/v5"
+v5_sub.sendall(packet(0x82, b"\x00\x03\x00" + field(v5_topic) + b"\x00"))
+v5_suback = receive(v5_sub, 5)
+v5_ready = v5_ok and len(v5_suback) >= 6 and v5_suback[0] == 0x90
+v5_pub = wait_port(mqtt_port)
+v5_pub_ok = mqtt5_connect(v5_pub, b"smoke-unsub-v5-pub")
+v5_pub.sendall(packet(0x30, field(v5_topic) + b"\x00" + b"v5-first"))
+v5_first_ok = b"v5-first" in receive(v5_sub, 5)
+v5_sub.sendall(packet(0xA2, b"\x00\x04\x00" + field(v5_topic)))
+v5_unsuback = receive(v5_sub, 5)
+v5_unsuback_ok = (len(v5_unsuback) >= 6 and v5_unsuback[0] == 0xB0
+                  and v5_unsuback[2:4] == b"\x00\x04" and v5_unsuback[5] == 0)
+v5_pub.sendall(packet(0x30, field(v5_topic) + b"\x00" + b"v5-second"))
+report("an MQTT 5 unsubscribe stops delivery and answers success",
+       v5_ready and v5_pub_ok and v5_first_ok and v5_unsuback_ok
+       and receive(v5_sub, 1) == b"")
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a5. The default Session Expiry cap is in operation at boot ---
+# A version 5 client asks for a Session Expiry Interval of 999999
+# seconds. The CONNACK holds the granted interval, capped at the
+# default of 86400 seconds. The operator sees the cap through the
+# socket. No test-only setter runs.
+python3 - "$MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def connect_with_expiry(sock, client_id, seconds):
+    # Version 5.0, clean start, Keep Alive 60. Property length 5, then
+    # Session Expiry Interval (0x11) as a four byte integer.
+    body = (b"\x00\x04MQTT\x05\x02\x00\x3c" + b"\x05"
+            + bytes([0x11]) + struct.pack(">I", seconds) + field(client_id))
+    sock.sendall(bytes([0x10, len(body)]) + body)
+    sock.settimeout(5)
+    return sock.recv(200)
+def granted_expiry(ack):
+    # 0x20 | remaining | ack flags | reason | property length | props.
+    # The Session Expiry Interval is the first property when sent.
+    if len(ack) < 10 or ack[0] != 0x20 or ack[3] != 0 or ack[5] != 0x11:
+        return None
+    return struct.unpack(">I", ack[6:10])[0]
+sock = wait_port(mqtt_port)
+ack = connect_with_expiry(sock, b"smoke-expiry-default", 999999)
+sock.close()
+report("the default cap of 86400 seconds limits the granted Session Expiry Interval",
+       granted_expiry(ack) == 86400)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a2. WebSocket on the kernel listener carries MQTT ---
+# A WebSocket client and a TCP client connect, subscribe,
+# and exchange a publish in both directions.
+# A wrong path fails.
+python3 - "$MQTT_PORT" "$WS_PORT" <<'PY'
+import base64, os, socket, struct, sys, time
+mqtt_port, ws_port = int(sys.argv[1]), int(sys.argv[2])
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def ws_upgrade(port, path, protocol=True):
+    sock = wait_port(port)
+    key = base64.b64encode(os.urandom(16)).decode()
+    headers = (f"GET {path} HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+               "Sec-WebSocket-Version: 13\r\n")
+    if protocol:
+        headers += "Sec-WebSocket-Protocol: mqtt\r\n"
+    headers += "\r\n"
+    sock.sendall(headers.encode())
+    head = b""
+    sock.settimeout(5)
+    try:
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(512)
+            if not chunk:
+                break
+            head += chunk
+    except OSError:
+        pass
+    return sock, head.split(b"\r\n")[0] if head else b""
+def ws_send(sock, payload):
+    mask = os.urandom(4)
+    length = len(payload)
+    if length < 126:
+        sock.sendall(bytes([0x82, 0x80 | length]) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    elif length < 65536:
+        sock.sendall(struct.pack(">BBH", 0x82, 0x80 | 126, length) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    else:
+        sock.sendall(struct.pack(">BBQ", 0x82, 0x80 | 127, length) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+def ws_recv(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        head = sock.recv(2)
+    except OSError:
+        return b""
+    if len(head) < 2:
+        return b""
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", sock.recv(8))[0]
+    data = b""
+    while len(data) < length:
+        try:
+            chunk = sock.recv(length - len(data))
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    return data
+def mqtt_connect_ws(sock, client_id):
+    sock.settimeout(5)
+    ws_send(sock, packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return ws_recv(sock, 5) == b"\x20\x02\x00\x00"
+def mqtt_connect_tcp(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+good, head = ws_upgrade(ws_port, "/smoke")
+report("the kernel WebSocket listener answers the upgrade on its path",
+       b"101" in head)
+bad, bad_head = ws_upgrade(ws_port, "/mqtt")
+report("the kernel WebSocket listener refuses a wrong path",
+       b"404" in bad_head)
+bad.close()
+topic = b"smoke/ws/check"
+secret_tcp = os.urandom(6).hex().encode()
+secret_ws = os.urandom(6).hex().encode()
+ws = good
+ws_ok = mqtt_connect_ws(ws, b"smoke-ws-sub") if b"101" in head else False
+tcp = wait_port(mqtt_port)
+tcp_ok = mqtt_connect_tcp(tcp, b"smoke-ws-tcp")
+ready = ws_ok and tcp_ok
+if ready:
+    ws_send(ws, packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ws_recv(ws, 5)[:1] == b"\x90"
+    tcp.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and tcp.recv(5)[:1] == b"\x90"
+if ready:
+    tcp.sendall(packet(0x30, field(topic) + secret_tcp))
+    report("a TCP publish reaches a WebSocket subscriber through the kernel",
+           ws_recv(ws, 5).endswith(secret_tcp))
+    # The TCP client subscribes too, so it first gets its own publish.
+    # Drain that echo, then wait for the WebSocket publish.
+    tcp.settimeout(5)
+    try:
+        tcp.recv(100)
+    except OSError:
+        pass
+    ws_send(ws, packet(0x30, field(topic) + secret_ws))
+    got = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and secret_ws not in got:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        tcp.settimeout(remaining)
+        try:
+            chunk = tcp.recv(100)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    report("a WebSocket publish reaches a TCP subscriber through the kernel",
+           got.endswith(secret_ws))
+else:
+    report("a TCP publish reaches a WebSocket subscriber through the kernel", False)
+    report("a WebSocket publish reaches a TCP subscriber through the kernel", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a3. Secure WebSocket on the kernel listener carries MQTT ---
+# A TLS client and a TCP client connect, subscribe,
+# and exchange a publish in both directions.
+# A client without TLS gets no upgrade. A wrong path fails.
+python3 - "$MQTT_PORT" "$WSS_PORT" "$WSS_CA" <<'PY'
+import base64, os, socket, ssl, struct, sys, time
+mqtt_port, wss_port, ca = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def tls_dial(port):
+    raw = wait_port(port)
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.check_hostname = False
+    return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+def wss_upgrade(port, path, protocol=True):
+    tls = tls_dial(port)
+    key = base64.b64encode(os.urandom(16)).decode()
+    headers = (f"GET {path} HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+               "Sec-WebSocket-Version: 13\r\n")
+    if protocol:
+        headers += "Sec-WebSocket-Protocol: mqtt\r\n"
+    headers += "\r\n"
+    tls.sendall(headers.encode())
+    head = b""
+    tls.settimeout(5)
+    try:
+        while b"\r\n\r\n" not in head:
+            chunk = tls.recv(512)
+            if not chunk:
+                break
+            head += chunk
+    except OSError:
+        pass
+    return tls, head.split(b"\r\n")[0] if head else b""
+def ws_send(sock, payload):
+    mask = os.urandom(4)
+    length = len(payload)
+    if length < 126:
+        sock.sendall(bytes([0x82, 0x80 | length]) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    elif length < 65536:
+        sock.sendall(struct.pack(">BBH", 0x82, 0x80 | 126, length) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    else:
+        sock.sendall(struct.pack(">BBQ", 0x82, 0x80 | 127, length) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+def ws_recv(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        head = sock.recv(2)
+    except OSError:
+        return b""
+    if len(head) < 2:
+        return b""
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", sock.recv(8))[0]
+    data = b""
+    while len(data) < length:
+        try:
+            chunk = sock.recv(length - len(data))
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    return data
+def mqtt_connect_ws(sock, client_id):
+    sock.settimeout(5)
+    ws_send(sock, packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return ws_recv(sock, 5) == b"\x20\x02\x00\x00"
+def mqtt_connect_tcp(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+good, head = wss_upgrade(wss_port, "/smoke")
+report("the kernel secure WebSocket listener answers the upgrade on its path",
+       b"101" in head)
+bad, bad_head = wss_upgrade(wss_port, "/mqtt")
+report("the kernel secure WebSocket listener refuses a wrong path",
+       b"404" in bad_head)
+bad.close()
+plain = wait_port(wss_port)
+plain.sendall((f"GET /smoke HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+               "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n").encode())
+plain.settimeout(5)
+try:
+    plain_head = plain.recv(12)
+except OSError:
+    plain_head = b""
+report("a client without TLS gets no upgrade on the secure port",
+       b"101" not in plain_head)
+plain.close()
+topic = b"smoke/wss/check"
+secret_tcp = os.urandom(6).hex().encode()
+secret_wss = os.urandom(6).hex().encode()
+wss = good
+wss_ok = mqtt_connect_ws(wss, b"smoke-wss-sub") if b"101" in head else False
+tcp = wait_port(mqtt_port)
+tcp_ok = mqtt_connect_tcp(tcp, b"smoke-wss-tcp")
+ready = wss_ok and tcp_ok
+if ready:
+    ws_send(wss, packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ws_recv(wss, 5)[:1] == b"\x90"
+    tcp.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and tcp.recv(5)[:1] == b"\x90"
+if ready:
+    tcp.sendall(packet(0x30, field(topic) + secret_tcp))
+    report("a TCP publish reaches a secure WebSocket subscriber through the kernel",
+           ws_recv(wss, 5).endswith(secret_tcp))
+    # The TCP client subscribes too, so it first gets its own publish.
+    # Drain that echo, then wait for the secure WebSocket publish.
+    tcp.settimeout(5)
+    try:
+        tcp.recv(100)
+    except OSError:
+        pass
+    ws_send(wss, packet(0x30, field(topic) + secret_wss))
+    got = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and secret_wss not in got:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        tcp.settimeout(remaining)
+        try:
+            chunk = tcp.recv(100)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    report("a secure WebSocket publish reaches a TCP subscriber through the kernel",
+           got.endswith(secret_wss))
+else:
+    report("a TCP publish reaches a secure WebSocket subscriber through the kernel", False)
+    report("a secure WebSocket publish reaches a TCP subscriber through the kernel", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a4. TLS on the kernel listener carries MQTT ---
+# A TLS client and a TCP client connect, subscribe,
+# and exchange a publish in both directions.
+# The TLS client uses the test certificate of the kernel TLS tests.
+# A client without TLS gets no MQTT handshake.
+python3 - "$MQTT_PORT" "$TLS_PORT" "$WSS_CA" <<'PY'
+import os, socket, ssl, struct, sys, time
+mqtt_port, tls_port, ca = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def tls_dial(port):
+    raw = wait_port(port)
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.check_hostname = False
+    return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+def mqtt_connect(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+tls = tls_dial(tls_port)
+report("the kernel TLS listener accepts a handshake with the test certificate",
+       mqtt_connect(tls, b"smoke-tls-sub"))
+topic = b"smoke/tls/check"
+secret_tcp = os.urandom(6).hex().encode()
+secret_tls = os.urandom(6).hex().encode()
+tls.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+ready = tls.recv(5)[:1] == b"\x90"
+tcp = wait_port(mqtt_port)
+tcp.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-tls-tcp")))
+tcp_ok = tcp.recv(4) == b"\x20\x02\x00\x00"
+ready = ready and tcp_ok
+if ready:
+    tcp.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = tcp.recv(5)[:1] == b"\x90"
+if ready:
+    tcp.sendall(packet(0x30, field(topic) + secret_tcp))
+    report("a TCP publish reaches a TLS subscriber through the kernel",
+           receive(tls, 5).endswith(secret_tcp))
+    # The TCP client subscribes too, so it first gets its own publish.
+    # Drain that echo, then wait for the TLS publish.
+    tcp.settimeout(5)
+    try:
+        tcp.recv(100)
+    except OSError:
+        pass
+    tls.sendall(packet(0x30, field(topic) + secret_tls))
+    got = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and secret_tls not in got:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        tcp.settimeout(remaining)
+        try:
+            chunk = tcp.recv(100)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    report("a TLS publish reaches a TCP subscriber through the kernel",
+           got.endswith(secret_tls))
+else:
+    report("a TCP publish reaches a TLS subscriber through the kernel", False)
+    report("a TLS publish reaches a TCP subscriber through the kernel", False)
+plain = socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+plain.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-tls-plain")))
+plain.settimeout(5)
+try:
+    plain_reply = plain.recv(4)
+except OSError:
+    plain_reply = b""
+report("a client without TLS gets no MQTT handshake",
+       plain_reply != b"\x20\x02\x00\x00")
+plain.close()
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a6. Anonymous CONNECT is refused when auth.allow_anonymous is false ---
+# A second kernel boots from the same file kind with the flag off.
+# No users exist. The broker refuses an anonymous CONNECT before any session exists.
+# It returns 5 for 3.1.1 and 0x87 for 5.0. The stored config stays
+# untouched. The operator still lists, reads and deletes records over
+# the API. The affected MQTT access stays denied (D2).
+read -r REFUSAL_API REFUSAL_MQTT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/refcfg" "$ROOT/refdata"
+cat > "$ROOT/refcfg/indra.toml" <<EOF
+[node]
+id = "boot-smoke-refusal"
+data_dir = "$ROOT/refdata"
+
+[listeners.tcp]
+bind = "127.0.0.1:$REFUSAL_MQTT"
+
+[listeners.api]
+bind = "127.0.0.1:$REFUSAL_API"
+
+[logging]
+level = "warn"
+
+[auth]
+allow_anonymous = false
+EOF
+"$KERNEL" --config-dir "$ROOT/refcfg" > "$ROOT/refusal.log" 2>&1 &
+REFUSAL_PID=$!
+refusal_up=0
+for _ in $(seq 1 50); do
+    if python3 - "$REFUSAL_API" >/dev/null 2>&1 <<'PY'
+import sys, urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1)
+PY
+    then
+        refusal_up=1
+        break
+    fi
+    kill -0 "$REFUSAL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+if [ "$refusal_up" = 1 ]; then
+    python3 - "$REFUSAL_MQTT" <<'PY'
+import socket, struct, sys
+def frame(kind, body):
+    head = bytearray([kind])
+    remaining = len(body)
+    while True:
+        digit = remaining % 128
+        remaining //= 128
+        head.append(digit | (128 if remaining else 0))
+        if not remaining:
+            return bytes(head) + body
+def word(value):
+    raw = value.encode() if isinstance(value, str) else value
+    return struct.pack("!H", len(raw)) + raw
+def packet(sock):
+    head = sock.recv(1)
+    if not head:
+        return head[0], b""
+    remaining = 0
+    scale = 1
+    while True:
+        digit = sock.recv(1)[0]
+        remaining += (digit & 127) * scale
+        if not digit & 128:
+            break
+        scale *= 128
+    body = b""
+    while len(body) < remaining:
+        chunk = sock.recv(remaining - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return head[0], body
+port = int(sys.argv[1])
+sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+sock.sendall(frame(16, b"\x00\x04MQTT\x04\x02\x00\x3c" + word("refusal-anon")))
+head, ack = packet(sock)
+sock.close()
+sys.exit(0 if head == 32 and ack == b"\x00\x05" else 1)
+PY
+    check "an anonymous CONNECT is refused when allow_anonymous is false" $?
+else
+    check "an anonymous CONNECT is refused when allow_anonymous is false" 1
+    head -20 "$ROOT/refusal.log" 2>/dev/null || true
+fi
+kill "$REFUSAL_PID" 2>/dev/null
+wait "$REFUSAL_PID" 2>/dev/null
+
+# --- 4b. Tenant filters on the client list keep tenants apart ---
+# Run this check before the first user exists. The broker stays open.
+# The tenant rule maps each username to its own tenant. The same
+# client id connects in both tenants. A publish uses a random value the
+# broker cannot know. Each tenant filter of the client list shows its
+# own client only. The unfiltered list shows both namesakes with two
+# tenant ids.
+python3 - "$MQTT_PORT" "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, urllib.request
+mqtt_port, api_port, api_key = sys.argv[1], sys.argv[2], sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def mqtt_connect(sock, client_id, username):
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(b"pw")
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+def api_get(path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}{path}",
+        headers={"Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req) as res:
+        return res.status, json.loads(res.read().decode())
+def rows_of(tenant):
+    status, body = api_get(f"/api/v5/clients?tenant={tenant}")
+    assert status == 200, f"client list of {tenant}: {status}"
+    return body["data"]
+topic = b"smoke/filter/check"
+secret = os.urandom(8).hex().encode()
+a_sock = wait_port(mqtt_port)
+a_ok = mqtt_connect(a_sock, b"smoke-filter-dup", b"alpha")
+b_sock = wait_port(mqtt_port)
+b_ok = mqtt_connect(b_sock, b"smoke-filter-dup", b"beta")
+a_pub = wait_port(mqtt_port)
+a_pub_ok = mqtt_connect(a_pub, b"smoke-filter-pub", b"alpha")
+ready = a_ok and b_ok and a_pub_ok and subscribe(a_sock, topic) and subscribe(b_sock, topic)
+if ready:
+    a_pub.sendall(packet(0x30, field(topic) + secret))
+    report("a subscriber gets the publish of its own tenant before the read check",
+           receive(a_sock, 5).endswith(secret))
+    report("a subscriber does not get the publish of another tenant before the read check",
+           secret not in receive(b_sock, 2))
+else:
+    report("a subscriber gets the publish of its own tenant before the read check", False)
+    report("a subscriber does not get the publish of another tenant before the read check", False)
+rows_a = rows_of("t-alpha")
+rows_b = rows_of("t-beta")
+report("the tenant filter of the first tenant shows its client only",
+       all(row.get("mountpoint") == "t-alpha" for row in rows_a)
+       and any(row.get("clientid") == "smoke-filter-dup" for row in rows_a))
+report("the tenant filter of the second tenant shows its client only",
+       all(row.get("mountpoint") == "t-beta" for row in rows_b)
+       and any(row.get("clientid") == "smoke-filter-dup" for row in rows_b))
+status, body = api_get("/api/v5/clients")
+mounts = sorted(row.get("mountpoint") for row in body["data"]
+                if row.get("clientid") == "smoke-filter-dup")
+report("the unfiltered list shows the same client id with two tenant ids",
+       status == 200 and mounts == ["t-alpha", "t-beta"])
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 10. Explicit bind sections keep tenants apart ---
+# Run this check before the first user exists. The broker stays open.
+# Unknown users connect. The check proves isolation on the new path.
+# Each connect uses the new bind path. The kernel sets the section
+# flags. Each publish uses a random value. Delivery stays in-tenant.
+# The default tenant still delivers as before.
+python3 - "$MQTT_PORT" <<'PY'
+import os, socket, struct, sys
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=2)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
+def mqtt_connect(sock, client_id, username=None):
+    if username is None:
+        body = b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)
+    else:
+        body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(b"pw")
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+def wait_port2(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def connect(client_id, username=None):
+    sock = wait_port2(mqtt_port)
+    return sock, mqtt_connect(sock, client_id, username)
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+secret = os.urandom(8).hex().encode()
+topic = b"smoke/bind/check"
+a_sub, a_ok = connect(b"bind-a-sub", b"bind-a")
+b_sub, b_ok = connect(b"bind-b-sub", b"bind-b")
+a_pub, a_pub_ok = connect(b"bind-a-pub", b"bind-a")
+ready = a_ok and b_ok and a_pub_ok and subscribe(a_sub, topic) and subscribe(b_sub, topic)
+if ready:
+    a_pub.sendall(packet(0x30, field(topic) + secret))
+    report("a subscriber gets the publish of its own tenant through the new bind path",
+           receive(a_sub, 5).endswith(secret))
+    report("a subscriber does not get the publish of another tenant through the new bind path",
+           secret not in receive(b_sub, 2))
+else:
+    report("a subscriber gets the publish of its own tenant through the new bind path", False)
+    report("a subscriber does not get the publish of another tenant through the new bind path", False)
+anon_secret = os.urandom(8).hex().encode()
+anon_sub, anon_ok = connect(b"bind-anon-sub")
+anon_pub, anon_pub_ok = connect(b"bind-anon-pub")
+anon_ready = anon_ok and anon_pub_ok
+if anon_ready:
+    anon_ready = subscribe(anon_sub, topic)
+if anon_ready:
+    anon_pub.sendall(packet(0x30, field(topic) + anon_secret))
+    report("the default tenant still delivers without credentials",
+           receive(anon_sub, 5).endswith(anon_secret))
+else:
+    report("the default tenant still delivers without credentials", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 5. Users and ACLs of each tenant stay after a restart ---
+# The tenant rule maps each username to its own tenant. The password is
+# random, thus the broker cannot know it. The broker restarts on the
+# same data directory. The same password must still open access, and a
+# wrong password must still fail. A publish must still reach the
+# subscriber in the same tenant, which proves the ACLs stayed too.
+KEEP_USER="smoke-keep"
+KEEP_TENANT="t-smoke-keep"
+KEEP_PASS=$(python3 -c 'import os; print(os.urandom(12).hex())')
+KEEP_TOPIC="smoke/keep/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$KEEP_TENANT" "$KEEP_USER" "$KEEP_PASS" <<'PY'
+import json, sys, urllib.request
+api, key, tenant, user, password = sys.argv[1:6]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req) as res:
+        return res.status, res.read().decode()
+status, _ = call("POST", f"/api/v1/auth/users?tenant={tenant}",
+                 {"username": user, "password": password})
+assert status == 201, f"create per-tenant user: {status}"
+for action in ("publish", "subscribe"):
+    status, _ = call("POST", f"/api/v1/auth/acls?tenant={tenant}",
+                     {"client_pattern": "*", "action": action,
+                      "topic_pattern": "smoke/keep/#", "allow": True})
+    assert status == 201, f"create per-tenant {action} rule: {status}"
+print("per-tenant user and ACLs are stored")
+PY
+check "a per-tenant user with a random password is stored through the API" $?
+
+# Restart the kernel on the same data directory.
+kill "$KERNEL_PID" 2>/dev/null
+wait 2>/dev/null
+sleep 0.5
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg" > "$ROOT/kernel2.log" 2>&1 &
+KERNEL_PID=$!
+healthz=
+for _ in $(seq 1 50); do
+    healthz=$(python3 - "$API_PORT" <<'PY' 2>/dev/null
+import sys, urllib.request
+print(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1).read().decode())
+PY
+)
+    [ "$healthz" = OK ] && break
+    kill -0 "$KERNEL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+[ "$healthz" = OK ]
+check "the kernel restarts on the same data directory" $?
+
+python3 - "$MQTT_PORT" "$KEEP_USER" "$KEEP_PASS" "$KEEP_TOPIC" <<'PY'
+import socket, struct, sys, time
+mqtt_port, username, password, topic = sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(), sys.argv[4].encode()
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port} after the restart")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+sub, ok = connect(b"keep-sub", username, password)
+report("the kept password still opens access after the restart", ok)
+wrong, wrong_ok = connect(b"keep-wrong", username, b"wrong-password")
+report("a wrong password still fails after the restart", not wrong_ok)
+ready = ok
+if ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = sub.recv(5)[:1] == b"\x90"
+    pub, pub_ok = connect(b"keep-pub", username, password)
+    ready = ready and pub_ok
+    if ready:
+        pub.sendall(packet(0x30, field(topic) + b"keep-ok"))
+        report("a publish still reaches the subscriber in the same tenant after the restart",
+               receive(sub, 5).endswith(b"keep-ok"))
+    else:
+        report("a publish still reaches the subscriber in the same tenant after the restart", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 6. A tenant from the management API carries a real client ---
+# The tenant rule maps each username to its own tenant. Each namespace
+# is created through POST /mt/ns/{ns}. Each user is created through the
+# API with a random password the broker cannot know. A publish in one
+# tenant reaches the subscriber in the same tenant only.
+MT_USER_A="mtapi"
+MT_NS_A="t-mtapi"
+MT_USER_B="mtother"
+MT_NS_B="t-mtother"
+MT_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+MT_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+MT_TOPIC="smoke/mt/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$MT_NS_A" "$MT_USER_A" "$MT_PASS_A" "$MT_NS_B" "$MT_USER_B" "$MT_PASS_B" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b = sys.argv[1:9]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/mt/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+    status, text = call("GET", f"/api/v5/mt/ns/{ns}/config")
+    assert status == 200, f"show managed namespace {ns}: {status} {text}"
+print("managed namespaces and tenant users are stored through the API")
+PY
+check "two tenants and two users with random passwords are stored through the API" $?
+
+python3 - "$MQTT_PORT" "$MT_USER_A" "$MT_PASS_A" "$MT_USER_B" "$MT_PASS_B" "$MT_TOPIC" <<'PY'
+import socket, struct, sys, time
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+import os
+secret = os.urandom(8).hex().encode()
+sub, ok = connect(b"mtapi-sub", username_a, password_a)
+other, other_ok = connect(b"mtapi-other", username_b, password_b)
+ready = ok and other_ok
+if ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and sub.recv(5)[:1] == b"\x90"
+if other_ok:
+    other.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and other.recv(5)[:1] == b"\x90"
+pub, pub_ok = connect(b"mtapi-pub", username_a, password_a)
+ready = ready and pub_ok
+if ready:
+    pub.sendall(packet(0x30, field(topic) + secret))
+    report("a publish in the API tenant reaches its own subscriber",
+           receive(sub, 5).endswith(secret))
+    report("a publish in the API tenant does not leak to another tenant",
+           secret not in receive(other, 2))
+else:
+    report("a publish in the API tenant reaches its own subscriber", False)
+    report("a publish in the API tenant does not leak to another tenant", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 7. Tenant commands of the operator CLI ---
+# Two tenants come from `indra ctl tenants create`. Each tenant gets
+# one user with a random password the broker cannot know, plus publish
+# and subscribe rules from `indra ctl acls create`. Real clients
+# connect in each tenant. A publish in one tenant reaches its own
+# subscriber only.
+CLI_NS_A="t-cli-a"
+CLI_NS_B="t-cli-b"
+CLI_USER_A="cli-a"
+CLI_USER_B="cli-b"
+CLI_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+CLI_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+CLI_TOPIC="smoke/cli/check"
+CTL_API="http://127.0.0.1:$API_PORT"
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants create "$CLI_NS_A" > /dev/null
+check "indra ctl tenants create makes the first tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants create "$CLI_NS_B" > /dev/null
+check "indra ctl tenants create makes the second tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants list | grep -q "$CLI_NS_A"
+check "indra ctl tenants list shows the first tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants show "$CLI_NS_B" | grep -q "namespace: $CLI_NS_B"
+check "indra ctl tenants show reads the second tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" users create --username "$CLI_USER_A" --tenant "$CLI_NS_A" --password "$CLI_PASS_A" > /dev/null
+check "indra ctl users create makes a user in the first tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" users create --username "$CLI_USER_B" --tenant "$CLI_NS_B" --password "$CLI_PASS_B" > /dev/null
+check "indra ctl users create makes a user in the second tenant" $?
+for action in publish subscribe; do
+    "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" acls create --tenant "$CLI_NS_A" --client-pattern '*' --action "$action" --topic-pattern 'smoke/cli/#' --allow > /dev/null
+    check "indra ctl acls create adds the $action rule in the first tenant" $?
+    "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" acls create --tenant "$CLI_NS_B" --client-pattern '*' --action "$action" --topic-pattern 'smoke/cli/#' --allow > /dev/null
+    check "indra ctl acls create adds the $action rule in the second tenant" $?
+done
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" acls list --tenant "$CLI_NS_A" | grep -q publish
+check "indra ctl acls list shows the rules of the first tenant" $?
+
+python3 - "$MQTT_PORT" "$CLI_USER_A" "$CLI_PASS_A" "$CLI_USER_B" "$CLI_PASS_B" "$CLI_TOPIC" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            import time
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+secret = os.urandom(8).hex().encode()
+sub, ok = connect(b"cli-a-sub", username_a, password_a)
+other, other_ok = connect(b"cli-b-sub", username_b, password_b)
+ready = ok and other_ok
+if ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and sub.recv(5)[:1] == b"\x90"
+if other_ok:
+    other.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and other.recv(5)[:1] == b"\x90"
+pub, pub_ok = connect(b"cli-a-pub", username_a, password_a)
+ready = ready and pub_ok
+if ready:
+    pub.sendall(packet(0x30, field(topic) + secret))
+    report("a publish through CLI users reaches its own subscriber",
+           receive(sub, 5).endswith(secret))
+    report("a publish through CLI users does not leak to another tenant",
+           secret not in receive(other, 2))
+else:
+    report("a publish through CLI users reaches its own subscriber", False)
+    report("a publish through CLI users does not leak to another tenant", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants delete "$CLI_NS_B" --yes > /dev/null
+check "indra ctl tenants delete removes the second tenant" $?
+if "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants list | grep -q "$CLI_NS_B"; then
+    fail "the deleted tenant stays out of indra ctl tenants list"
+else
+    pass "the deleted tenant stays out of indra ctl tenants list"
+fi
+
+# --- 8. A rule of one tenant fires only for that tenant ---
+# Two tenants come from the API. One rule of the first tenant
+# republishes. A random value the broker cannot know is published in
+# each tenant. The republished message arrives in the first tenant
+# only. A publish in the second tenant fires no rule.
+RULE_NS_A="t-rule-a"
+RULE_NS_B="t-rule-b"
+RULE_USER_A="rule-a"
+RULE_USER_B="rule-b"
+RULE_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+RULE_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+RULE_IN="smoke/rule/in"
+RULE_OUT="smoke/rule/out"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$RULE_NS_A" "$RULE_USER_A" "$RULE_PASS_A" "$RULE_NS_B" "$RULE_USER_B" "$RULE_PASS_B" "$RULE_IN" "$RULE_OUT" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b, rule_in, rule_out = sys.argv[1:11]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/rule/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+status, text = call("POST", "/api/v1/rules",
+                    {"name": "smoke-tenant-rule", "topic_filter": rule_in,
+                     "tenant": ns_a,
+                     "actions": [{"type": "republish", "topic": rule_out, "qos": 0}]})
+assert status == 201, f"create tenant rule: {status} {text}"
+assert json.loads(text)["tenant"] == ns_a, f"rule keeps its tenant: {text}"
+print("tenant rule is stored through the API")
+PY
+check "a rule of the first tenant with a republish action is stored through the API" $?
+
+python3 - "$MQTT_PORT" "$RULE_USER_A" "$RULE_PASS_A" "$RULE_USER_B" "$RULE_PASS_B" "$RULE_IN" "$RULE_OUT" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, rule_in, rule_out = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode(), sys.argv[7].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            import time
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+secret_a = os.urandom(8).hex().encode()
+secret_b = os.urandom(8).hex().encode()
+sub_a, ok_a = connect(b"rule-a-sub", username_a, password_a)
+sub_b, ok_b = connect(b"rule-b-sub", username_b, password_b)
+ready = ok_a and ok_b
+if ok_a:
+    sub_a.sendall(packet(0x82, b"\x00\x01" + field(rule_out) + b"\x00"))
+    ready = ready and sub_a.recv(5)[:1] == b"\x90"
+if ok_b:
+    sub_b.sendall(packet(0x82, b"\x00\x01" + field(rule_out) + b"\x00"))
+    ready = ready and sub_b.recv(5)[:1] == b"\x90"
+pub_a, pub_a_ok = connect(b"rule-a-pub", username_a, password_a)
+pub_b, pub_b_ok = connect(b"rule-b-pub", username_b, password_b)
+ready = ready and pub_a_ok and pub_b_ok
+if ready:
+    pub_a.sendall(packet(0x30, field(rule_in) + secret_a))
+    report("the rule output arrives in the tenant of the rule",
+           receive(sub_a, 5).endswith(secret_a))
+    report("the rule output does not leak to the other tenant",
+           secret_a not in receive(sub_b, 2))
+    pub_b.sendall(packet(0x30, field(rule_in) + secret_b))
+    report("a publish in the tenant without the rule fires no output there",
+           secret_b not in receive(sub_b, 2))
+    report("a publish in the tenant without the rule sends nothing to the rule tenant",
+           secret_b not in receive(sub_a, 2))
+else:
+    report("the rule output arrives in the tenant of the rule", False)
+    report("the rule output does not leak to the other tenant", False)
+    report("a publish in the tenant without the rule fires no output there", False)
+    report("a publish in the tenant without the rule sends nothing to the rule tenant", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 9. A full tenant keeps service for other tenants ---
+# Two tenants come from the API. The first tenant sets a low
+# connection limit. The limit fills with real clients. A client in
+# the second tenant still connects and publishes a random value.
+LIM_NS_A="t-lim-a"
+LIM_NS_B="t-lim-b"
+LIM_USER_A="lim-a"
+LIM_USER_B="lim-b"
+LIM_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIM_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIM_TOPIC="smoke/lim/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$LIM_NS_A" "$LIM_USER_A" "$LIM_PASS_A" "$LIM_NS_B" "$LIM_USER_B" "$LIM_PASS_B" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b = sys.argv[1:9]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/lim/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+status, _ = call("PUT", f"/api/v5/mt/ns/{ns_a}/config",
+                 {"limits": {"max_connections": 1}})
+assert status == 200, f"set per-tenant connection limit: {status}"
+print("per-tenant connection limit is stored through the API")
+PY
+check "a low connection limit for one tenant is stored through the API" $?
+
+python3 - "$MQTT_PORT" "$LIM_USER_A" "$LIM_PASS_A" "$LIM_USER_B" "$LIM_PASS_B" "$LIM_TOPIC" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            import time
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+secret = os.urandom(8).hex().encode()
+first, first_ok = connect(b"lim-a-first", username_a, password_a)
+second, second_ok = connect(b"lim-a-second", username_a, password_a)
+report("a tenant at its connection limit refuses a new connection", first_ok and not second_ok)
+sub, sub_ok = connect(b"lim-b-sub", username_b, password_b)
+ready = sub_ok
+if sub_ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and sub.recv(5)[:1] == b"\x90"
+pub, pub_ok = connect(b"lim-b-pub", username_b, password_b)
+ready = ready and pub_ok
+if ready:
+    pub.sendall(packet(0x30, field(topic) + secret))
+    report("the other tenant still publishes a random value", receive(sub, 5).endswith(secret))
+else:
+    report("the other tenant still publishes a random value", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 11. Listener scope and client certificate defaults through the socket ---
+# The broker starts from indra.toml with listener-scoped tenant rules.
+# The default rule is first, so TCP clients use the per-username
+# rule. Each tenant gets one user with a random password the broker
+# cannot know, plus publish and subscribe rules. Real clients connect
+# in each tenant. A publish in one tenant reaches its own subscriber
+# only. The check also proves the verify switches stay off by default,
+# so the broker requests no client certificate.
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.verify_client_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.tls.verify_client_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.verify_client_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.wss.verify_client_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.verify 2>/dev/null | grep -q 'verify_none'
+check "explain shows listeners.tls.verify stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.verify 2>/dev/null | grep -q 'verify_none'
+check "explain shows listeners.wss.verify stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.fail_if_no_peer_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.tls.fail_if_no_peer_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.fail_if_no_peer_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.wss.fail_if_no_peer_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.peer_cert_as_username 2>/dev/null | grep -q 'disabled'
+check "explain shows listeners.tls.peer_cert_as_username stays disabled by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.peer_cert_as_username 2>/dev/null | grep -q 'disabled'
+check "explain shows listeners.wss.peer_cert_as_username stays disabled by default" $?
+LIS_NS_A="t-lis-a"
+LIS_NS_B="t-lis-b"
+LIS_USER_A="lis-a"
+LIS_USER_B="lis-b"
+LIS_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIS_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIS_TOPIC="smoke/listener/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$LIS_NS_A" "$LIS_USER_A" "$LIS_PASS_A" "$LIS_NS_B" "$LIS_USER_B" "$LIS_PASS_B" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b = sys.argv[1:9]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/listener/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+print("listener tenants and users are stored through the API")
+PY
+check "two listener tenants and users with random passwords are stored through the API" $?
+python3 - "$MQTT_PORT" "$LIS_USER_A" "$LIS_PASS_A" "$LIS_USER_B" "$LIS_PASS_B" "$LIS_TOPIC" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def mqtt_connect(sock, client_id, username, password):
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+secret = os.urandom(8).hex().encode()
+a_sub = wait_port(mqtt_port)
+a_ok = mqtt_connect(a_sub, b"lis-a-sub", username_a, password_a)
+b_sub = wait_port(mqtt_port)
+b_ok = mqtt_connect(b_sub, b"lis-b-sub", username_b, password_b)
+a_pub = wait_port(mqtt_port)
+a_pub_ok = mqtt_connect(a_pub, b"lis-a-pub", username_a, password_a)
+ready = a_ok and b_ok and a_pub_ok and subscribe(a_sub, topic) and subscribe(b_sub, topic)
+if ready:
+    a_pub.sendall(packet(0x30, field(topic) + secret))
+    report("a subscriber gets the publish of its own tenant with listener rules present",
+           receive(a_sub, 5).endswith(secret))
+    report("a subscriber does not get the publish of another tenant with listener rules present",
+           secret not in receive(b_sub, 2))
+else:
+    report("a subscriber gets the publish of its own tenant with listener rules present", False)
+    report("a subscriber does not get the publish of another tenant with listener rules present", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 12. The operator Session Expiry cap is in operation at boot ---
+# An operator sets session.max_session_expiry_secs to 3600 in
+# indra.toml. A version 5 client that asks for 999999 seconds gets
+# 3600 in the CONNACK. This kernel runs its own config and ports so it
+# does not disturb the checks above.
+read -r SESSION_API_PORT SESSION_MQTT_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-session" "$ROOT/data-session"
+cat > "$ROOT/cfg-session/indra.toml" <<EOF
+[node]
+id = "boot-smoke-session"
+data_dir = "$ROOT/data-session"
+
+[listeners.tcp]
+bind = "127.0.0.1:$SESSION_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$SESSION_API_PORT"
+
+[session]
+max_session_expiry_secs = 3600
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg-session" > "$ROOT/kernel-session.log" 2>&1 &
+SESSION_KERNEL_PID=$!
+python3 - "$SESSION_MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(200):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the session-cap kernel listener does not listen")
+def connect_with_expiry(sock, client_id, seconds):
+    body = (b"\x00\x04MQTT\x05\x02\x00\x3c" + b"\x05"
+            + bytes([0x11]) + struct.pack(">I", seconds) + field(client_id))
+    sock.sendall(bytes([0x10, len(body)]) + body)
+    sock.settimeout(5)
+    return sock.recv(200)
+def granted_expiry(ack):
+    if len(ack) < 10 or ack[0] != 0x20 or ack[3] != 0 or ack[5] != 0x11:
+        return None
+    return struct.unpack(">I", ack[6:10])[0]
+sock = wait_port(mqtt_port)
+ack = connect_with_expiry(sock, b"smoke-expiry-configured", 999999)
+sock.close()
+report("session.max_session_expiry_secs from indra.toml limits the granted interval",
+       granted_expiry(ack) == 3600)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$SESSION_KERNEL_PID" 2>/dev/null
+wait "$SESSION_KERNEL_PID" 2>/dev/null
+
+# --- 13. A disabled API listener opens no socket ---
+# An operator sets listeners.api.enabled to false in indra.toml. MQTT
+# still serves from the same file, but the API port refuses. The API
+# bind runs before the MQTT binds. An MQTT accept proves the boot
+# reached the API decision: a refusal then means no socket, not a slow
+# boot. A second MQTT accept proves the kernel is still alive. This
+# kernel runs its own config and ports so it does not disturb the
+# checks above.
+read -r NOAPI_MQTT_PORT NOAPI_API_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-noapi" "$ROOT/data-noapi"
+cat > "$ROOT/cfg-noapi/indra.toml" <<EOF
+[node]
+id = "boot-smoke-noapi"
+data_dir = "$ROOT/data-noapi"
+
+[listeners.tcp]
+bind = "127.0.0.1:$NOAPI_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$NOAPI_API_PORT"
+enabled = false
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+"$KERNEL" --config-dir "$ROOT/cfg-noapi" > "$ROOT/kernel-noapi.log" 2>&1 &
+NOAPI_KERNEL_PID=$!
+python3 - "$NOAPI_MQTT_PORT" "$NOAPI_API_PORT" <<'PY'
+import socket, sys, time
+mqtt_port, api_port = sys.argv[1:3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def wait_port(port):
+    for _ in range(200):
+        try:
+            sock = socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+            sock.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+report("the no-API kernel serves MQTT from indra.toml", wait_port(mqtt_port))
+try:
+    sock = socket.create_connection(("127.0.0.1", int(api_port)), timeout=5)
+    sock.close()
+    refused = False
+except OSError:
+    refused = True
+report("listeners.api.enabled = false from indra.toml opens no socket", refused)
+report("the no-API kernel is still alive after the refused API dial",
+       wait_port(mqtt_port))
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$NOAPI_KERNEL_PID" 2>/dev/null
+wait "$NOAPI_KERNEL_PID" 2>/dev/null
+
+# --- 14. A disabled MCP endpoint answers 404 ---
+# The kernel boots with `[mcp] enabled = false`. It still serves
+# `/healthz` and MQTT. Each `POST /mcp` call answers 404.
+# A key and no key both get 404: disabled wins over auth.
+# This kernel uses its own config and ports. It does not disturb
+# the checks above.
+read -r MCP_OFF_MQTT_PORT MCP_OFF_API_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-mcp-off" "$ROOT/data-mcp-off"
+cat > "$ROOT/cfg-mcp-off/indra.toml" <<EOF
+[node]
+id = "boot-smoke-mcp-off"
+data_dir = "$ROOT/data-mcp-off"
+
+[listeners.tcp]
+bind = "127.0.0.1:$MCP_OFF_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$MCP_OFF_API_PORT"
+
+[mcp]
+enabled = false
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg-mcp-off" > "$ROOT/kernel-mcp-off.log" 2>&1 &
+MCP_OFF_KERNEL_PID=$!
+for _ in $(seq 1 50); do
+    if python3 - "$MCP_OFF_API_PORT" >/dev/null 2>&1 <<'PY'
+import sys, urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1)
+PY
+    then
+        break
+    fi
+    kill -0 "$MCP_OFF_KERNEL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+python3 - "$MCP_OFF_MQTT_PORT" "$MCP_OFF_API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, time, urllib.request, urllib.error
+mqtt_port, api_port, key = sys.argv[1], sys.argv[2], sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the disabled-MCP kernel listener does not listen")
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+try:
+    healthz = urllib.request.urlopen(
+        f"http://127.0.0.1:{api_port}/healthz", timeout=5).read().decode()
+except OSError:
+    healthz = ""
+report("the disabled-MCP kernel serves /healthz from indra.toml",
+       healthz == "OK")
+sub = wait_port(mqtt_port)
+sub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-mcp-off-sub")))
+sub_ok = sub.recv(4) == b"\x20\x02\x00\x00"
+topic = b"smoke/mcp-off/check"
+token = os.urandom(6).hex().encode()
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+suback_ok = sub.recv(5)[:1] == b"\x90"
+pub = wait_port(mqtt_port)
+pub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-mcp-off-pub")))
+pub_ok = pub.recv(4) == b"\x20\x02\x00\x00"
+pub.sendall(packet(0x30, field(topic) + token))
+sub.settimeout(5)
+try:
+    delivered = sub.recv(100)
+except OSError:
+    delivered = b""
+report("a publish goes to a subscriber when MCP is disabled",
+       sub_ok and suback_ok and pub_ok and delivered.endswith(token))
+def post(body, auth):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/mcp", data=data, method="POST",
+        headers={"Content-Type": "application/json"})
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as err:
+        try:
+            return err.code, json.loads(err.read().decode())
+        except ValueError:
+            return err.code, {}
+    except OSError:
+        return 0, {}
+status, body = post({"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+                    f"Bearer {key}")
+report("the disabled MCP endpoint answers 404 with a key",
+       status == 404 and body.get("code") == "NOT_FOUND")
+status, _ = post({"jsonrpc": "2.0", "method": "ping", "id": 2}, None)
+report("the disabled MCP endpoint answers 404 with no key", status == 404)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$MCP_OFF_KERNEL_PID" 2>/dev/null
+wait "$MCP_OFF_KERNEL_PID" 2>/dev/null
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0
 fi
 echo "boot smoke: $failures check(s) failed"
 echo "--- kernel log"; tail -15 "$ROOT/kernel.log"
-echo "--- edge log"; tail -15 "$ROOT/edge.log" 2>/dev/null
 exit 1

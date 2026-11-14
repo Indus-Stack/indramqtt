@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub mod tenant;
+pub mod tenant_limits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
@@ -280,6 +281,23 @@ pub struct Session {
     /// fan-out path never touches this lock. Bounded by
     /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] with oldest-first eviction.
     pub authz_cache: RwLock<VecDeque<AuthzDecision>>,
+    /// Node-cache health counters for the status read (W2-15): cumulative
+    /// hits (repeat decision refreshed in place), misses (new decision
+    /// recorded) and inserts (new entries added) since boot. Three fixed
+    /// `u64`s per session (24 bytes): the set never grows, and resets or
+    /// evictions leave them untouched (cumulative, memory-only, never
+    /// persisted). Incremented under the `authz_cache` write lock the
+    /// authorize event already holds, with relaxed atomics: no new lock,
+    /// no allocation, no unbounded work on the publish path, and the
+    /// status read loads them lock-free.
+    // TODO(parity): should a global or per-client clear zero these
+    // counters, and should a disabled node policy stop the increments?
+    // The rulebook does not decide the reset or disabled semantics; the
+    // current choice keeps them cumulative and always counting so the
+    // status observes every decision, until the checker pins it.
+    authz_cache_hits: AtomicU64,
+    authz_cache_misses: AtomicU64,
+    authz_cache_inserts: AtomicU64,
     next_packet_id: AtomicU16,
     /// Negotiated protocol level for this session (X1-02): 4 (3.1.1) or
     /// 5. Written on the CONNECT (bind) event from the bind metadata;
@@ -377,6 +395,29 @@ pub struct AuthzDecision {
     pub updated_ms: u64,
 }
 
+/// Cumulative per-session node-cache health counters (W2-15): hits
+/// (repeat decisions refreshed in place), misses (new decisions) and
+/// inserts (new entries) since boot. Fixed three-`u64` set per session;
+/// memory-only, never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthzCacheCounters {
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
+}
+
+/// Node-wide authorization cache health rolled up across every live
+/// session (W2-15): live entry count plus the summed cumulative
+/// hit/miss/insert counters. Computed live on the management plane;
+/// memory-only, never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthzNodeStats {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
+}
+
 /// One QoS 1 downlink held from the moment it is written toward a
 /// subscriber until its PUBACK arrives (T-31). The packet id is the
 /// downlink id on the wire; replay reuses it with DUP set, so resume
@@ -395,6 +436,11 @@ pub struct InflightMessage {
     /// no new unbounded state. Reason for `Instant` (monotonic) over
     /// wall-clock: ack latency must not jump on clock adjustments.
     pub enqueued_at: Instant,
+    /// Publish time recorded where the downlink is already being built,
+    /// as millis since the Unix epoch. `None` means the entry predates
+    /// timestamp recording; API reads omit the field rather than
+    /// substituting anything. Stamped on track when absent.
+    pub publish_at_ms: Option<u64>,
 }
 
 /// Maximum unacknowledged QoS 1 downlinks held in the per-session
@@ -452,6 +498,16 @@ pub enum InflightTrackOutcome {
 /// and no alias is ever assigned on delivery).
 pub const DEFAULT_TOPIC_ALIAS_MAXIMUM: u16 = 10;
 
+/// Default largest MQTT packet in bytes (P2): 1048576 (1 MiB).
+/// Reason: 1 MiB matches the documented server limit and bounds one
+/// connection near 1 MiB of read buffer plus one frame. Configurable
+/// per manager via [`SessionManager::set_max_packet_size`].
+pub const DEFAULT_MAX_PACKET_SIZE: u32 = 1_048_576;
+
+/// Wire ceiling for one MQTT packet: 268435455, the MQTT Remaining
+/// Length maximum. Reason: a larger frame cannot arrive as one packet.
+pub const MAX_PACKET_SIZE_WIRE: u32 = 268_435_455;
+
 /// Maximum alias value the tables can ever index (wire `u16` range).
 pub const MAX_TOPIC_ALIAS_VALUE: u16 = u16::MAX;
 
@@ -472,6 +528,13 @@ pub const DEFAULT_SESSION_EXPIRY_SECS: u32 = 0;
 /// client opt-in only; the code never chooses it (the default is
 /// [`DEFAULT_SESSION_EXPIRY_SECS`]).
 pub const SESSION_EXPIRY_NEVER: u32 = 0xFFFF_FFFF;
+
+/// Default session expiry cap in seconds: 86400 (one day).
+/// Reason: one day covers durable sessions without pinning state
+/// forever. Schema home is `session.max_session_expiry_secs`.
+/// Configurable per manager via
+/// [`SessionManager::set_max_session_expiry_secs`].
+pub const DEFAULT_MAX_SESSION_EXPIRY_SECS: u64 = 86_400;
 
 /// Documented default client Receive Maximum (X1-02): 65535, the wire
 /// maximum, i.e. no effective cap. Rationale: version-4 clients and v5
@@ -572,6 +635,22 @@ pub const MAX_OFFLINE_QUEUE: usize = 1024;
 /// [`SessionManager::new_with_limits`], or pass `None` there for an
 /// unbounded memory-backed queue.
 pub const DEFAULT_MAX_OFFLINE_QUEUE: usize = 10_000;
+
+/// Encode an offline cap for the atomic store: 0 = unbounded, else the
+/// floored cap. Keeps the manager `Sync` without a lock on the queue
+/// path.
+fn encode_offline_cap(limit: Option<usize>) -> usize {
+    limit.map(|value| value.max(1)).unwrap_or(0)
+}
+
+/// Decode the atomic store back to a cap: 0 = unbounded.
+fn decode_offline_cap(raw: usize) -> Option<usize> {
+    if raw == 0 {
+        None
+    } else {
+        Some(raw)
+    }
+}
 
 /// Maximum rows snapshotted by one global subscription listing (W1-14).
 /// The read clones at most this many `(client, filter)` rows under short
@@ -690,6 +769,9 @@ impl Session {
             connected_at_ms: RwLock::new(Some(now_ms())),
             ended_at_ms: RwLock::new(None),
             authz_cache: RwLock::new(VecDeque::new()),
+            authz_cache_hits: AtomicU64::new(0),
+            authz_cache_misses: AtomicU64::new(0),
+            authz_cache_inserts: AtomicU64::new(0),
             next_packet_id: AtomicU16::new(1),
             protocol_version: AtomicU8::new(4),
             session_expiry: AtomicU32::new(DEFAULT_SESSION_EXPIRY_SECS),
@@ -908,6 +990,10 @@ impl Session {
     /// Fast path: one atomic load plus one bounded deque push under a
     /// single write lock, no allocation beyond the message itself.
     pub fn track_inflight(&self, message: InflightMessage) -> bool {
+        let mut message = message;
+        if message.publish_at_ms.is_none() {
+            message.publish_at_ms = Some(now_ms());
+        }
         let limit = self.max_inflight();
         let mut inflight = self.inflight.write();
         if inflight.len() >= limit {
@@ -930,6 +1016,10 @@ impl Session {
     /// publish-to-delivery pair is printed by
     /// `qos1_inflight_delivery_workload_timings` in broker-node.
     pub fn track_inflight_or_spill(&self, message: InflightMessage) -> InflightTrackOutcome {
+        let mut message = message;
+        if message.publish_at_ms.is_none() {
+            message.publish_at_ms = Some(now_ms());
+        }
         let limit = self.max_inflight();
         {
             let mut inflight = self.inflight.write();
@@ -946,6 +1036,35 @@ impl Session {
         spill.push_back(message);
         self.spill_count.fetch_add(1, Ordering::Relaxed);
         InflightTrackOutcome::Spilled
+    }
+
+    /// Allocate one downlink id and hold the entry (PF-02).
+    /// Reuses [`Session::next_packet_id`] for the id and
+    /// [`Session::track_inflight_or_spill`] for the hold. Both paths
+    /// share one scan set and one insert path. Ids skip 0 and held
+    /// ids. The window fills first, then the spill. Past both, the
+    /// caller still sends live once and counts the drop. All stores
+    /// stay bounded by the window, spill and QoS 2 caps.
+    pub fn alloc_qos1_downlink(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+        enqueued_at: Instant,
+    ) -> (u16, InflightTrackOutcome) {
+        let pid = self.next_packet_id();
+        let message = InflightMessage {
+            packet_id: pid,
+            topic,
+            qos,
+            retain,
+            payload,
+            enqueued_at,
+            publish_at_ms: Some(now_ms()),
+        };
+        let outcome = self.track_inflight_or_spill(message);
+        (pid, outcome)
     }
 
     /// Release one downlink on its PUBACK, from the window or the spill.
@@ -1297,11 +1416,16 @@ impl Session {
     /// concrete topic or filter; `qos`/`retain` ride with the entry so the
     /// management read can render them without consulting the hot path.
     /// A repeat of the same `(action, topic, qos, retain)` refreshes the
-    /// decision and recency instead of duplicating; past
-    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] the oldest entry is evicted.
-    /// Called on the publish/subscribe authorization event only; the
-    /// delivery fan-out path never touches this lock, and management
-    /// reads take only this per-session lock.
+    /// decision and recency instead of duplicating (counted as a node-cache
+    /// hit for the W2-15 status read; a refreshed verdict with a changed
+    /// `allow` still counts as a hit because the lookup found an entry,
+    /// and the stored verdict is replaced); a new key is a miss plus one
+    /// insert. Past [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] the oldest entry is
+    /// evicted. Called on the publish/subscribe authorization event only;
+    /// the delivery fan-out path never touches this lock, and management
+    /// reads take only this per-session lock. The counter increments are
+    /// two relaxed atomic adds under the already-held write lock: no new
+    /// lock, allocation or unbounded work on the publish path.
     pub fn record_authz_decision(
         &self,
         action: &str,
@@ -1315,6 +1439,10 @@ impl Session {
             e.action == action && e.topic == topic && e.qos == qos && e.retain == retain
         }) {
             cache.remove(pos);
+            self.authz_cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.authz_cache_misses.fetch_add(1, Ordering::Relaxed);
+            self.authz_cache_inserts.fetch_add(1, Ordering::Relaxed);
         }
         cache.push_back(AuthzDecision {
             action: action.to_string(),
@@ -1326,6 +1454,17 @@ impl Session {
         });
         while cache.len() > MAX_AUTHZ_DECISIONS_PER_CLIENT {
             cache.pop_front();
+        }
+    }
+
+    /// Cumulative node-cache health counters for this session (W2-15):
+    /// `(hits, misses, inserts)` since boot. Lock-free relaxed loads;
+    /// management-plane only.
+    pub fn authz_cache_counters(&self) -> AuthzCacheCounters {
+        AuthzCacheCounters {
+            hits: self.authz_cache_hits.load(Ordering::Relaxed),
+            misses: self.authz_cache_misses.load(Ordering::Relaxed),
+            inserts: self.authz_cache_inserts.load(Ordering::Relaxed),
         }
     }
 
@@ -1342,6 +1481,91 @@ impl Session {
     /// that never runs on the publish or deliver path.
     pub fn clear_authz_cache(&self) {
         self.authz_cache.write().clear();
+    }
+
+    /// Look up a cached authorization verdict on the authorize path.
+    /// Returns the cached `allow` for a fresh entry. The key is
+    /// `(action, topic, qos, retain)`. `now_ms` stays within `ttl_ms`
+    /// of its write time. An expired match is removed and reads as a
+    /// miss; other expired entries stay until a later lookup, trim or
+    /// clear (the read filters them, the cap bounds them).
+    /// A hit takes only a read lock; only an expired entry takes a
+    /// write lock to remove it. The publish path thus pays no write
+    /// lock on a hit (SA-22 item 7).
+    pub fn cached_authz_verdict(
+        &self,
+        action: &str,
+        topic: &str,
+        qos: u8,
+        retain: bool,
+        ttl_ms: u64,
+    ) -> Option<bool> {
+        let now = now_ms();
+        // Fast path: read lock covers the hit. A fresh entry returns
+        // without ever taking the write lock.
+        {
+            let cache = self.authz_cache.read();
+            let entry = cache.iter().find(|entry| {
+                entry.action == action
+                    && entry.topic == topic
+                    && entry.qos == qos
+                    && entry.retain == retain
+            })?;
+            if now.saturating_sub(entry.updated_ms) <= ttl_ms {
+                return Some(entry.allow);
+            }
+        }
+        // Slow path: the entry exists but is stale. Take the write
+        // lock once to remove it, then report a miss.
+        let mut cache = self.authz_cache.write();
+        if let Some(pos) = cache.iter().position(|entry| {
+            entry.action == action
+                && entry.topic == topic
+                && entry.qos == qos
+                && entry.retain == retain
+        }) {
+            if now.saturating_sub(cache[pos].updated_ms) <= ttl_ms {
+                return Some(cache[pos].allow);
+            }
+            cache.remove(pos);
+        }
+        None
+    }
+
+    /// Trim the per-client decision cache to `max_size` entries.
+    /// Evicts the oldest entries first. One short per-session write
+    /// lock on the authorize event only. The floor is one entry.
+    pub fn trim_authz_cache_to(&self, max_size: usize) {
+        let cap = max_size.max(1);
+        let mut cache = self.authz_cache.write();
+        while cache.len() > cap {
+            cache.pop_front();
+        }
+    }
+
+    /// True when `topic` matches one entry of the `excludes` list.
+    /// Exact match wins; a pattern that ends with `/#` matches the
+    /// prefix; `#` alone matches every topic. Used to skip caching.
+    /// No allocation on the authorize path.
+    pub fn authz_topic_excluded(topic: &str, excludes: &[String]) -> bool {
+        for pattern in excludes {
+            if pattern == "#" {
+                return true;
+            }
+            if pattern == topic {
+                return true;
+            }
+            if let Some(prefix) = pattern.strip_suffix("/#") {
+                if topic == prefix
+                    || (topic.len() > prefix.len()
+                        && topic.starts_with(prefix)
+                        && topic.as_bytes()[prefix.len()] == b'/')
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Buffer one message for later replay, evicting the oldest entry
@@ -1751,8 +1975,10 @@ pub struct SessionManager {
     /// fan-in.
     connected_count: AtomicU64,
     /// Offline queue cap applied by [`SessionManager::queue_offline`];
-    /// `None` queues without bound.
-    max_offline_queue: Option<usize>,
+    /// 0 = unbounded (`None`), else the per-session cap. One relaxed
+    /// atomic load per detached-session queue op; the connected deliver
+    /// path never reads it.
+    max_offline_queue: AtomicUsize,
     /// Default QoS 1 window bound applied to sessions created after the
     /// last set (B4-01). One relaxed atomic load per new session; never
     /// touched on the publish fast path.
@@ -1765,6 +1991,13 @@ pub struct SessionManager {
     /// after the last set (B4-05). One relaxed atomic load per new
     /// session; never touched on the publish fast path.
     max_topic_alias: AtomicU16,
+    /// Largest MQTT packet in bytes (P2). One relaxed atomic load per
+    /// new connection; never touched on the publish fast path.
+    max_packet_size: std::sync::atomic::AtomicU32,
+    /// Session expiry cap in seconds (0 means no cap).
+    /// One relaxed atomic load per new connection.
+    /// Never touched on the publish fast path.
+    max_session_expiry_secs: AtomicU64,
     /// Durable backing for every detached offline queue (B4-06, T-93).
     /// `None` (the default) keeps memory-only queues exactly as before.
     /// The kernel installs one store at boot (see
@@ -1839,10 +2072,12 @@ impl SessionManager {
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
             connected_count: AtomicU64::new(0),
-            max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
+            max_offline_queue: AtomicUsize::new(encode_offline_cap(max_offline_queue)),
             max_qos1_inflight: AtomicUsize::new(max_qos1_inflight.max(1)),
             max_qos1_spill: AtomicUsize::new(max_qos1_spill.max(1)),
             max_topic_alias: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
+            max_packet_size: std::sync::atomic::AtomicU32::new(DEFAULT_MAX_PACKET_SIZE),
+            max_session_expiry_secs: AtomicU64::new(DEFAULT_MAX_SESSION_EXPIRY_SECS),
             offline_store: RwLock::new(None),
         }
     }
@@ -1935,7 +2170,7 @@ impl SessionManager {
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(Some(store.clone()));
             *session.connected.write() = false;
-            let dropped = session.push_restored_with_limit(messages, self.max_offline_queue);
+            let dropped = session.push_restored_with_limit(messages, self.max_offline_queue());
             stats.capped_dropped += dropped;
             if dropped > 0 {
                 let snapshot: Vec<OfflineRecord> = session
@@ -1973,7 +2208,15 @@ impl SessionManager {
 
     /// Configured offline queue cap (`None` = unbounded).
     pub fn max_offline_queue(&self) -> Option<usize> {
+        decode_offline_cap(self.max_offline_queue.load(Ordering::Relaxed))
+    }
+
+    /// Override the offline queue cap for sessions buffering afterwards
+    /// (floored at 1; `None` = unbounded). One relaxed atomic store;
+    /// sessions created afterwards queue under the new cap.
+    pub fn set_max_offline_queue(&self, limit: Option<usize>) {
         self.max_offline_queue
+            .store(encode_offline_cap(limit), Ordering::Relaxed);
     }
 
     /// Default QoS 1 window bound for sessions created after the last
@@ -2031,6 +2274,69 @@ impl SessionManager {
         session.set_inbound_alias_max(self.max_topic_alias());
     }
 
+    /// Largest MQTT packet in bytes (default [`DEFAULT_MAX_PACKET_SIZE`]).
+    pub fn max_packet_size(&self) -> u32 {
+        self.max_packet_size.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the largest MQTT packet for connections after this call.
+    /// Values above the wire ceiling clamp to the ceiling; the code
+    /// never stores an unbounded value.
+    pub fn set_max_packet_size(&self, max: u32) {
+        self.max_packet_size
+            .store(max.clamp(1, MAX_PACKET_SIZE_WIRE), Ordering::Relaxed);
+    }
+
+    /// Session expiry cap in seconds (default 86400, 0 means no cap).
+    /// Connect path only. The publish path never reads it.
+    pub fn max_session_expiry_secs(&self) -> u64 {
+        self.max_session_expiry_secs.load(Ordering::Relaxed)
+    }
+
+    /// Override the session expiry cap for connections after this call.
+    /// Zero opts into no cap. One relaxed atomic store. Boot path only.
+    pub fn set_max_session_expiry_secs(&self, max: u64) {
+        self.max_session_expiry_secs.store(max, Ordering::Relaxed);
+    }
+
+    /// Clamp one CONNECT expiry to the cap. Zero cap means no cap.
+    /// Connect path only. Never allocates. Never touches the hot path.
+    pub fn cap_session_expiry(&self, expiry: u32) -> u32 {
+        let max = self.max_session_expiry_secs.load(Ordering::Relaxed);
+        if max == 0 {
+            return expiry;
+        }
+        let capped = (expiry as u64).min(max);
+        capped.min(u32::MAX as u64) as u32
+    }
+
+    /// Sessions held in one tenant (live plus detached with state).
+    ///
+    /// Reads the inner map length under one short read. Connect path
+    /// only; the publish and deliver paths never call this.
+    pub fn session_count_in_tenant(&self, tenant: &str) -> usize {
+        self.sessions
+            .read()
+            .get(tenant)
+            .map(|inner| inner.len())
+            .unwrap_or(0)
+    }
+
+    /// Live connections held in one tenant.
+    ///
+    /// Counts sessions with a live edge binding under one short read.
+    /// Connect path only; the publish and deliver paths never call this.
+    pub fn live_connection_count_in_tenant(&self, tenant: &str) -> usize {
+        let map = self.sessions.read();
+        let Some(inner) = map.get(tenant) else {
+            return 0;
+        };
+        inner
+            .values()
+            .filter(|session| *session.connected.read())
+            .count()
+    }
+
     /// Buffer one message for a detached session, applying this
     /// manager's offline cap. False when the client has no session or when
     /// the durable persist failed and nothing was queued (fail closed).
@@ -2052,7 +2358,7 @@ impl SessionManager {
         message: QueuedMessage,
     ) -> bool {
         match self.get_in_tenant(tenant, client_id) {
-            Some(session) => session.push_offline_with_limit(message, self.max_offline_queue),
+            Some(session) => session.push_offline_with_limit(message, self.max_offline_queue()),
             None => false,
         }
     }
@@ -2217,6 +2523,25 @@ impl SessionManager {
             .collect()
     }
 
+    /// Every session that carries `client_id`, one per owning tenant.
+    /// Each item pairs the owning tenant key with its session, so a
+    /// caller never reads another tenant's row by mistake. Covers
+    /// connected and detached sessions. One short map read; clones at
+    /// most one `Arc` per tenant (bounded by [`MAX_TENANTS`]).
+    /// Management-plane only, never publish or deliver.
+    pub fn sessions_for_client(&self, client_id: &str) -> Vec<(String, Arc<Session>)> {
+        self.sessions
+            .read()
+            .iter()
+            .filter_map(|(tenant, inner)| {
+                inner
+                    .get(client_id)
+                    .cloned()
+                    .map(|session| (tenant.clone(), session))
+            })
+            .collect()
+    }
+
     /// Snapshot every subscription in the system for the global list
     /// (W1-14). Reads the session mirror written by the subscribe
     /// routes, not the router trie, so list reads never block the
@@ -2337,6 +2662,65 @@ impl SessionManager {
                     subs
                 },
             })
+    }
+
+    /// Evict every cached authorization decision on every session
+    /// (W2-13, `DELETE /authorization/cache`).
+    ///
+    /// Global clear: clones one `Arc` per live session under a single
+    /// short map read, then clears each per-session cache under its own
+    /// short lock. Returns the number of entries evicted across all
+    /// sessions. Management-plane only: the publish and deliver paths
+    /// never call this; eviction never blocks the message path beyond
+    /// those short per-session locks, and no new allocation rides the
+    /// hot path (the `Arc` list lives only for this call). Clearing an
+    /// already-empty cache still succeeds (returns zero).
+    pub fn clear_all_authz_caches(&self) -> usize {
+        // The session map has one inner map for each tenant. Read all of them.
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .read()
+            .values()
+            .flat_map(|tenant| tenant.values().cloned())
+            .collect();
+        let mut evicted = 0;
+        for session in sessions {
+            let mut cache = session.authz_cache.write();
+            evicted += cache.len();
+            cache.clear();
+        }
+        evicted
+    }
+
+    /// Node-wide authorization cache health for the status read (W2-15,
+    /// `GET /authorization/node_cache/status`): live entry count summed
+    /// over every session plus the summed cumulative hit/miss/insert
+    /// counters.
+    ///
+    /// Management-plane only: clones one `Arc` per live session under a
+    /// single short map read, then takes each per-session cache read lock
+    /// for its length and lock-free atomic loads for the counters; the
+    /// publish and deliver paths never call this. Sums saturate instead
+    /// of wrapping, and the snapshot is one pass over the live sessions.
+    pub fn authz_node_stats(&self) -> AuthzNodeStats {
+        // The session map has one inner map for each tenant. Read all of them.
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .read()
+            .values()
+            .flat_map(|tenant| tenant.values().cloned())
+            .collect();
+        let mut stats = AuthzNodeStats::default();
+        for session in sessions {
+            stats.entries = stats
+                .entries
+                .saturating_add(session.authz_cache.read().len() as u64);
+            let counters = session.authz_cache_counters();
+            stats.hits = stats.hits.saturating_add(counters.hits);
+            stats.misses = stats.misses.saturating_add(counters.misses);
+            stats.inserts = stats.inserts.saturating_add(counters.inserts);
+        }
+        stats
     }
 
     /// Track one granted subscription on the session (mirrors the router).
@@ -2590,6 +2974,9 @@ impl SessionManager {
         receive_max: u16,
         max_packet: u32,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
+        // Cap the CONNECT expiry at the configured maximum.
+        // Zero cap means the operator opts into no cap.
+        let expiry = self.cap_session_expiry(expiry);
         if clean_start {
             let (session, present) = self.get_or_create_in_tenant(tenant, client_id, true);
             debug_assert!(!present);
@@ -2685,6 +3072,14 @@ impl SessionManager {
     /// never scans the session map and never runs on the message path.
     pub fn connected_count(&self) -> u64 {
         self.connected_count.load(Ordering::SeqCst)
+    }
+
+    /// Number of sessions held in memory, connected or detached.
+    /// Sums the length of each tenant map under one short read lock.
+    /// The tenant count is bounded by [`MAX_TENANTS`]. Management plane
+    /// only; never runs on the message path.
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().values().map(HashMap::len).sum()
     }
 
     /// Snapshot the subscription filters of one session, if known.
@@ -3457,6 +3852,7 @@ mod tests {
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
                 enqueued_at: Instant::now(),
+                publish_at_ms: None,
             }
         }
 
@@ -3524,6 +3920,7 @@ mod tests {
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
                 enqueued_at: Instant::now(),
+                publish_at_ms: None,
             }
         }
 
@@ -3600,6 +3997,7 @@ mod tests {
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
                 enqueued_at: Instant::now(),
+                publish_at_ms: None,
             }
         }
 
@@ -3643,6 +4041,55 @@ mod tests {
     }
 
     #[test]
+    fn test_alloc_qos1_downlink_matches_two_step_path() {
+        // PF-02 proves the production entry equals the old path.
+        // Both sessions use a window of 3 and a spill of 2.
+        // Each step checks the same outcome on both paths.
+        use super::InflightTrackOutcome;
+        let manager = SessionManager::new_with_all_limits(Some(10), 3, 2);
+        let (single, _) = manager.get_or_create("alloc-single", false);
+        let (paired, _) = manager.get_or_create("alloc-paired", false);
+        let topic = Topic::new("t").unwrap();
+        let payload = Bytes::from_static(b"x");
+        for step in 0..6 {
+            let (pid, single_outcome) = single.alloc_qos1_downlink(
+                topic.clone(),
+                broker_protocol::QoS::AtLeastOnce,
+                false,
+                payload.clone(),
+                Instant::now(),
+            );
+            assert_ne!(pid, 0, "step {step} skips id 0");
+            let two_pid = paired.next_packet_id();
+            assert_ne!(two_pid, 0, "step {step} skips id 0");
+            let two_outcome = paired.track_inflight_or_spill(super::InflightMessage {
+                packet_id: two_pid,
+                topic: topic.clone(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: payload.clone(),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            });
+            let want = match step {
+                0..=2 => InflightTrackOutcome::Tracked,
+                3..=4 => InflightTrackOutcome::Spilled,
+                _ => InflightTrackOutcome::Dropped,
+            };
+            assert_eq!(single_outcome, want, "step {step} lands");
+            assert_eq!(two_outcome, want, "step {step} lands");
+        }
+        assert_eq!(single.inflight_len(), 3);
+        assert_eq!(single.inflight_spill_len(), 2);
+        assert_eq!(paired.inflight_len(), 3);
+        assert_eq!(paired.inflight_spill_len(), 2);
+        assert!(single.ack_inflight(1));
+        assert!(paired.ack_inflight(1));
+        assert_eq!(single.inflight_len(), 3);
+        assert_eq!(paired.inflight_len(), 3);
+    }
+
+    #[test]
     fn test_qos1_inflight_hot_path_timings() {
         // B4-01 timing record for the session store (RULEBOOK.md:70).
         // Before/after pair measured in this same run: BEFORE is the
@@ -3678,6 +4125,7 @@ mod tests {
             retain: false,
             payload: payload.clone(),
             enqueued_at: Instant::now(),
+            publish_at_ms: None,
         };
 
         // BEFORE baseline (pre-B4-01 window-only entry point): the legacy

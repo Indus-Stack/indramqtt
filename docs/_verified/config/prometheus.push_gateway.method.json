@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with method post and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.push_gateway]\nmethod = \"post\"\n",
+  "item": "prometheus.push_gateway.method",
+  "kind": "setting",
+  "output": "push_method=post",
+  "returncode": 0,
+  "verified": true
+}

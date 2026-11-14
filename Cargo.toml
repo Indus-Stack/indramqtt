@@ -12,6 +12,7 @@ members = [
     "crates/broker-connectors-enterprise",
     "crates/broker-cluster",
     "crates/broker-api",
+    "crates/broker-delayed",
     "crates/broker-observability",
     "crates/broker-node",
     "crates/broker-gateway",
@@ -38,7 +39,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"
 futures = "0.3"
 parking_lot = "0.12"
@@ -53,8 +54,7 @@ pbkdf2 = "0.12"
 base64 = "0.22"
 flate2 = "1.1"
 uuid = { version = "1", features = ["v4"] }
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-rsa = { version = "0.9", features = ["pem", "sha2"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 rand = "0.10"
 reqwest = { version = "0.12", features = ["json"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
@@ -62,6 +62,8 @@ clap = { version = "4.5", features = ["derive"] }
 arc-swap = "1.7"
 toml = "1.1"
 socket2 = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+tar = "0.4"
 
 # Internal workspace crates
 brokerlink = { path = "crates/brokerlink" }
@@ -76,6 +78,7 @@ broker-connectors = { path = "crates/broker-connectors" }
 broker-connectors-enterprise = { path = "crates/broker-connectors-enterprise" }
 broker-cluster = { path = "crates/broker-cluster" }
 broker-api = { path = "crates/broker-api" }
+broker-delayed = { path = "crates/broker-delayed" }
 broker-observability = { path = "crates/broker-observability" }
 broker-gateway = { path = "crates/broker-gateway" }
 broker-config = { path = "crates/broker-config" }
@@ -88,3 +91,9 @@ codegen-units = 1
 # connection, and the other connections continue. With "abort", one
 # panic stops the broker for all clients.
 panic = "unwind"
+
+# Use zstd 0.14 for the vendored rule engine parser.
+# The pinned release requires zstd 0.13, which has open advisories.
+# The vendored copy keeps the same bulk API.
+[patch."https://github.com/Indus-Stack/rekuiper.git"]
+rekuiper-sql = { path = "vendor/rekuiper-sql" }

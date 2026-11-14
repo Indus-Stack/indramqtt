@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "tenants",
+    "--help"
+  ],
+  "item": "cmd-ctl-tenants-delete",
+  "match": "delete",
+  "output": "Tenant namespaces: list, show, create, delete\n  delete  Delete one tenant namespace. Destructive: requires `--yes` or an interactive confirm. The server first kicks the tenant clients, then drops its credential rows",
+  "output_bytes": 520,
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-max-packet-size"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--max-packet-size"

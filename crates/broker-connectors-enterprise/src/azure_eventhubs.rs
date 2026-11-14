@@ -600,8 +600,8 @@ impl AzureEventHubsSink {
     }
 
     /// Flush buffered rows (no-op when empty). 429/503 retry in place
-    /// up to `max_retries`; terminal and transport failures restore
-    /// the buffer, engage backoff, and propagate.
+    /// up to `max_retries`. Exhaustion drops the batch and engages
+    /// backoff. Terminal failures restore the buffer and propagate.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {
@@ -968,6 +968,7 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 1);
 
         // Exhaustion (max_retries 0): single attempt, then fail fast.
+        // The failed batch drops so a restart sends only new rows.
         let mut config = test_config();
         config.batch_size = Some(10);
         config.max_retries = Some(0);
@@ -1145,8 +1146,7 @@ mod tests {
     async fn test_http_flush_reports_retryable_when_endpoint_unreachable() {
         // The REST write path runs offline: with no listener on the
         // custom endpoint the HTTPS send fails with a retryable
-        // Connection error, rows are restored and backoff engages, so
-        // nothing is dropped.
+        // Connection error, the failed batch drops and backoff engages.
         let mut config = test_config();
         config.endpoint = Some("http://127.0.0.1:9".to_string());
         config.timeout_ms = Some(2_000);
@@ -1205,15 +1205,13 @@ mod tests {
     async fn test_qualify_rest_write_path() {
         let namespace = qual_env("AZURE_EVENTHUBS_NAMESPACE").unwrap_or_default();
         if namespace.is_empty() {
-            eprintln!("AZURE_EVENTHUBS_NAMESPACE is empty; skipping qualification");
-            return;
+            panic!("missing AZURE_EVENTHUBS_NAMESPACE; cannot run qualification without a server endpoint");
         }
         let hub = qual_env("AZURE_EVENTHUBS_HUB").unwrap_or_default();
         let key_name = qual_env("AZURE_EVENTHUBS_KEY_NAME").unwrap_or_default();
         let key = qual_env("AZURE_EVENTHUBS_KEY").unwrap_or_default();
         if hub.is_empty() || key_name.is_empty() || key.is_empty() {
-            eprintln!("AZURE_EVENTHUBS_HUB/KEY_NAME/KEY missing; skipping qualification");
-            return;
+            panic!("missing AZURE_EVENTHUBS_HUB/KEY_NAME/KEY; cannot run qualification without hub credentials");
         }
         eprintln!("qual server: namespace={namespace} hub={hub} key_name={key_name}");
 

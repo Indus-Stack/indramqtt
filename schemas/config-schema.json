@@ -47,22 +47,22 @@
         },
         "enabled": {
           "default": false,
-          "description": "Whether multi-node distributed clustering is enabled.",
+          "description": "Refused clustering switch. The broker fails boot when true.",
           "type": "boolean"
         },
         "gossip_bind": {
           "default": "0.0.0.0:7946",
-          "description": "Gossip membership bind address for peer discovery.",
+          "description": "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
           "type": "string"
         },
         "quic_bind": {
           "default": "0.0.0.0:9092",
-          "description": "Multiplexed data plane bind address for inter-broker message routing.",
+          "description": "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
           "type": "string"
         },
         "seed_nodes": {
           "default": [],
-          "description": "Seed node addresses to join an existing cluster.",
+          "description": "Refused seed list. The broker fails boot when not empty.",
           "items": {
             "type": "string"
           },
@@ -415,7 +415,7 @@
             },
             "native": {
               "default": false,
-              "description": "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.",
+              "description": "Deprecated. Ignored. The kernel always serves this listener.",
               "type": "boolean"
             }
           },
@@ -428,6 +428,11 @@
               "description": "Bind address for the secure TLS MQTT listener.",
               "type": "string"
             },
+            "cacertfile": {
+              "default": "",
+              "description": "CA file for client certificate checks of the TLS listener.",
+              "type": "string"
+            },
             "cert_file": {
               "default": "",
               "description": "Path to the PEM server certificate for the TLS listener.",
@@ -438,6 +443,11 @@
               "description": "Whether the secure TLS MQTT listener accepts connections.",
               "type": "boolean"
             },
+            "fail_if_no_peer_cert": {
+              "default": false,
+              "description": "Whether the TLS listener refuses a handshake without a certificate.",
+              "type": "boolean"
+            },
             "key_file": {
               "default": "",
               "description": "Path to the PEM private key for the TLS listener.",
@@ -445,7 +455,51 @@
             },
             "native": {
               "default": false,
-              "description": "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
+              "description": "Deprecated. Ignored. The kernel always serves this listener.",
+              "type": "boolean"
+            },
+            "peer_cert_as_clientid": {
+              "default": "disabled",
+              "description": "Source for the bind client identifier from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "peer_cert_as_username": {
+              "default": "disabled",
+              "description": "Source for the bind username from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "psk_enabled": {
+              "default": false,
+              "description": "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
+              "type": "boolean"
+            },
+            "psk_keys_file": {
+              "default": "",
+              "description": "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
+              "type": "string"
+            },
+            "verify": {
+              "default": "verify_none",
+              "description": "Client certificate chain check mode of the TLS listener.",
+              "enum": [
+                "verify_none",
+                "verify_peer"
+              ],
+              "type": "string"
+            },
+            "verify_client_cert": {
+              "default": false,
+              "description": "Whether the TLS listener requests and verifies a client certificate.",
               "type": "boolean"
             }
           },
@@ -463,6 +517,11 @@
               "description": "Whether the MQTT-over-WebSocket listener accepts connections.",
               "type": "boolean"
             },
+            "native": {
+              "default": false,
+              "description": "Deprecated. Ignored. The kernel always serves this listener.",
+              "type": "boolean"
+            },
             "path": {
               "default": "/mqtt",
               "description": "HTTP path serving MQTT-over-WebSocket traffic.",
@@ -478,6 +537,11 @@
               "description": "Bind address for the secure WebSocket listener.",
               "type": "string"
             },
+            "cacertfile": {
+              "default": "",
+              "description": "CA file for client certificate checks of the secure WebSocket listener.",
+              "type": "string"
+            },
             "cert_file": {
               "default": "",
               "description": "Path to the PEM server certificate for the secure WebSocket listener.",
@@ -488,15 +552,59 @@
               "description": "Whether the secure WebSocket listener accepts connections.",
               "type": "boolean"
             },
+            "fail_if_no_peer_cert": {
+              "default": false,
+              "description": "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+              "type": "boolean"
+            },
             "key_file": {
               "default": "",
               "description": "Path to the PEM private key for the secure WebSocket listener.",
               "type": "string"
             },
+            "native": {
+              "default": false,
+              "description": "Deprecated. Ignored. The kernel always serves this listener.",
+              "type": "boolean"
+            },
             "path": {
               "default": "/mqtt",
               "description": "HTTP path serving secure WebSocket traffic.",
               "type": "string"
+            },
+            "peer_cert_as_clientid": {
+              "default": "disabled",
+              "description": "Source for the bind client identifier from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "peer_cert_as_username": {
+              "default": "disabled",
+              "description": "Source for the bind username from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "verify": {
+              "default": "verify_none",
+              "description": "Client certificate chain check mode of the secure WebSocket listener.",
+              "enum": [
+                "verify_none",
+                "verify_peer"
+              ],
+              "type": "string"
+            },
+            "verify_client_cert": {
+              "default": false,
+              "description": "Whether the secure WebSocket listener requests and verifies a client certificate.",
+              "type": "boolean"
             }
           },
           "type": "object"
@@ -521,11 +629,26 @@
       },
       "type": "object"
     },
+    "mcp": {
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether the MCP endpoint on the management listener serves tool calls.",
+          "type": "boolean"
+        },
+        "read_only": {
+          "default": false,
+          "description": "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "node": {
       "properties": {
         "brokerlink_bind": {
           "default": "127.0.0.1:18883",
-          "description": "BrokerLink IPC listen address for edge clients (TCP loopback).",
+          "description": "Deprecated. Ignored. The kernel serves clients directly.",
           "type": "string"
         },
         "data_dir": {
@@ -563,6 +686,114 @@
       },
       "type": "object"
     },
+    "prometheus": {
+      "properties": {
+        "collectors": {
+          "properties": {
+            "mnesia": {
+              "default": "disabled",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_dist": {
+              "default": "disabled",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_memory": {
+              "default": "disabled",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_msacc": {
+              "default": "disabled",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_statistics": {
+              "default": "disabled",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_system_info": {
+              "default": "disabled",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "enable_basic_auth": {
+          "default": true,
+          "description": "Require credentials on the scrape endpoints.",
+          "type": "boolean"
+        },
+        "latency_buckets": {
+          "default": "10ms, 100ms, 1s, 5s, 30s",
+          "description": "Latency histogram buckets for the exposition.",
+          "type": "string"
+        },
+        "push_gateway": {
+          "properties": {
+            "enable": {
+              "default": false,
+              "description": "Stored push intent. The broker runs no push client.",
+              "type": "boolean"
+            },
+            "interval": {
+              "default": "15s",
+              "description": "Push interval for the exposition.",
+              "type": "string"
+            },
+            "job_name": {
+              "default": "${name}/instance/${name}~${host}",
+              "description": "Job name template for each push.",
+              "type": "string"
+            },
+            "method": {
+              "default": "put",
+              "description": "Push method for the exposition.",
+              "enum": [
+                "put",
+                "post"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "default": "http://127.0.0.1:9091",
+              "description": "Push target URL for the exposition.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "quotas": {
       "properties": {
         "burst_multiplier": {
@@ -585,6 +816,27 @@
           "maximum": 10000000,
           "minimum": 0,
           "type": "integer"
+        },
+        "max_connections_per_tenant": {
+          "default": 0,
+          "description": "Default max live connections per tenant (0 = unlimited).",
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_retained_per_tenant": {
+          "default": 0,
+          "description": "Default max retained topics per tenant (0 = unlimited).",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sessions_per_tenant": {
+          "default": 0,
+          "description": "Default max sessions per tenant (0 = unlimited).",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -605,7 +857,7 @@
         },
         "spill_dir": {
           "default": "",
-          "description": "Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total).",
+          "description": "Rule ingress spill directory.",
           "type": "string"
         },
         "window_channel_depth": {
@@ -638,6 +890,13 @@
           "default": 50000,
           "description": "Maximum queued offline messages per session.",
           "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_packet_size": {
+          "default": 1048576,
+          "description": "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+          "maximum": 268435455,
           "minimum": 1,
           "type": "integer"
         },

@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "clause-select"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"temperature": 72.5}'
+
+[[case]]
+sql = 'SELECT humidity FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"humidity": null}'

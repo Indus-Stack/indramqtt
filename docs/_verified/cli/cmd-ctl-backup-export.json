@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "backup",
+    "--help"
+  ],
+  "item": "cmd-ctl-backup-export",
+  "match": "export",
+  "output": "Backup: export a versioned config snapshot, import one back\n  export  Export the latest versioned snapshot to a file (secret references stay redacted markers; secret values never appear)",
+  "output_bytes": 476,
+  "returncode": 0,
+  "verified": true
+}

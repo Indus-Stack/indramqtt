@@ -15,15 +15,15 @@
 //!
 //! Licence: MIT OR Apache-2.0, as the other crates of this repository.
 //!
-//! Default build (no features): every module except the X1-09 first half
-//! is compiled in. The gated kinds are absent from the build and the
-//! binary unless their Cargo feature is enabled: `aws_iot` (feature
-//! `aws_iot`), `azure_blob` (feature `azure_blob`), `azure_eventhubs`
-//! (feature `azure_eventhubs`), `azure_iot` (feature `azure_iot`),
-//! `bigquery` (feature `bigquery`), `dynamodb` (feature `dynamodb`),
-//! `gcp_iot` (feature `gcp_iot`). Unresolvable kinds under a disabled
-//! feature fail registration closed with an error naming the missing
-//! feature.
+//! Default build (no features): only light sinks are compiled in.
+//! The X1-09 first half stays off (`aws_iot`, `azure_blob`,
+//! `azure_eventhubs`, `azure_iot`, `bigquery`, `dynamodb`, `gcp_iot`).
+//! The X1-10 heavy SDK set stays off too (`cassandra`, `confluent`,
+//! `couchbase`, `mongodb`, `gcp_pubsub`, `kinesis`). Each gated kind is absent
+//! from the build and the binary unless its Cargo feature is enabled.
+//! Unresolvable kinds under a disabled feature fail registration closed
+//! with an error naming the missing feature. The remaining B3 connectors
+//! land behind features from the start.
 
 pub mod alloydb;
 #[cfg(feature = "aws_iot")]
@@ -36,9 +36,12 @@ pub mod azure_eventhubs;
 pub mod azure_iot;
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
+#[cfg(feature = "cassandra")]
 pub mod cassandra;
 pub mod cockroachdb;
+#[cfg(feature = "confluent")]
 pub mod confluent;
+#[cfg(feature = "couchbase")]
 pub mod couchbase;
 pub mod databricks;
 pub mod datalayers;
@@ -47,9 +50,12 @@ pub mod doris;
 pub mod dynamodb;
 #[cfg(feature = "gcp_iot")]
 pub mod gcp_iot;
+#[cfg(feature = "gcp_pubsub")]
 pub mod gcp_pubsub;
 pub mod iotdb;
+#[cfg(feature = "kinesis")]
 pub mod kinesis;
+#[cfg(feature = "mongodb")]
 pub mod mongodb;
 pub mod mssql;
 pub mod oci_streaming;
@@ -58,7 +64,6 @@ pub mod oracle;
 pub mod pulsar;
 pub mod redshift;
 pub mod rocketmq;
-pub mod s3_tables;
 pub mod snowflake;
 pub mod sparkplug_b;
 pub mod tablestore;
@@ -67,10 +72,10 @@ pub mod timestream;
 
 pub use alloydb::{
     alloydb_connect_config, alloydb_value_to_boxed, build_alloydb_insert_query,
-    classify_alloydb_error, extract_alloydb_row, map_driver_error, resolve_alloydb_password,
-    AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector, AlloydbErrorClassification,
-    AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport, AlloydbValue,
-    CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport, TcpAlloydbTransport,
+    classify_alloydb_error, coerce_alloydb_params_for_types, extract_alloydb_row, map_driver_error,
+    resolve_alloydb_password, AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector,
+    AlloydbErrorClassification, AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport,
+    AlloydbValue, CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport,
 };
 #[cfg(feature = "aws_iot")]
 pub use aws_iot::{
@@ -81,10 +86,11 @@ pub use aws_iot::{
 };
 #[cfg(feature = "azure_blob")]
 pub use azure_blob::{
-    azure_error_code, canonicalized_resource, classify_blob_status, container_string_to_sign,
-    shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AzureBlobAuth,
-    AzureBlobCompression, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
-    AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
+    azure_error_code, blob_request_path, canonicalized_resource, classify_blob_status,
+    container_request_path, container_string_to_sign, shared_key_authorization,
+    string_to_sign as azure_blob_string_to_sign, AzureBlobAuth, AzureBlobCompression,
+    AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig, AzureBlobTransport,
+    HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
 };
 #[cfg(feature = "azure_eventhubs")]
 pub use azure_eventhubs::{
@@ -104,8 +110,9 @@ pub use bigquery::{
     classify_driver_response, classify_insert_errors, driver_insert_request,
     render_insert_body as render_bigquery_body, BigQueryConnector, BigQueryInsertResponse,
     BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert,
-    HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
+    MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
 };
+#[cfg(feature = "cassandra")]
 pub use cassandra::{
     decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token,
     parse_contact_point, CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink,
@@ -115,12 +122,13 @@ pub use cassandra::{
 };
 pub use cockroachdb::{
     build_native_upsert_query, build_on_conflict_upsert_query, classify_cockroach_sqlstate,
-    cockroach_connect_config, cockroach_use_tls, cockroach_value_to_boxed, extract_cockroach_row,
-    map_cockroach_driver_error, CapturedCockroachExecution, CockroachDbConfig,
-    CockroachDbConnector, CockroachDbSink, CockroachDbTransport, CockroachErrorClassification,
-    CockroachQueryResult, CockroachRow, CockroachValue, MockCockroachDbTransport,
-    PgDriverCockroachDbTransport, TcpCockroachDbTransport,
+    cockroach_connect_config, cockroach_use_tls, cockroach_value_to_boxed,
+    coerce_cockroach_params_for_types, extract_cockroach_row, map_cockroach_driver_error,
+    CapturedCockroachExecution, CockroachDbConfig, CockroachDbConnector, CockroachDbSink,
+    CockroachDbTransport, CockroachErrorClassification, CockroachQueryResult, CockroachRow,
+    CockroachValue, MockCockroachDbTransport, PgDriverCockroachDbTransport,
 };
+#[cfg(feature = "confluent")]
 pub use confluent::{
     classify_driver_error, classify_kafka_error, frame_schema_registry, is_terminal_driver_message,
     parse_scram_server_first, rdkafka_client_config, registry_subject_for_topic,
@@ -131,8 +139,9 @@ pub use confluent::{
     ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord,
     ConfluentSchemaRegistryConfig, ConfluentSecurityProtocol, ConfluentTransport,
     MemoryConfluentTransport, RdkafkaConfluentTransport, RegistrySchemaClient, SaslMechanism,
-    ScramHash, ScramServerFirst, TcpConfluentTransport,
+    ScramHash, ScramServerFirst,
 };
+#[cfg(feature = "couchbase")]
 pub use couchbase::{
     decode_response as decode_kv_response, encode_mutation as encode_kv_mutation,
     parse_connection_string as parse_couchbase_connection_string, CapturedCouchbaseBatch,
@@ -162,33 +171,35 @@ pub use dynamodb::{
     attribute_value_from_dynamodb_json, build_item_body, dynamodb_attribute,
     item_body_to_attribute_map, parse_unprocessed, render_batch_body as render_dynamodb_batch_body,
     DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig,
-    DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome,
-    MockDynamoDbTransport, SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
+    DynamoDbTransport, DynamoKeyConfig, MockDynamoDbOutcome, MockDynamoDbTransport,
+    SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
 };
 #[cfg(feature = "gcp_iot")]
 pub use gcp_iot::{
     build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink,
     state_topic, telemetry_topic, validate_state_snapshot, CapturedGcpIotPublish, DownlinkRoute,
     GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport,
-    MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, TlsGcpIotTransport,
+    MockGcpIotOutcome, MockGcpIotTransport, TlsGcpIotTransport,
 };
+#[cfg(feature = "gcp_pubsub")]
 pub use gcp_pubsub::{
     build_jwt_assertion, driver_message_for, parse_publish_response, render_publish_body,
     CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink,
-    GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome,
-    MockGcpPubSubTransport, SdkGcpPubSubTransport, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
+    GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, MockGcpOutcome, MockGcpPubSubTransport,
+    SdkGcpPubSubTransport, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
 };
 pub use iotdb::{
     render_tablet_body, CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector,
     IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport,
     MockIotDbOutcome, MockIotDbTransport,
 };
+#[cfg(feature = "kinesis")]
 pub use kinesis::{
-    HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
-    KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
-    MockKinesisOutcome, MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE,
-    KINESIS_TARGET,
+    KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse, KinesisRecordEntry,
+    KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport, MockKinesisOutcome,
+    MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE, KINESIS_TARGET,
 };
+#[cfg(feature = "mongodb")]
 pub use mongodb::{
     decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string,
     scram_client_proof, BsonDocument, BsonValue, CapturedMongoBulk, DriverMongoDbTransport,
@@ -210,28 +221,29 @@ pub use oci_streaming::{
 pub use opc_ua::{
     datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant,
     encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json,
-    MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth, OpcUaChannelFrame, OpcUaConnector,
-    OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode,
-    OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport,
-    OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
+    DriverOpcUaTransport, MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth,
+    OpcUaChannelFrame, OpcUaConnector, OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue,
+    OpcUaSecurityMode, OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus,
+    OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame,
 };
 pub use oracle::{
-    build_merge_sql, classify_ora_error, extract_oracle_row, CapturedOracleExecution,
-    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OracleBindParam,
-    OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig, OracleTransport,
-    OracleValue,
+    build_merge_sql, classify_ora_code, classify_ora_error, classify_oracle_driver_error,
+    extract_oracle_row, ora_error_is_retryable, parse_ora_code, referenced_oracle_params,
+    validate_oracle_action_sql, CapturedOracleExecution, DriverOracleTransport,
+    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OraErrorKind,
+    OracleActionSink, OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink,
+    OracleSinkConfig, OracleTransport, OracleValue,
 };
 pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
-    CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector,
-    PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
-    TcpPulsarTransport,
+    CapturedProduce, DecodedMetadata, DriverPulsarTransport, MemoryPulsarTransport, PulsarAuth,
+    PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
 };
 pub use redshift::{
     default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
-    render_statement as render_redshift_statement, HttpRedshiftTransport, MockRedshiftOutcome,
-    MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector,
-    RedshiftSink, RedshiftSinkConfig, RedshiftTransport, SdkRedshiftTransport,
+    render_statement as render_redshift_statement, MockRedshiftOutcome, MockRedshiftTransport,
+    RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector, RedshiftSink,
+    RedshiftSinkConfig, RedshiftTransport, SdkRedshiftTransport,
 };
 pub use rocketmq::{
     authorization_header as rocketmq_authorization,
@@ -239,17 +251,10 @@ pub use rocketmq::{
     classify_status as classify_rocketmq_status, decode_envelope as decode_rocketmq_envelope,
     encode_envelope as encode_rocketmq_envelope, fifo_partition, fnv1a_32,
     md5_hex as rocketmq_md5_hex, resolve_system_field as resolve_rocketmq_field,
-    signing_string as rocketmq_signing_string, MockRocketMqTransport, RocketMqConnector,
-    RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink,
-    RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
-    TcpRocketMqTransport, ENVELOPE_VERSION,
-};
-pub use s3_tables::{
-    apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path,
-    parse_table_bucket_arn, partition_path, render_snapshot, s3tables_authorization,
-    HttpS3TablesTransport, IcebergPartitionField, IcebergTransform, MockS3TablesTransport,
-    S3TablesConnector, S3TablesFormat, S3TablesOutcome, S3TablesPut, S3TablesSigning, S3TablesSink,
-    S3TablesSinkConfig, S3TablesTransport, SnapshotFile, TableBucketArn,
+    signing_string as rocketmq_signing_string, MockRocketMqTransport, RemotingRocketMqTransport,
+    RocketMqConnector, RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome,
+    RocketMqSink, RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
+    TcpRocketMqTransport, DEFAULT_BUFFER_CAPACITY, ENVELOPE_VERSION,
 };
 pub use snowflake::{
     build_jwt_assertion as build_snowflake_jwt,
@@ -308,7 +313,9 @@ pub(crate) mod test_rsa_keys {
 
 #[cfg(test)]
 mod tests {
-    use super::{connector_tier, KinesisSink, KinesisSinkConfig, MockKinesisTransport};
+    use super::connector_tier;
+    #[cfg(feature = "kinesis")]
+    use super::{KinesisSink, KinesisSinkConfig, MockKinesisTransport};
     use broker_connectors::{
         HttpAuth, HttpBodyFormat, HttpMethod, HttpSink, HttpSinkConfig, MockHttpTransport,
         Sink as _,
@@ -341,6 +348,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "kinesis")]
     fn base64_decode(input: &str) -> Vec<u8> {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -411,6 +419,7 @@ mod tests {
     /// Split evidence (enterprise half): a Kinesis rule dispatches
     /// through the same rule path with identical framing to before
     /// the move, and the tier tag is unchanged.
+    #[cfg(feature = "kinesis")]
     #[tokio::test]
     async fn test_split_enterprise_kinesis_through_rule_engine() {
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -474,6 +483,92 @@ mod tests {
             ))
             .unwrap(),
             serde_json::json!({"client_id": "device-42", "temp": 22.5})
+        );
+    }
+
+    #[test]
+    fn test_live_qualification_never_skips() {
+        // Scan live tests for early exit.
+        // Read source files from both connector crates.
+        // Fail on a bare early exit or on a bypass message.
+        // Require at least 20 live tests.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut dirs = vec![manifest.join("src")];
+        if let Some(root) = manifest.parent() {
+            dirs.push(root.join("broker-connectors/src"));
+        }
+        let marker = ["fn test_qual", "ify"].concat();
+        let early = ["ret", "urn;"].concat();
+        let bypass = ["ski", "pp"].concat();
+        let mut count = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for dir in &dirs {
+            let entries = std::fs::read_dir(dir).expect("read connector src");
+            let mut names: Vec<std::path::PathBuf> = Vec::new();
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    names.push(path);
+                }
+            }
+            names.sort();
+            for path in names {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                let lines: Vec<&str> = text.lines().collect();
+                let mut i = 0usize;
+                while i < lines.len() {
+                    let trimmed = lines[i].trim_start();
+                    let head = trimmed.strip_prefix("async ").unwrap_or(trimmed);
+                    if !head.starts_with(&marker) {
+                        i += 1;
+                        continue;
+                    }
+                    let mut j = i;
+                    while j < lines.len() && !lines[j].contains('{') {
+                        j += 1;
+                    }
+                    if j >= lines.len() {
+                        break;
+                    }
+                    let mut depth = 0i32;
+                    let mut started = false;
+                    let mut k = j;
+                    while k < lines.len() {
+                        for ch in lines[k].chars() {
+                            if ch == '{' {
+                                depth += 1;
+                                started = true;
+                            } else if ch == '}' {
+                                depth -= 1;
+                            }
+                        }
+                        if started && depth <= 0 {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    count += 1;
+                    let end = k.min(lines.len().saturating_sub(1));
+                    for (off, &line) in lines.iter().enumerate().take(end + 1).skip(i) {
+                        if line.trim_start().starts_with("//") {
+                            continue;
+                        }
+                        if line.contains(&early) {
+                            bad.push(format!("{}:{} has early exit", path.display(), off + 1));
+                        }
+                        if line.to_lowercase().contains(&bypass) {
+                            bad.push(format!("{}:{} has bypass message", path.display(), off + 1));
+                        }
+                    }
+                    i = k + 1;
+                }
+            }
+        }
+        assert!(count >= 20, "found only {count} live tests, need 20");
+        assert!(
+            bad.is_empty(),
+            "live tests must panic without env: {}",
+            bad.join("; ")
         );
     }
 }

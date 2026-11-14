@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "users",
+    "--help"
+  ],
+  "item": "cmd-ctl-users-delete",
+  "match": "delete",
+  "output": "Authentication users: list, show, create, delete\n  delete  Delete one user. Destructive: requires `--yes` or an interactive confirm",
+  "output_bytes": 449,
+  "returncode": 0,
+  "verified": true
+}

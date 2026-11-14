@@ -828,11 +828,11 @@ fn decoding_key(entry: &CachedKey) -> Option<jsonwebtoken::DecodingKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Single-source JWKS fixtures (B5-02): the signing-key minter and the
+    // Single-source JWKS fixtures (B5-02): the signing key and the
     // loopback HTTPS server live in `crate::jwks_test_support` (test-only)
     // and are shared with the `broker-node` CONNECT tests via a `#[path]`
     // include of the same file, so there is one copy
-    // of the RSA/`CompatRng`/base64/PEM/server logic.
+    // of the RSA/base64/PEM/server logic.
     use crate::jwks_test_support::{TestJwksServer as HttpsJwks, TestSigningKey as SigningKey};
     use std::sync::Arc;
     use std::time::Duration;
@@ -951,29 +951,29 @@ mod tests {
     /// Build a loopback TLS acceptor from the shared fixture certificate
     /// (same trust as `TestJwksServer`; clients use `tls_verify = false`).
     async fn tls_acceptor_for_fault_tests() -> tokio_rustls::TlsAcceptor {
+        use rustls::pki_types::pem::PemObject as _;
         use std::sync::Arc;
-        let mut cert_reader =
-            std::io::BufReader::new(crate::jwks_test_support::TEST_CERT_PEM.as_bytes());
+        // Install the default provider. The engine enables `ring`.
+        // This keeps `ServerConfig::builder` safe under unification.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_reader)
-                .expect("fixture cert reads")
-                .into_iter()
-                .map(rustls::pki_types::CertificateDer::from)
-                .collect();
+            rustls::pki_types::CertificateDer::pem_slice_iter(
+                crate::jwks_test_support::TEST_CERT_PEM.as_bytes(),
+            )
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("fixture cert reads");
         assert!(!certs.is_empty(), "fixture holds a certificate");
-        let mut key_reader =
-            std::io::BufReader::new(crate::jwks_test_support::TEST_KEY_PEM.as_bytes());
-        let mut private_key = None;
-        while let Some(item) = rustls_pemfile::read_one(&mut key_reader).expect("fixture key reads")
-        {
-            if let rustls_pemfile::Item::PKCS8Key(key) = item {
-                private_key = Some(rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()));
-                break;
-            }
-        }
+        let private_key: rustls::pki_types::PrivateKeyDer<'static> =
+            rustls::pki_types::PrivateKeyDer::pem_slice_iter(
+                crate::jwks_test_support::TEST_KEY_PEM.as_bytes(),
+            )
+            .next()
+            .transpose()
+            .expect("fixture key reads")
+            .expect("fixture holds a private key");
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(certs, private_key.expect("fixture holds a private key"))
+            .with_single_cert(certs, private_key)
             .expect("TLS config builds");
         tokio_rustls::TlsAcceptor::from(Arc::new(config))
     }

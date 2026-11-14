@@ -5,8 +5,7 @@
 //! delivery mode / timestamp / content type ride the content header, and
 //! MQTT topic, QoS, and timestamp repeat inside the headers table for
 //! downstream consumers. The [`RabbitMqTransport`] boundary keeps unit
-//! tests broker-free ([`MemoryAmqpTransport`]); [`TcpRabbitTransport`]
-//! performs the real PLAIN handshake over TCP.
+//! tests broker-free ([`MemoryAmqpTransport`]).
 
 use super::{ConnectorError, Result, Sink};
 use async_trait::async_trait;
@@ -16,8 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +23,20 @@ pub struct RabbitMqSinkConfig {
     pub exchange: String,
     pub routing_key_template: String,
     pub delivery_mode: u8,
+    /// Extra message headers: each pair is a header name plus a value
+    /// template (`${topic}`, `${payload}`). Reason: the reference
+    /// `headers_template` action field.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Body template (`${topic}`, `${payload}`); `None` forwards the
+    /// raw event bytes. Reason: the reference `payload_template`
+    /// action field (empty means the whole message).
+    #[serde(default)]
+    pub payload_template: Option<String>,
 }
+
+/// Longest accepted exchange name in bytes. Reason: AMQP shortstr holds at most 255 bytes.
+const MAX_EXCHANGE_LEN: usize = 255;
 
 impl RabbitMqSinkConfig {
     pub fn validate(&self) -> Result<()> {
@@ -35,9 +45,11 @@ impl RabbitMqSinkConfig {
                 "rabbitmq endpoint must not be empty".to_string(),
             ));
         }
-        if self.exchange.is_empty() || self.exchange.len() > 255 {
+        // Empty exchange selects the default exchange. The schema sets
+        // the default to empty. See #components/schemas/bridge_rabbitmq.action_parameters.
+        if self.exchange.len() > MAX_EXCHANGE_LEN {
             return Err(ConnectorError::Dispatch(
-                "rabbitmq exchange must be 1..=255 bytes".to_string(),
+                "rabbitmq exchange must be 0..=255 bytes".to_string(),
             ));
         }
         if self.routing_key_template.trim().is_empty() {
@@ -59,6 +71,22 @@ impl RabbitMqSinkConfig {
 /// `sensor.${topic}` with `a/b` becomes `sensor.a.b`.
 pub fn render_routing_key(template: &str, topic: &str) -> String {
     template.replace("${topic}", topic).replace('/', ".")
+}
+
+/// Render one body or header value template: `${topic}` takes the
+/// event topic, `${payload}` takes the raw event bytes as text.
+pub fn render_body_template_string(template: &str, topic: &str, payload: &[u8]) -> String {
+    template
+        .replace("${topic}", topic)
+        .replace("${payload}", &String::from_utf8_lossy(payload))
+}
+
+/// Render one body template, failing closed on non-UTF-8 bytes.
+pub fn render_body_template(template: &str, topic: &str, payload: &[u8]) -> Option<String> {
+    if std::str::from_utf8(payload).is_err() && template.contains("${payload}") {
+        return None;
+    }
+    Some(render_body_template_string(template, topic, payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -250,21 +278,26 @@ impl RabbitMqTransport for MemoryAmqpTransport {
     }
 }
 
-#[derive(Debug, Clone)]
-struct AmqpEndpoint {
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    vhost: String,
+/// The endpoint without its user and password, for messages. An
+/// error text never holds a credential.
+fn endpoint_without_credentials(endpoint: &str) -> String {
+    match endpoint.strip_prefix("amqp://") {
+        Some(rest) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("amqp://{host}"),
+            None => endpoint.to_string(),
+        },
+        None => "amqp endpoint".to_string(),
+    }
 }
 
 /// Parse `amqp://[user[:pass]@]host[:port][/vhost]` (defaults guest /
-/// guest, 5672, `/`; `%2f` decodes to `/` in the vhost).
-fn parse_endpoint(endpoint: &str) -> Result<AmqpEndpoint> {
+/// guest, 5672, `/`; `%2f` decodes to `/` in the vhost) into
+/// `(host, port, username, password, vhost)`.
+fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String, String, String)> {
     let rest = endpoint.strip_prefix("amqp://").ok_or_else(|| {
         ConnectorError::Dispatch(format!(
-            "rabbitmq endpoint must start with amqp://: {endpoint:?}"
+            "rabbitmq endpoint must start with amqp://: {:?}",
+            endpoint_without_credentials(endpoint)
         ))
     })?;
     let (authority, vhost_raw) = match rest.split_once('/') {
@@ -294,209 +327,32 @@ fn parse_endpoint(endpoint: &str) -> Result<AmqpEndpoint> {
         Some((host, port)) => (
             host.to_string(),
             port.parse::<u16>().map_err(|_| {
-                ConnectorError::Dispatch(format!("rabbitmq bad port in {endpoint:?}"))
+                ConnectorError::Dispatch(format!(
+                    "rabbitmq bad port in {:?}",
+                    endpoint_without_credentials(endpoint)
+                ))
             })?,
         ),
         None => (hostport.to_string(), 5672),
     };
     if host.is_empty() {
         return Err(ConnectorError::Dispatch(format!(
-            "rabbitmq endpoint needs a host: {endpoint:?}"
+            "rabbitmq endpoint needs a host: {:?}",
+            endpoint_without_credentials(endpoint)
         )));
     }
-    Ok(AmqpEndpoint {
-        host,
-        port,
-        username,
-        password,
-        vhost,
-    })
-}
-
-struct RabbitConn {
-    stream: TcpStream,
-}
-
-async fn read_frame(stream: &mut TcpStream) -> Result<(u8, u16, Vec<u8>)> {
-    let mut header = [0u8; 7];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut header))
-        .await
-        .map_err(|_| ConnectorError::Connection("amqp read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("amqp read failed: {e}")))?;
-    let size = u32::from_be_bytes([header[3], header[4], header[5], header[6]]) as usize;
-    if size > 4 * 1024 * 1024 {
-        return Err(ConnectorError::Connection(format!(
-            "amqp frame too large: {size}"
-        )));
-    }
-    let mut payload = vec![0u8; size];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut payload))
-        .await
-        .map_err(|_| ConnectorError::Connection("amqp read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("amqp read failed: {e}")))?;
-    let mut end = [0u8; 1];
-    stream
-        .read_exact(&mut end)
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("amqp read failed: {e}")))?;
-    if end[0] != FRAME_END {
-        return Err(ConnectorError::Connection(format!(
-            "amqp bad frame end: {:#x}",
-            end[0]
-        )));
-    }
-    Ok((
-        header[0],
-        u16::from_be_bytes([header[1], header[2]]),
-        payload,
-    ))
-}
-
-async fn write_frame(stream: &mut TcpStream, frame: &AmqpFrame) -> Result<()> {
-    stream
-        .write_all(&frame.encode())
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("amqp write failed: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("amqp flush failed: {e}")))?;
-    Ok(())
-}
-
-async fn expect_method(stream: &mut TcpStream, class_id: u16, method_id: u16) -> Result<Vec<u8>> {
-    let (frame_type, _channel, payload) = read_frame(stream).await?;
-    if frame_type != FRAME_METHOD || payload.len() < 4 {
-        return Err(ConnectorError::Connection(format!(
-            "amqp expected method frame, got type {frame_type}"
-        )));
-    }
-    let got_class = u16::from_be_bytes([payload[0], payload[1]]);
-    let got_method = u16::from_be_bytes([payload[2], payload[3]]);
-    if got_class != class_id || got_method != method_id {
-        return Err(ConnectorError::Connection(format!(
-            "amqp expected {class_id}/{method_id}, got {got_class}/{got_method}"
-        )));
-    }
-    Ok(payload[4..].to_vec())
-}
-
-/// TCP transport with a minimal PLAIN handshake and a reused channel.
-/// Connects lazily on first use; any I/O failure drops the connection
-/// and retries once after a fresh handshake.
-pub struct TcpRabbitTransport {
-    endpoint: AmqpEndpoint,
-    conn: AsyncMutex<Option<RabbitConn>>,
-}
-
-impl TcpRabbitTransport {
-    pub fn new(endpoint: &str) -> Result<Self> {
-        Ok(Self {
-            endpoint: parse_endpoint(endpoint)?,
-            conn: AsyncMutex::new(None),
-        })
-    }
-
-    async fn handshake(&self, stream: &mut TcpStream) -> Result<()> {
-        // Protocol header.
-        stream
-            .write_all(b"AMQP\x00\x00\x09\x01")
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("amqp write failed: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("amqp flush failed: {e}")))?;
-        // Connection.Start -> Start-Ok (PLAIN).
-        expect_method(stream, 10, 10).await?;
-        let sasl = format!("\0{}\0{}", self.endpoint.username, self.endpoint.password);
-        let mut args = Vec::new();
-        encode_empty_table(&mut args);
-        encode_shortstr("PLAIN", &mut args)?;
-        encode_longstr(sasl.as_bytes(), &mut args);
-        encode_shortstr("en_US", &mut args)?;
-        write_frame(stream, &method_frame(0, 10, 11, &args)).await?;
-        // Tune -> Tune-Ok (echo server values).
-        let tune = expect_method(stream, 10, 30).await?;
-        if tune.len() < 8 {
-            return Err(ConnectorError::Connection(
-                "truncated tune frame".to_string(),
-            ));
-        }
-        let mut tune_ok = Vec::new();
-        tune_ok.extend_from_slice(&tune[..8]);
-        write_frame(stream, &method_frame(0, 10, 31, &tune_ok)).await?;
-        // Open vhost.
-        let mut open = Vec::new();
-        encode_shortstr(&self.endpoint.vhost, &mut open)?;
-        encode_shortstr("", &mut open)?;
-        open.push(0u8);
-        write_frame(stream, &method_frame(0, 10, 40, &open)).await?;
-        expect_method(stream, 10, 41).await?;
-        // Channel 1 open.
-        let mut channel_open = Vec::new();
-        encode_shortstr("", &mut channel_open)?;
-        write_frame(stream, &method_frame(1, 20, 10, &channel_open)).await?;
-        expect_method(stream, 20, 11).await?;
-        Ok(())
-    }
-
-    async fn publish_once(&self, publish: &AmqpPublish) -> Result<()> {
-        let mut guard = self.conn.lock().await;
-        if guard.is_none() {
-            let stream = tokio::time::timeout(
-                Duration::from_secs(5),
-                TcpStream::connect(format!("{}:{}", self.endpoint.host, self.endpoint.port)),
-            )
-            .await
-            .map_err(|_| {
-                ConnectorError::Connection(format!(
-                    "amqp connect timeout: {}:{}",
-                    self.endpoint.host, self.endpoint.port
-                ))
-            })?
-            .map_err(|e| ConnectorError::Connection(format!("amqp connect failed: {e}")))?;
-            let mut fresh = RabbitConn { stream };
-            self.handshake(&mut fresh.stream).await?;
-            *guard = Some(fresh);
-        }
-        let conn = guard.as_mut().expect("connected");
-        for frame in encode_basic_publish(publish)? {
-            write_frame(&mut conn.stream, &frame).await?;
-        }
-        Ok(())
-    }
-}
-
-fn encode_empty_table(out: &mut Vec<u8>) {
-    out.extend_from_slice(&0u32.to_be_bytes());
-}
-
-#[async_trait]
-impl RabbitMqTransport for TcpRabbitTransport {
-    async fn publish(&self, publish: AmqpPublish) -> Result<()> {
-        match self.publish_once(&publish).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // Drop the poisoned connection and retry once fresh.
-                *self.conn.lock().await = None;
-                self.publish_once(&publish).await
-            }
-        }
-    }
+    Ok((host, port, username, password, vhost))
 }
 
 // ---------------------------------------------------------------------------
 // Production transport on the maintained `lapin` driver.
 // ---------------------------------------------------------------------------
 
-/// Connect timeout for the driver handshake: 5 s matches the legacy
-/// [`TcpRabbitTransport`] dial timeout (the protocol requirement is a
-/// bounded handshake, not a specific value).
+/// Connect timeout for the driver handshake: 5 s bounds the handshake
+/// (the protocol requires a bound, not a specific value).
 const LAPIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Publisher-confirm wait: 10 s matches the legacy `read_frame` timeout
-/// on the same path.
+/// Publisher-confirm wait: 10 s bounds the confirm wait.
 const LAPIN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Convert sink headers into a driver field table: `Str` rides as
@@ -536,9 +392,8 @@ struct LapinChannelState {
 
 /// Production RabbitMQ transport on the maintained `lapin` driver
 /// (MIT): AMQP 0-9-1 PLAIN handshake plus `Basic.Publish` with content
-/// header/body frames through the driver. The legacy
-/// [`TcpRabbitTransport`] stays for offline unit tests only;
-/// production wiring uses this transport.
+/// header/body frames through the driver. Production wiring uses this
+/// transport.
 ///
 /// Bound: one shared connection and one multiplexed channel, created
 /// lazily and reused; each `publish` is one driver `basic_publish`
@@ -577,12 +432,39 @@ impl LapinRabbitTransport {
         .map_err(|_| {
             ConnectorError::Connection(format!(
                 "rabbitmq driver connect timeout: {}",
-                self.amqp_url
+                endpoint_without_credentials(&self.amqp_url)
             ))
         })?
         .map_err(|e| ConnectorError::Connection(format!("rabbitmq driver connect failed: {e}")))?;
-        let channel = connection.create_channel().await.map_err(|e| {
-            ConnectorError::Connection(format!("rabbitmq driver channel failed: {e}"))
+        // Bound the channel handshake. A downed broker fails closed fast.
+        let channel = tokio::time::timeout(LAPIN_CONNECT_TIMEOUT, connection.create_channel())
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "rabbitmq driver channel timeout: {}",
+                    endpoint_without_credentials(&self.amqp_url)
+                ))
+            })?
+            .map_err(|e| {
+                ConnectorError::Connection(format!("rabbitmq driver channel failed: {e}"))
+            })?;
+        // Publisher confirms: every publish below awaits the broker
+        // ack, so a lost or rejected message counts a failed forward
+        // instead of reading success it never earned.
+        // Bound the confirm handshake. A downed broker fails closed fast.
+        tokio::time::timeout(
+            LAPIN_CONNECT_TIMEOUT,
+            channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "rabbitmq driver confirm mode timeout: {}",
+                endpoint_without_credentials(&self.amqp_url)
+            ))
+        })?
+        .map_err(|e| {
+            ConnectorError::Connection(format!("rabbitmq driver confirm mode failed: {e}"))
         })?;
         let cloned = channel.clone();
         *guard = Some(LapinChannelState {
@@ -606,12 +488,19 @@ impl LapinRabbitTransport {
             .map_err(|e| {
                 ConnectorError::Connection(format!("rabbitmq driver publish failed: {e}"))
             })?;
-        tokio::time::timeout(LAPIN_CONFIRM_TIMEOUT, confirm)
+        let confirm = tokio::time::timeout(LAPIN_CONFIRM_TIMEOUT, confirm)
             .await
             .map_err(|_| ConnectorError::Connection("rabbitmq driver confirm timeout".to_string()))?
             .map_err(|e| {
                 ConnectorError::Connection(format!("rabbitmq driver publish not confirmed: {e}"))
             })?;
+        // A broker nack refuses the publish: report it so the sink
+        // counts a failed forward instead of a success it never earned.
+        if confirm.is_nack() {
+            return Err(ConnectorError::Connection(
+                "rabbitmq driver publish not confirmed: nack".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -665,26 +554,47 @@ impl RabbitMqSink {
 #[async_trait]
 impl Sink for RabbitMqSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> super::Result<()> {
+        let body = match &self.config.payload_template {
+            Some(template) => Bytes::from(
+                render_body_template(template, topic.as_str(), payload).ok_or_else(|| {
+                    ConnectorError::Dispatch(
+                        "rabbitmq payload template needs UTF-8 bytes".to_string(),
+                    )
+                })?,
+            ),
+            None => payload.clone(),
+        };
+        let mut headers = vec![
+            (
+                "mqtt.topic".to_string(),
+                FieldValue::Str(topic.as_str().to_string()),
+            ),
+            (
+                "mqtt.qos".to_string(),
+                FieldValue::I32(u8::from(qos) as i32),
+            ),
+            (
+                "mqtt.timestamp".to_string(),
+                FieldValue::Timestamp(now_secs()),
+            ),
+        ];
+        for (name, template) in &self.config.extra_headers {
+            headers.push((
+                name.clone(),
+                FieldValue::Str(render_body_template_string(
+                    template,
+                    topic.as_str(),
+                    payload,
+                )),
+            ));
+        }
         let publish = AmqpPublish {
             exchange: self.config.exchange.clone(),
             routing_key: render_routing_key(&self.config.routing_key_template, topic.as_str()),
             delivery_mode: self.config.delivery_mode,
             timestamp_secs: now_secs(),
-            headers: vec![
-                (
-                    "mqtt.topic".to_string(),
-                    FieldValue::Str(topic.as_str().to_string()),
-                ),
-                (
-                    "mqtt.qos".to_string(),
-                    FieldValue::I32(u8::from(qos) as i32),
-                ),
-                (
-                    "mqtt.timestamp".to_string(),
-                    FieldValue::Timestamp(now_secs()),
-                ),
-            ],
-            body: payload.clone(),
+            headers,
+            body,
         };
         if publish.routing_key.len() > 255 {
             return Err(ConnectorError::Dispatch(format!(
@@ -712,6 +622,8 @@ mod tests {
             exchange: "telemetry".to_string(),
             routing_key_template: "sensor.${topic}".to_string(),
             delivery_mode: 2,
+            extra_headers: Vec::new(),
+            payload_template: None,
         }
     }
 
@@ -724,7 +636,12 @@ mod tests {
         assert!(config.validate().is_err());
         config.endpoint = "amqp://h".to_string();
 
+        // Empty exchange is valid. It selects the default exchange.
+        // See #components/schemas/bridge_rabbitmq.action_parameters.
+        // Old code refused empty. New code accepts empty.
         config.exchange.clear();
+        assert!(config.validate().is_ok());
+        config.exchange = "e".repeat(256);
         assert!(config.validate().is_err());
         config.exchange = "telemetry".to_string();
 
@@ -736,17 +653,19 @@ mod tests {
 
     #[test]
     fn test_endpoint_parsing() {
-        let endpoint = parse_endpoint("amqp://guest:guest@127.0.0.1:5672/%2f").expect("parses");
-        assert_eq!(endpoint.host, "127.0.0.1");
-        assert_eq!(endpoint.port, 5672);
-        assert_eq!(endpoint.username, "guest");
-        assert_eq!(endpoint.password, "guest");
-        assert_eq!(endpoint.vhost, "/");
+        let (host, port, username, password, vhost) =
+            parse_endpoint("amqp://guest:guest@127.0.0.1:5672/%2f").expect("parses");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 5672);
+        assert_eq!(username, "guest");
+        assert_eq!(password, "guest");
+        assert_eq!(vhost, "/");
 
-        let endpoint = parse_endpoint("amqp://broker").expect("defaults");
-        assert_eq!(endpoint.port, 5672);
-        assert_eq!(endpoint.username, "guest");
-        assert_eq!(endpoint.vhost, "/");
+        let (_host, port, username, _password, vhost) =
+            parse_endpoint("amqp://broker").expect("defaults");
+        assert_eq!(port, 5672);
+        assert_eq!(username, "guest");
+        assert_eq!(vhost, "/");
 
         assert!(parse_endpoint("http://x").is_err());
         assert!(parse_endpoint("amqp://:nopass@h").is_err());
@@ -836,133 +755,6 @@ mod tests {
         assert_eq!(publishes[0].exchange, "telemetry");
         assert_eq!(publishes[0].routing_key, "sensor.a.b");
         assert_eq!(publishes[0].delivery_mode, 2);
-    }
-
-    /// In-process fake RabbitMQ broker: scripted PLAIN handshake, then
-    /// captures the published frames for byte-level assertions.
-    #[tokio::test]
-    async fn test_tcp_transport_handshake_and_publish() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let captured_rx = captured.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // Protocol header.
-            let mut header = [0u8; 8];
-            stream.read_exact(&mut header).await.expect("proto header");
-            assert_eq!(&header, b"AMQP\x00\x00\x09\x01");
-            // Connection.Start with PLAIN + en_US offered.
-            send_method(&mut stream, 0, 10, 10, &start_args()).await;
-            let ((class, method), args) = read_method(&mut stream).await;
-            assert_eq!((class, method), (10, 11));
-            assert!(args.windows(5).any(|w| w == b"PLAIN"));
-            // Tune, Open, channel open: canned oks.
-            send_method(&mut stream, 0, 10, 30, &[0, 0, 0, 0, 0, 0, 0, 0]).await;
-            let _ = read_method(&mut stream).await; // Tune-Ok
-            let _ = read_method(&mut stream).await; // Open
-            send_method(&mut stream, 0, 10, 41, &[0]).await; // Open-Ok
-            let _ = read_method(&mut stream).await; // Channel.Open
-            send_method(&mut stream, 1, 20, 11, &[0, 0, 0, 0]).await; // Open-Ok
-                                                                      // Publish triple: capture raw bytes.
-            for _ in 0..3 {
-                let raw = read_raw_frame(&mut stream).await;
-                captured_rx.lock().extend_from_slice(&raw);
-            }
-        });
-
-        let transport =
-            TcpRabbitTransport::new(&format!("amqp://guest:guest@127.0.0.1:{port}/%2f"))
-                .expect("valid endpoint");
-        let sink = RabbitMqSink::new(test_config(), Arc::new(transport)).expect("valid sink");
-        sink.send(
-            &Topic::new("a/b").unwrap(),
-            &Bytes::from_static(br#"{ "v": 1 }"#),
-            QoS::AtMostOnce,
-        )
-        .await
-        .expect("publish over TCP");
-        assert_eq!(sink.sent_count(), 1);
-
-        let finished = {
-            // The transport returns once bytes hit the kernel; poll until
-            // the fake broker has consumed the publish triple.
-            let mut done = false;
-            for _ in 0..500 {
-                if server.is_finished() {
-                    done = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            done
-        };
-        assert!(finished, "fake broker never consumed the publish");
-        server.await.expect("fake broker task");
-        let wire = captured.lock().clone();
-        assert!(
-            wire.windows(10).any(|w| w == b"sensor.a.b"),
-            "routing key dots"
-        );
-        let payload = br#"{ "v": 1 }"#;
-        assert!(
-            wire.windows(payload.len()).any(|w| w == payload),
-            "body bytes"
-        );
-        assert!(wire.windows(10).any(|w| w == b"mqtt.topic"), "header table");
-        assert!(
-            wire.iter().filter(|b| **b == FRAME_END).count() >= 3,
-            "frame ends"
-        );
-    }
-
-    fn start_args() -> Vec<u8> {
-        let mut args = Vec::new();
-        args.extend_from_slice(&[0, 0]); // version
-        args.extend_from_slice(&[0, 0, 0, 0]); // empty server properties
-        args.extend_from_slice(&[0, 5, b'P', b'L', b'A', b'I', b'N']); // mechanisms
-        args.extend_from_slice(&[0, 5, b'e', b'n', b'_', b'U', b'S']); // locales
-        args
-    }
-
-    async fn send_method(
-        stream: &mut TcpStream,
-        channel: u16,
-        class_id: u16,
-        method_id: u16,
-        args: &[u8],
-    ) {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&class_id.to_be_bytes());
-        payload.extend_from_slice(&method_id.to_be_bytes());
-        payload.extend_from_slice(args);
-        let frame = AmqpFrame {
-            frame_type: FRAME_METHOD,
-            channel,
-            payload,
-        };
-        stream.write_all(&frame.encode()).await.expect("write");
-    }
-
-    async fn read_method(stream: &mut TcpStream) -> ((u16, u16), Vec<u8>) {
-        let (frame_type, _channel, payload) = read_frame(stream).await.expect("read method");
-        assert_eq!(frame_type, FRAME_METHOD);
-        let class_id = u16::from_be_bytes([payload[0], payload[1]]);
-        let method_id = u16::from_be_bytes([payload[2], payload[3]]);
-        ((class_id, method_id), payload[4..].to_vec())
-    }
-
-    async fn read_raw_frame(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 7];
-        stream.read_exact(&mut header).await.expect("frame head");
-        let size = u32::from_be_bytes([header[3], header[4], header[5], header[6]]) as usize;
-        let mut rest = vec![0u8; size + 1];
-        stream.read_exact(&mut rest).await.expect("frame tail");
-        let mut raw = header.to_vec();
-        raw.extend_from_slice(&rest);
-        raw
     }
 
     #[test]
@@ -1113,6 +905,8 @@ mod tests {
             exchange: exchange.clone(),
             routing_key_template: "${topic}".to_string(),
             delivery_mode: 2,
+            extra_headers: Vec::new(),
+            payload_template: None,
         };
         config.validate().expect("qual config validates");
         let transport = Arc::new(LapinRabbitTransport::new(&amqp_url).expect("qual transport"));

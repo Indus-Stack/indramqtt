@@ -1,0 +1,18 @@
+[example]
+area = "connectors"
+item = "gcp_pubsub_producer"
+kind = "connector-create"
+
+[[case]]
+name = "gcp-pubsub-producer-normal"
+project_id = "my-iot-project"
+topic_id = "telemetry-events"
+timeout_ms = 5000
+expect_status = 201
+
+[[case]]
+name = "gcp-pubsub-producer-edge-empty-topic"
+project_id = "my-iot-project"
+topic_id = ""
+timeout_ms = 5000
+expect_status = 400

@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "config",
+    "--help"
+  ],
+  "item": "cmd-ctl-config-validate",
+  "match": "validate",
+  "output": "Configuration: validate, diff, explain, reload, history\n  validate  Validate a snapshot document without changing any state",
+  "output_bytes": 684,
+  "returncode": 0,
+  "verified": true
+}

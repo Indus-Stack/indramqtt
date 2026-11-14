@@ -4,29 +4,203 @@
 //! 1. Multi-topic Radix Trie router registration and matching.
 //! 2. Streaming SQL evaluation and rule action dispatch.
 //! 3. Session state retention, QoS 1 in-flight tracking, and offline queueing.
-//! 4. API kick of a connected client delivers a BrokerLink `ConnClose` to
-//!    the edge and the client observes TCP close.
+//! 4. API kick of a connected client delivers `ConnClose` through
+//!    the kernel listener and the client observes TCP close.
+//!
+//! Each test that needs a broker boots one real kernel with
+//! [`spawn_kernel`]. The helper writes a config dir with ephemeral ports
+//! for the TCP, WebSocket and API listeners, waits for `/healthz` and
+//! the MQTT port, and stops the child on drop. The kernel serves every
+//! enabled listener, so the configs set no `native` key.
 
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
 use broker_session::{QueuedMessage, SessionManager};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Reports a test that cannot run because the edge or `erl` is absent.
+/// Bound for one socket step. A missing packet fails instead of hanging.
+const STEP: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound for one kernel boot. A cold debug boot needs the full minute.
+const BOOT: std::time::Duration = std::time::Duration::from_secs(60);
+/// API key for the management API. It clears the 16-char minimum.
+const API_KEY: &str = "p6-e2e-test-key-0001";
+
+/// One booted kernel for a test.
+struct Kernel {
+    child: tokio::process::Child,
+    mqtt_port: u16,
+    ws_port: u16,
+    api_port: u16,
+    scratch: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
+}
+
+impl Kernel {
+    /// Stops the kernel and removes its temp dirs.
+    async fn finish(mut self) {
+        let _ = self.child.kill().await;
+        let _ = std::fs::remove_dir_all(&self.scratch);
+        let _ = std::fs::remove_dir_all(&self.config_dir);
+    }
+}
+
+/// Takes one free loopback port.
+fn ephemeral_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("probe binds")
+        .local_addr()
+        .expect("probe addr")
+        .port()
+}
+
+/// Counter for kernel boot tags. Parallel boots never share dirs.
+static KERNEL_TAG_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// Boots one real kernel with the kernel listener on ephemeral ports.
 ///
-/// On a developer machine the test prints the reason and stops. If
-/// `E2E_REQUIRE_EDGE` is set, the test fails. CI and the build lanes set
-/// it, because a test that does not run must not count as a pass.
-macro_rules! e2e_skip {
-    ($($arg:tt)*) => {{
-        let reason = format!($($arg)*);
-        if std::env::var_os("E2E_REQUIRE_EDGE").is_some() {
-            panic!("{reason}. E2E_REQUIRE_EDGE is set, thus this test must run.");
+/// `extra_toml` appends to `indra.toml` (tenant rules, session limits).
+/// TCP, WebSocket and API get explicit loopback ports. TLS and secure
+/// WebSocket stay disabled. The link bind gets an explicit loopback port
+/// so parallel tests never share the default port. The call waits for
+/// `/healthz` plus the MQTT and WebSocket ports. The child dies with the
+/// test (`kill_on_drop`).
+async fn spawn_kernel(extra_toml: &str) -> Kernel {
+    // Boot up to three times. A parallel boot sometimes takes a probed
+    // port first, and the loser exits during boot. Each attempt uses
+    // fresh ports and fresh dirs. A real boot defect fails each attempt
+    // and still panics.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match try_spawn_kernel(extra_toml).await {
+            Ok(kernel) => return kernel,
+            Err(boot) if boot.exited && attempt < 3 => continue,
+            Err(boot) => panic!("{}", boot.message),
         }
-        eprintln!("{reason}");
-    }};
+    }
+}
+
+/// One kernel boot failure. `exited` marks an early child exit.
+struct BootFailure {
+    exited: bool,
+    message: String,
+}
+
+/// Boots one kernel once. Returns the kernel on success. Returns the
+/// failure on a timeout or an early child exit. The caller retries an
+/// early exit and panics otherwise.
+async fn try_spawn_kernel(extra_toml: &str) -> Result<Kernel, BootFailure> {
+    let slot = KERNEL_TAG_SLOT.fetch_add(1, Ordering::SeqCst);
+    let tag = format!(
+        "p6-{}-{:?}-{}-{slot}",
+        std::process::id(),
+        std::thread::current().id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+    let bl_port = ephemeral_port();
+    let mqtt_port = ephemeral_port();
+    let ws_port = ephemeral_port();
+    let api_port = ephemeral_port();
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        format!(
+            "[node]\n\
+             id = \"p6-e2e\"\n\
+             data_dir = \"{}\"\n\
+             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+             \n\
+             [listeners.tcp]\n\
+              bind = \"127.0.0.1:{mqtt_port}\"\n\
+              \n\
+              [listeners.tls]\n\
+              enabled = false\n\
+              \n\
+              [listeners.ws]\n\
+              bind = \"127.0.0.1:{ws_port}\"\n\
+              \n\
+              [listeners.wss]\n\
+              enabled = false\n\
+              \n\
+              [listeners.api]\n\
+              bind = \"127.0.0.1:{api_port}\"\n\
+              \n\
+              [logging]\n\
+              level = \"warn\"\n\
+              \n\
+              {extra_toml}",
+            scratch.display(),
+        ),
+    )
+    .expect("write indra.toml");
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--allow-anonymous")
+        .env("INDRA_API_KEYS", API_KEY)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{api_port}");
+    let deadline = std::time::Instant::now() + BOOT;
+    loop {
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(format!("{base}/healthz")).send(),
+        )
+        .await;
+        if let Ok(Ok(res)) = up {
+            if let Ok(text) = res.text().await {
+                if text == "OK"
+                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                        .await
+                        .is_ok()
+                    && tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
+                        .await
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return Err(BootFailure {
+                exited: false,
+                message: format!("kernel never opened API {api_port} and MQTT {mqtt_port}"),
+            });
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return Err(BootFailure {
+                exited: true,
+                message: format!("kernel exited during boot: {status}"),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(Kernel {
+        child,
+        mqtt_port,
+        ws_port,
+        api_port,
+        scratch,
+        config_dir,
+    })
 }
 
 #[derive(Debug, Default)]
@@ -163,7 +337,7 @@ fn test_e2e_session_lifecycle_and_offline_queue() {
 
 /// Minimal MQTT 3.1.1 CONNECT packet for `client_id` (clean session,
 /// keepalive 60): fixed header plus the `MQTT`/4 variable header and
-/// the id payload. Enough for the harness edge to accept the client.
+/// the id payload. Enough for the kernel listener to accept the client.
 fn mqtt_connect_packet(client_id: &str) -> Vec<u8> {
     let mut rest = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
     rest.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
@@ -213,796 +387,148 @@ async fn read_mqtt_packet(sock: &mut tokio::net::TcpStream) -> std::io::Result<(
     Ok((head[0], body))
 }
 
-/// Every socket or channel wait in the kick test is bounded by this:
-/// a missing edge or a regressed kick order fails the test instead of
-/// hanging the worker (the `broker-api` hang the manager killed).
-const KICK_E2E_STEP: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Bound for launcher probes: spawning `wsl.exe` cold-boots the VM,
-/// which takes longer than one step; the probe still fails loudly on
-/// expiry (as a SKIP with a reason, never a hang).
-const KICK_E2E_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// `(client_id, clean_start, keepalive, username, password)` decoded from
-/// one `BindConnection` metadata body.
-type E2eBind = (String, bool, u16, Option<String>, Option<Vec<u8>>);
-
-/// Decode a `BindConnection` metadata body into [`E2eBind`], mirroring
-/// the kernel's `decode_bind_meta` contract (`ClientIdLen:16be |
-/// ClientId | Flags:8 | Keepalive:16be`, plus the optional trailing
-/// `UserLen | Username | PassLen | Password` credentials section and the
-/// optional trailing `PeerLen:16be | PeerIp` peer-address section).
-fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
-    if meta.len() < 5 {
-        return None;
-    }
-    let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if meta.len() < 2 + id_len + 3 {
-        return None;
-    }
-    let client_id = std::str::from_utf8(&meta[2..2 + id_len]).ok()?.to_string();
-    let flags = meta[2 + id_len];
-    let keepalive = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
-    let rest = &meta[5 + id_len..];
-    let (username, password) = if rest.is_empty() {
-        (None, None)
-    } else {
-        if rest.len() < 2 {
-            return None;
-        }
-        let user_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
-        if rest.len() < 2 + user_len + 2 {
-            // Too short for credentials: only a peer-only anonymous bind
-            // (peer-aware edge appends `PeerLen | PeerIp`) decodes here.
-            e2e_decode_peer_section(rest)?;
-            (None, None)
-        } else {
-            let username = std::str::from_utf8(&rest[2..2 + user_len])
-                .ok()?
-                .to_string();
-            let base = 2 + user_len;
-            let pass_len = u16::from_be_bytes([rest[base], rest[base + 1]]) as usize;
-            if rest.len() < base + 2 + pass_len {
-                return None;
-            }
-            let password = rest[base + 2..base + 2 + pass_len].to_vec();
-            let tail = &rest[base + 2 + pass_len..];
-            if !tail.is_empty() {
-                // Optional trailing peer-address section; anything else
-                // is malformed trailing garbage.
-                e2e_decode_peer_section(tail)?;
-            }
-            (Some(username), Some(password))
-        }
-    };
-    Some((client_id, flags & 0x01 != 0, keepalive, username, password))
+/// Dials the kernel MQTT listener with a bound.
+async fn dial_mqtt(port: u16) -> tokio::net::TcpStream {
+    tokio::time::timeout(STEP, tokio::net::TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .expect("dial in time")
+        .expect("dial")
 }
 
-/// Decode one peer-address section `PeerLen:16be | PeerIp`: exactly those
-/// bytes and an IP literal, otherwise `None`. Mirrors the kernel's
-/// `decode_peer_section`.
-fn e2e_decode_peer_section(section: &[u8]) -> Option<String> {
-    if section.len() < 2 {
-        return None;
-    }
-    let peer_len = u16::from_be_bytes([section[0], section[1]]) as usize;
-    if section.len() != 2 + peer_len {
-        return None;
-    }
-    let literal = std::str::from_utf8(&section[2..]).ok()?;
-    literal.parse::<std::net::IpAddr>().ok()?;
-    Some(literal.to_string())
+/// Sends bytes with a bound.
+async fn send_mqtt(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(STEP, sock.write_all(bytes))
+        .await
+        .expect("send in time")
+        .expect("send");
 }
 
-/// Decode an `UnbindConnection` metadata body (`ClientIdLen:16be |
-/// ClientId`), mirroring the kernel's `decode_unbind_meta`.
-fn decode_e2e_unbind(meta: &[u8]) -> Option<String> {
-    if meta.len() < 2 {
-        return None;
-    }
-    let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if meta.len() != 2 + id_len {
-        return None;
-    }
-    std::str::from_utf8(&meta[2..2 + id_len])
-        .ok()
-        .map(str::to_string)
+/// Reads one MQTT packet with a bound.
+async fn recv_mqtt(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    tokio::time::timeout(STEP, read_mqtt_packet(sock))
+        .await
+        .expect("packet in time")
+        .expect("packet")
 }
 
-/// Minimal kernel side of the BrokerLink handshake for one edge
-/// connection: answers every `BindConnection` with `SessionBinding`
-/// (mirroring `bind_connection_reply`), answers `Ping` with `Pong`,
-/// applies `UnbindConnection` like `apply_unbind`, and forwards this
-/// connection's mailbox onto the edge transport (mirroring
-/// `handle_connection`'s outbound arm). The session directory and the
-/// connection directory are the production ones shared with `ApiState`,
-/// so the kick route resolves the real session and routes `ConnClose`
-/// through the real `ConnTable`. Every wait is bounded by
-/// `KICK_E2E_STEP` so a dead edge ends the task instead of hanging it.
-async fn e2e_kernel_edge_handler(
-    stream: tokio::net::TcpStream,
-    sessions: Arc<SessionManager>,
-    conns: Arc<broker_router::ConnTable>,
-    auth: Arc<broker_auth::MemoryAuth>,
-) {
-    use broker_auth::Authenticator;
-    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
-    use bytes::Bytes;
-
-    let transport = Arc::new(FramedTransport::new(stream));
-    let (mb_tx, mut mb_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
-    let mut bound: Option<(String, u64)> = None;
-    eprintln!("kick-e2e: kernel accepted an edge connection");
-    let detach = |bound: &Option<(String, u64)>,
-                  tx: &tokio::sync::mpsc::UnboundedSender<BrokerFrame>| {
-        conns.prune_sender(tx);
-        if let Some((client_id, conn_id)) = bound {
-            sessions.unbind_connection(client_id, *conn_id);
-        }
-    };
-    loop {
-        tokio::select! {
-            inbound = tokio::time::timeout(KICK_E2E_STEP, transport.recv()) => {
-                let frame = match inbound {
-                    Ok(Ok(frame)) => frame,
-                    // Edge idle: keep serving; edge gone or broken frame:
-                    // detach exactly like the kernel does and stop.
-                    Err(_) => continue,
-                    Ok(Err(brokerlink::BrokerLinkError::ConnectionClosed)) => {
-                        detach(&bound, &mb_tx);
-                        break;
-                    }
-                    Ok(Err(_)) => {
-                        detach(&bound, &mb_tx);
-                        break;
-                    }
-                };
-                let conn_id = frame.header.conn_id;
-                let seq = frame.header.sequence_no;
-                eprintln!(
-                    "kick-e2e: kernel got opcode={:?} conn={conn_id}",
-                    frame.header.opcode
-                );
-                match frame.header.opcode {
-                    OpCode::BindConnection => {
-                        let mut session_id = 0u64;
-                        let mut present = false;
-                        let mut return_code = 2u8;
-                        if let Some((client_id, clean_start, keepalive, username, password)) =
-                            decode_e2e_bind(&frame.metadata)
-                        {
-                            // Same gates as the kernel's `apply_bind`:
-                            // anonymous binds need an empty user store,
-                            // credentialed binds authenticate first.
-                            if username.is_none() {
-                                if auth.user_count() == 0 {
-                                    return_code = 0;
-                                } else {
-                                    return_code = 0x87;
-                                }
-                            } else if auth
-                                .authenticate(&client_id, username.as_deref(), password.as_deref())
-                                .await
-                                .is_ok()
-                            {
-                                return_code = 0;
-                            } else {
-                                return_code = 0x86;
-                            }
-                            if return_code == 0 {
-                                let (session, was_present) =
-                                    sessions.get_or_create(&client_id, clean_start);
-                                *session.conn_id.write() = Some(conn_id);
-                                *session.keepalive_secs.write() = keepalive;
-                                *session.connected.write() = true;
-                                session_id = session.id.0;
-                                present = was_present;
-                                conns.register(conn_id, mb_tx.clone());
-                                bound = Some((client_id, conn_id));
-                            }
-                        }
-                        let mut reply_meta = Vec::with_capacity(10);
-                        reply_meta.extend_from_slice(&session_id.to_be_bytes());
-                        reply_meta.push(u8::from(present));
-                        reply_meta.push(return_code);
-                        let reply = BrokerFrame::new(
-                            OpCode::SessionBinding,
-                            conn_id,
-                            seq,
-                            Bytes::from(reply_meta),
-                            Bytes::new(),
-                        )
-                        .expect("SessionBinding reply within size bounds");
-                        if tokio::time::timeout(KICK_E2E_STEP, transport.send(reply))
-                            .await
-                            .is_err()
-                        {
-                            detach(&bound, &mb_tx);
-                            break;
-                        }
-                    }
-                    OpCode::Ping => {
-                        let pong = BrokerFrame::pong(conn_id, seq);
-                        if tokio::time::timeout(KICK_E2E_STEP, transport.send(pong))
-                            .await
-                            .is_err()
-                        {
-                            detach(&bound, &mb_tx);
-                            break;
-                        }
-                    }
-                    OpCode::UnbindConnection => {
-                        if let Some(client_id) = decode_e2e_unbind(&frame.metadata) {
-                            sessions.unbind_connection(&client_id, conn_id);
-                        }
-                        conns.unregister(conn_id);
-                    }
-                    _ => {}
-                }
-            }
-            outbound = tokio::time::timeout(KICK_E2E_STEP, mb_rx.recv()) => {
-                match outbound {
-                    Ok(Some(frame)) => {
-                        let send = tokio::time::timeout(KICK_E2E_STEP, transport.send(frame)).await;
-                        match send {
-                            Ok(Ok(())) => {}
-                            _ => {
-                                detach(&bound, &mb_tx);
-                                break;
-                            }
-                        }
-                    }
-                    // Mailbox closed: nothing left to deliver.
-                    Ok(None) => {
-                        detach(&bound, &mb_tx);
-                        break;
-                    }
-                    // Idle mailbox: keep serving.
-                    Err(_) => continue,
-                }
-            }
-        }
-    }
-}
-
-/// Where the shipped Erlang edge comes from for the kick test.
-struct EdgeTarget {
-    program: String,
-    /// Arguments, including the executable script for the `wsl.exe` fallback.
-    args: Vec<String>,
-    /// Host the MQTT client dials (loopback natively, the WSL guest IP
-    /// when the edge runs under `wsl.exe`).
-    mqtt_host: String,
-    /// Shell snippet that kills the edge started for `mqtt_port`
-    /// (the `wsl.exe` wrapper outlives `kill_on_drop`; native `erl` is
-    /// a direct child and needs no extra cleanup).
-    cleanup: Option<(String, Vec<String>)>,
-    /// Firewall proxy fronting the kernel listener (Windows+WSL branch
-    /// only): killed with the edge at the end of the test.
-    proxy: Option<tokio::process::Child>,
-}
-
-/// Transparent local TCP proxy for the Windows+WSL branch: Windows
-/// Firewall lets WSL open connections to `python.exe` listeners but
-/// stealth-drops them to this test binary, so the edge dials the
-/// proxy and the proxy forwards raw bytes to the real kernel listener
-/// on loopback. Usage: `python -c E2E_PROXY_SCRIPT <real_port>`; it
-/// prints the proxy port on stdout. Below the BrokerLink codec, so the
-/// handshake and kick hops under test are unchanged.
-const E2E_PROXY_SCRIPT: &str = r#"
-import socket
-import sys
-import threading
-
-real = int(sys.argv[1])
-srv = socket.socket()
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", 0))
-print(srv.getsockname()[1], flush=True)
-srv.listen(16)
-
-
-def pipe(source, dest):
-    try:
-        while True:
-            chunk = source.recv(65536)
-            if not chunk:
-                break
-            dest.sendall(chunk)
-    except OSError:
-        pass
-    try:
-        dest.shutdown(socket.SHUT_WR)
-    except OSError:
-        pass
-
-
-def handle(client):
-    try:
-        upstream = socket.create_connection(("127.0.0.1", real), timeout=10)
-    except OSError:
-        client.close()
-        return
-    relay = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
-    relay.start()
-    pipe(upstream, client)
-    client.close()
-    upstream.close()
-
-
-while True:
-    peer, _ = srv.accept()
-    threading.Thread(target=handle, args=(peer,), daemon=True).start()
-"#;
-
-/// Run `program args` and return its output unless it takes longer than
-/// `timeout`.
-async fn e2e_command_output(
-    program: &str,
-    args: &[&str],
-    timeout: std::time::Duration,
-) -> Option<std::process::Output> {
-    match tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new(program).args(args).output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => Some(output),
-        _ => None,
-    }
-}
-
-/// Locate the shipped edge (`beam/ebin` next to this workspace) and an
-/// Erlang runtime to run it: native `erl` first (CI installs OTP), then
-/// `wsl.exe` on Windows. Returns the launch plus the MQTT port the edge
-/// was told to bind (probed in the edge's own network namespace: a port
-/// free on Windows may be taken in WSL). Returns `None` with a logged
-/// reason when no runtime exists, in which case the caller skips instead
-/// of failing.
-async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16, u16)> {
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ebin = manifest.join("../../beam/ebin");
-    let ebin = ebin.canonicalize().unwrap_or(ebin);
-    if !ebin.join("indra_edge.app").is_file() {
-        e2e_skip!(
-            "SKIP kicked_mqtt_client_sees_disconnect: no compiled edge at {} (build beam/ first)",
-            ebin.display()
-        );
-        return None;
-    }
-    // Native Erlang: `erl` on PATH (CI's erlef/setup-beam, dev machines).
-    let native = e2e_command_output("erl", &["-version"], KICK_E2E_STEP).await;
-    if native.as_ref().is_some_and(|out| out.status.success()) {
-        let mqtt_port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral MQTT port");
-            probe.local_addr().expect("MQTT port").port()
-        };
-        // The plaintext WebSocket listener rides beside MQTT on its own
-        // ephemeral port so parallel tests never share 8083.
-        let ws_port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral WS port");
-            probe.local_addr().expect("WS port").port()
-        };
-        let args = vec![
-            "-noshell".to_string(),
-            "-pa".to_string(),
-            ebin.to_string_lossy().into_owned(),
-            "-indra_edge".to_string(),
-            "mqtt_port".to_string(),
-            mqtt_port.to_string(),
-            "-indra_edge".to_string(),
-            "ws_port".to_string(),
-            ws_port.to_string(),
-            "-indra_edge".to_string(),
-            "kernel_host".to_string(),
-            "\"127.0.0.1\"".to_string(),
-            "-indra_edge".to_string(),
-            "kernel_port".to_string(),
-            bl_port.to_string(),
-            "-eval".to_string(),
-            "{ok,_} = application:ensure_all_started(indra_edge), timer:sleep(infinity)."
-                .to_string(),
-        ];
-        return Some((
-            EdgeTarget {
-                program: "erl".to_string(),
-                args,
-                mqtt_host: "127.0.0.1".to_string(),
-                cleanup: None,
-                proxy: None,
-            },
-            mqtt_port,
-            ws_port,
-        ));
-    }
-    // Windows fallback: Erlang lives in WSL (this repo's edge toolchain).
-    // The edge then dials the Windows host through the WSL gateway while
-    // the MQTT client dials the guest IP: loopback is not shared there.
-    // (`cfg!` keeps this compiling on every platform; it only runs on
-    // Windows, where native `erl` was already ruled out above.)
-    if cfg!(windows) {
-        let has_erl = e2e_command_output(
-            "wsl.exe",
-            &["-e", "bash", "-lc", "command -v erl"],
-            KICK_E2E_PROBE,
-        )
-        .await;
-        if !has_erl.as_ref().is_some_and(|out| out.status.success()) {
-            e2e_skip!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH and none in WSL");
-            return None;
-        }
-        let route = e2e_command_output(
-            "wsl.exe",
-            &["-e", "bash", "-lc", "ip route show default"],
-            KICK_E2E_PROBE,
-        )
-        .await?;
-        let route = String::from_utf8_lossy(&route.stdout);
-        let gateway = route
-            .split_whitespace()
-            .skip_while(|word| *word != "via")
-            .nth(1)?
-            .to_string();
-        let addr = e2e_command_output(
-            "wsl.exe",
-            &["-e", "bash", "-lc", "ip -4 -o addr show eth0"],
-            KICK_E2E_PROBE,
-        )
-        .await?;
-        let addr = String::from_utf8_lossy(&addr.stdout);
-        let inet = addr.split_whitespace().find(|word| word.contains('/'))?;
-        let guest_ip = inet.split('/').next()?.to_string();
-        // A port free in the guest (the edge binds there): probing from
-        // Windows would check the wrong namespace.
-        let probe = e2e_command_output(
-            "wsl.exe",
-            &[
-                "-e",
-                "bash",
-                "-lc",
-                "python3 -c 'import socket; s = socket.socket(); s.bind((\"0.0.0.0\", 0)); print(s.getsockname()[1])'",
-            ],
-            KICK_E2E_PROBE,
-        )
-        .await?;
-        if !probe.status.success() {
-            return None;
-        }
-        let mqtt_port: u16 = String::from_utf8_lossy(&probe.stdout).trim().parse().ok()?;
-        // The plaintext WebSocket listener gets its own guest-side
-        // ephemeral port beside MQTT for the same reason.
-        let ws_probe = e2e_command_output(
-            "wsl.exe",
-            &[
-                "-e",
-                "bash",
-                "-lc",
-                "python3 -c 'import socket; s = socket.socket(); s.bind((\"0.0.0.0\", 0)); print(s.getsockname()[1])'",
-            ],
-            KICK_E2E_PROBE,
-        )
-        .await?;
-        if !ws_probe.status.success() {
-            return None;
-        }
-        let ws_port: u16 = String::from_utf8_lossy(&ws_probe.stdout)
-            .trim()
-            .parse()
-            .ok()?;
-        // Firewall proxy (see `E2E_PROXY_SCRIPT`): the edge dials the
-        // proxy through the gateway; the proxy forwards to `bl_port`
-        // on loopback. Without it the edge's SYNs never reach this
-        // binary and the edge never gets past BrokerLink init.
-        if !e2e_command_output("python", &["--version"], KICK_E2E_PROBE)
-            .await
-            .as_ref()
-            .is_some_and(|out| out.status.success())
-        {
-            e2e_skip!(
-                "SKIP kicked_mqtt_client_sees_disconnect: no `python` for the WSL firewall proxy"
-            );
-            return None;
-        }
-        let mut proxy = tokio::process::Command::new("python")
-            .arg("-c")
-            .arg(E2E_PROXY_SCRIPT)
-            .arg(bl_port.to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let proxy_stdout = proxy.stdout.take()?;
-        let mut lines = BufReader::new(proxy_stdout).lines();
-        let first = tokio::time::timeout(KICK_E2E_PROBE, lines.next_line())
-            .await
-            .ok()?
-            .ok()?
-            .unwrap_or_default();
-        let proxy_port: u16 = first.trim().parse().ok()?;
-        eprintln!("kick-e2e: firewall proxy forwards gateway:{proxy_port} -> 127.0.0.1:{bl_port}");
-        // Rust `canonicalize` returns a `\\?\`-prefixed UNC path on
-        // Windows, which WSL cannot resolve: strip it back to a plain
-        // `C:\...` path before translating to `/mnt/c/...`.
-        let win = ebin.to_string_lossy();
-        let win = win.strip_prefix(r"\\?\").unwrap_or(&win);
-        let drive = win.chars().next()?.to_ascii_lowercase();
-        let wsl_ebin = if win.as_bytes().get(1) == Some(&b':') {
-            format!("/mnt/{drive}{}", win[2..].replace('\\', "/"))
-        } else {
-            win.to_string()
-        };
-        let script = format!(
-            "cd /tmp && erl -noshell -pa '{wsl_ebin}' \
-             -indra_edge mqtt_port {mqtt_port} \
-             -indra_edge ws_port {ws_port} \
-             -indra_edge kernel_host '\"{gateway}\"' \
-             -indra_edge kernel_port {proxy_port} \
-             -eval '{{ok,_}} = application:ensure_all_started(indra_edge), timer:sleep(infinity).'"
-        );
-        let cleanup = format!("pkill -f 'mqtt_port {mqtt_port}'");
-        return Some((
-            EdgeTarget {
-                program: "wsl.exe".to_string(),
-                args: vec![
-                    "-e".to_string(),
-                    "bash".to_string(),
-                    "-lc".to_string(),
-                    script,
-                ],
-                mqtt_host: guest_ip,
-                cleanup: Some((
-                    "wsl.exe".to_string(),
-                    vec![
-                        "-e".to_string(),
-                        "bash".to_string(),
-                        "-lc".to_string(),
-                        cleanup,
-                    ],
-                )),
-                proxy: Some(proxy),
-            },
-            mqtt_port,
-            ws_port,
-        ));
-    }
-    e2e_skip!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH");
-    None
-}
-
-/// Kick loop against the shipped Erlang edge: a real MQTT 3.1.1 client
-/// connects through `indra_edge` (spawned from this repo's `beam/ebin`
-/// with its MQTT and BrokerLink ports pointed at the harness), the test
-/// calls `DELETE /api/v5/clients/{id}`, the kernel routes `ConnClose`
-/// to the edge, the edge closes the client socket (W0-25 contract), and
-/// the client observes TCP close.
+/// Kick closes the socket of a live client through the kernel listener.
 ///
-/// Kernel side this exercises the production path end to end: the kick
-/// route sends on `ApiState`'s kernel→edge sender, the `serve_api`-style
-/// forwarder routes the frame through the connection directory
-/// (`ConnTable::route`), and the connection mailbox hands it to the
-/// BrokerLink transport — the same hops a live connection takes
-/// (`serve_api`/`handle_connection` in `broker-node/src/main.rs`).
-/// Because the frame is routed *before* the kick unregisters the
-/// connection, a regressed unregister-first order drops the close and
-/// this test times out instead of passing.
-///
-/// The only non-production piece is the kernel's BrokerLink acceptor
-/// (`e2e_kernel_edge_handler`): it answers `BindConnection`/`Ping`
-/// exactly like the kernel's handshake so the edge can boot against a
-/// test-scoped session directory. The edge binary, the MQTT framing,
-/// the kick route, the session directory and the connection directory
-/// are all production. Needs an Erlang runtime (`erl` on PATH, or WSL
-/// on Windows); without one the test logs a SKIP and passes.
+/// A real 3.1.1 client connects to the booted kernel. The test kicks it
+/// with `DELETE /api/v5/clients/{id}` and bearer auth. The client then
+/// observes TCP close. The kick sends `ConnClose` with empty metadata,
+/// so a version-5 client gets no DISCONNECT either. A regressed
+/// unregister-first order drops the close and the final read times out
+/// instead of passing.
 #[tokio::test]
 async fn kicked_mqtt_client_sees_disconnect() {
-    use brokerlink::BrokerFrame;
-    use std::time::{Duration, Instant};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncReadExt;
 
     const CLIENT_ID: &str = "kicked-client";
-    const TIMEOUT: Duration = KICK_E2E_STEP;
-    // Boot budget: the edge starts an OTP VM (slower over WSL's 9p
-    // filesystem), so process boot gets a minute while every single
-    // wait stays at 5 s and fails loudly on expiry.
-    const BOOT_BUDGET: Duration = Duration::from_secs(60);
 
-    // Production kernel-side state, wired exactly as `serve_api` wires it.
+    let kernel = spawn_kernel("").await;
+    let mut sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(&mut sock, &mqtt_connect_packet(CLIENT_ID)).await;
+    let (head, body) = recv_mqtt(&mut sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(body, vec![0x00, 0x00], "CONNECT is accepted");
+
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}", kernel.api_port);
+    let kick = tokio::time::timeout(
+        STEP,
+        http.delete(format!("{base}/api/v5/clients/{CLIENT_ID}"))
+            .bearer_auth(API_KEY)
+            .send(),
+    )
+    .await
+    .expect("kick in time")
+    .expect("kick send");
+    assert_eq!(kick.status(), 204, "kick removes the live client");
+
+    let mut probe = [0u8; 1];
+    let closed = tokio::time::timeout(STEP, sock.read(&mut probe))
+        .await
+        .expect("close in time")
+        .expect("close read");
+    assert_eq!(closed, 0, "kicked socket is closed");
+
+    let again = tokio::time::timeout(
+        STEP,
+        http.delete(format!("{base}/api/v5/clients/{CLIENT_ID}"))
+            .bearer_auth(API_KEY)
+            .send(),
+    )
+    .await
+    .expect("second kick in time")
+    .expect("second kick send");
+    assert_eq!(again.status(), 404, "kicked client is gone");
+
+    kernel.finish().await;
+}
+
+/// Backup file download through the broker HTTP API (C18-05).
+///
+/// Upload one file with random bytes through POST /data/files. Fetch it
+/// through GET /data/files/{filename}. Check the bytes match. Check an
+/// unknown name returns 404 NOT_FOUND. Check a bad name returns 400.
+#[tokio::test]
+async fn backup_file_download_through_broker_api() {
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use broker_api::ApiState;
+    use broker_auth::MemoryAuth;
+    use broker_config::ConfigRegistry;
+    use broker_observability::Metrics;
+    use broker_router::{ConnTable, Router};
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+    use broker_session::SessionManager;
+    use rand::Rng;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    // Bound for one management request in this test. Ten seconds
+    // matches STEP above; a cold debug boot plus parallel hashing
+    // and fsync completes within ten seconds under load.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
     let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
     let sessions = Arc::new(SessionManager::new());
     let sub_router = Arc::new(Router::new());
-    let metrics = Arc::new(broker_observability::Metrics::new());
-    let auth = Arc::new(broker_auth::MemoryAuth::new());
-    let conns = Arc::new(broker_router::ConnTable::default());
+    let metrics = Arc::new(Metrics::new());
+    let auth = Arc::new(MemoryAuth::new());
+    let conns = Arc::new(ConnTable::default());
     let scratch = std::env::temp_dir().join(format!(
-        "indramqtt-kick-e2e-{}-{}",
+        "indramqtt-backup-e2e-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let config =
-        Arc::new(broker_config::ConfigRegistry::load(&scratch).expect("validated defaults load"));
-    let (edge_tx, mut edge_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
-    let api_state = broker_api::ApiState::new(
+    let config = Arc::new(ConfigRegistry::load(&scratch).expect("validated defaults load"));
+    let (edge_tx, _edge_rx) = tokio::sync::mpsc::unbounded_channel::<brokerlink::BrokerFrame>();
+    let api_state = ApiState::new(
         engine,
-        sessions.clone(),
+        sessions,
         sub_router,
         metrics,
-        auth.clone(),
-        conns.clone(),
+        auth,
+        conns,
         config,
         "indra-node-1".to_string(),
         edge_tx,
     );
 
-    // Kernel listener on loopback: natively the edge dials it
-    // directly; under WSL a `python` proxy (an allow-listed listener
-    // program) forwards the edge's connection to it.
-    let bl_listener = tokio::time::timeout(TIMEOUT, TcpListener::bind("127.0.0.1:0"))
-        .await
-        .expect("bind BrokerLink listener in time")
-        .expect("bind BrokerLink listener");
-    let bl_port = bl_listener.local_addr().expect("BrokerLink addr").port();
-    let (edge, mqtt_port, _ws_port) = match e2e_edge_target(bl_port).await {
-        // SKIP already logged when no runtime exists.
-        Some(target) => target,
-        None => return,
-    };
-    // The edge's stderr lands here; on a boot failure the tail is
-    // quoted in the panic, on success the file is removed.
-    let edge_log = std::env::temp_dir().join(format!(
-        "indramqtt-kick-edge-{}-{mqtt_port}.log",
-        std::process::id()
-    ));
-    eprintln!(
-        "kick-e2e: spawning {} (mqtt={} on {}, brokerlink={} on Windows)",
-        edge.program, mqtt_port, edge.mqtt_host, bl_port
-    );
-    eprintln!("kick-e2e: edge argv: {}", edge.args.join(" "));
-    let edge_stderr = std::fs::File::create(&edge_log).expect("edge log file");
-    let mut edge_child = tokio::process::Command::new(&edge.program)
-        .args(&edge.args)
-        .stdout(std::process::Stdio::null())
-        .stderr(edge_stderr)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shipped edge");
-
-    // Kernel acceptor: every edge connection (including reconnects)
-    // gets the production-shaped handshake handler.
-    let accept_sessions = sessions.clone();
-    let accept_conns = conns.clone();
-    let accept_auth = auth.clone();
-    let acceptor = tokio::spawn(async move {
-        loop {
-            match tokio::time::timeout(TIMEOUT, bl_listener.accept()).await {
-                Ok(Ok((stream, _))) => {
-                    let sessions = accept_sessions.clone();
-                    let conns = accept_conns.clone();
-                    let auth = accept_auth.clone();
-                    tokio::spawn(e2e_kernel_edge_handler(stream, sessions, conns, auth));
-                }
-                // No dial yet (edge still booting): keep listening.
-                Err(_) => continue,
-                Ok(Err(error)) => panic!("BrokerLink accept failed: {error}"),
-            }
-        }
-    });
-
-    // Production kick forwarder, as `serve_api` wires it: every
-    // kernel→edge close frame is routed through the connection
-    // directory to the owning connection task. Frames for unregistered
-    // connections are dropped there, so the kick must send the close
-    // BEFORE unregistering (see `kick_client`).
-    let forwarder_conns = conns.clone();
-    let forwarder = tokio::spawn(async move {
-        loop {
-            match tokio::time::timeout(TIMEOUT, edge_rx.recv()).await {
-                Ok(Some(frame)) => {
-                    let _ = forwarder_conns.route(frame.header.conn_id, frame);
-                }
-                // All senders gone: nothing left to deliver.
-                Ok(None) => break,
-                // Idle: keep forwarding.
-                Err(_) => continue,
-            }
-        }
-    });
-
-    // Management API on loopback (mirrors `broker_api::serve`).
     let api_listener = tokio::time::timeout(TIMEOUT, TcpListener::bind("127.0.0.1:0"))
         .await
         .expect("bind API listener in time")
         .expect("bind API listener");
     let api_port = api_listener.local_addr().expect("API addr").port();
-    let api_task = tokio::spawn(async move { broker_api::serve(api_listener, api_state).await });
+    tokio::spawn(async move { broker_api::serve(api_listener, api_state).await });
     let base = format!("http://127.0.0.1:{api_port}");
 
-    // Wait for the shipped edge's MQTT listener, then complete a real
-    // MQTT 3.1.1 handshake through it: CONNECT out, CONNACK back. The
-    // edge only sends CONNACK after the kernel answered its
-    // `BindConnection`, so success here also proves the bind path.
-    let mut client_sock = {
-        let deadline = Instant::now() + BOOT_BUDGET;
-        loop {
-            let dial = tokio::time::timeout(
-                TIMEOUT,
-                TcpStream::connect((edge.mqtt_host.as_str(), mqtt_port)),
-            )
-            .await;
-            match dial {
-                Ok(Ok(sock)) => break sock,
-                other => {
-                    // The panic below only ever needs the latest dial
-                    // error, so it stays a per-iteration local instead of
-                    // a carried variable.
-                    let last_error = match &other {
-                        Ok(Err(error)) => error.to_string(),
-                        Err(_) => "dial timed out".to_string(),
-                        Ok(Ok(_)) => unreachable!("guarded above"),
-                    };
-                    if Instant::now() >= deadline {
-                        panic!(
-                            "shipped edge never opened MQTT port {mqtt_port} (last dial: {last_error})"
-                        );
-                    }
-                    // Fail fast when the edge VM died during boot
-                    // instead of polling a dead port for a minute.
-                    if let Ok(Some(status)) = edge_child.try_wait() {
-                        let log = std::fs::read_to_string(&edge_log).unwrap_or_default();
-                        let tail = &log[log.len().saturating_sub(2000)..];
-                        panic!("shipped edge exited during boot: {status}\nedge log tail:\n{tail}");
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
-    };
-    tokio::time::timeout(
-        TIMEOUT,
-        client_sock.write_all(&mqtt_connect_packet(CLIENT_ID)),
-    )
-    .await
-    .expect("client sends CONNECT in time")
-    .expect("client sends CONNECT");
-    let (packet_type, connack_body) =
-        tokio::time::timeout(TIMEOUT, read_mqtt_packet(&mut client_sock))
-            .await
-            .expect("client reads CONNACK in time")
-            .expect("client reads CONNACK");
-    assert_eq!(packet_type, 0x20, "edge answers with CONNACK");
-    assert_eq!(
-        connack_body,
-        vec![0x00, 0x00],
-        "CONNACK signals session-present=false, return-code=accepted"
-    );
-
-    // The edge bound this client to one of its own connections: learn
-    // which (the edge assigns the conn id, never the test).
-    let edge_conn_id = {
-        let deadline = Instant::now() + BOOT_BUDGET;
-        loop {
-            if let Some(session) = sessions.get(CLIENT_ID) {
-                if let Some(conn_id) = *session.conn_id.read() {
-                    break conn_id;
-                }
-            }
-            if Instant::now() >= deadline {
-                panic!("kernel never bound {CLIENT_ID} (edge bind missing?)");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
-
-    // Authenticated kick through the real HTTP route. The first token
-    // still carries `must_change_password`, so it only opens the login
-    // and password-change routes: change the password, log in again,
-    // then kick with the fully-privileged token.
+    // Log in. Use the default admin credential first.
     let http = reqwest::Client::new();
     let login = tokio::time::timeout(
         TIMEOUT,
@@ -1026,7 +552,7 @@ async fn kicked_mqtt_client_sees_disconnect() {
         TIMEOUT,
         http.put(format!("{base}/api/v5/users/admin/change_pwd"))
             .bearer_auth(&fresh)
-            .json(&serde_json::json!({"old_pwd": "public", "new_pwd": "Kick-e2e-1!"}))
+            .json(&serde_json::json!({"old_pwd": "public", "new_pwd": "Backup-e2e-1!"}))
             .send(),
     )
     .await
@@ -1036,7 +562,7 @@ async fn kicked_mqtt_client_sees_disconnect() {
     let login = tokio::time::timeout(
         TIMEOUT,
         http.post(format!("{base}/api/v5/login"))
-            .json(&serde_json::json!({"username": "admin", "password": "Kick-e2e-1!"}))
+            .json(&serde_json::json!({"username": "admin", "password": "Backup-e2e-1!"}))
             .send(),
     )
     .await
@@ -1052,297 +578,113 @@ async fn kicked_mqtt_client_sees_disconnect() {
         .expect("login token")
         .to_string();
 
-    let kick = tokio::time::timeout(
+    // Make random bytes. The broker cannot know them in advance.
+    let mut rng = rand::rng();
+    let mut test_content = vec![0u8; 8192];
+    rng.fill_bytes(&mut test_content);
+    let content = BASE64_STANDARD.encode(&test_content);
+    let filename = "e2e-dl-hit.tar.gz";
+    let upload = tokio::time::timeout(
         TIMEOUT,
-        http.delete(format!("{base}/api/v5/clients/{CLIENT_ID}"))
+        http.post(format!("{base}/api/v5/data/files"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"filename": filename, "content": content}))
+            .send(),
+    )
+    .await
+    .expect("upload request in time")
+    .expect("upload request");
+    assert_eq!(upload.status(), 204);
+
+    // Fetch the file. Check status, type, name and bytes.
+    let download = tokio::time::timeout(
+        TIMEOUT,
+        http.get(format!("{base}/api/v5/data/files/{filename}"))
             .bearer_auth(&token)
             .send(),
     )
     .await
-    .expect("kick request in time")
-    .expect("kick request");
-    assert_eq!(kick.status(), 204);
-
-    // The shipped edge got `ConnClose` for its connection and closed
-    // the client socket, so the MQTT client observes TCP close. A
-    // regressed unregister-first kick order drops the close here and
-    // this read times out instead of passing.
-    let mut probe = [0u8; 1];
-    let closed = tokio::time::timeout(TIMEOUT, client_sock.read(&mut probe))
-        .await
-        .expect("client sees close in time")
-        .expect("client read succeeds");
+    .expect("download request in time")
+    .expect("download request");
+    assert_eq!(download.status(), 200);
     assert_eq!(
-        closed, 0,
-        "client socket for edge conn {edge_conn_id} is closed by the kick"
+        download
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream")
     );
+    assert!(download
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains(filename))
+        .unwrap_or(false));
+    let bytes = tokio::time::timeout(TIMEOUT, download.bytes())
+        .await
+        .expect("download body in time")
+        .expect("response body readable");
+    assert_eq!(bytes.as_ref(), test_content.as_slice());
 
-    // Kernel state is torn down as before.
-    let session = sessions.get(CLIENT_ID).expect("session survives kick");
-    assert_eq!(*session.conn_id.read(), None);
-    assert!(!*session.connected.read());
-
-    api_task.abort();
-    acceptor.abort();
-    forwarder.abort();
-    let _ = edge_child.kill().await;
-    if let Some((program, args)) = edge.cleanup {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let _ = e2e_command_output(&program, &refs, TIMEOUT).await;
-    }
-    if let Some(mut proxy) = edge.proxy {
-        let _ = proxy.kill().await;
-    }
-    let _ = std::fs::remove_file(&edge_log);
-}
-
-/// Bound for every BrokerLink wait in the sharded-transports test: a
-/// regressed kernel fails the test instead of hanging the worker.
-const SHARD_E2E_STEP: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Budget for spawning the real kernel binary and waiting for its
-/// BrokerLink listener (a cold debug boot is slower than one step).
-const SHARD_E2E_BOOT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Encode `BindConnection` metadata (`ClientIdLen:16be | ClientId |
-/// Flags:8 | Keepalive:16be`), mirroring the kernel's `decode_bind_meta`.
-fn shard_encode_bind(client_id: &str, clean_start: bool, keepalive: u16) -> bytes::Bytes {
-    let id = client_id.as_bytes();
-    let mut meta = Vec::with_capacity(2 + id.len() + 1 + 2);
-    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    meta.extend_from_slice(id);
-    meta.push(u8::from(clean_start));
-    meta.extend_from_slice(&keepalive.to_be_bytes());
-    bytes::Bytes::from(meta)
-}
-
-/// Will-carrying bind parameters for [`shard_encode_bind_with_will_and_alias`].
-/// Grouped in one struct so the helper stays under the argument-count lint.
-struct ShardWillBind<'a> {
-    client_id: &'a str,
-    clean_start: bool,
-    keepalive: u16,
-    will_topic: &'a str,
-    will_payload: &'a [u8],
-    will_qos: u8,
-    will_retain: bool,
-    client_alias_max: u16,
-}
-
-/// Encode `BindConnection` metadata with an F1-01 last-will section plus
-/// the B4-05 trailing `ClientAliasMax:16be` (the canonical encoding the
-/// edge sends for a WebSocket connection carrying PSK identity, will and
-/// alias state together): will-bit head, then
-/// `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
-/// PayloadLen:32be | Payload`, then the alias maximum.
-fn shard_encode_bind_with_will_and_alias(params: ShardWillBind<'_>) -> bytes::Bytes {
-    let id = params.client_id.as_bytes();
-    let mut meta = Vec::new();
-    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    meta.extend_from_slice(id);
-    meta.push(u8::from(params.clean_start) | 0x02);
-    meta.extend_from_slice(&params.keepalive.to_be_bytes());
-    meta.push(params.will_qos);
-    meta.push(u8::from(params.will_retain));
-    meta.extend_from_slice(&(params.will_topic.len() as u16).to_be_bytes());
-    meta.extend_from_slice(params.will_topic.as_bytes());
-    meta.extend_from_slice(&(params.will_payload.len() as u32).to_be_bytes());
-    meta.extend_from_slice(params.will_payload);
-    meta.extend_from_slice(&params.client_alias_max.to_be_bytes());
-    bytes::Bytes::from(meta)
-}
-
-/// Encode `PubAckIn` metadata (`PacketId:16be | RC:8`) for one downlink ack.
-fn shard_encode_puback(packet_id: u16) -> bytes::Bytes {
-    let mut meta = Vec::with_capacity(3);
-    meta.extend_from_slice(&packet_id.to_be_bytes());
-    meta.push(0u8);
-    bytes::Bytes::from(meta)
-}
-
-/// Encode `DisconnectIn`/`UnbindConnection` metadata (`IdLen:16be | ClientId`).
-fn shard_encode_client_id(client_id: &str) -> bytes::Bytes {
-    let id = client_id.as_bytes();
-    let mut meta = Vec::with_capacity(2 + id.len());
-    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    meta.extend_from_slice(id);
-    bytes::Bytes::from(meta)
-}
-
-/// One ephemeral loopback port for a test kernel's BrokerLink listener.
-fn shard_ephemeral_port() -> u16 {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
-    probe.local_addr().expect("port").port()
-}
-
-/// Spawn one real kernel with the given extra argv (after the standard
-/// `--brokerlink-bind/--api-bind/--data-dir/--allow-anonymous` prefix),
-/// wait for its BrokerLink listener, and return the child plus address.
-/// The caller owns `child.kill()` (plus scratch cleanup where relevant).
-async fn shard_spawn_kernel(
-    extra_argv: &[&str],
-    scratch: &std::path::Path,
-    bl_port: u16,
-) -> (tokio::process::Child, std::net::SocketAddr) {
-    let mut child = tokio::process::Command::new(shard_kernel_binary());
-    child
-        .arg("--brokerlink-bind")
-        .arg(format!("127.0.0.1:{bl_port}"))
-        .arg("--api-bind")
-        .arg("")
-        .arg("--data-dir")
-        .arg(scratch)
-        .arg("--allow-anonymous");
-    for arg in extra_argv {
-        child.arg(arg);
-    }
-    let mut child = child
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn real kernel");
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{bl_port}").parse().expect("addr");
-    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
-    loop {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(stream) => {
-                drop(stream);
-                break;
-            }
-            Err(error) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill().await;
-                    panic!("kernel never opened BrokerLink {bl_port}: {error}");
-                }
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("kernel exited during boot: {status}");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-    }
-    (child, addr)
-}
-
-/// Decode `SessionBinding` metadata into `(session_id, present, rc,
-/// alias_max)`. Accepts 10-byte (pre-alias, alias maximum 0) and 12-byte
-/// (B4-05 with trailing Topic Alias Maximum) encodings; the trailing
-/// maximum is asserted by the alias negotiation test below.
-fn shard_decode_binding(meta: &[u8]) -> (u64, bool, u8, u16) {
-    assert!(
-        meta.len() == 10 || meta.len() == 12,
-        "SessionBinding meta must be 10 or 12 bytes, got {}",
-        meta.len()
-    );
-    let session_id = u64::from_be_bytes(meta[0..8].try_into().unwrap());
-    let alias_max = if meta.len() == 12 {
-        u16::from_be_bytes([meta[10], meta[11]])
-    } else {
-        0
-    };
-    (session_id, meta[8] != 0, meta[9], alias_max)
-}
-
-/// Decode `SessionBinding` metadata into `(session_id, present, rc)`,
-/// ignoring the trailing alias maximum (legacy callers).
-fn shard_decode_binding_legacy(meta: &[u8]) -> (u64, bool, u8) {
-    let (session_id, present, rc, _) = shard_decode_binding(meta);
-    (session_id, present, rc)
-}
-
-/// Encode `SubscribeMeta` (`PacketId:16be | IdLen:16be | ClientId |
-/// N:16be | (FilterLen:16be | Filter | QoS:8) * N`).
-fn shard_encode_subscribe(packet_id: u16, client_id: &str, subs: &[(&str, u8)]) -> bytes::Bytes {
-    let id = client_id.as_bytes();
-    let mut meta = Vec::new();
-    meta.extend_from_slice(&packet_id.to_be_bytes());
-    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    meta.extend_from_slice(id);
-    meta.extend_from_slice(&(subs.len() as u16).to_be_bytes());
-    for (filter, qos) in subs {
-        meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
-        meta.extend_from_slice(filter.as_bytes());
-        meta.push(*qos);
-    }
-    bytes::Bytes::from(meta)
-}
-
-/// Encode `PublishMeta` (`TopicLen:16be | Topic | PacketId:16be |
-/// QoS:8 | Retain:8 | Dup:8`) plus the raw payload.
-fn shard_encode_publish(
-    topic: &str,
-    packet_id: u16,
-    qos: u8,
-    retain: bool,
-    payload: &[u8],
-) -> (bytes::Bytes, bytes::Bytes) {
-    let mut meta = Vec::new();
-    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-    meta.extend_from_slice(topic.as_bytes());
-    meta.extend_from_slice(&packet_id.to_be_bytes());
-    meta.push(qos);
-    meta.push(u8::from(retain));
-    meta.push(0u8);
-    (
-        bytes::Bytes::from(meta),
-        bytes::Bytes::from(payload.to_vec()),
+    // Fetch an unknown name. Check 404 NOT_FOUND.
+    let missing = tokio::time::timeout(
+        TIMEOUT,
+        http.get(format!("{base}/api/v5/data/files/e2e-dl-missing.tar.gz"))
+            .bearer_auth(&token)
+            .send(),
     )
-}
+    .await
+    .expect("missing request in time")
+    .expect("missing request");
+    assert_eq!(missing.status(), 404);
+    let body: serde_json::Value = missing.json().await.expect("error body");
+    assert_eq!(body["code"], "NOT_FOUND");
 
-/// Encode `PublishMeta` with the trailing B4-05 alias section
-/// (`Alias:16be`). An empty topic with a nonzero alias encodes
-/// alias-by-reference; absent-alias callers use
-/// [`shard_encode_publish`].
-fn shard_encode_publish_with_alias(
-    topic: &str,
-    packet_id: u16,
-    qos: u8,
-    retain: bool,
-    alias: u16,
-    payload: &[u8],
-) -> (bytes::Bytes, bytes::Bytes) {
-    let mut meta = Vec::new();
-    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-    meta.extend_from_slice(topic.as_bytes());
-    meta.extend_from_slice(&packet_id.to_be_bytes());
-    meta.push(qos);
-    meta.push(u8::from(retain));
-    meta.push(0u8);
-    meta.extend_from_slice(&alias.to_be_bytes());
-    (
-        bytes::Bytes::from(meta),
-        bytes::Bytes::from(payload.to_vec()),
+    // Fetch a bad name. Check 400 BAD_REQUEST.
+    let bad = tokio::time::timeout(
+        TIMEOUT,
+        http.get(format!("{base}/api/v5/data/files/evil..traversal.tar.gz"))
+            .bearer_auth(&token)
+            .send(),
     )
+    .await
+    .expect("bad-name request in time")
+    .expect("bad-name request");
+    assert_eq!(bad.status(), 400);
+    let body: serde_json::Value = bad.json().await.expect("error body");
+    assert_eq!(body["code"], "BAD_REQUEST");
+
+    // Fetch with an unknown node. Check 404 NOT_FOUND.
+    let bad_node = tokio::time::timeout(
+        TIMEOUT,
+        http.get(format!(
+            "{base}/api/v5/data/files/{filename}?node=no-such-node"
+        ))
+        .bearer_auth(&token)
+        .send(),
+    )
+    .await
+    .expect("node request in time")
+    .expect("node request");
+    assert_eq!(bad_node.status(), 404);
+    let body: serde_json::Value = bad_node.json().await.expect("error body");
+    assert_eq!(body["code"], "NOT_FOUND");
+
+    // Remove the file. Keep the scratch dir clean.
+    let delete = tokio::time::timeout(
+        TIMEOUT,
+        http.delete(format!("{base}/api/v5/data/files/{filename}"))
+            .bearer_auth(&token)
+            .send(),
+    )
+    .await
+    .expect("delete request in time")
+    .expect("delete request");
+    assert_eq!(delete.status(), 204);
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// Decode `PublishOut` metadata into `(topic, packet_id, qos, alias)`.
-/// The kernel always appends the B4-05 alias section, so the meta is
-/// `TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 | Dup:8 |
-/// Alias:16be`, optionally followed by the X1-03 subscription-identifier
-/// trailer `SubId:32be` (absent for version-4 deliveries) and the X1-03
-/// forwarded v5 section `Format:8 | Expiry:32be | users' (absent when
-/// the publish carried no properties).
-fn shard_decode_publish_out(meta: &[u8]) -> (String, u16, u8, u16) {
-    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    let base = 2 + topic_len;
-    assert!(
-        meta.len() == base + 2 + 3 + 2
-            || meta.len() == base + 2 + 3 + 2 + 4
-            || meta.len() >= base + 2 + 3 + 2 + 4 + 1 + 4 + 2,
-        "PublishOut meta must carry the trailing alias section, got {} bytes",
-        meta.len()
-    );
-    let topic = std::str::from_utf8(&meta[2..base])
-        .expect("topic UTF-8")
-        .to_string();
-    let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
-    let qos = meta[base + 2];
-    let alias = u16::from_be_bytes([meta[base + 5], meta[base + 6]]);
-    (topic, packet_id, qos, alias)
-}
-
-/// Locate the real kernel binary for the sharded-transports test.
+/// Locate the real kernel binary for the spawned-kernel tests.
 /// `CARGO_BIN_EXE_indramqtt` is set when Cargo builds the test target;
 /// the probe fallback covers binaries built by an earlier explicit
 /// `cargo build -p broker-node` under either target directory.
@@ -1365,527 +707,220 @@ fn shard_kernel_binary() -> std::path::PathBuf {
         }
     }
     panic!(
-        "sharded kernel binary not found: run `cargo build -p broker-node` first \
+        "kernel binary not found: run `cargo build -p broker-node` first \
          (CARGO_BIN_EXE_indramqtt unset and no binary under target/debug or target/ci-check/debug)"
     );
 }
 
-/// Extract the downlink packet id from `PublishOut` metadata
-/// (`TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 | Dup:8`).
-fn shard_downlink_packet_id(meta: &[u8]) -> u16 {
-    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    let base = 2 + topic_len;
-    u16::from_be_bytes([meta[base], meta[base + 1]])
-}
-
-/// Bind one client over `transport`, asserting the accepted
-/// `SessionBinding` reply. Returns `(session_id, present)`.
-async fn shard_bind(
-    transport: &brokerlink::FramedTransport<tokio::net::TcpStream>,
-    conn_id: u64,
-    client_id: &str,
-    clean_start: bool,
-) -> (u64, bool) {
-    use brokerlink::{BrokerFrame, BrokerLinkTransport, OpCode};
-    let frame = BrokerFrame::new(
-        OpCode::BindConnection,
-        conn_id,
-        1,
-        shard_encode_bind(client_id, clean_start, 60),
-        bytes::Bytes::new(),
-    )
-    .expect("valid bind frame");
-    tokio::time::timeout(SHARD_E2E_STEP, transport.send(frame))
-        .await
-        .expect("bind send in time")
-        .expect("bind send");
-    let reply = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
-        .await
-        .expect("bind reply in time")
-        .expect("bind reply");
-    assert_eq!(reply.header.opcode, OpCode::SessionBinding);
-    assert_eq!(reply.header.conn_id, conn_id);
-    let (session_id, present, rc) = shard_decode_binding_legacy(&reply.metadata);
-    assert_eq!(rc, 0, "bind of {client_id} must be accepted");
-    assert_ne!(session_id, 0);
-    (session_id, present)
-}
-
-/// B4-05 end-to-end alias assertion through the broker: CONNACK carries
-/// the configured Topic Alias Maximum, an alias publish delivers the
-/// correct topic, and the alias value itself rides the downlink frame.
+/// Topic aliases cross the broker on real MQTT 5 sockets.
+///
+/// A 3.1.1 subscriber and a version-5 publisher use the kernel listener.
+/// The publisher registers alias 3 with a full topic, then publishes by
+/// reference with an empty topic. Both downlinks carry the full topic.
+/// A version-5 subscriber then proves the server-to-client direction:
+/// the kernel assigns an outbound alias to a plain publish.
 #[tokio::test]
 async fn sharded_topic_alias_negotiation_and_delivery() {
-    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
-    let scratch = std::env::temp_dir().join(format!(
-        "indramqtt-alias-e2e-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let bl_port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
-        probe.local_addr().expect("port").port()
-    };
-    let mut child = tokio::process::Command::new(shard_kernel_binary())
-        .arg("--brokerlink-bind")
-        .arg(format!("127.0.0.1:{bl_port}"))
-        .arg("--api-bind")
-        .arg("")
-        .arg("--data-dir")
-        .arg(&scratch)
-        .arg("--allow-anonymous")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn real kernel");
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{bl_port}").parse().expect("addr");
-    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
-    loop {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(stream) => {
-                drop(stream);
-                break;
-            }
-            Err(_) => {
-                if std::time::Instant::now() >= deadline {
-                    panic!("kernel did not listen in time");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-    }
-    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let transport = FramedTransport::new(stream);
-    // Bind asserts CONNACK carries the configured maximum (12-byte form).
-    let bind = BrokerFrame::new(
-        OpCode::BindConnection,
-        201,
-        1,
-        shard_encode_bind("alias-e2e-1", false, 60),
-        bytes::Bytes::new(),
+    let kernel = spawn_kernel("").await;
+
+    let mut sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(&mut sub, &sy02_connect311("alias-e2e-2", true, 60, None)).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send_mqtt(&mut sub, &sy02_subscribe(1, &[("alias/e2e", 0)])).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0u8]));
+
+    let mut publisher = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_connect5("alias-e2e-1", true, 60, None, None, 10),
     )
-    .expect("valid bind");
-    tokio::time::timeout(SHARD_E2E_STEP, transport.send(bind))
-        .await
-        .expect("send in time")
-        .expect("send");
-    let reply = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
-        .await
-        .expect("reply in time")
-        .expect("reply");
-    let (_, _, rc, alias_max) = shard_decode_binding(&reply.metadata);
-    assert_eq!(rc, 0);
-    assert!(
-        alias_max > 0,
-        "CONNACK carries the configured alias maximum"
-    );
-    // An alias publish through the broker delivers the correct topic,
-    // and the alias value itself rides the downlink frame (outbound
-    // direction). The subscriber binds on the same transport.
-    let pub_conn = 201u64;
-    let sub_conn = 202u64;
-    let sub_bind = BrokerFrame::new(
-        OpCode::BindConnection,
-        sub_conn,
-        2,
-        shard_encode_bind("alias-e2e-2", false, 60),
-        bytes::Bytes::new(),
+    .await;
+    let (head, body) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    let (_, reason, alias_max) = sy02_parse_connack5(&body);
+    assert_eq!(reason, 0, "alias-carrying CONNECT is accepted");
+    assert_eq!(alias_max, 10, "CONNACK carries the alias maximum");
+
+    // First publish carries topic plus alias 3. It registers the mapping
+    // and delivers the full topic.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish5("alias/e2e", 0, 0, false, Some(3), b"21.5"),
     )
-    .expect("valid bind");
-    tokio::time::timeout(SHARD_E2E_STEP, transport.send(sub_bind))
-        .await
-        .expect("send in time")
-        .expect("send");
-    let sub_reply = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
-        .await
-        .expect("reply in time")
-        .expect("reply");
-    assert_eq!(sub_reply.header.opcode, OpCode::SessionBinding);
-    let sub = BrokerFrame::new(
-        OpCode::SubscribeIn,
-        sub_conn,
-        3,
-        shard_encode_subscribe(1, "alias-e2e-2", &[("alias/e2e", 0)]),
-        bytes::Bytes::new(),
-    )
-    .expect("valid subscribe frame");
-    tokio::time::timeout(SHARD_E2E_STEP, transport.send(sub))
-        .await
-        .expect("send in time")
-        .expect("send");
-    let suback = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
-        .await
-        .expect("suback in time")
-        .expect("suback");
-    assert_eq!(suback.header.opcode, OpCode::SubAckOut);
-    // First publish carries topic + alias 3: registers the mapping and
-    // delivers the full topic with the assigned downlink alias.
-    let (meta, body) = shard_encode_publish_with_alias("alias/e2e", 0, 0, false, 3, b"21.5");
-    let publish =
-        BrokerFrame::new(OpCode::PublishIn, pub_conn, 4, meta, body).expect("valid publish frame");
-    tokio::time::timeout(SHARD_E2E_STEP, transport.send(publish))
-        .await
-        .expect("send in time")
-        .expect("send");
-    let downlink = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
-        .await
-        .expect("downlink in time")
-        .expect("downlink");
-    assert_eq!(downlink.header.opcode, OpCode::PublishOut);
-    assert_eq!(downlink.header.conn_id, sub_conn);
-    let (topic, _, _, _) = shard_decode_publish_out(&downlink.metadata);
-    assert_eq!(topic, "alias/e2e");
-    assert_eq!(downlink.payload, bytes::Bytes::from_static(b"21.5"));
-    // Second publish carries the empty topic + alias 3: the broker
+    .await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let first = sy02_parse_publish_classic(head, &body);
+    assert_eq!(first.topic, "alias/e2e");
+    assert_eq!(first.payload, b"21.5");
+
+    // Second publish carries the empty topic plus alias 3. The broker
     // resolves the alias and the subscriber still sees the topic.
-    let (meta2, body2) = shard_encode_publish_with_alias("", 0, 0, false, 3, b"22.5");
-    let publish2 = BrokerFrame::new(OpCode::PublishIn, pub_conn, 5, meta2, body2)
-        .expect("valid publish frame");
-    tokio::time::timeout(SHARD_E2E_STEP, transport.send(publish2))
-        .await
-        .expect("send in time")
-        .expect("send");
-    let downlink2 = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
-        .await
-        .expect("downlink in time")
-        .expect("downlink");
-    assert_eq!(downlink2.header.opcode, OpCode::PublishOut);
-    assert_eq!(downlink2.header.conn_id, sub_conn);
-    let (topic2, _, _, _) = shard_decode_publish_out(&downlink2.metadata);
-    assert_eq!(topic2, "alias/e2e", "alias resolves to the correct topic");
-    assert_eq!(downlink2.payload, bytes::Bytes::from_static(b"22.5"));
-    let _ = child.kill().await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish5("", 0, 0, false, Some(3), b"22.5"),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let second = sy02_parse_publish_classic(head, &body);
+    assert_eq!(second.topic, "alias/e2e");
+    assert_eq!(second.payload, b"22.5");
+
+    // Server-to-client direction: a version-5 subscriber gets an
+    // outbound alias on a plain publish.
+    let mut v5sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut v5sub,
+        &sy02_connect5("alias-e2e-3", true, 60, None, None, 10),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut v5sub).await;
+    assert_eq!(head & 0xF0, 0x20, "version-5 subscriber gets CONNACK");
+    let (_, reason, alias_max) = sy02_parse_connack5(&body);
+    assert_eq!(reason, 0);
+    assert_eq!(alias_max, 10, "CONNACK carries the alias maximum");
+    send_mqtt(&mut v5sub, &sy02_subscribe_v5(1, &[("alias/e2e", 0)], 0)).await;
+    let (head, _) = recv_mqtt(&mut v5sub).await;
+    assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish5("alias/e2e", 0, 0, false, None, b"23.5"),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut v5sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let third = sy02_parse_publish_alias(head, &body);
+    assert_eq!(third.topic, "alias/e2e");
+    assert_eq!(third.payload, b"23.5");
+    assert_ne!(third.alias, 0, "server assigns an outbound alias");
+
+    kernel.finish().await;
 }
 
-/// K parallel BrokerLink transports against one real kernel are
-/// first-class: concurrent publishes from every transport are all
-/// answered and routed (no cross-transport serialization), and a dead
-/// transport detaches every client bound on it (not just the last
-/// bind), so a durable subscriber replays what was published while it
-/// was gone.
+/// Concurrent publishers share one kernel without loss or duplication.
 ///
-/// Kernel side this exercises the production path end to end: the real
-/// `indramqtt` binary serves `serve_brokerlink`, with one
-/// `handle_connection` task per transport. The single-`bound` snapshot
-/// fails the replay phase: only the last bind on the dropped transport
-/// detaches, the first-bound subscriber leaks as connected, its message
-/// routes into the pruned mailbox and is lost, and the reconnect sees
-/// no replay.
+/// 200 publishers publish one QoS 1 message each through the kernel
+/// listener. A durable subscriber receives every payload exactly once.
+/// The subscriber then drops, one message publishes while it is gone,
+/// and the reconnect replays exactly that message.
 #[tokio::test]
 async fn sharded_transports_do_not_serialize() {
-    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
+    use std::collections::HashSet;
 
-    // K generic transports; the edge shards by `conn_id rem K`, so the
-    // kernel must treat every transport as independent.
-    const K: usize = 2;
-    const BURST: u16 = 20;
+    const PUBLISHERS: u32 = 200;
 
-    let scratch = std::env::temp_dir().join(format!(
-        "indramqtt-shard-e2e-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let bl_port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
-        probe.local_addr().expect("port").port()
-    };
-    let mut child = tokio::process::Command::new(shard_kernel_binary())
-        .arg("--brokerlink-bind")
-        .arg(format!("127.0.0.1:{bl_port}"))
-        .arg("--api-bind")
-        .arg("")
-        .arg("--data-dir")
-        .arg(&scratch)
-        .arg("--allow-anonymous")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn real kernel");
+    let kernel = spawn_kernel("").await;
 
-    // Wait for the BrokerLink listener.
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{bl_port}").parse().expect("addr");
-    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
-    loop {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(stream) => {
-                drop(stream);
-                break;
-            }
-            Err(error) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill().await;
-                    panic!("kernel never opened BrokerLink {bl_port}: {error}");
-                }
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("kernel exited during boot: {status}");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
+    let mut sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(&mut sub, &sy02_connect311("shard-sub", false, 60, None)).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (false, 0),
+        "first durable CONNECT reports session_present=false"
+    );
+    send_mqtt(&mut sub, &sy02_subscribe(1, &[("shard/topic", 1)])).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x90, "kernel answers with SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+
+    // 200 publishers publish concurrently, one QoS 1 message each.
+    let mut tasks = Vec::new();
+    for i in 0..PUBLISHERS {
+        let port = kernel.mqtt_port;
+        tasks.push(tokio::spawn(async move {
+            let mut sock = dial_mqtt(port).await;
+            let id = format!("shard-pub-{i}");
+            send_mqtt(&mut sock, &sy02_connect311(&id, true, 60, None)).await;
+            let (head, _) = recv_mqtt(&mut sock).await;
+            assert_eq!(head, 0x20, "publisher gets CONNACK");
+            let payload = format!("burst-{i}");
+            send_mqtt(
+                &mut sock,
+                &sy02_publish311("shard/topic", 1, 1, false, payload.as_bytes()),
+            )
+            .await;
+            let (head, body) = recv_mqtt(&mut sock).await;
+            assert_eq!(head, 0x40, "publisher sees PUBACK");
+            assert_eq!(body, vec![0x00, 0x01], "PUBACK mirrors its packet id");
+        }));
     }
-
-    // Open K transports against the one kernel.
-    let mut transports = Vec::with_capacity(K);
-    for _ in 0..K {
-        let io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
+    for task in tasks {
+        tokio::time::timeout(BOOT, task)
             .await
-            .expect("transport dial in time")
-            .expect("transport dial");
-        transports.push(FramedTransport::new(io));
+            .expect("publisher joins in time")
+            .expect("publisher passes");
     }
-    let (t1, t2) = (&transports[0], &transports[1]);
 
-    // Durable subscriber on T1, then a second bind on the same
-    // transport (the multiplexing a shard performs).
-    let (_, present) = shard_bind(t1, 11, "shard-sub", false).await;
-    assert!(!present, "first durable bind reports session_present=false");
-    let sub = BrokerFrame::new(
-        OpCode::SubscribeIn,
-        11,
-        2,
-        shard_encode_subscribe(1, "shard-sub", &[("shard/topic", 1)]),
-        bytes::Bytes::new(),
-    )
-    .expect("valid subscribe frame");
-    tokio::time::timeout(SHARD_E2E_STEP, t1.send(sub))
-        .await
-        .expect("subscribe in time")
-        .expect("subscribe");
-    let suback = tokio::time::timeout(SHARD_E2E_STEP, t1.recv())
-        .await
-        .expect("suback in time")
-        .expect("suback");
-    assert_eq!(suback.header.opcode, OpCode::SubAckOut);
-    assert_eq!(&suback.metadata[..], &[0x00, 0x01, 0x01]);
-    shard_bind(t1, 12, "shard-filler", true).await;
-    shard_bind(t2, 21, "shard-pub", true).await;
-
-    // Concurrent publishes from both transports: a burst on T2, one on
-    // T1. Every publish is QoS 1, so each needs its own PubAck, and the
-    // subscriber must see every delivery.
-    for seq in 1..=BURST {
-        let payload = format!("burst-{seq}");
-        let (meta, body) = shard_encode_publish("shard/topic", seq, 1, false, payload.as_bytes());
-        let frame = BrokerFrame::new(OpCode::PublishIn, 21, u64::from(seq) + 100, meta, body)
-            .expect("valid publish frame");
-        tokio::time::timeout(SHARD_E2E_STEP, t2.send(frame))
-            .await
-            .expect("burst send in time")
-            .expect("burst send");
+    // The subscriber receives every payload exactly once and acks each
+    // delivery, so nothing stays inflight at the drop below.
+    let mut seen = HashSet::new();
+    for _ in 0..PUBLISHERS {
+        let (head, body) = recv_mqtt(&mut sub).await;
+        assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+        let downlink = sy02_parse_publish_classic(head, &body);
+        assert_eq!(downlink.qos, 1, "downlink keeps QoS 1");
+        assert!(seen.insert(downlink.payload.clone()), "no duped delivery");
+        send_mqtt(&mut sub, &sy02_puback(downlink.packet_id)).await;
     }
-    let (meta, body) = shard_encode_publish("shard/topic", 1, 1, false, b"solo");
-    let solo =
-        BrokerFrame::new(OpCode::PublishIn, 12, 200, meta, body).expect("valid publish frame");
-    tokio::time::timeout(SHARD_E2E_STEP, t1.send(solo))
-        .await
-        .expect("solo send in time")
-        .expect("solo send");
-
-    // T1 carries both the subscriber (conn 11) and the solo publisher
-    // (conn 12), so its PublishOut deliveries interleave with the solo
-    // PubAck on the same transport. Drain T1 until the solo ack is seen
-    // and every delivery arrived: T1's answer never stalls behind T2's
-    // burst, and no delivery is lost or duped.
-    let mut solo_acked = false;
-    let mut seen = std::collections::HashSet::new();
-    while !solo_acked || seen.len() < BURST as usize + 1 {
-        let frame = tokio::time::timeout(SHARD_E2E_STEP, t1.recv())
-            .await
-            .expect("T1 frame in time")
-            .expect("T1 frame");
-        match frame.header.opcode {
-            OpCode::PubAckOut => {
-                assert_eq!(frame.header.conn_id, 12);
-                assert_eq!(&frame.metadata[..], &[0x00, 0x01, 0x00]);
-                assert!(!solo_acked, "solo PubAck delivered exactly once");
-                solo_acked = true;
-            }
-            OpCode::PublishOut => {
-                assert_eq!(frame.header.conn_id, 11);
-                assert!(seen.insert(frame.payload.to_vec()), "no duped delivery");
-                // T-31: ack every live QoS 1 downlink (correct MQTT
-                // client behaviour) so nothing stays inflight at
-                // detach; the reconnect then replays only what was
-                // published while detached. No assertion below changes.
-                let pid = shard_downlink_packet_id(&frame.metadata);
-                assert_ne!(pid, 0, "QoS 1 downlink carries a packet id");
-                let ack = BrokerFrame::new(
-                    OpCode::PubAckIn,
-                    11,
-                    400 + seen.len() as u64,
-                    shard_encode_puback(pid),
-                    bytes::Bytes::new(),
-                )
-                .expect("valid puback frame");
-                tokio::time::timeout(SHARD_E2E_STEP, t1.send(ack))
-                    .await
-                    .expect("puback in time")
-                    .expect("puback send");
-            }
-            other => panic!("unexpected frame on T1: {other:?}"),
-        }
-    }
-    assert!(seen.contains(b"solo".as_slice()));
-    for seq in 1..=BURST {
-        assert!(seen.contains(&format!("burst-{seq}").into_bytes()));
-    }
-    for seq in 1..=BURST {
-        let ack = tokio::time::timeout(SHARD_E2E_STEP, t2.recv())
-            .await
-            .expect("burst PubAck in time")
-            .expect("burst PubAck");
-        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
-        assert_eq!(ack.header.conn_id, 21);
-        assert_eq!(
-            &ack.metadata[..],
-            &[(seq >> 8) as u8, seq as u8, 0x00],
-            "burst PubAck {seq} mirrors its packet id"
+    assert_eq!(seen.len(), PUBLISHERS as usize, "every publish arrives");
+    for i in 0..PUBLISHERS {
+        assert!(
+            seen.contains(&format!("burst-{i}").into_bytes()),
+            "burst {i} arrives"
         );
     }
 
-    // Kill T1 without DISCONNECT: both of its clients must detach.
-    // (Dropping the transport closes its TCP connection; T2 stays live
-    // at index 0 afterwards.)
-    drop(transports.remove(0));
+    // Ungraceful drop of the subscriber socket. One publish while
+    // detached queues instead of routing to the dead socket.
+    drop(sub);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut detached = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut detached,
+        &sy02_connect311("shard-detached-pub", true, 60, None),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut detached).await;
+    assert_eq!(head, 0x20, "detached publisher gets CONNACK");
+    send_mqtt(
+        &mut detached,
+        &sy02_publish311("shard/topic", 9, 1, false, b"replay-me"),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut detached).await;
+    assert_eq!(head, 0x40, "detached publisher sees PUBACK");
+    assert_eq!(body, vec![0x00, 0x09], "PUBACK mirrors its packet id");
 
-    // Published while the durable subscriber is detached: queued, not
-    // routed to the dead mailbox.
-    let t2 = &transports[0];
-    let (meta, body) = shard_encode_publish("shard/topic", 101, 1, false, b"replay-me");
-    let frame =
-        BrokerFrame::new(OpCode::PublishIn, 21, 300, meta, body).expect("valid publish frame");
-    tokio::time::timeout(SHARD_E2E_STEP, t2.send(frame))
-        .await
-        .expect("detached publish in time")
-        .expect("detached publish");
-    let ack = tokio::time::timeout(SHARD_E2E_STEP, t2.recv())
-        .await
-        .expect("detached PubAck in time")
-        .expect("detached PubAck");
-    assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+    // Reconnect resumes the durable session and replays the queued
+    // message. A dropped first bind that never detached would route the
+    // publish into the dead mailbox instead of the queue, and this read
+    // would time out.
+    let mut re = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(&mut re, &sy02_connect311("shard-sub", false, 60, None)).await;
+    let (head, body) = recv_mqtt(&mut re).await;
+    assert_eq!(head, 0x20, "kernel answers the reconnect with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (true, 0),
+        "resumed session reports session_present=true"
+    );
+    let (head, body) = recv_mqtt(&mut re).await;
+    assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
+    let replay = sy02_parse_publish_classic(head, &body);
+    assert_eq!(replay.topic, "shard/topic");
+    assert_eq!(replay.payload, b"replay-me");
+    let quiet =
+        tokio::time::timeout(std::time::Duration::from_secs(2), read_mqtt_packet(&mut re)).await;
+    assert!(quiet.is_err(), "exactly one message replays");
 
-    // Reconnect the durable subscriber on a fresh transport: the queued
-    // message replays. On the single-`bound` snapshot this times out:
-    // the first-bound client never detached, so the publish above was
-    // dropped into the pruned mailbox instead of queued.
-    let io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
-        .await
-        .expect("reconnect in time")
-        .expect("reconnect");
-    let t3 = FramedTransport::new(io);
-    let (_, present) = shard_bind(&t3, 31, "shard-sub", false).await;
-    assert!(present, "resumed session must report session_present=true");
-    let replayed = tokio::time::timeout(SHARD_E2E_STEP, t3.recv())
-        .await
-        .expect("replay arrives: every bind on a dead transport must detach")
-        .expect("replay");
-    assert_eq!(replayed.header.opcode, OpCode::PublishOut);
-    assert_eq!(replayed.header.conn_id, 31);
-    assert_eq!(replayed.payload, bytes::Bytes::from_static(b"replay-me"));
-
-    let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&scratch);
-}
-
-/// SY-02 edge harness: a spawned kernel plus the shipped Erlang edge.
-///
-/// The three SY-02 tests speak real MQTT through the edge (TCP and
-/// WebSocket) the way production clients do, never `SessionManager` or
-/// `Router` directly. Returns `None` (with a logged SKIP reason, like
-/// [`e2e_edge_target`]) when the edge cannot run here; a spawned edge
-/// that never opens its ports is a loud failure, never a skip.
-struct Sy02Edge {
-    child: tokio::process::Child,
-    edge: EdgeTarget,
-    log: std::path::PathBuf,
-    mqtt_port: u16,
-    ws_port: u16,
-}
-
-async fn sy02_spawn_edge(bl_port: u16) -> Option<Sy02Edge> {
-    use std::time::{Duration, Instant};
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ebin = manifest.join("../../beam/ebin");
-    // The WebSocket listener beams must exist; without them the edge
-    // supervisor cannot start and no port ever opens.
-    if !ebin.join("indra_ws_listener.beam").is_file() {
-        e2e_skip!(
-            "SKIP sy02 edge test: no WS edge beams at {} (build beam/ first)",
-            ebin.display()
-        );
-        return None;
-    }
-    let (edge, mqtt_port, ws_port) = e2e_edge_target(bl_port).await?;
-    let log = std::env::temp_dir().join(format!(
-        "indramqtt-sy02-edge-{}-{mqtt_port}.log",
-        std::process::id()
-    ));
-    let edge_stderr = std::fs::File::create(&log).expect("edge log file");
-    let mut child = tokio::process::Command::new(&edge.program)
-        .args(&edge.args)
-        .stdout(std::process::Stdio::null())
-        .stderr(edge_stderr)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shipped edge");
-    // Both listeners must open: the TCP MQTT port and the WebSocket
-    // port. Fail fast when the VM dies instead of polling dead ports.
-    let deadline = Instant::now() + SHARD_E2E_BOOT;
-    loop {
-        let mqtt_open = tokio::net::TcpStream::connect((edge.mqtt_host.as_str(), mqtt_port))
-            .await
-            .is_ok();
-        let ws_open = tokio::net::TcpStream::connect((edge.mqtt_host.as_str(), ws_port))
-            .await
-            .is_ok();
-        if mqtt_open && ws_open {
-            break;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-            let tail = &log_text[log_text.len().saturating_sub(2000)..];
-            panic!("shipped edge exited during boot: {status}\nedge log tail:\n{tail}");
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill().await;
-            panic!("shipped edge never opened MQTT {mqtt_port} and WS {ws_port}");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Some(Sy02Edge {
-        child,
-        edge,
-        log,
-        mqtt_port,
-        ws_port,
-    })
-}
-
-impl Sy02Edge {
-    fn host(&self) -> &str {
-        &self.edge.mqtt_host
-    }
-
-    async fn finish(mut self) {
-        let _ = self.child.kill().await;
-        if let Some((program, args)) = self.edge.cleanup {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let _ = e2e_command_output(&program, &refs, KICK_E2E_STEP).await;
-        }
-        if let Some(mut proxy) = self.edge.proxy {
-            let _ = proxy.kill().await;
-        }
-        let _ = std::fs::remove_file(&self.log);
-    }
+    kernel.finish().await;
 }
 
 /// Encode an MQTT remaining length (variable-byte integer).
@@ -2008,7 +1043,7 @@ fn sy02_connect5(
 }
 
 /// Classic SUBSCRIBE (`packet id | filter | qos ...`): the shape the
-/// edge decodes on every session, 3.1.1 and 5 alike.
+/// kernel decodes on every session, 3.1.1 and 5 alike.
 fn sy02_subscribe(packet_id: u16, subs: &[(&str, u8)]) -> Vec<u8> {
     let mut rest = Vec::new();
     rest.extend_from_slice(&packet_id.to_be_bytes());
@@ -2022,7 +1057,7 @@ fn sy02_subscribe(packet_id: u16, subs: &[(&str, u8)]) -> Vec<u8> {
     packet
 }
 
-/// MQTT 3.1.1 PUBLISH (client to edge).
+/// MQTT 3.1.1 PUBLISH (client to kernel).
 fn sy02_publish311(topic: &str, packet_id: u16, qos: u8, retain: bool, payload: &[u8]) -> Vec<u8> {
     let mut rest = sy02_mqtt_str(topic);
     if qos > 0 {
@@ -2039,7 +1074,7 @@ fn sy02_publish311(topic: &str, packet_id: u16, qos: u8, retain: bool, payload: 
     packet
 }
 
-/// MQTT 5 PUBLISH (client to edge): `topic | packet id | properties |
+/// MQTT 5 PUBLISH (client to kernel): `topic | packet id | properties |
 /// payload`. `Some(alias)` registers the alias (property 35);
 /// `None` sends an empty property section.
 fn sy02_publish5(
@@ -2073,8 +1108,8 @@ fn sy02_publish5(
     packet
 }
 
-/// Two-byte PUBACK (packet id only): the shape the edge forwards to the
-/// kernel on every session, 3.1.1 and 5 alike.
+/// Two-byte PUBACK (packet id only): the shape clients send on every
+/// session, 3.1.1 and 5 alike.
 fn sy02_puback(packet_id: u16) -> Vec<u8> {
     vec![0x40, 0x02, (packet_id >> 8) as u8, (packet_id & 0xff) as u8]
 }
@@ -2147,7 +1182,7 @@ fn sy02_publish5_with_props(
     }
     let mut rest = sy02_mqtt_str(topic);
     // QoS 0 in this test: no packet id.
-    assert_eq!(qos, 0, "X1-03 edge test uses QoS 0");
+    assert_eq!(qos, 0, "X1-03 test uses QoS 0");
     rest.extend_from_slice(&sy02_encode_varint(props.len() as u32));
     rest.extend_from_slice(&props);
     rest.extend_from_slice(payload);
@@ -2180,7 +1215,7 @@ fn sy02_parse_suback5(body: &[u8]) -> (u16, Vec<u8>) {
     (packet_id, body[2 + used + prop_len..].to_vec())
 }
 
-/// One MQTT 5 PUBLISH as the edge delivers it, with forwarded props.
+/// One MQTT 5 PUBLISH as the kernel delivers it, with forwarded props.
 struct Sy02Publish5 {
     topic: String,
     qos: u8,
@@ -2196,7 +1231,7 @@ struct Sy02Publish5 {
 /// and payload.
 fn sy02_parse_publish_v5(header: u8, body: &[u8]) -> Sy02Publish5 {
     let qos = (header >> 1) & 0x03;
-    assert_eq!(qos, 0, "X1-03 edge test uses QoS 0");
+    assert_eq!(qos, 0, "X1-03 test uses QoS 0");
     assert!(body.len() >= 2, "PUBLISH carries a topic");
     let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
     let topic = std::str::from_utf8(&body[2..2 + topic_len])
@@ -2289,7 +1324,7 @@ fn sy02_parse_connack311(body: &[u8]) -> (bool, u8) {
 
 /// Parse an MQTT 5 CONNACK body into `(session_present, reason, alias_max)`.
 /// Scans the property section for the Topic Alias Maximum (34) while
-/// accepting every other property the edge may advertise on the live
+/// accepting every other property the kernel may advertise on the live
 /// handshake path (X1-02): session expiry (17, u32), assigned client
 /// id (18, UTF-8), server receive maximum (33, u16), server maximum
 /// packet size (39, u32), reason string (31, UTF-8) and user
@@ -2361,7 +1396,7 @@ fn sy02_parse_suback(body: &[u8]) -> (u16, Vec<u8>) {
     (u16::from_be_bytes([body[0], body[1]]), body[2..].to_vec())
 }
 
-/// One PUBLISH as the edge delivers it to a subscribing client.
+/// One PUBLISH as the kernel delivers it to a subscribing client.
 struct Sy02Publish {
     topic: String,
     packet_id: u16,
@@ -2455,47 +1490,13 @@ fn sy02_parse_publish_alias(header: u8, body: &[u8]) -> Sy02Publish {
     }
 }
 
-/// Connect a TCP MQTT client and read its CONNACK, retrying through edge
-/// boot: the edge accepts the socket before its BrokerLink shard is up,
-/// and an early CONNECT can be dropped. Uses a throwaway clean session
-/// so retries leave no state behind.
-async fn sy02_mqtt_ready(host: &str, port: u16) {
-    use std::time::{Duration, Instant};
-    use tokio::io::AsyncWriteExt;
-    let deadline = Instant::now() + SHARD_E2E_BOOT;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let dial =
-            tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect((host, port)))
-                .await;
-        if let Ok(Ok(mut sock)) = dial {
-            let probe = sy02_connect311(&format!("sy02-probe-{attempt}"), true, 60, None);
-            let sent = tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&probe)).await;
-            if sent.as_ref().is_ok_and(|r| r.is_ok()) {
-                if let Ok(Ok((head, body))) =
-                    tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sock)).await
-                {
-                    if head == 0x20 && body == vec![0x00, 0x00] {
-                        return;
-                    }
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            panic!("edge MQTT {port} never answered a CONNECT");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
 /// RFC 6455 example key: the server cannot echo the right accept value
 /// without computing it, so asserting the known answer verifies the
 /// handshake.
 const SY02_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const SY02_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
 
-/// Complete a WebSocket upgrade for MQTT against the edge and verify
+/// Complete a WebSocket upgrade for MQTT against the kernel and verify
 /// the 101 answer (accept key plus `mqtt` subprotocol).
 async fn sy02_ws_handshake(
     sock: &mut tokio::net::TcpStream,
@@ -2533,10 +1534,12 @@ async fn sy02_ws_handshake(
     let mut proto_ok = false;
     for line in lines {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("Sec-WebSocket-Accept:") {
-            accept_ok = value.trim() == SY02_WS_ACCEPT;
-        } else if let Some(value) = line.strip_prefix("Sec-WebSocket-Protocol:") {
-            proto_ok = value.split(',').any(|token| token.trim() == "mqtt");
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("sec-websocket-accept") {
+                accept_ok = value.trim() == SY02_WS_ACCEPT;
+            } else if name.trim().eq_ignore_ascii_case("sec-websocket-protocol") {
+                proto_ok = value.split(',').any(|token| token.trim() == "mqtt");
+            }
         }
     }
     assert!(accept_ok, "WS accept key matches the offered key");
@@ -2622,157 +1625,67 @@ async fn sy02_ws_recv(sock: &mut tokio::net::TcpStream) -> std::io::Result<Sy02W
     }
 }
 
-/// SY-02: a last will fires to a subscriber on ungraceful close, through
-/// the real broker, on both transports.
+/// A last will fires on ungraceful close on TCP and on WebSocket.
 ///
-/// The edge sends one canonical bind for a WebSocket connection carrying
-/// PSK identity, will and alias state together; the kernel cannot tell WS
-/// binds from TCP binds past that. The first leg drives that exact
-/// encoding (will section plus trailing `ClientAliasMax`) over a real
-/// BrokerLink socket: the subscriber binds and subscribes, the publisher
-/// binds with a last will, drops with `DisconnectIn` (no
-/// `DISCONNECT`/unbind), and the subscriber's transport receives the
-/// will payload. The second leg connects a real MQTT 5 client over
-/// WebSocket through the shipped edge with a will, drops the socket with
-/// no DISCONNECT, and the same subscriber receives that will too. Bind,
-/// subscribe, disconnect and delivery all run through the broker, never
-/// the store.
+/// A 3.1.1 subscriber watches the will topic through the kernel
+/// listener. A version-5 TCP publisher connects with a will and drops
+/// without DISCONNECT, and the subscriber gets the will. A version-5
+/// WebSocket publisher repeats the same over the WebSocket listener,
+/// and the same subscriber gets the second will.
 #[tokio::test]
 async fn sy02_ws_mqtt5_will_fires_to_subscriber() {
-    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
-    let scratch = std::env::temp_dir().join(format!(
-        "indramqtt-sy02-will-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let bl_port = shard_ephemeral_port();
-    let (mut child, addr) = shard_spawn_kernel(&[], &scratch, bl_port).await;
+    let kernel = spawn_kernel("").await;
 
-    let sub_io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
-        .await
-        .expect("subscriber dial in time")
-        .expect("subscriber dial");
-    let sub = FramedTransport::new(sub_io);
-    let pub_io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
-        .await
-        .expect("publisher dial in time")
-        .expect("publisher dial");
-    let publisher = FramedTransport::new(pub_io);
+    let mut sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(&mut sub, &sy02_connect311("sy02-ws-sub", true, 60, None)).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send_mqtt(&mut sub, &sy02_subscribe(1, &[("sy02/ws/will", 0)])).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x90, "kernel answers with SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
 
-    // Subscriber binds durably and subscribes to the will topic.
-    let (_, present) = shard_bind(&sub, 7001, "sy02-ws-sub", false).await;
-    assert!(!present, "first durable bind reports session_present=false");
-    let sub_frame = BrokerFrame::new(
-        OpCode::SubscribeIn,
-        7001,
-        2,
-        shard_encode_subscribe(1, "sy02-ws-sub", &[("sy02/ws/will", 0)]),
-        bytes::Bytes::new(),
+    // TCP leg: a version-5 publisher connects with a will and drops the
+    // socket with no DISCONNECT. The kernel fires the stored will once.
+    let mut tcp_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut tcp_pub,
+        &sy02_connect5(
+            "sy02-ws-pub",
+            true,
+            60,
+            None,
+            Some(("sy02/ws/will", b"ws-will-bytes")),
+            10,
+        ),
     )
-    .expect("valid subscribe frame");
-    tokio::time::timeout(SHARD_E2E_STEP, sub.send(sub_frame))
-        .await
-        .expect("subscribe in time")
-        .expect("subscribe");
-    let suback = tokio::time::timeout(SHARD_E2E_STEP, sub.recv())
-        .await
-        .expect("suback in time")
-        .expect("suback");
-    assert_eq!(suback.header.opcode, OpCode::SubAckOut);
-    assert_eq!(&suback.metadata[..], &[0x00, 0x01, 0x00]);
+    .await;
+    let (head, body) = recv_mqtt(&mut tcp_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "TCP publisher gets CONNACK");
+    let (_, reason, alias_max) = sy02_parse_connack5(&body);
+    assert_eq!(reason, 0, "will-carrying CONNECT is accepted");
+    assert_eq!(alias_max, 10, "CONNACK carries the alias maximum");
+    drop(tcp_pub);
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let first = sy02_parse_publish_classic(head, &body);
+    assert_eq!(first.topic, "sy02/ws/will");
+    assert_eq!(first.payload, b"ws-will-bytes");
 
-    // Publisher binds with the WS-equivalent encoding: will section plus
-    // the client's alias maximum. CONNACK carries the kernel alias bound.
-    let pub_bind = BrokerFrame::new(
-        OpCode::BindConnection,
-        7002,
-        1,
-        shard_encode_bind_with_will_and_alias(ShardWillBind {
-            client_id: "sy02-ws-pub",
-            clean_start: true,
-            keepalive: 60,
-            will_topic: "sy02/ws/will",
-            will_payload: b"ws-will-bytes",
-            will_qos: 0,
-            will_retain: false,
-            client_alias_max: 10,
-        }),
-        bytes::Bytes::new(),
-    )
-    .expect("valid bind frame");
-    tokio::time::timeout(SHARD_E2E_STEP, publisher.send(pub_bind))
-        .await
-        .expect("pub bind in time")
-        .expect("pub bind send");
-    let pub_reply = tokio::time::timeout(SHARD_E2E_STEP, publisher.recv())
-        .await
-        .expect("pub bind reply in time")
-        .expect("pub bind reply");
-    assert_eq!(pub_reply.header.opcode, OpCode::SessionBinding);
-    let (_, _, rc, alias_max) = shard_decode_binding(&pub_reply.metadata);
-    assert_eq!(rc, 0, "will-carrying bind must be accepted");
-    assert!(alias_max > 0, "CONNACK carries the alias maximum");
-
-    // Ungraceful close: DisconnectIn with no preceding unbind (no clean
-    // DISCONNECT). The kernel fires the stored will once.
-    let drop_frame = BrokerFrame::new(
-        OpCode::DisconnectIn,
-        7002,
-        2,
-        shard_encode_client_id("sy02-ws-pub"),
-        bytes::Bytes::new(),
-    )
-    .expect("valid disconnect frame");
-    tokio::time::timeout(SHARD_E2E_STEP, publisher.send(drop_frame))
-        .await
-        .expect("disconnect in time")
-        .expect("disconnect send");
-
-    // The subscriber receives the will over its live transport.
-    let downlink = tokio::time::timeout(SHARD_E2E_STEP, sub.recv())
-        .await
-        .expect("will arrives in time")
-        .expect("will delivery");
-    assert_eq!(downlink.header.opcode, OpCode::PublishOut);
-    assert_eq!(downlink.header.conn_id, 7001);
-    assert_eq!(
-        downlink.payload,
-        bytes::Bytes::from_static(b"ws-will-bytes")
-    );
-    let (topic, _, _, _) = shard_decode_publish_out(&downlink.metadata);
-    assert_eq!(topic, "sy02/ws/will");
-
-    // Second leg: a real MQTT 5 client over WebSocket. The edge is
-    // spawned against the same kernel; the publisher completes the WS
-    // upgrade, connects with a will, and drops the socket with no
-    // DISCONNECT and no WS close frame. The same subscriber receives
-    // the will, proving the WS transport gets will handling exactly
-    // like the BrokerLink path above.
-    let edge = match sy02_spawn_edge(bl_port).await {
-        Some(edge) => edge,
-        None => {
-            // SKIP already logged: the kernel leg above still verified
-            // the will through the broker.
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&scratch);
-            return;
-        }
-    };
-    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
-    let ws_io = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.ws_port)),
+    // WebSocket leg: the same handshake over the WebSocket listener.
+    // The publisher completes the upgrade, connects with a will, and
+    // drops the socket with no DISCONNECT and no close frame.
+    let mut ws = tokio::time::timeout(
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.ws_port)),
     )
     .await
     .expect("WS dial in time")
     .expect("WS dial");
-    let mut ws = ws_io;
     tokio::time::timeout(
-        SHARD_E2E_STEP,
-        sy02_ws_handshake(&mut ws, edge.host(), edge.ws_port),
+        STEP,
+        sy02_ws_handshake(&mut ws, "127.0.0.1", kernel.ws_port),
     )
     .await
     .expect("WS handshake in time")
@@ -2785,92 +1698,63 @@ async fn sy02_ws_mqtt5_will_fires_to_subscriber() {
         Some(("sy02/ws/will", b"ws5-will-bytes")),
         10,
     );
-    tokio::time::timeout(SHARD_E2E_STEP, sy02_ws_send(&mut ws, &connect))
+    tokio::time::timeout(STEP, sy02_ws_send(&mut ws, &connect))
         .await
         .expect("WS CONNECT in time")
         .expect("WS CONNECT send");
-    let connack = tokio::time::timeout(SHARD_E2E_STEP, sy02_ws_recv(&mut ws))
+    let connack = tokio::time::timeout(STEP, sy02_ws_recv(&mut ws))
         .await
         .expect("WS CONNACK in time")
         .expect("WS CONNACK");
     let (present, reason, alias_max) = match connack {
         Sy02WsMsg::Binary(frame) => {
-            assert_eq!(frame[0] & 0xF0, 0x20, "edge answers with CONNACK");
+            assert_eq!(frame[0] & 0xF0, 0x20, "socket answers with CONNACK");
             let body = &frame[2..];
             sy02_parse_connack5(body)
         }
-        Sy02WsMsg::Closed => panic!("edge closed the WS socket on CONNECT"),
+        Sy02WsMsg::Closed => panic!("socket closed on CONNECT"),
     };
     assert!(!present, "first WS bind reports session_present=false");
-    assert_eq!(reason, 0, "will-carrying WS CONNECT must be accepted");
-    assert_eq!(alias_max, 10, "WS CONNACK carries the kernel alias maximum");
-    // Ungraceful close: drop the socket with no DISCONNECT. The edge
-    // reports the close and the kernel fires the stored will once.
+    assert_eq!(reason, 0, "will-carrying WS CONNECT is accepted");
+    assert_eq!(alias_max, 10, "WS CONNACK carries the alias maximum");
     drop(ws);
-    let downlink = tokio::time::timeout(SHARD_E2E_STEP, sub.recv())
-        .await
-        .expect("WS will arrives in time")
-        .expect("WS will delivery");
-    assert_eq!(downlink.header.opcode, OpCode::PublishOut);
-    assert_eq!(downlink.header.conn_id, 7001);
-    assert_eq!(
-        downlink.payload,
-        bytes::Bytes::from_static(b"ws5-will-bytes")
-    );
-    let (topic, _, _, _) = shard_decode_publish_out(&downlink.metadata);
-    assert_eq!(topic, "sy02/ws/will");
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let second = sy02_parse_publish_classic(head, &body);
+    assert_eq!(second.topic, "sy02/ws/will");
+    assert_eq!(second.payload, b"ws5-will-bytes");
 
-    edge.finish().await;
-    let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&scratch);
+    kernel.finish().await;
 }
 
-/// X1-03: end-to-end through the edge with real MQTT 5 clients.
+/// X1-03: end-to-end through the kernel listener with real MQTT clients.
 ///
 /// A version-5 subscriber connects with properties, subscribes with
 /// options plus a subscription identifier, and receives a version-5
 /// publish carrying the same user properties (plus the identifier) on
 /// delivery; the publisher disconnects with a reason code. The same
 /// scenario over version 4 still passes unchanged (proves 3.1.1 is
-/// untouched). Goes through the broker (edge codec, subscribe event,
+/// untouched). Goes through the broker (listener codec, subscribe event,
 /// publish event, delivery to socket), never the store.
 #[tokio::test]
-async fn x103_v5_subscriptions_reasons_edge_e2e() {
+async fn x103_v5_subscriptions_reasons_e2e() {
     use tokio::io::AsyncWriteExt;
-    let tag = format!(
-        "x103-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
-    let bl_port = shard_ephemeral_port();
-    let (mut child, _addr) = shard_spawn_kernel(&[], &scratch, bl_port).await;
-    let edge = match sy02_spawn_edge(bl_port).await {
-        Some(edge) => edge,
-        None => {
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&scratch);
-            return;
-        }
-    };
-    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+    // The kernel serves the same MQTT bytes on its own listener.
+    let kernel = spawn_kernel("").await;
     async fn dial(host: &str, port: u16) -> tokio::net::TcpStream {
-        tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect((host, port)))
+        tokio::time::timeout(STEP, tokio::net::TcpStream::connect((host, port)))
             .await
             .expect("dial in time")
             .expect("dial")
     }
     async fn recv(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
-        tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("packet in time")
             .expect("packet")
     }
     async fn send(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(bytes))
+        tokio::time::timeout(STEP, sock.write_all(bytes))
             .await
             .expect("send in time")
             .expect("send");
@@ -2878,24 +1762,24 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
     // Version-5 leg: CONNECT with properties (alias maximum), SUBSCRIBE
     // with options plus identifier, PUBLISH with user properties,
     // DISCONNECT with a reason code.
-    let mut sub = dial(edge.host(), edge.mqtt_port).await;
+    let mut sub = dial("127.0.0.1", kernel.mqtt_port).await;
     send(
         &mut sub,
         &sy02_connect5("x103-v5-sub", true, 60, None, None, 10),
     )
     .await;
     let (head, body) = recv(&mut sub).await;
-    assert_eq!(head & 0xF0, 0x20, "edge answers with CONNACK");
+    assert_eq!(head & 0xF0, 0x20, "kernel answers with CONNACK");
     let (_, reason, _) = sy02_parse_connack5(&body);
     assert_eq!(reason, 0, "v5 CONNECT accepted");
     // Options: QoS 0, no-local 0, rap 0, retain-handling 0.
     send(&mut sub, &sy02_subscribe_v5(7, &[("x103/v5/props", 0)], 42)).await;
     let (head, body) = recv(&mut sub).await;
-    assert_eq!(head & 0xF0, 0x90, "edge answers with SUBACK");
+    assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
     let (packet_id, codes) = sy02_parse_suback5(&body);
     assert_eq!(packet_id, 7);
     assert_eq!(codes, vec![0u8], "v5 subscribe granted QoS 0");
-    let mut publisher = dial(edge.host(), edge.mqtt_port).await;
+    let mut publisher = dial("127.0.0.1", kernel.mqtt_port).await;
     send(
         &mut publisher,
         &sy02_connect5("x103-v5-pub", true, 60, None, None, 10),
@@ -2944,7 +1828,7 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
     )
     .await;
     let (head, body) = recv(&mut sub).await;
-    assert_eq!(head & 0xF0, 0x90, "edge answers mixed SUBACK");
+    assert_eq!(head & 0xF0, 0x90, "kernel answers mixed SUBACK");
     let (packet_id, codes) = sy02_parse_suback5(&body);
     assert_eq!(packet_id, 8);
     assert_eq!(
@@ -2953,7 +1837,7 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
         "good filter grants, bad filter fails alone"
     );
     // Version-4 leg unchanged: classic CONNECT/SUBSCRIBE/PUBLISH.
-    let mut sub4 = dial(edge.host(), edge.mqtt_port).await;
+    let mut sub4 = dial("127.0.0.1", kernel.mqtt_port).await;
     send(&mut sub4, &sy02_connect311("x103-v4-sub", true, 60, None)).await;
     let (head, body) = recv(&mut sub4).await;
     assert_eq!(head, 0x20, "v4 CONNACK");
@@ -2962,7 +1846,7 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
     let (head, body) = recv(&mut sub4).await;
     assert_eq!(head & 0xF0, 0x90, "v4 SUBACK");
     assert_eq!(sy02_parse_suback(&body), (1, vec![0u8]));
-    let mut pub4 = dial(edge.host(), edge.mqtt_port).await;
+    let mut pub4 = dial("127.0.0.1", kernel.mqtt_port).await;
     send(&mut pub4, &sy02_connect311("x103-v4-pub", true, 60, None)).await;
     let (head, body) = recv(&mut pub4).await;
     assert_eq!(head, 0x20);
@@ -2977,9 +1861,7 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
     let got4 = sy02_parse_publish_classic(head, &body);
     assert_eq!(got4.topic, "x103/v4/plain");
     assert_eq!(got4.payload, b"hello-v4");
-    edge.finish().await;
-    let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&scratch);
+    kernel.finish().await;
 }
 
 /// SY-02: the QoS 1 inflight window set through `indra.toml` and its
@@ -2988,8 +1870,8 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
 /// The config file sets `session.max_qos1_inflight = 2` /
 /// `session.max_qos1_spill = 2`; the environment overrides both to 1.
 /// The kernel boots against that config dir with the environment set, so
-/// the resolved window is 1 and spill is 1, and the shipped edge serves
-/// real MQTT clients against it. A durable subscriber receives three
+/// the resolved window is 1 and spill is 1, and the kernel listener
+/// serves real MQTT clients. A durable subscriber receives three
 /// live QoS 1 downlinks without acking; it then drops and reconnects.
 /// Only the two tracked downlinks (window oldest-first, then spill)
 /// replay with DUP set — the third, delivered live once but past
@@ -3001,6 +1883,8 @@ async fn x103_v5_subscriptions_reasons_edge_e2e() {
 /// arrive.
 #[tokio::test]
 async fn sy02_qos1_window_from_toml_and_env_enforced() {
+    // A probe dir proves the file layer alone resolves to 2/2 through
+    // the real loader. The booted kernel below carries the same section.
     let tag = format!(
         "sy02-qos1-{}-{}",
         std::process::id(),
@@ -3009,11 +1893,10 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
-    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
-    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+    let probe_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-probe"));
+    std::fs::create_dir_all(&probe_dir).expect("create probe config dir");
     std::fs::write(
-        config_dir.join("indra.toml"),
+        probe_dir.join("indra.toml"),
         "[session]\nmax_qos1_inflight = 2\nmax_qos1_spill = 2\n",
     )
     .expect("write indra.toml");
@@ -3022,10 +1905,11 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     {
         use broker_config::layers::{load_layered_with_env, CliOverrides};
         let layered =
-            load_layered_with_env(&config_dir, &[], &CliOverrides::default()).expect("load file");
+            load_layered_with_env(&probe_dir, &[], &CliOverrides::default()).expect("load file");
         assert_eq!(layered.config().session.max_qos1_inflight, 2);
         assert_eq!(layered.config().session.max_qos1_spill, 2);
     }
+    let _ = std::fs::remove_dir_all(&probe_dir);
 
     // The environment overrides the file for the booted kernel below.
     let prev_window = std::env::var("INDRA_SESSION__MAX_QOS1_INFLIGHT").ok();
@@ -3033,9 +1917,10 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     std::env::set_var("INDRA_SESSION__MAX_QOS1_INFLIGHT", "1");
     std::env::set_var("INDRA_SESSION__MAX_QOS1_SPILL", "1");
 
-    let bl_port = shard_ephemeral_port();
-    let config_arg = format!("--config-dir={}", config_dir.display());
-    let (mut child, _addr) = shard_spawn_kernel(&[config_arg.as_str()], &scratch, bl_port).await;
+    // The kernel boots with the same session section in its config dir.
+    // The wait for `/healthz` inside completes the boot, so the restore
+    // below cannot race the kernel read of the environment.
+    let kernel = spawn_kernel("[session]\nmax_qos1_inflight = 2\nmax_qos1_spill = 2\n").await;
 
     std::env::remove_var("INDRA_SESSION__MAX_QOS1_INFLIGHT");
     std::env::remove_var("INDRA_SESSION__MAX_QOS1_SPILL");
@@ -3046,56 +1931,42 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
         std::env::set_var("INDRA_SESSION__MAX_QOS1_SPILL", v);
     }
 
-    // Real MQTT clients through the shipped edge, served by the kernel
-    // above (same config dir, same env-resolved window).
-    let edge = match sy02_spawn_edge(bl_port).await {
-        Some(edge) => edge,
-        None => {
-            // SKIP already logged.
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&scratch);
-            let _ = std::fs::remove_dir_all(&config_dir);
-            return;
-        }
-    };
-    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
-
     use tokio::io::AsyncWriteExt;
 
     // Durable subscriber over real MQTT: CONNECT (clean_start=false),
     // then a QoS 1 subscribe.
     let mut sub = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("subscriber dial in time")
     .expect("subscriber dial");
     let connect = sy02_connect311("sy02-qos1-sub", false, 60, None);
-    tokio::time::timeout(SHARD_E2E_STEP, sub.write_all(&connect))
+    tokio::time::timeout(STEP, sub.write_all(&connect))
         .await
         .expect("CONNECT in time")
         .expect("CONNECT send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sub))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut sub))
         .await
         .expect("CONNACK in time")
         .expect("CONNACK");
-    assert_eq!(head, 0x20, "edge answers with CONNACK");
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
     assert_eq!(
         sy02_parse_connack311(&body),
         (false, 0),
         "first durable CONNECT accepted with session_present=false"
     );
     let subscribe = sy02_subscribe(1, &[("sy02/qos1", 1)]);
-    tokio::time::timeout(SHARD_E2E_STEP, sub.write_all(&subscribe))
+    tokio::time::timeout(STEP, sub.write_all(&subscribe))
         .await
         .expect("SUBSCRIBE in time")
         .expect("SUBSCRIBE send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sub))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut sub))
         .await
         .expect("SUBACK in time")
         .expect("SUBACK");
-    assert_eq!(head, 0x90, "edge answers with SUBACK");
+    assert_eq!(head, 0x90, "kernel answers with SUBACK");
     assert_eq!(
         sy02_parse_suback(&body),
         (1, vec![1]),
@@ -3104,22 +1975,22 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
 
     // Publisher over real MQTT.
     let mut publisher = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("publisher dial in time")
     .expect("publisher dial");
     let connect = sy02_connect311("sy02-qos1-pub", true, 60, None);
-    tokio::time::timeout(SHARD_E2E_STEP, publisher.write_all(&connect))
+    tokio::time::timeout(STEP, publisher.write_all(&connect))
         .await
         .expect("publisher CONNECT in time")
         .expect("publisher CONNECT send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut publisher))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
         .await
         .expect("publisher CONNACK in time")
         .expect("publisher CONNACK");
-    assert_eq!(head, 0x20, "edge answers the publisher with CONNACK");
+    assert_eq!(head, 0x20, "kernel answers the publisher with CONNACK");
     assert_eq!(sy02_parse_connack311(&body), (false, 0));
 
     // Three QoS 1 publishes; the subscriber receives all three live (live
@@ -3127,11 +1998,11 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     // drains its own PUBACKs to stay in sync.
     for (seq, payload) in [(1u16, "qos1-1"), (2, "qos1-2"), (3, "qos1-3")] {
         let publish = sy02_publish311("sy02/qos1", seq, 1, false, payload.as_bytes());
-        tokio::time::timeout(SHARD_E2E_STEP, publisher.write_all(&publish))
+        tokio::time::timeout(STEP, publisher.write_all(&publish))
             .await
             .expect("publish in time")
             .expect("publish send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut publisher))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
             .await
             .expect("PUBACK in time")
             .expect("PUBACK");
@@ -3144,7 +2015,7 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     }
     let mut live = Vec::new();
     for _ in 0..3 {
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sub))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut sub))
             .await
             .expect("live downlink in time")
             .expect("live downlink");
@@ -3165,22 +2036,22 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     drop(sub);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let mut re = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("reconnect in time")
     .expect("reconnect");
     let connect = sy02_connect311("sy02-qos1-sub", false, 60, None);
-    tokio::time::timeout(SHARD_E2E_STEP, re.write_all(&connect))
+    tokio::time::timeout(STEP, re.write_all(&connect))
         .await
         .expect("reconnect CONNECT in time")
         .expect("reconnect CONNECT send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut re))
         .await
         .expect("reconnect CONNACK in time")
         .expect("reconnect CONNACK");
-    assert_eq!(head, 0x20, "edge answers the reconnect with CONNACK");
+    assert_eq!(head, 0x20, "kernel answers the reconnect with CONNACK");
     assert_eq!(
         sy02_parse_connack311(&body),
         (true, 0),
@@ -3192,7 +2063,7 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     let mut replayed = Vec::new();
     let mut replay_ids = Vec::new();
     for _ in 0..2 {
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut re))
             .await
             .expect("replay in time")
             .expect("replay");
@@ -3218,7 +2089,7 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     // again and replays alone after the next drop, proving the broker
     // holds the excess only until acks arrive.
     for packet_id in &replay_ids {
-        tokio::time::timeout(SHARD_E2E_STEP, re.write_all(&sy02_puback(*packet_id)))
+        tokio::time::timeout(STEP, re.write_all(&sy02_puback(*packet_id)))
             .await
             .expect("PUBACK in time")
             .expect("PUBACK send");
@@ -3226,17 +2097,17 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     // Let the PUBACKs land before the next publish races them.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let publish = sy02_publish311("sy02/qos1", 4, 1, false, b"qos1-4");
-    tokio::time::timeout(SHARD_E2E_STEP, publisher.write_all(&publish))
+    tokio::time::timeout(STEP, publisher.write_all(&publish))
         .await
         .expect("fourth publish in time")
         .expect("fourth publish send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut publisher))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
         .await
         .expect("fourth PUBACK in time")
         .expect("fourth PUBACK");
     assert_eq!(head, 0x40, "publisher sees the fourth PUBACK");
     assert_eq!(body, vec![0x00, 0x04]);
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut re))
         .await
         .expect("fourth live downlink in time")
         .expect("fourth live downlink");
@@ -3247,28 +2118,28 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
     drop(re);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let mut re2 = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("second reconnect in time")
     .expect("second reconnect");
     let connect = sy02_connect311("sy02-qos1-sub", false, 60, None);
-    tokio::time::timeout(SHARD_E2E_STEP, re2.write_all(&connect))
+    tokio::time::timeout(STEP, re2.write_all(&connect))
         .await
         .expect("second reconnect CONNECT in time")
         .expect("second reconnect CONNECT send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re2))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut re2))
         .await
         .expect("second reconnect CONNACK in time")
         .expect("second reconnect CONNACK");
-    assert_eq!(head, 0x20, "edge answers with CONNACK");
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
     assert_eq!(
         sy02_parse_connack311(&body),
         (true, 0),
         "resumed session reports session_present=true"
     );
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re2))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut re2))
         .await
         .expect("fourth replay in time")
         .expect("fourth replay");
@@ -3289,10 +2160,7 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
         "no second replay: acked entries stay released"
     );
 
-    edge.finish().await;
-    let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&scratch);
-    let _ = std::fs::remove_dir_all(&config_dir);
+    kernel.finish().await;
 }
 
 /// SY-02: two tenants cannot see each other's messages while aliases,
@@ -3300,8 +2168,8 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
 ///
 /// The kernel boots with one tenant rule (`t-${username}`) installed from
 /// `indra.toml` via `TenantsConf -> TenantRegistry::replace`, and the
-/// shipped edge serves real MQTT 5 clients against it, so CONNECTs
-/// carrying username `user-a` land in one tenant and `user-b` in another.
+/// kernel listener serves real MQTT 5 clients, so CONNECTs carrying
+/// username `user-a` land in one tenant and `user-b` in another.
 /// In each tenant: the subscriber connects durably with an alias maximum,
 /// a topic+alias publish registers the inbound alias and arrives with the
 /// full topic plus an outbound alias, an alias-by-reference publish
@@ -3313,45 +2181,14 @@ async fn sy02_qos1_window_from_toml_and_env_enforced() {
 /// the store.
 #[tokio::test]
 async fn sy02_tenants_isolated_with_aliases_and_offline() {
-    let tag = format!(
-        "sy02-tenant-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
-    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
-    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
-    std::fs::write(
-        config_dir.join("indra.toml"),
-        "[[tenants.rules]]\nexpression = \"t-${username}\"\n",
-    )
-    .expect("write indra.toml");
-
-    let bl_port = shard_ephemeral_port();
-    let config_arg = format!("--config-dir={}", config_dir.display());
-    let (mut child, _addr) = shard_spawn_kernel(&[config_arg.as_str()], &scratch, bl_port).await;
-
-    // Real MQTT 5 clients through the shipped edge, served by the kernel
-    // above (same tenant config). One socket per client so every
-    // downlink is attributable.
-    let edge = match sy02_spawn_edge(bl_port).await {
-        Some(edge) => edge,
-        None => {
-            // SKIP already logged.
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&scratch);
-            let _ = std::fs::remove_dir_all(&config_dir);
-            return;
-        }
-    };
-    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+    // The kernel boots with one tenant rule in its config dir. Real
+    // MQTT 5 clients use the kernel listener, so CONNECTs that carry
+    // username `user-a` land in one tenant and `user-b` in another.
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
 
     // One socket per client so every downlink is attributable.
     async fn dial(host: &str, port: u16) -> tokio::net::TcpStream {
-        tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect((host, port)))
+        tokio::time::timeout(STEP, tokio::net::TcpStream::connect((host, port)))
             .await
             .expect("dial in time")
             .expect("dial")
@@ -3374,15 +2211,15 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
             None,
             10,
         );
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&connect))
+        tokio::time::timeout(STEP, sock.write_all(&connect))
             .await
             .expect("CONNECT in time")
             .expect("CONNECT send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("CONNACK in time")
             .expect("CONNACK");
-        assert_eq!(head, 0x20, "edge answers {client_id} with CONNACK");
+        assert_eq!(head, 0x20, "kernel answers {client_id} with CONNACK");
         let (present, reason, alias_max) = sy02_parse_connack5(&body);
         assert_eq!(reason, 0, "CONNECT of {client_id} must be accepted");
         assert_eq!(alias_max, 10, "CONNACK carries the kernel alias maximum");
@@ -3394,15 +2231,15 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
         // with retain-as-published set, so retained replay
         // keeps the retain flag like the old v4 path.
         let subscribe = sy02_subscribe_v5(1, &[(filter, 9)], 0);
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&subscribe))
+        tokio::time::timeout(STEP, sock.write_all(&subscribe))
             .await
             .expect("SUBSCRIBE in time")
             .expect("SUBSCRIBE send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("SUBACK in time")
             .expect("SUBACK");
-        assert_eq!(head & 0xF0, 0x90, "edge answers with SUBACK");
+        assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
         assert_eq!(
             sy02_parse_suback5(&body),
             (1, vec![1]),
@@ -3410,7 +2247,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
         );
     }
     async fn recv_packet(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
-        tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("downlink in time")
             .expect("downlink")
@@ -3425,11 +2262,11 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     ) {
         use tokio::io::AsyncWriteExt;
         let publish = sy02_publish5(topic, packet_id, 1, retain, alias, payload);
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&publish))
+        tokio::time::timeout(STEP, sock.write_all(&publish))
             .await
             .expect("publish in time")
             .expect("publish send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("PUBACK in time")
             .expect("PUBACK");
@@ -3442,7 +2279,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     }
     async fn ack(sock: &mut tokio::net::TcpStream, packet_id: u16) {
         use tokio::io::AsyncWriteExt;
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&sy02_puback(packet_id)))
+        tokio::time::timeout(STEP, sock.write_all(&sy02_puback(packet_id)))
             .await
             .expect("PUBACK in time")
             .expect("PUBACK send");
@@ -3453,10 +2290,10 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
         assert!(extra.is_err(), "{what}");
     }
 
-    let mut a_sub = dial(edge.host(), edge.mqtt_port).await;
-    let mut a_pub = dial(edge.host(), edge.mqtt_port).await;
-    let mut b_sub = dial(edge.host(), edge.mqtt_port).await;
-    let mut b_pub = dial(edge.host(), edge.mqtt_port).await;
+    let mut a_sub = dial("127.0.0.1", kernel.mqtt_port).await;
+    let mut a_pub = dial("127.0.0.1", kernel.mqtt_port).await;
+    let mut b_sub = dial("127.0.0.1", kernel.mqtt_port).await;
+    let mut b_pub = dial("127.0.0.1", kernel.mqtt_port).await;
 
     assert!(
         !connect_tenant(&mut a_sub, "sy02-a-sub", false, "user-a").await,
@@ -3514,7 +2351,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     // per tenant, and each tenant's new subscriber sees only its own.
     publish_qos1(&mut a_pub, "sy02/retained", 3, true, None, b"a-ret").await;
     publish_qos1(&mut b_pub, "sy02/retained", 3, true, None, b"b-ret").await;
-    let mut a_ret = dial(edge.host(), edge.mqtt_port).await;
+    let mut a_ret = dial("127.0.0.1", kernel.mqtt_port).await;
     assert!(
         !connect_tenant(&mut a_ret, "sy02-a-ret", true, "user-a").await,
         "tenant-a retained reader connects clean"
@@ -3530,7 +2367,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     );
     assert!(retained_a.retain, "retained replay carries retain");
     expect_silence(&mut a_ret, "tenant-a holds only its own retained message").await;
-    let mut b_ret = dial(edge.host(), edge.mqtt_port).await;
+    let mut b_ret = dial("127.0.0.1", kernel.mqtt_port).await;
     assert!(
         !connect_tenant(&mut b_ret, "sy02-b-ret", true, "user-b").await,
         "tenant-b retained reader connects clean"
@@ -3555,8 +2392,8 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     publish_qos1(&mut a_pub, "sy02/iso", 4, false, None, b"a-off").await;
     publish_qos1(&mut b_pub, "sy02/iso", 4, false, None, b"b-off").await;
-    let mut a_re = dial(edge.host(), edge.mqtt_port).await;
-    let mut b_re = dial(edge.host(), edge.mqtt_port).await;
+    let mut a_re = dial("127.0.0.1", kernel.mqtt_port).await;
+    let mut b_re = dial("127.0.0.1", kernel.mqtt_port).await;
     assert!(
         connect_tenant(&mut a_re, "sy02-a-sub", false, "user-a").await,
         "tenant-a resume reports session_present=true"
@@ -3579,10 +2416,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     expect_silence(&mut a_re, "tenant-a holds only its own replay").await;
     expect_silence(&mut b_re, "tenant-b holds only its own replay").await;
 
-    edge.finish().await;
-    let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&scratch);
-    let _ = std::fs::remove_dir_all(&config_dir);
+    kernel.finish().await;
 }
 
 /// MT-07: the same client id in two tenants holds two connections.
@@ -3593,66 +2427,40 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
 /// publish in each tenant reaches only its own tenant. The test uses
 /// the file entry and client sockets only.
 #[tokio::test]
-async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
+async fn mt07_same_client_id_in_two_tenants_stays_connected() {
     use tokio::io::AsyncWriteExt;
-    let tag = format!(
-        "mt07-dup-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
-    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
-    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
-    std::fs::write(
-        config_dir.join("indra.toml"),
-        "[[tenants.rules]]\nexpression = \"t-${username}\"\n",
-    )
-    .expect("write indra.toml");
-    let bl_port = shard_ephemeral_port();
-    let config_arg = format!("--config-dir={}", config_dir.display());
-    let (mut child, _addr) = shard_spawn_kernel(&[config_arg.as_str()], &scratch, bl_port).await;
-    let edge = match sy02_spawn_edge(bl_port).await {
-        Some(edge) => edge,
-        None => {
-            // SKIP already logged.
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&scratch);
-            let _ = std::fs::remove_dir_all(&config_dir);
-            return;
-        }
-    };
-    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+    // The kernel boots with one tenant rule in its config dir. Real
+    // MQTT clients use the kernel listener, so each username lands in
+    // its own tenant.
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
 
     // Two sockets share one client id. Each carries its own username,
     // so each lands in its own tenant.
     let mut a_sock = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("dial A in time")
     .expect("dial A");
     let mut b_sock = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("dial B in time")
     .expect("dial B");
     for (sock, user) in [(&mut a_sock, "alpha"), (&mut b_sock, "beta")] {
         let connect = sy02_connect311("mt07-dup", true, 60, Some((user, b"pw")));
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&connect))
+        tokio::time::timeout(STEP, sock.write_all(&connect))
             .await
             .expect("CONNECT in time")
             .expect("CONNECT send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("CONNACK in time")
             .expect("CONNACK");
-        assert_eq!(head, 0x20, "edge answers {user} with CONNACK");
+        assert_eq!(head, 0x20, "kernel answers {user} with CONNACK");
         assert_eq!(
             sy02_parse_connack311(&body),
             (false, 0),
@@ -3662,28 +2470,28 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
     // Both tenants subscribe to the same topic string.
     for sock in [&mut a_sock, &mut b_sock] {
         let subscribe = sy02_subscribe(1, &[("mt07/dup", 1)]);
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&subscribe))
+        tokio::time::timeout(STEP, sock.write_all(&subscribe))
             .await
             .expect("SUBSCRIBE in time")
             .expect("SUBSCRIBE send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("SUBACK in time")
             .expect("SUBACK");
-        assert_eq!(head, 0x90, "edge answers with SUBACK");
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
         assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
     }
     // One publisher per tenant.
     let mut a_pub = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("dial A pub in time")
     .expect("dial A pub");
     let mut b_pub = tokio::time::timeout(
-        SHARD_E2E_STEP,
-        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+        STEP,
+        tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port)),
     )
     .await
     .expect("dial B pub in time")
@@ -3693,30 +2501,30 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
         (&mut b_pub, "mt07-b-pub", "beta"),
     ] {
         let connect = sy02_connect311(id, true, 60, Some((user, b"pw")));
-        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&connect))
+        tokio::time::timeout(STEP, sock.write_all(&connect))
             .await
             .expect("pub CONNECT in time")
             .expect("pub CONNECT send");
-        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
             .await
             .expect("pub CONNACK in time")
             .expect("pub CONNACK");
-        assert_eq!(head, 0x20, "edge answers the publisher with CONNACK");
+        assert_eq!(head, 0x20, "kernel answers the publisher with CONNACK");
         assert_eq!(sy02_parse_connack311(&body), (false, 0));
     }
     // A publish in tenant A reaches A only. B stays silent.
     let publish = sy02_publish311("mt07/dup", 1, 1, false, b"from-a");
-    tokio::time::timeout(SHARD_E2E_STEP, a_pub.write_all(&publish))
+    tokio::time::timeout(STEP, a_pub.write_all(&publish))
         .await
         .expect("publish in time")
         .expect("publish send");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut a_pub))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut a_pub))
         .await
         .expect("PUBACK in time")
         .expect("PUBACK");
     assert_eq!(head, 0x40, "publisher sees PUBACK");
     assert_eq!(body, vec![0, 1], "PUBACK mirrors its packet id");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut a_sock))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut a_sock))
         .await
         .expect("A downlink in time")
         .expect("A downlink");
@@ -3724,13 +2532,10 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
     let downlink = sy02_parse_publish_classic(head, &body);
     assert_eq!(downlink.topic, "mt07/dup");
     assert_eq!(downlink.payload, b"from-a");
-    tokio::time::timeout(
-        SHARD_E2E_STEP,
-        a_sock.write_all(&sy02_puback(downlink.packet_id)),
-    )
-    .await
-    .expect("PUBACK in time")
-    .expect("PUBACK send");
+    tokio::time::timeout(STEP, a_sock.write_all(&sy02_puback(downlink.packet_id)))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK send");
     let silent = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         read_mqtt_packet(&mut b_sock),
@@ -3739,16 +2544,16 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
     assert!(silent.is_err(), "B holds none of A's publish");
     // A publish in tenant B reaches B only. A stays silent.
     let publish = sy02_publish311("mt07/dup", 2, 1, false, b"from-b");
-    tokio::time::timeout(SHARD_E2E_STEP, b_pub.write_all(&publish))
+    tokio::time::timeout(STEP, b_pub.write_all(&publish))
         .await
         .expect("publish in time")
         .expect("publish send");
-    let (head, _) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut b_pub))
+    let (head, _) = tokio::time::timeout(STEP, read_mqtt_packet(&mut b_pub))
         .await
         .expect("PUBACK in time")
         .expect("PUBACK");
     assert_eq!(head, 0x40, "publisher sees PUBACK");
-    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut b_sock))
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut b_sock))
         .await
         .expect("B downlink in time")
         .expect("B downlink");
@@ -3756,13 +2561,10 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
     let downlink = sy02_parse_publish_classic(head, &body);
     assert_eq!(downlink.topic, "mt07/dup");
     assert_eq!(downlink.payload, b"from-b");
-    tokio::time::timeout(
-        SHARD_E2E_STEP,
-        b_sock.write_all(&sy02_puback(downlink.packet_id)),
-    )
-    .await
-    .expect("PUBACK in time")
-    .expect("PUBACK send");
+    tokio::time::timeout(STEP, b_sock.write_all(&sy02_puback(downlink.packet_id)))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK send");
     let silent = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         read_mqtt_packet(&mut a_sock),
@@ -3770,8 +2572,9797 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
     .await;
     assert!(silent.is_err(), "A holds none of B's publish");
 
-    edge.finish().await;
+    kernel.finish().await;
+}
+
+/// SA-09: shared subscriptions keep the tenant.
+///
+/// The kernel boots with one tenant rule. Each tenant holds one
+/// shared subscription on the same group and topic. A publish in
+/// tenant A reaches only the member in tenant A. A publish in
+/// tenant B reaches only the member in tenant B. The test uses
+/// real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_shared_subscriptions_stay_in_tenant() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    for (sock, id, user) in [
+        (&mut a_sub, "sa09-a-sub", "user-a"),
+        (&mut b_sub, "sa09-b-sub", "user-b"),
+        (&mut a_pub, "sa09-a-pub", "user-a"),
+        (&mut b_pub, "sa09-b-pub", "user-b"),
+    ] {
+        send_mqtt(sock, &sy02_connect311(id, true, 60, Some((user, b"pw")))).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x20, "kernel answers with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    }
+    // Both tenants share one group name and one topic string.
+    // Each group balances inside its own tenant only.
+    for sock in [&mut a_sub, &mut b_sub] {
+        send_mqtt(sock, &sy02_subscribe(1, &[("$share/g/sa09/shared", 1)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    // A publish in tenant A reaches A only. B stays silent.
+    send_mqtt(
+        &mut a_pub,
+        &sy02_publish311("sa09/shared", 1, 1, false, b"from-a"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "sa09/shared");
+    assert_eq!(downlink.payload, b"from-a");
+    send_mqtt(&mut a_sub, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A shared publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/shared", 2, 1, false, b"from-b"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "sa09/shared");
+    assert_eq!(downlink.payload, b"from-b");
+    send_mqtt(&mut b_sub, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B shared publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: the last will keeps the tenant.
+///
+/// The kernel boots with one tenant rule. Each tenant subscribes
+/// to one will topic. A publisher in tenant A drops without
+/// DISCONNECT. Only tenant A receives the will. Then a publisher
+/// in tenant B drops. Only tenant B receives the will. The test
+/// uses real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_will_stays_in_tenant() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_sub = dial_mqtt(kernel.mqtt_port).await;
+    for (sock, id, user) in [
+        (&mut a_sub, "sa09-will-a-sub", "user-a"),
+        (&mut b_sub, "sa09-will-b-sub", "user-b"),
+    ] {
+        send_mqtt(sock, &sy02_connect311(id, true, 60, Some((user, b"pw")))).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x20, "kernel answers with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+        send_mqtt(sock, &sy02_subscribe(1, &[("sa09/will", 0)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    }
+    // Tenant A publisher drops. Only tenant A receives the will.
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_pub,
+        &sy02_connect5(
+            "sa09-will-a-pub",
+            true,
+            60,
+            Some(("user-a", b"pw")),
+            Some(("sa09/will", b"will-a")),
+            0,
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    assert_eq!(sy02_parse_connack5(&body).1, 0);
+    drop(a_pub);
+    let (head, body) = recv_mqtt(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let first = sy02_parse_publish_classic(head, &body);
+    assert_eq!(first.topic, "sa09/will");
+    assert_eq!(first.payload, b"will-a");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A will");
+    // Tenant B publisher drops. Only tenant B receives the will.
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_pub,
+        &sy02_connect5(
+            "sa09-will-b-pub",
+            true,
+            60,
+            Some(("user-b", b"pw")),
+            Some(("sa09/will", b"will-b")),
+            0,
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    assert_eq!(sy02_parse_connack5(&body).1, 0);
+    drop(b_pub);
+    let (head, body) = recv_mqtt(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let second = sy02_parse_publish_classic(head, &body);
+    assert_eq!(second.topic, "sa09/will");
+    assert_eq!(second.payload, b"will-b");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B will");
+
+    kernel.finish().await;
+}
+
+/// SA-09: a reconnect in another tenant keeps both sessions.
+///
+/// The kernel boots with one tenant rule. One client id connects
+/// in tenant A and again in tenant B. Both connects succeed and
+/// both sessions stay live. Each publish reaches only its own
+/// tenant. A new connect in tenant A resumes A and leaves B live.
+/// The test uses real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_reconnect_in_other_tenant_keeps_both_sessions() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_sock,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    let mut b_sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_sock,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-b", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (false, 0),
+        "other tenant starts a fresh session"
+    );
+    // Both sessions subscribe to one topic string.
+    for sock in [&mut a_sock, &mut b_sock] {
+        send_mqtt(sock, &sy02_subscribe(1, &[("sa09/dup", 1)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_pub,
+        &sy02_connect311("sa09-dup-a-pub", true, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_pub,
+        &sy02_connect311("sa09-dup-b-pub", true, 60, Some(("user-b", b"pw"))),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    // A publish in tenant A reaches A only. B stays silent.
+    send_mqtt(
+        &mut a_pub,
+        &sy02_publish311("sa09/dup", 1, 1, false, b"a-1"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut a_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"a-1");
+    send_mqtt(&mut a_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/dup", 2, 1, false, b"b-1"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"b-1");
+    send_mqtt(&mut b_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B publish");
+    // A new connect in tenant A resumes A and leaves B live.
+    let mut a_re = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_re,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_re).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (true, 0),
+        "same tenant resumes its session"
+    );
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/dup", 3, 1, false, b"b-2"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"b-2");
+    send_mqtt(&mut b_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_re),
+    )
+    .await;
+    assert!(silent.is_err(), "resumed A holds none of B publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: the cluster entry is refused and the node stays single.
+///
+/// The loader refuses each cluster entry at schema load. The boot
+/// with a file entry exits. The single node binds no UDP socket.
+/// A default tenant publish reaches its own subscriber only, so
+/// no message crosses nodes. The test uses file, flag and socket
+/// entries, never the store.
+#[tokio::test]
+async fn sa09_cluster_entry_stays_single_node() {
+    // The schema refuses each entry. Each load must fail.
+    // On the base each load succeeds, so each assert fails there.
+    {
+        use broker_config::layers::{load_layered_with_env, CliOverrides};
+        let tag = format!(
+            "sa09-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        // The file seed_nodes leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-seeds"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(
+                dir.join("indra.toml"),
+                "[cluster]\nseed_nodes = [\"127.0.0.1:19883\"]\n",
+            )
+            .expect("write indra.toml");
+            let err = load_layered_with_env(&dir, &[], &CliOverrides::default())
+                .expect_err("seed_nodes file must fail");
+            assert!(
+                err.to_string().contains("cluster.seed_nodes"),
+                "error names the seed entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // The file enabled leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-enabled"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(dir.join("indra.toml"), "[cluster]\nenabled = true\n")
+                .expect("write indra.toml");
+            let err = load_layered_with_env(&dir, &[], &CliOverrides::default())
+                .expect_err("enabled file must fail");
+            assert!(
+                err.to_string().contains("cluster.enabled"),
+                "error names the enabled entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // The --cluster-seeds flag leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-flag"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            let cli = CliOverrides {
+                cluster_seeds: Some("127.0.0.1:19883".to_string()),
+                ..CliOverrides::default()
+            };
+            let err =
+                load_layered_with_env(&dir, &[], &cli).expect_err("--cluster-seeds flag must fail");
+            assert!(
+                err.to_string().contains("cluster.seed_nodes"),
+                "error names the seed entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    // The boot with a file entry exits. The file is the production entry.
+    // On the base the kernel boots, so the exit assert fails there.
+    {
+        let tag = format!(
+            "sa09-boot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
+        let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+        std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+        let bl_port = ephemeral_port();
+        let mqtt_port = ephemeral_port();
+        let ws_port = ephemeral_port();
+        let api_port = ephemeral_port();
+        std::fs::write(
+            config_dir.join("indra.toml"),
+            format!(
+                "[node]\nid = \"sa09-refuse\"\ndata_dir = \"{}\"\nbrokerlink_bind = \"127.0.0.1:{bl_port}\"\n[listeners.tcp]\nbind = \"127.0.0.1:{mqtt_port}\"\n[listeners.tls]\nenabled = false\n[listeners.ws]\nbind = \"127.0.0.1:{ws_port}\"\n[listeners.wss]\nenabled = false\n[listeners.api]\nbind = \"127.0.0.1:{api_port}\"\n[logging]\nlevel = \"warn\"\n[cluster]\nseed_nodes = [\"127.0.0.1:19883\"]\n",
+                scratch.display(),
+            ),
+        )
+        .expect("write indra.toml");
+        let mut child = tokio::process::Command::new(shard_kernel_binary())
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn real kernel");
+        let mut exited = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Ok(Some(_)) = child.try_wait() {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "kernel with cluster entry exits");
+        let _ = child.kill().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+    // The single node binds no UDP socket and forwards no default message.
+    // The default tenant publish goes through forward_cluster with no plane.
+    let kernel = spawn_kernel("").await;
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:19883")
+        .await
+        .expect("cluster UDP stays free");
+    drop(udp);
+    let mut sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut sub,
+        &sy02_connect311("sa09-cl-def-sub", true, 60, None),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send_mqtt(&mut sub, &sy02_subscribe(1, &[("sa09/cluster", 1)])).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x90, "kernel answers with SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    let mut publisher = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_connect311("sa09-cl-def-pub", true, 60, None),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sa09/cluster", 1, 1, false, b"default-only"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    assert_eq!(
+        sy02_parse_publish_classic(head, &body).payload,
+        b"default-only"
+    );
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut sub),
+    )
+    .await;
+    assert!(silent.is_err(), "default publish forwards nothing extra");
+
+    kernel.finish().await;
+}
+
+/// MV-05: the tenant session limit applies at the MQTT entry.
+///
+/// The kernel boots with one tenant rule. A management write sets
+/// `limits.max_sessions` to 1 for one tenant. The first MQTT session
+/// connects. A second client in the same tenant gets CONNACK 0x03.
+/// Another tenant still connects. The test uses real sockets and the
+/// real API, not a store read.
+#[tokio::test]
+async fn mv05_tenant_session_limit_refuses_second_mqtt_session() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let base = format!("http://127.0.0.1:{}", kernel.api_port);
+    let http = reqwest::Client::new();
+
+    let created = tokio::time::timeout(
+        STEP,
+        http.post(format!("{base}/api/v5/mt/ns/t-mv05-lim"))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({}))
+            .send(),
+    )
+    .await
+    .expect("namespace create in time")
+    .expect("namespace create sends");
+    assert_eq!(created.status(), 204, "managed namespace is created");
+
+    let limit = tokio::time::timeout(
+        STEP,
+        http.put(format!("{base}/api/v5/mt/ns/t-mv05-lim/config"))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({"limits": {"max_sessions": 1}}))
+            .send(),
+    )
+    .await
+    .expect("limit write in time")
+    .expect("limit write sends");
+    assert_eq!(limit.status(), 200, "tenant session limit is stored");
+
+    let mut first = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut first,
+        &sy02_connect311("mv05-limit-a", true, 60, Some(("mv05-lim", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut first).await;
+    assert_eq!(head, 0x20, "first session gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(reason, 0, "first session in the tenant is accepted");
+
+    let mut second = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut second,
+        &sy02_connect311("mv05-limit-b", true, 60, Some(("mv05-lim", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut second).await;
+    assert_eq!(head, 0x20, "second session gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(
+        reason, 0x03,
+        "the tenant session limit refuses the second session"
+    );
+
+    let mut other = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut other,
+        &sy02_connect311("mv05-limit-c", true, 60, Some(("mv05-other", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut other).await;
+    assert_eq!(head, 0x20, "other tenant gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(reason, 0, "another tenant still connects");
+
+    kernel.finish().await;
+}
+
+/// TM-09: tenant in client and subscription reads, through real
+/// sockets and the real API.
+///
+/// The kernel boots from `indra.toml` with one tenant rule and its own
+/// MQTT listener, so no edge is needed. Two tenants connect the same
+/// client id. Each tenant publishes a random value the broker cannot
+/// know. Delivery stays in-tenant. The API then shows each tenant its
+/// own rows only, and the default-tenant reads keep their shapes.
+#[tokio::test]
+async fn tm09_tenant_client_reads_through_sockets_and_api() {
+    use tokio::io::AsyncWriteExt;
+
+    let tag = format!(
+        "tm09-reads-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+
+    let bl_port = ephemeral_port();
+    let mqtt_port = ephemeral_port();
+    let api_port = ephemeral_port();
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        format!(
+            "[node]\n\
+             id = \"tm09-e2e\"\n\
+             data_dir = \"{}\"\n\
+             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+             \n\
+             [listeners.tcp]\n\
+              bind = \"127.0.0.1:{mqtt_port}\"\n\
+              \n\
+              [listeners.tls]\n\
+              enabled = false\n\
+              \n\
+              [listeners.ws]\n\
+              enabled = false\n\
+              \n\
+              [listeners.wss]\n\
+              enabled = false\n\
+              \n\
+              [listeners.api]\n\
+              bind = \"127.0.0.1:{api_port}\"\n\
+              \n\
+              [logging]\n\
+              level = \"warn\"\n\
+              \n\
+              [[tenants.rules]]\n\
+              expression = \"t-${{username}}\"\n",
+            scratch.display(),
+        ),
+    )
+    .expect("write indra.toml");
+
+    // Operator key: 21 chars, above the 16-char minimum. Bearer auth
+    // opens the management API with no user setup.
+    let api_key = "tm09-e2e-test-key-0001";
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--allow-anonymous")
+        .env("INDRA_API_KEYS", api_key)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{api_port}");
+    let deadline = std::time::Instant::now() + BOOT;
+    loop {
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(format!("{base}/healthz")).send(),
+        )
+        .await;
+        if let Ok(Ok(res)) = up {
+            if let Ok(text) = res.text().await {
+                if text == "OK"
+                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                        .await
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            panic!("tm09 kernel never opened API {api_port} and MQTT {mqtt_port}");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("tm09 kernel exited during boot: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    async fn dial(port: u16) -> tokio::net::TcpStream {
+        tokio::time::timeout(STEP, tokio::net::TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .expect("dial in time")
+            .expect("dial")
+    }
+    async fn connect_user(sock: &mut tokio::net::TcpStream, client_id: &str, username: &str) {
+        tokio::time::timeout(
+            STEP,
+            sock.write_all(&sy02_connect311(
+                client_id,
+                true,
+                60,
+                Some((username, b"pw")),
+            )),
+        )
+        .await
+        .expect("CONNECT in time")
+        .expect("CONNECT send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+            .await
+            .expect("CONNACK in time")
+            .expect("CONNACK");
+        assert_eq!(head, 0x20, "kernel answers {client_id} with CONNACK");
+        assert_eq!(body, vec![0x00, 0x00], "CONNECT of {client_id} is accepted");
+    }
+    async fn subscribe(sock: &mut tokio::net::TcpStream, filter: &str) {
+        tokio::time::timeout(STEP, sock.write_all(&sy02_subscribe(1, &[(filter, 0)])))
+            .await
+            .expect("SUBSCRIBE in time")
+            .expect("SUBSCRIBE send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+            .await
+            .expect("SUBACK in time")
+            .expect("SUBACK");
+        assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
+        assert_eq!(body, vec![0x00, 0x01, 0x00], "subscribe is granted");
+    }
+
+    // Same client id in two tenants. Both connects succeed.
+    let mut a_sub = dial(mqtt_port).await;
+    let mut b_sub = dial(mqtt_port).await;
+    let mut a_pub = dial(mqtt_port).await;
+    let mut b_pub = dial(mqtt_port).await;
+    connect_user(&mut a_sub, "tm09-dup", "tm09-a").await;
+    connect_user(&mut b_sub, "tm09-dup", "tm09-b").await;
+    subscribe(&mut a_sub, "tm09/check").await;
+    subscribe(&mut b_sub, "tm09/check").await;
+    connect_user(&mut a_pub, "tm09-a-pub", "tm09-a").await;
+    connect_user(&mut b_pub, "tm09-b-pub", "tm09-b").await;
+
+    // Random values the broker cannot know. Delivery stays in-tenant.
+    let secret_a = format!("tm09-{}-a-{}", std::process::id(), rand::random::<u64>());
+    let secret_b = format!("tm09-{}-b-{}", std::process::id(), rand::random::<u64>());
+    tokio::time::timeout(
+        STEP,
+        a_pub.write_all(&sy02_publish311(
+            "tm09/check",
+            0,
+            0,
+            false,
+            secret_a.as_bytes(),
+        )),
+    )
+    .await
+    .expect("publish in time")
+    .expect("publish send");
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut a_sub))
+        .await
+        .expect("downlink in time")
+        .expect("downlink");
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let own = sy02_parse_publish_classic(head, &body);
+    assert_eq!(own.topic, "tm09/check");
+    assert_eq!(own.payload, secret_a.as_bytes());
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "tenant B holds none of tenant A publish");
+
+    tokio::time::timeout(
+        STEP,
+        b_pub.write_all(&sy02_publish311(
+            "tm09/check",
+            0,
+            0,
+            false,
+            secret_b.as_bytes(),
+        )),
+    )
+    .await
+    .expect("publish in time")
+    .expect("publish send");
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut b_sub))
+        .await
+        .expect("downlink in time")
+        .expect("downlink");
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let own = sy02_parse_publish_classic(head, &body);
+    assert_eq!(own.payload, secret_b.as_bytes());
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "tenant A holds none of tenant B publish");
+
+    // Reads through the API. Each tenant filter shows its rows only.
+    async fn api_get(
+        http: &reqwest::Client,
+        base: &str,
+        key: &str,
+        path: &str,
+    ) -> (u16, serde_json::Value) {
+        let res = tokio::time::timeout(
+            STEP,
+            http.get(format!("{base}{path}")).bearer_auth(key).send(),
+        )
+        .await
+        .expect("API in time")
+        .expect("API send");
+        let status = res.status().as_u16();
+        let body: serde_json::Value = tokio::time::timeout(STEP, res.json())
+            .await
+            .expect("body in time")
+            .expect("body is JSON");
+        (status, body)
+    }
+    for tenant in ["t-tm09-a", "t-tm09-b"] {
+        let (status, body) = api_get(
+            &http,
+            &base,
+            api_key,
+            &format!("/api/v5/clients?tenant={tenant}"),
+        )
+        .await;
+        assert_eq!(status, 200, "client list of {tenant}");
+        let data = body["data"].as_array().expect("client list has data");
+        assert!(!data.is_empty(), "{tenant} keeps its rows");
+        for row in data {
+            assert_eq!(row["mountpoint"], serde_json::json!(tenant));
+        }
+        assert!(
+            data.iter().any(|row| row["clientid"] == "tm09-dup"),
+            "{tenant} shows its namesake"
+        );
+    }
+    let (status, body) = api_get(&http, &base, api_key, "/api/v5/clients").await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().expect("client list has data");
+    let mut mounts: Vec<&str> = data
+        .iter()
+        .filter(|row| row["clientid"] == "tm09-dup")
+        .map(|row| row["mountpoint"].as_str().expect("row carries mountpoint"))
+        .collect();
+    mounts.sort_unstable();
+    assert_eq!(mounts, vec!["t-tm09-a", "t-tm09-b"]);
+
+    // The bare detail read keeps the default tenant, so it misses
+    // here instead of leaking another tenant session.
+    let (status, _) = api_get(&http, &base, api_key, "/api/v5/clients/tm09-dup").await;
+    assert_eq!(status, 404);
+    let (status, body) = api_get(
+        &http,
+        &base,
+        api_key,
+        "/api/v5/clients/tm09-dup?tenant=t-tm09-a",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mountpoint"], serde_json::json!("t-tm09-a"));
+
+    // Subscription reads scope the same way with the current shape.
+    let (status, body) = api_get(
+        &http,
+        &base,
+        api_key,
+        "/api/v5/subscriptions?tenant=t-tm09-a",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let rows = body.as_array().expect("subscription list is an array");
+    assert!(!rows.is_empty(), "tenant A keeps its subscriptions");
+    for row in rows {
+        assert!(row.get("tenant").is_none());
+    }
+    assert!(
+        rows.iter().any(|row| row["topic"] == "tm09/check"),
+        "tenant A shows its subscription"
+    );
+    let (status, _) = api_get(&http, &base, api_key, "/api/v5/topics").await;
+    assert_eq!(status, 200);
+    let (status, _) = api_get(&http, &base, api_key, "/api/v5/sessions_count").await;
+    assert_eq!(status, 200);
+
     let _ = child.kill().await;
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+/// Built-in rule actions of the reference API, through real sockets and
+/// the real management API.
+///
+/// The kernel boots from `indra.toml` with its own MQTT listener, so no
+/// edge is needed. Each rule is created with `POST /api/v5/rules`. Real
+/// MQTT clients publish, and other clients receive on the republish
+/// topic. Every value is random, so the broker cannot know it.
+#[tokio::test]
+async fn rule_builtin_actions_republish_and_console_through_the_broker() {
+    use tokio::io::AsyncWriteExt;
+
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(1500);
+    let tag = format!(
+        "rb-actions-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    let kernel_log = std::env::temp_dir().join(format!("indramqtt-{tag}.log"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+
+    let bl_port = ephemeral_port();
+    let mqtt_port = ephemeral_port();
+    let api_port = ephemeral_port();
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        format!(
+            "[node]\n\
+             id = \"rb-e2e\"\n\
+             data_dir = \"{}\"\n\
+             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+             \n\
+             [listeners.tcp]\n\
+              bind = \"127.0.0.1:{mqtt_port}\"\n\
+              \n\
+              [listeners.tls]\n\
+              enabled = false\n\
+              \n\
+              [listeners.ws]\n\
+              enabled = false\n\
+              \n\
+              [listeners.wss]\n\
+              enabled = false\n\
+              \n\
+              [listeners.api]\n\
+              bind = \"127.0.0.1:{api_port}\"\n\
+              \n\
+              [logging]\n\
+              level = \"info\"\n\
+              \n\
+              [[tenants.rules]]\n\
+              expression = \"t-${{username}}\"\n",
+            scratch.display(),
+        ),
+    )
+    .expect("write indra.toml");
+
+    let api_key = "rb-e2e-test-key-0001";
+    let log_file = std::fs::File::create(&kernel_log).expect("create kernel log");
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--allow-anonymous")
+        .env("INDRA_API_KEYS", api_key)
+        .env("NO_COLOR", "1")
+        .stdout(log_file.try_clone().expect("clone log handle"))
+        .stderr(log_file)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{api_port}");
+    let deadline = std::time::Instant::now() + BOOT;
+    loop {
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(format!("{base}/healthz")).send(),
+        )
+        .await;
+        if let Ok(Ok(res)) = up {
+            if let Ok(text) = res.text().await {
+                if text == "OK"
+                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                        .await
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            panic!("rule actions kernel never opened API {api_port} and MQTT {mqtt_port}");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("rule actions kernel exited during boot: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    async fn api(
+        http: &reqwest::Client,
+        base: &str,
+        key: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let mut request = http
+            .request(method, format!("{base}{path}"))
+            .bearer_auth(key);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let res = tokio::time::timeout(STEP, request.send())
+            .await
+            .expect("API in time")
+            .expect("API send");
+        let status = res.status().as_u16();
+        let text = res.text().await.expect("API body");
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+    async fn dial(port: u16) -> tokio::net::TcpStream {
+        tokio::time::timeout(STEP, tokio::net::TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .expect("dial in time")
+            .expect("dial")
+    }
+    async fn connect(port: u16, client_id: &str, username: Option<&str>) -> tokio::net::TcpStream {
+        let mut sock = dial(port).await;
+        let creds = username.map(|name| (name, &b"pw"[..]));
+        tokio::time::timeout(
+            STEP,
+            sock.write_all(&sy02_connect311(client_id, true, 60, creds)),
+        )
+        .await
+        .expect("CONNECT in time")
+        .expect("CONNECT send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut sock))
+            .await
+            .expect("CONNACK in time")
+            .expect("CONNACK");
+        assert_eq!(head, 0x20, "kernel answers {client_id} with CONNACK");
+        assert_eq!(body, vec![0x00, 0x00], "CONNECT of {client_id} is accepted");
+        sock
+    }
+    async fn subscribe(sock: &mut tokio::net::TcpStream, filter: &str, qos: u8) {
+        tokio::time::timeout(STEP, sock.write_all(&sy02_subscribe(1, &[(filter, qos)])))
+            .await
+            .expect("SUBSCRIBE in time")
+            .expect("SUBSCRIBE send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+            .await
+            .expect("SUBACK in time")
+            .expect("SUBACK");
+        assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
+        assert_eq!(body, vec![0x00, 0x01, qos], "subscribe to {filter} granted");
+    }
+    async fn publish(sock: &mut tokio::net::TcpStream, topic: &str, qos: u8, payload: &[u8]) {
+        tokio::time::timeout(
+            STEP,
+            sock.write_all(&sy02_publish311(topic, 7, qos, false, payload)),
+        )
+        .await
+        .expect("publish in time")
+        .expect("publish send");
+        if qos > 0 {
+            let (head, _) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+                .await
+                .expect("PUBACK in time")
+                .expect("PUBACK");
+            assert_eq!(head, 0x40, "publisher sees PUBACK");
+        }
+    }
+    /// The next PUBLISH on the socket, or `None` when nothing comes in
+    /// the given time.
+    async fn next_publish(
+        sock: &mut tokio::net::TcpStream,
+        wait: std::time::Duration,
+    ) -> Option<Sy02Publish> {
+        let (head, body) = tokio::time::timeout(wait, read_mqtt_packet(sock))
+            .await
+            .ok()?
+            .expect("downlink");
+        assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+        Some(sy02_parse_publish_classic(head, &body))
+    }
+    let nonce = || format!("{:016x}", rand::random::<u64>());
+
+    // Two tenants own rules; clients with these usernames land there.
+    for ns in ["t-rb-a", "t-rb-b"] {
+        let (status, body) = api(
+            &http,
+            &base,
+            api_key,
+            reqwest::Method::POST,
+            &format!("/api/v5/mt/ns/{ns}"),
+            None,
+        )
+        .await;
+        assert!(status < 300, "namespace {ns} answered {status}: {body}");
+    }
+    let make_rule = |name: &str, sql: &str, actions: serde_json::Value| serde_json::json!({"id": name, "name": name, "sql": sql, "actions": actions});
+
+    // 1. A fixed topic and the default `${payload}`. The republish topic
+    // matches the filter of the rule itself: a loop would deliver more
+    // than one copy.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-fixed",
+            "SELECT * FROM \"rb/one/#\"",
+            serde_json::json!([
+                {"function": "republish", "args": {"topic": "rb/one/out", "payload": "${payload}"}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    assert_eq!(body["actions"][0]["function"], "republish");
+    let mut sub_one = connect(mqtt_port, "rb-sub-one", None).await;
+    subscribe(&mut sub_one, "rb/one/out", 0).await;
+    let mut pubr = connect(mqtt_port, "rb-pub", None).await;
+    let value = nonce();
+    let message = format!("{{\"v\":\"{value}\"}}");
+    publish(&mut pubr, "rb/one/in", 0, message.as_bytes()).await;
+    let got = next_publish(&mut sub_one, STEP).await.expect("republish");
+    assert_eq!(got.topic, "rb/one/out");
+    assert_eq!(got.payload, message.as_bytes());
+    assert!(
+        next_publish(&mut sub_one, QUIET).await.is_none(),
+        "one input gives one output: a republish does not start its own rule again"
+    );
+
+    // 2. A payload template with selected fields and a topic template.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-template",
+            "SELECT temp, dev FROM \"rb/two/+\"",
+            serde_json::json!([
+                {"function": "republish",
+                 "args": {"topic": "rb/two/out/${dev}", "payload": "temp=${temp};dev=${dev}"}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut sub_two = connect(mqtt_port, "rb-sub-two", None).await;
+    subscribe(&mut sub_two, "rb/two/out/#", 0).await;
+    let dev = nonce();
+    let temp = rand::random::<u32>();
+    let message = format!("{{\"temp\":{temp},\"dev\":\"{dev}\",\"noise\":\"x\"}}");
+    publish(&mut pubr, "rb/two/in", 0, message.as_bytes()).await;
+    let got = next_publish(&mut sub_two, STEP).await.expect("template");
+    assert_eq!(got.topic, format!("rb/two/out/{dev}"));
+    assert_eq!(got.payload, format!("temp={temp};dev={dev}").as_bytes());
+
+    // 3. A WHERE clause filters.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-where",
+            "SELECT * FROM \"rb/three\" WHERE n > 5",
+            serde_json::json!([{"function": "republish", "args": {"topic": "rb/three/out"}}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut sub_three = connect(mqtt_port, "rb-sub-three", None).await;
+    subscribe(&mut sub_three, "rb/three/out", 0).await;
+    publish(&mut pubr, "rb/three", 0, br#"{"n":1,"w":"low"}"#).await;
+    assert!(
+        next_publish(&mut sub_three, QUIET).await.is_none(),
+        "WHERE n > 5 drops n = 1"
+    );
+    let high = format!("{{\"n\":9,\"w\":\"{}\"}}", nonce());
+    publish(&mut pubr, "rb/three", 0, high.as_bytes()).await;
+    let got = next_publish(&mut sub_three, STEP).await.expect("where");
+    assert_eq!(got.payload, high.as_bytes());
+
+    // 4. QoS: the default follows the input message, a number is fixed,
+    // and a template reads a field.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-qos",
+            "SELECT * FROM \"rb/four\"",
+            serde_json::json!([
+                {"function": "republish", "args": {"topic": "rb/four/follow"}},
+                {"function": "republish", "args": {"topic": "rb/four/fixed", "qos": 1}},
+                {"function": "republish", "args": {"topic": "rb/four/field", "qos": "${lvl}"}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut sub_four = connect(mqtt_port, "rb-sub-four", None).await;
+    subscribe(&mut sub_four, "rb/four/+", 2).await;
+    for (input_qos, expect) in [(1u8, [1u8, 1, 2]), (0u8, [0u8, 1, 2])] {
+        let message = format!("{{\"lvl\":2,\"id\":\"{}\"}}", nonce());
+        publish(&mut pubr, "rb/four", input_qos, message.as_bytes()).await;
+        let mut seen = std::collections::HashMap::new();
+        for _ in 0..3 {
+            let got = next_publish(&mut sub_four, STEP).await.expect("qos output");
+            if got.qos == 1 {
+                tokio::time::timeout(STEP, sub_four.write_all(&sy02_puback(got.packet_id)))
+                    .await
+                    .expect("PUBACK in time")
+                    .expect("PUBACK send");
+            }
+            seen.insert(got.topic.clone(), got.qos);
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "three outputs for input QoS {input_qos}: {seen:?}"
+        );
+        assert_eq!(
+            seen["rb/four/follow"], expect[0],
+            "follows input QoS {input_qos}"
+        );
+        assert_eq!(seen["rb/four/fixed"], expect[1], "fixed QoS 1");
+        assert_eq!(seen["rb/four/field"], expect[2], "QoS from the field `lvl`");
+    }
+
+    // 5. A retained republish is kept for later subscribers.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-retain",
+            "SELECT * FROM \"rb/five\"",
+            serde_json::json!([
+                {"function": "republish", "args": {"topic": "rb/five/kept", "retain": true}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let kept = format!("{{\"keep\":\"{}\"}}", nonce());
+    publish(&mut pubr, "rb/five", 0, kept.as_bytes()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut late = connect(mqtt_port, "rb-late", None).await;
+    subscribe(&mut late, "rb/five/kept", 0).await;
+    let got = next_publish(&mut late, STEP)
+        .await
+        .expect("retained replay");
+    assert_eq!(got.payload, kept.as_bytes());
+    assert!(got.retain, "the replay carries the retain flag");
+
+    // 6. A rule of tenant A republishes inside tenant A only.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(serde_json::json!({
+            "name": "rb-tenant-a",
+            "tenant": "t-rb-a",
+            "sql": "SELECT * FROM \"rb/six\"",
+            "actions": [{"function": "republish", "args": {"topic": "rb/six/out"}}]
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut a_sub = connect(mqtt_port, "rb-a-sub", Some("rb-a")).await;
+    let mut a_pub = connect(mqtt_port, "rb-a-pub", Some("rb-a")).await;
+    let mut b_sub = connect(mqtt_port, "rb-b-sub", Some("rb-b")).await;
+    let mut b_pub = connect(mqtt_port, "rb-b-pub", Some("rb-b")).await;
+    let mut default_sub = connect(mqtt_port, "rb-d-sub", None).await;
+    for sock in [&mut a_sub, &mut b_sub, &mut default_sub] {
+        subscribe(sock, "rb/six/out", 0).await;
+    }
+    let secret = nonce();
+    let message = format!("{{\"s\":\"{secret}\"}}");
+    publish(&mut a_pub, "rb/six", 0, message.as_bytes()).await;
+    let got = next_publish(&mut a_sub, STEP)
+        .await
+        .expect("tenant A output");
+    assert_eq!(got.payload, message.as_bytes());
+    assert!(
+        next_publish(&mut b_sub, QUIET).await.is_none(),
+        "tenant B holds none of the output of a rule of tenant A"
+    );
+    assert!(
+        next_publish(&mut default_sub, std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the default tenant holds none of the output of a rule of tenant A"
+    );
+    // A publish of tenant B on the same topic does not fire the rule.
+    publish(&mut b_pub, "rb/six", 0, message.as_bytes()).await;
+    assert!(
+        next_publish(&mut a_sub, QUIET).await.is_none(),
+        "a publish of tenant B does not fire a rule of tenant A"
+    );
+    assert!(
+        next_publish(&mut b_sub, std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a publish of tenant B gives no output in tenant B"
+    );
+
+    // 7. MQTT 5 properties: user properties from a result field and the
+    // message expiry from the arguments.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-props",
+            "SELECT * FROM \"rb/seven\"",
+            serde_json::json!([
+                {"function": "republish",
+                 "args": {"topic": "rb/seven/out", "user_properties": "${props}",
+                          "mqtt_properties": {"Message-Expiry-Interval": "120"}}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut v5_sub = dial(mqtt_port).await;
+    tokio::time::timeout(
+        STEP,
+        v5_sub.write_all(&sy02_connect5("rb-v5-sub", true, 60, None, None, 0)),
+    )
+    .await
+    .expect("CONNECT in time")
+    .expect("CONNECT send");
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5_sub))
+        .await
+        .expect("CONNACK in time")
+        .expect("CONNACK");
+    assert_eq!(head, 0x20);
+    assert_eq!(body[1], 0, "v5 CONNECT accepted");
+    tokio::time::timeout(
+        STEP,
+        v5_sub.write_all(&sy02_subscribe_v5(1, &[("rb/seven/out", 0)], 0)),
+    )
+    .await
+    .expect("SUBSCRIBE in time")
+    .expect("SUBSCRIBE send");
+    let (head, _) = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5_sub))
+        .await
+        .expect("SUBACK in time")
+        .expect("SUBACK");
+    assert_eq!(head & 0xF0, 0x90);
+    let prop_value = nonce();
+    let message = format!("{{\"props\":{{\"trace\":\"{prop_value}\"}},\"body\":1}}");
+    publish(&mut pubr, "rb/seven", 0, message.as_bytes()).await;
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5_sub))
+        .await
+        .expect("v5 downlink in time")
+        .expect("v5 downlink");
+    let parsed = sy02_parse_publish_v5(head, &body);
+    assert_eq!(parsed.topic, "rb/seven/out");
+    assert_eq!(parsed.expiry, 120);
+    assert_eq!(parsed.users, vec![("trace".to_string(), prop_value)]);
+
+    // 8. The console function writes the result to the log, on one line,
+    // with a size limit.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-console",
+            "SELECT * FROM \"rb/eight\"",
+            serde_json::json!([{"function": "console"}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let seen_value = nonce();
+    publish(
+        &mut pubr,
+        "rb/eight",
+        0,
+        format!("{{\"seen\":\"{seen_value}\"}}").as_bytes(),
+    )
+    .await;
+    let big_mark = nonce();
+    let big = format!(
+        "{{\"mark\":\"{big_mark}\",\"pad\":\"{}\"}}",
+        "x".repeat(4000)
+    );
+    publish(&mut pubr, "rb/eight", 0, big.as_bytes()).await;
+    let mut console_lines = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let text = std::fs::read_to_string(&kernel_log).unwrap_or_default();
+        console_lines = text
+            .lines()
+            .filter(|line| line.contains("rule console"))
+            .map(str::to_string)
+            .collect();
+        if console_lines.iter().any(|l| l.contains(&seen_value))
+            && console_lines.iter().any(|l| l.contains(&big_mark))
+        {
+            break;
+        }
+    }
+    assert!(
+        console_lines.iter().any(|l| l.contains(&seen_value)),
+        "the console line holds the result: {console_lines:?}"
+    );
+    let big_line = console_lines
+        .iter()
+        .find(|l| l.contains(&big_mark))
+        .expect("console line of the big result");
+    assert!(
+        !big_line.contains(&"x".repeat(2000)),
+        "the console line is cut at the size limit"
+    );
+    assert!(big_line.contains("..."), "a cut line ends with dots");
+
+    // 9. A user function is refused with 400 and nothing is stored.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-user-fn",
+            "SELECT * FROM \"rb/nine\"",
+            serde_json::json!([{"function": "my_module:my_function", "args": {}}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 400, "user function answered {body}");
+    assert_eq!(body["code"], "BAD_REQUEST");
+    let (status, _) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::GET,
+        "/api/v5/rules/rb-user-fn",
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "the refused rule was not stored");
+
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_file(&kernel_log);
+}
+
+/// Send a management request to a real broker and retain its JSON order.
+async fn mv00_api(
+    kernel: &Kernel,
+    method: reqwest::Method,
+    path: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let response = tokio::time::timeout(
+        STEP,
+        reqwest::Client::new()
+            .request(
+                method,
+                format!("http://127.0.0.1:{}{path}", kernel.api_port),
+            )
+            .bearer_auth(API_KEY)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("management request in time")
+    .expect("management request");
+    let status = response.status().as_u16();
+    let text = response.text().await.expect("management response body");
+    let value = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).expect("management JSON")
+    };
+    (status, value)
+}
+
+async fn mv00_connect(kernel: &Kernel, id: &str) -> tokio::net::TcpStream {
+    let mut socket = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(&mut socket, &mqtt_connect_packet(id)).await;
+    let (head, body) = recv_mqtt(&mut socket).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    socket
+}
+
+async fn mv00_subscribe(socket: &mut tokio::net::TcpStream) {
+    send_mqtt(socket, &sy02_subscribe(1, &[("mv00/out/#", 0)])).await;
+    let (head, body) = recv_mqtt(socket).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+}
+
+fn mv00_rule(id: &str, sql: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": id,
+        "sql": sql,
+        "actions": [{"function": "republish", "args": {"topic": format!("mv00/out/{id}")}}],
+    })
+}
+
+async fn mv00_publish_outputs(
+    publisher: &mut tokio::net::TcpStream,
+    subscriber: &mut tokio::net::TcpStream,
+    id: &str,
+    input: &str,
+    count: usize,
+) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    send_mqtt(
+        publisher,
+        &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+    )
+    .await;
+    for _ in 0..count {
+        let (head, body) = recv_mqtt(subscriber).await;
+        assert_eq!(head & 0xf0, 0x30, "rule output is PUBLISH");
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        messages.push(message.payload);
+    }
+    messages
+}
+
+async fn mv00_assert_publish(
+    publisher: &mut tokio::net::TcpStream,
+    subscriber: &mut tokio::net::TcpStream,
+    id: &str,
+    input: &str,
+    expected: &[&str],
+) {
+    let messages = mv00_publish_outputs(publisher, subscriber, id, input, expected.len()).await;
+    let want: Vec<&[u8]> = expected.iter().map(|row| row.as_bytes()).collect();
+    assert_eq!(messages, want, "rule {id} output bytes");
+}
+
+/// A real MQTT input and the HTTP tester use the same ordered result.
+#[tokio::test]
+async fn mv00_projection_order_through_mqtt_and_http() {
+    let kernel = spawn_kernel("").await;
+    let mut subscriber = mv00_connect(&kernel, "mv00-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-pub").await;
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "explicit",
+            "SELECT b, a, c",
+            r#"{"c":3,"a":1,"b":2}"#,
+            &[r#"{"b":2,"a":1,"c":3}"#],
+        ),
+        (
+            "wildcard",
+            "SELECT *",
+            r#"{"c":3,"a":1,"b":2}"#,
+            &[r#"{"c":3,"a":1,"b":2}"#],
+        ),
+        (
+            "mixed",
+            "SELECT c AS first, *, a AS last",
+            r#"{"c":3,"a":1,"b":2}"#,
+            &[r#"{"first":3,"c":3,"a":1,"b":2,"last":1}"#],
+        ),
+        (
+            "mixed-duplicate",
+            "SELECT 99 AS a, *",
+            r#"{"b":2,"a":1,"c":3}"#,
+            &[r#"{"a":1,"b":2,"c":3}"#],
+        ),
+        (
+            "alias",
+            "SELECT b AS x, a",
+            r#"{"a":1,"b":2}"#,
+            &[r#"{"x":2,"a":1}"#],
+        ),
+        (
+            "duplicate",
+            "SELECT b AS x, a AS y, c AS x",
+            r#"{"a":1,"b":2,"c":3}"#,
+            &[r#"{"x":3,"y":1}"#],
+        ),
+        (
+            "nested",
+            "SELECT obj, b",
+            r#"{"b":3,"obj":{"z":1,"a":2}}"#,
+            &[r#"{"obj":{"z":1,"a":2},"b":3}"#],
+        ),
+        (
+            "shadow",
+            "SELECT *",
+            r#"{"topic":"payload-topic","qos":2,"b":3}"#,
+            &[r#"{"topic":"payload-topic","qos":2,"b":3}"#],
+        ),
+        (
+            "shadow-payload",
+            "SELECT payload AS shadow, b",
+            r#"{"payload":{"z":1,"a":2},"b":3}"#,
+            &[r#"{"shadow":{"z":1,"a":2},"b":3}"#],
+        ),
+        (
+            "metadata",
+            "SELECT qos AS level, b, topic AS origin",
+            r#"{"b":2,"qos":0}"#,
+            &[r#"{"level":0,"b":2,"origin":"mv00/in/metadata"}"#],
+        ),
+        (
+            "missing",
+            "SELECT missing, b",
+            r#"{"b":2}"#,
+            &[r#"{"missing":null,"b":2}"#],
+        ),
+        (
+            "expression",
+            "SELECT b + 1, abs(a), c + 2",
+            r#"{"b":2,"a":-1.5,"c":4}"#,
+            &[r#"{"kuiper_field_0":3,"abs":1.5,"kuiper_field_1":6}"#],
+        ),
+        (
+            "indexed",
+            "SELECT p[1], q[1:2]",
+            r#"{"p":[7,8],"q":[4,5,6]}"#,
+            &[r#"{"kuiper_field_0":7,"kuiper_field_1":[5]}"#],
+        ),
+        (
+            "foreach-indexed",
+            "FOREACH payload.items DO item.b[1], item.a[1:2]",
+            r#"{"items":[{"b":[7,8],"a":[4,5,6]}]}"#,
+            &[r#"{"b":7,"a":[5]}"#],
+        ),
+        (
+            "foreach",
+            "FOREACH payload.items",
+            r#"{"items":[{"b":2,"a":1},{"b":4,"a":3}]}"#,
+            &[r#"{"item":{"b":2,"a":1}}"#, r#"{"item":{"b":4,"a":3}}"#],
+        ),
+        (
+            "foreach-do",
+            "FOREACH payload.items DO item.b AS z, item.a, item.b + 1",
+            r#"{"items":[{"b":2,"a":1},{"b":4,"a":3}]}"#,
+            &[r#"{"z":2,"a":1,"col_2":3}"#, r#"{"z":4,"a":3,"col_2":5}"#],
+        ),
+        (
+            "foreach-duplicate",
+            "FOREACH payload.items DO item.b AS x, item.a AS y, item.a AS x",
+            r#"{"items":[{"b":2,"a":1}]}"#,
+            &[r#"{"x":1,"y":1}"#],
+        ),
+        (
+            "dotted-missing",
+            "SELECT b AS z, payload.a, missing",
+            r#"{"a":1,"b":2}"#,
+            &[r#"{"z":2,"a":1,"missing":null}"#],
+        ),
+        (
+            "foreach-guards",
+            "FOREACH payload.items DO item.b AS z, item.missing INCASE item.b > 1",
+            r#"{"items":[{"b":0},{"b":2},{"b":3}]}"#,
+            &[r#"{"z":2,"missing":null}"#, r#"{"z":3,"missing":null}"#],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (id, fields, input, expected) in cases {
+        let sql = format!("{fields} FROM \"mv00/in/{id}\"");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            mv00_rule(id, &sql),
+        )
+        .await;
+        assert_eq!(status, 201, "create {id}: {body}");
+        let repeats = if *id == "explicit" { 50 } else { 1 };
+        for _ in 0..repeats {
+            let messages =
+                mv00_publish_outputs(&mut publisher, &mut subscriber, id, input, expected.len())
+                    .await;
+            let want: Vec<&[u8]> = expected.iter().map(|row| row.as_bytes()).collect();
+            if messages != want {
+                failures.push(format!("MQTT {id}: {messages:?} != {want:?}"));
+            }
+        }
+        let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+            "sql": sql,
+            "context": {"event_type": "message_publish", "topic": format!("mv00/in/{id}"), "payload": input},
+        })).await;
+        assert_eq!(status, 200, "test {id}: {body}");
+        let want = if fields.starts_with("FOREACH") {
+            format!("[{}]", expected.join(","))
+        } else {
+            expected[0].to_string()
+        };
+        let projected_bytes = body["projected"].to_string();
+        if projected_bytes != want {
+            failures.push(format!("HTTP {id}: {} != {want}", body["projected"]));
+        }
+        assert_eq!(
+            body["output"].to_string(),
+            want,
+            "HTTP {id} output alias bytes"
+        );
+        let (status, rpc) = mv00_api(&kernel, reqwest::Method::POST, "/mcp", serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "post_api_v5_rule_test", "arguments": {"body": {
+                "sql": sql,
+                "context": {"event_type": "message_publish", "topic": format!("mv00/in/{id}"), "payload": input},
+            }}},
+        })).await;
+        assert_eq!(status, 200, "MCP {id}: {rpc}");
+        assert_ne!(rpc["result"]["isError"], true, "MCP {id}: {rpc}");
+        let text = rpc["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP result text");
+        let forwarded: serde_json::Value = serde_json::from_str(text).expect("MCP forwarded JSON");
+        let forwarded_bytes = forwarded["projected"].to_string();
+        if forwarded_bytes != want {
+            failures.push(format!("MCP {id}: {} != {want}", forwarded["projected"]));
+        }
+    }
+    kernel.finish().await;
+    assert!(
+        failures.is_empty(),
+        "projection mismatches:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Window aliases keep their first position and use the last value.
+/// Regression for upstream issue #47: retain the last-value contract.
+#[tokio::test]
+async fn mv00_window_w4_last_duplicate_value_through_mqtt() {
+    mv00_window_case(
+        "w4",
+        "SELECT sum(v) AS x, v AS x, count(*) AS n",
+        r#"{"x":1,"n":2}"#,
+    )
+    .await;
+}
+
+/// A wildcard after an aggregate replaces its value at its first position.
+/// Regression for upstream issue #47: retain the last-value contract.
+#[tokio::test]
+async fn mv00_window_w5_later_wildcard_value_through_mqtt() {
+    mv00_window_case("w5", "SELECT sum(v) AS v, *", r#"{"v":1}"#).await;
+}
+
+async fn mv00_window_case(id: &str, fields: &str, expected: &str) {
+    mv00_window_inputs_case(id, fields, &[r#"{"v":1}"#, r#"{"v":3}"#], expected).await;
+}
+
+async fn mv00_window_inputs_case(id: &str, fields: &str, inputs: &[&str], expected: &str) {
+    let sql = format!("{fields} FROM \"mv00/in/{id}\" GROUP BY COUNTWINDOW(2)");
+    mv00_window_sql_case(id, &sql, inputs, expected).await;
+}
+
+async fn mv00_window_sql_case(id: &str, sql: &str, inputs: &[&str], expected: &str) {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "window create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-window-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-window-pub").await;
+    for input in inputs {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": format!("mv00/in/{id}"), "payload": format!("[{}]", inputs.join(","))},
+    })).await;
+    assert_eq!(status, 200, "window HTTP: {body}");
+    assert_eq!(
+        (message.payload, body["projected"].to_string()),
+        (expected.as_bytes().to_vec(), format!("[{expected}]")),
+        "window {id}: MQTT bytes and HTTP result",
+    );
+    kernel.finish().await;
+}
+
+/// Reboot from the same durable state and the same listener configuration.
+async fn mv00_restart(kernel: &mut Kernel) {
+    kernel
+        .child
+        .kill()
+        .await
+        .expect("stop broker before restart");
+    kernel.child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--config-dir")
+        .arg(&kernel.config_dir)
+        .arg("--allow-anonymous")
+        .env("INDRA_API_KEYS", API_KEY)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("restart broker");
+    let deadline = std::time::Instant::now() + BOOT;
+    loop {
+        if let Ok(Ok(response)) = tokio::time::timeout(
+            STEP,
+            reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{}/healthz", kernel.api_port))
+                .send(),
+        )
+        .await
+        {
+            if response.text().await.expect("health body") == "OK"
+                && tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port))
+                    .await
+                    .is_ok()
+            {
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart opens listeners in time"
+        );
+        assert!(
+            kernel.child.try_wait().expect("restart status").is_none(),
+            "restarted broker stays running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// An accepted update changes the order; a refused update and restart keep it.
+#[tokio::test]
+async fn mv00_update_refusal_and_restart_keep_projection_order() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "update";
+    let sql = "SELECT b, a, c FROM \"mv00/in/update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-update-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-update-pub").await;
+    let input = r#"{"a":1,"b":2,"c":3}"#;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        input,
+        &[r#"{"b":2,"a":1,"c":3}"#],
+    )
+    .await;
+    let sql = "SELECT c, b, a FROM \"mv00/in/update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/update",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 200, "update: {body}");
+    let expected = &[r#"{"c":3,"b":2,"a":1}"#];
+    mv00_assert_publish(&mut publisher, &mut subscriber, id, input, expected).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/update",
+        mv00_rule(id, "SELECT WHERE WHERE"),
+    )
+    .await;
+    assert_eq!(status, 400, "invalid update: {body}");
+    assert_eq!(body["code"], "BAD_REQUEST");
+    mv00_assert_publish(&mut publisher, &mut subscriber, id, input, expected).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules/update",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["sql"], sql,
+        "refused SQL did not replace durable or live state"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/absent",
+        mv00_rule("absent", sql),
+    )
+    .await;
+    assert_eq!(status, 404, "unknown update: {body}");
+    drop(publisher);
+    drop(subscriber);
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules/update",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["sql"], sql, "accepted order persisted through restart");
+    let mut subscriber = mv00_connect(&kernel, "mv00-restart-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-restart-pub").await;
+    mv00_assert_publish(&mut publisher, &mut subscriber, id, input, expected).await;
+    kernel.finish().await;
+}
+
+/// Ordered aggregate fields and wildcard inputs pass through the real window bus.
+#[tokio::test]
+async fn mv00_window_projection_order_through_mqtt_and_http() {
+    mv00_window_case(
+        "window-explicit",
+        "SELECT sum(v) AS total, count(*) AS n",
+        r#"{"total":4,"n":2}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mv00_window_fraction_keeps_numeric_value_and_field_order() {
+    mv00_window_inputs_case(
+        "window-fraction",
+        "SELECT sum(v) AS total, count(*) AS n",
+        &[r#"{"v":1.5}"#, r#"{"v":3}"#],
+        r#"{"total":4.5,"n":2}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mv00_window_wildcard_keeps_input_order_without_metadata() {
+    mv00_window_case(
+        "window-wildcard",
+        "SELECT *, sum(v) AS total",
+        r#"{"v":1,"total":4}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mv00_window_expressions_keep_names_and_order() {
+    mv00_window_case(
+        "window-expression",
+        "SELECT sum(v), count(*), sum(v) + 1",
+        r#"{"sum":4,"count":2,"kuiper_field_0":5}"#,
+    )
+    .await;
+}
+
+/// Time-window metadata stays in its SELECT position on each supported path.
+#[tokio::test]
+async fn mv00_window_bounds_keep_select_positions_through_mqtt() {
+    for (id, window) in [
+        ("count-bounds", "COUNTWINDOW(1)"),
+        ("tumbling-bounds", "TUMBLINGWINDOW(ms, 50)"),
+        ("hopping-bounds", "HOPPINGWINDOW(ms, 1000, 50)"),
+        ("sliding-bounds", "SLIDINGWINDOW(ss, 1)"),
+    ] {
+        let kernel = spawn_kernel("").await;
+        let sql = format!("SELECT window_end() AS end, sum(v) AS total, window_start() AS start FROM \"mv00/in/{id}\" GROUP BY {window}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            mv00_rule(id, &sql),
+        )
+        .await;
+        assert_eq!(status, 201, "window bounds create: {body}");
+        let mut subscriber = mv00_connect(&kernel, "mv00-bounds-sub").await;
+        mv00_subscribe(&mut subscriber).await;
+        let mut publisher = mv00_connect(&kernel, "mv00-bounds-pub").await;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, br#"{"v":1}"#),
+        )
+        .await;
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        let output: serde_json::Value =
+            serde_json::from_slice(&message.payload).expect("window JSON");
+        let keys: Vec<&str> = output
+            .as_object()
+            .expect("window object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["end", "total", "start"], "{id} SELECT order");
+        let start = output["start"].as_u64().expect("real window start");
+        let end = output["end"].as_u64().expect("real window end");
+        assert!(start > 0 && end >= start, "{id} real bounds");
+        assert_eq!(output["total"].as_f64(), Some(1.0));
+        kernel.finish().await;
+    }
+}
+
+/// Window rules emit for plain payloads, as stateless rules do.
+#[tokio::test]
+async fn sb23_window_plain_payload_emits_through_mqtt() {
+    let id = "sb23-plain";
+    let kernel = spawn_kernel("").await;
+    let sql = format!("SELECT * FROM \"mv00/in/{id}\" GROUP BY COUNTWINDOW(1)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, &sql),
+    )
+    .await;
+    assert_eq!(status, 201, "window create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "sb23-plain-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "sb23-plain-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, b"hello"),
+    )
+    .await;
+    let (head, body) = tokio::time::timeout(STEP, recv_mqtt(&mut subscriber))
+        .await
+        .expect("window output in time");
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    let output: serde_json::Value = serde_json::from_slice(&message.payload).expect("window JSON");
+    assert_eq!(output, serde_json::json!({}), "plain yields empty row");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "metrics read: {body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert_eq!(body["metrics"]["passed"], 1, "{body}");
+    assert_eq!(body["metrics"]["actions.total"], 1, "{body}");
+    kernel.finish().await;
+}
+
+/// SB-27 plain payloads agree inline and in windows through sockets.
+#[tokio::test]
+async fn sb27_inline_and_window_plain_payload_agree_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let inline_id = "sb27-inline";
+    let inline_sql = format!("SELECT * FROM \"mv00/in/{inline_id}\"");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(inline_id, &inline_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "inline create: {body}");
+    let window_id = "sb27-window";
+    let window_sql = format!("SELECT * FROM \"mv00/in/{window_id}\" GROUP BY COUNTWINDOW(1)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(window_id, &window_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "window create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "sb27-agree-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "sb27-agree-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{inline_id}"), 0, 0, false, b"hello"),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{window_id}"), 0, 0, false, b"hello"),
+    )
+    .await;
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = tokio::time::timeout(STEP, recv_mqtt(&mut subscriber))
+            .await
+            .expect("rule output in time");
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        let output: serde_json::Value =
+            serde_json::from_slice(&message.payload).expect("rule JSON");
+        assert_eq!(output, serde_json::json!({}), "plain yields empty row");
+        got.push(message.topic);
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            format!("mv00/out/{inline_id}"),
+            format!("mv00/out/{window_id}")
+        ]
+    );
+    for id in [inline_id, window_id] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "metrics read: {body}");
+        assert_eq!(body["metrics"]["matched"], 1, "{body}");
+        assert_eq!(body["metrics"]["passed"], 1, "{body}");
+        assert_eq!(body["metrics"]["failed"], 0, "{body}");
+    }
+    let object_id = "sb27-object";
+    let object_sql = format!("SELECT * FROM \"mv00/in/{object_id}\" GROUP BY COUNTWINDOW(1)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(object_id, &object_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "object window create: {body}");
+    // A JSON object payload uses the same rule path.
+    // It delivers the object in windows.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{object_id}"), 0, 0, false, br#"{"v":42}"#),
+    )
+    .await;
+    let (head, body) = tokio::time::timeout(STEP, recv_mqtt(&mut subscriber))
+        .await
+        .expect("object window output in time");
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{object_id}"));
+    let output: serde_json::Value =
+        serde_json::from_slice(&message.payload).expect("object window JSON");
+    assert_eq!(
+        output,
+        serde_json::json!({"v": 42}),
+        "object yields its fields"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{object_id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "object metrics read: {body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert_eq!(body["metrics"]["passed"], 1, "{body}");
+    assert_eq!(body["metrics"]["failed"], 0, "{body}");
+    // A filtered input counts failed once. The rule stays stored.
+    let filtered_id = "sb27-filtered";
+    let filtered_sql = format!("SELECT * FROM \"mv00/in/{filtered_id}\" WHERE v = 1");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(filtered_id, &filtered_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "filtered create: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{filtered_id}"),
+            0,
+            0,
+            false,
+            br#"{"v":2}"#,
+        ),
+    )
+    .await;
+    for _ in 0..100 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{filtered_id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "filtered metrics read: {body}");
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{filtered_id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "filtered metrics read: {body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert_eq!(body["metrics"]["passed"], 0, "{body}");
+    assert_eq!(body["metrics"]["failed"], 1, "{body}");
+    kernel.finish().await;
+}
+
+/// SB-14: the rules API reads FROM with the SQL parser, merges PUT
+/// fields, filters the list, and serves the rule events through HTTP.
+#[tokio::test]
+async fn sb14_rules_crud_topic_parsing_and_filters_through_api() {
+    let kernel = spawn_kernel("").await;
+    let create = |id: &str, sql: &str| serde_json::json!({"id": id, "sql": sql, "actions": []});
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "sb14-topic-a",
+            "sql": r#"SELECT * FROM "sb14/topic/+""#,
+            "description": "kitchen sensors",
+            "metadata": {"owner": "sb14"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "quoted topic create: {body}");
+    assert_eq!(body["from"], serde_json::json!(["sb14/topic/+"]));
+    assert_eq!(body["name"], serde_json::json!(""));
+    assert_eq!(body["description"], serde_json::json!("kitchen sensors"));
+    assert_eq!(body["metadata"], serde_json::json!({"owner": "sb14"}));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        create(
+            "sb14-topic-event",
+            r#"SELECT * FROM "$events/client_connected""#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "event source create: {body}");
+    assert_eq!(
+        body["from"],
+        serde_json::json!(["$events/client_connected"])
+    );
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "sb14-topic-multi",
+            "sql": r#"SELECT * FROM "sb14/multi/a", "sb14/multi/b""#,
+            "actions": [{"function": "republish", "args": {"topic": "sb14/out/multi"}}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "multi-source create: {body}");
+    assert_eq!(
+        body["from"],
+        serde_json::json!(["sb14/multi/a", "sb14/multi/b"])
+    );
+    let mut subscriber = mv00_connect(&kernel, "sb14-topic-multi-sub").await;
+    send_mqtt(&mut subscriber, &sy02_subscribe(1, &[("sb14/out/#", 0)])).await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    let mut publisher = mv00_connect(&kernel, "sb14-topic-multi-pub").await;
+    for topic in ["sb14/multi/a", "sb14/multi/b"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(topic, 0, 0, false, br#"{"v":1}"#),
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30, "multi-source output is PUBLISH");
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, "sb14/out/multi");
+    }
+
+    for (id, sql) in [
+        ("sb14-no-from", "SELECT 1"),
+        ("sb14-bad-sql", "SELECT WHERE WHERE"),
+        ("sb14-bad-topic", r#"SELECT * FROM "sb14/[bad""#),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            create(id, sql),
+        )
+        .await;
+        assert_eq!(status, 400, "invalid FROM {id}: {body}");
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?like_id=sb14-topic",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "like_id filter: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["sb14-topic-a", "sb14-topic-event", "sb14-topic-multi"]
+    );
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?like_description=kitchen",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "like_description filter: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["sb14-topic-a"]);
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?from=sb14%2Fmulti%2Fa",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "from filter: {body}");
+    assert!(body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .any(|row| row["id"] == "sb14-topic-multi"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::json!({"name": "renamed"}),
+    )
+    .await;
+    assert_eq!(status, 200, "partial name update: {body}");
+    assert_eq!(body["name"], serde_json::json!("renamed"));
+    assert_eq!(
+        body["sql"],
+        serde_json::json!(r#"SELECT * FROM "sb14/topic/+""#)
+    );
+    assert_eq!(body["from"], serde_json::json!(["sb14/topic/+"]));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::json!({"enable": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "partial enable update: {body}");
+    assert_eq!(body["enable"], serde_json::json!(false));
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules?enable=false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "enable filter: {body}");
+    assert!(body["data"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .any(|row| row["id"] == "sb14-topic-a"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::json!({"sql": "SELECT WHERE WHERE"}),
+    )
+    .await;
+    assert_eq!(status, 400, "refused update: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules/sb14-topic-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["sql"],
+        serde_json::json!(r#"SELECT * FROM "sb14/topic/+""#)
+    );
+
+    for query in ["page=0", "limit=0", "limit=10001"] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules?{query}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 400, "invalid page/limit {query}: {body}");
+    }
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rule_events",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "rule events: {body}");
+    assert!(body
+        .as_array()
+        .expect("rule event list")
+        .iter()
+        .any(|row| row["event"] == "$events/client_connected"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rule_test",
+        serde_json::json!({
+            "sql": r#"SELECT * FROM "sb14/test""#,
+            "context": {"event_type": "message_publish", "topic": "sb14/test", "payload": "{\"a\":1}"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule test match: {body}");
+    assert_eq!(body["matched"], serde_json::json!(true));
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rule_test",
+        serde_json::json!({"sql": r#"SELECT * FROM "sb14/test""#}),
+    )
+    .await;
+    assert_eq!(status, 412, "rule test without topic: {body}");
+    assert_eq!(body["code"], serde_json::json!("NOT_MATCH"));
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rule_test",
+        serde_json::json!({"context": {"event_type": "message_publish", "topic": "t"}}),
+    )
+    .await;
+    assert_eq!(status, 400, "rule test without sql");
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/sb14-topic-multi",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/rules/sb14-topic-multi",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/sb14-absent",
+        serde_json::json!({"sql": r#"SELECT * FROM "sb14/absent""#}),
+    )
+    .await;
+    assert_eq!(status, 404, "absent update");
+
+    kernel.finish().await;
+}
+
+/// SB-14: rule counters come from the live engine. A filtered publish
+/// counts a failure and a no-result. Reset zeroes every counter. A
+/// disabled rule counts nothing. A multi-action rule counts each action.
+#[tokio::test]
+async fn sb14_rule_counters_and_reset_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "sb14-count";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": id,
+            "sql": r#"SELECT * FROM "sb14/count/in" WHERE v = 1"#,
+            "actions": [{"function": "republish", "args": {"topic": "sb14/count/out"}}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "counter rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "sb14-count-pub").await;
+    for payload in [r#"{"v":1}"#, r#"{"v":1}"#, r#"{"v":0}"#, "not-json"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("sb14/count/in", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+
+    let mut latest = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "counter read: {body}");
+        latest = body.clone();
+        if body["metrics"]["matched"] == serde_json::json!(4)
+            && body["metrics"]["failed"] == serde_json::json!(2)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        latest["metrics"]["matched"],
+        serde_json::json!(4),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["passed"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["failed"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["failed.no_result"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert_eq!(
+        latest["metrics"]["actions.total"],
+        serde_json::json!(2),
+        "{latest}"
+    );
+    assert!(latest["node_metrics"][0]["node"]
+        .as_str()
+        .is_some_and(|node| node.contains('@')));
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        &format!("/api/v5/rules/{id}/metrics/reset"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "counter reset");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    for counter in [
+        "matched",
+        "passed",
+        "failed",
+        "failed.no_result",
+        "actions.total",
+        "actions.success",
+        "actions.failed",
+    ] {
+        assert_eq!(body["metrics"][counter], serde_json::json!(0), "{counter}");
+    }
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        &format!("/api/v5/rules/{id}"),
+        serde_json::json!({"enable": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "disable rule");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sb14/count/in", 0, 0, false, br#"{"v":1}"#),
+    )
+    .await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["metrics"]["matched"], serde_json::json!(0));
+
+    let multi_id = "sb14-count-multi";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": multi_id,
+            "sql": r#"SELECT * FROM "sb14/count/multi""#,
+            "actions": [
+                {"function": "republish", "args": {"topic": "sb14/count/one"}},
+                {"function": "republish", "args": {"topic": "sb14/count/two"}},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "multi-action rule create: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sb14/count/multi", 0, 0, false, br#"{"v":1}"#),
+    )
+    .await;
+    let mut multi = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{multi_id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "multi counter read: {body}");
+        multi = body.clone();
+        if body["metrics"]["actions.total"] == serde_json::json!(2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(multi["metrics"]["matched"], serde_json::json!(1), "{multi}");
+    assert_eq!(multi["metrics"]["passed"], serde_json::json!(1), "{multi}");
+    assert_eq!(
+        multi["metrics"]["actions.total"],
+        serde_json::json!(2),
+        "{multi}"
+    );
+    assert_eq!(
+        multi["metrics"]["actions.success"],
+        serde_json::json!(2),
+        "{multi}"
+    );
+    kernel.finish().await;
+}
+
+/// Group rows keep first-seen order and each group's payload metadata keys.
+#[tokio::test]
+async fn mv00_group_windows_keep_order_and_payload_shadows() {
+    let mut failures = Vec::new();
+    for (id, fields, expected) in [
+        (
+            "groups",
+            "SELECT sum(v) AS total, count(*) AS n, sensor_id",
+            vec![
+                r#"{"total":4,"n":2,"sensor_id":"z"}"#,
+                r#"{"total":2,"n":1,"sensor_id":"a"}"#,
+            ],
+        ),
+        (
+            "group-shadows",
+            "SELECT *, sum(v) AS total",
+            vec![
+                r#"{"v":1,"sensor_id":"z","topic":"payload-topic","total":4}"#,
+                r#"{"v":2,"sensor_id":"a","total":2}"#,
+            ],
+        ),
+    ] {
+        let kernel = spawn_kernel("").await;
+        let sql = format!("{fields} FROM \"mv00/in/{id}\" GROUP BY sensor_id, COUNTWINDOW(3)");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            mv00_rule(id, &sql),
+        )
+        .await;
+        assert_eq!(status, 201, "group create: {body}");
+        let mut subscriber = mv00_connect(&kernel, "mv00-group-sub").await;
+        mv00_subscribe(&mut subscriber).await;
+        let mut publisher = mv00_connect(&kernel, "mv00-group-pub").await;
+        let inputs = [
+            r#"{"v":1,"sensor_id":"z","topic":"payload-topic"}"#,
+            r#"{"v":2,"sensor_id":"a"}"#,
+            r#"{"v":3,"sensor_id":"z"}"#,
+        ];
+        let mut messages = Vec::new();
+        for input in inputs {
+            send_mqtt(
+                &mut publisher,
+                &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+            )
+            .await;
+        }
+        for _ in &expected {
+            let (head, body) = recv_mqtt(&mut subscriber).await;
+            assert_eq!(head & 0xf0, 0x30);
+            let message = sy02_parse_publish_classic(head, &body);
+            assert_eq!(message.topic, format!("mv00/out/{id}"));
+            messages.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+        }
+        if messages != expected {
+            failures.push(format!("MQTT {id}: {messages:?} != {expected:?}"));
+        }
+        let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+            "sql": sql, "context": {"event_type": "message_publish", "topic": format!("mv00/in/{id}"), "payload": format!("[{}]", inputs.join(","))},
+        })).await;
+        assert_eq!(status, 200, "group HTTP: {body}");
+        let want = format!("[{}]", expected.join(","));
+        let projected_bytes = body["projected"].to_string();
+        if projected_bytes != want {
+            failures.push(format!("HTTP {id}: {} != {want}", body["projected"]));
+        }
+        kernel.finish().await;
+    }
+    assert!(
+        failures.is_empty(),
+        "group mismatches:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Non-array input and a false guard produce no FOREACH output.
+#[tokio::test]
+async fn mv00_foreach_no_match_and_refused_update_keep_state() {
+    let kernel = spawn_kernel("").await;
+    let id = "foreach-negative";
+    let sql = "FOREACH payload.items DO item.b AS z, item.a FROM \"mv00/in/foreach-negative\" WHERE allow = true";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "FOREACH create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-negative-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-negative-pub").await;
+    for input in [
+        r#"{"allow":false,"items":[{"b":2,"a":1}]}"#,
+        r#"{"allow":true,"items":2}"#,
+    ] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+        let mut head = [0_u8; 1];
+        use tokio::io::AsyncReadExt;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                subscriber.read_exact(&mut head)
+            )
+            .await
+            .is_err(),
+            "no output for unmatched FOREACH"
+        );
+        let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+            "sql": sql, "context": {"event_type": "message_publish", "topic": format!("mv00/in/{id}"), "payload": input},
+        })).await;
+        assert_eq!(status, 412, "unmatched HTTP: {body}");
+        assert_eq!(body["code"], "NOT_MATCH");
+    }
+    for invalid in [
+        "FOREACH payload.items DO * FROM \"mv00/in/foreach-negative\"",
+        "FOREACH payload.items FROM \"mv00/in/foreach-negative\" GROUP BY COUNTWINDOW(2)",
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::PUT,
+            "/api/v5/rules/foreach-negative",
+            mv00_rule(id, invalid),
+        )
+        .await;
+        assert_eq!(status, 400, "refused FOREACH update: {body}");
+        assert_eq!(body["code"], "BAD_REQUEST");
+        mv00_assert_publish(
+            &mut publisher,
+            &mut subscriber,
+            id,
+            r#"{"allow":true,"items":[{"b":2,"a":1}]}"#,
+            &[r#"{"z":2,"a":1}"#],
+        )
+        .await;
+    }
+    kernel.finish().await;
+}
+
+/// The connector receives the projected bytes after real MQTT ingress.
+#[tokio::test]
+async fn mv00_webhook_keeps_projection_bytes_through_mqtt() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("HTTP receiver binds");
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("HTTP request accepted");
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut byte = [0_u8; 1];
+            socket
+                .read_exact(&mut byte)
+                .await
+                .expect("HTTP header byte");
+            request.push(byte[0]);
+            assert!(request.len() <= 16384, "bounded HTTP header");
+            if request.ends_with(b"\r\n\r\n") {
+                break request.len();
+            }
+        };
+        let headers = String::from_utf8(request).expect("HTTP headers");
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().expect("HTTP length"))
+            })
+            .expect("HTTP content length");
+        assert!(header_end > 0 && length <= 4096, "bounded body");
+        let mut body = vec![0_u8; length];
+        socket.read_exact(&mut body).await.expect("HTTP body");
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("HTTP response");
+        body
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v1/connectors", serde_json::json!({
+        "id": "mv00-hook", "kind": "webhook", "config": {"url": format!("http://{address}/order"), "batch_size": 1},
+    })).await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v1/rules",
+        serde_json::json!({
+            "name": "mv00-hook-rule", "topic_filter": "mv00/hook/in",
+            "sql_query": "SELECT b, a, obj FROM \"mv00/hook/in\"",
+            "actions": [{"type": "forwardconnector", "connector_id": "mv00-hook"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "forward rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv00-hook-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            "mv00/hook/in",
+            0,
+            0,
+            false,
+            br#"{"a":1,"b":2,"obj":{"z":3,"a":4}}"#,
+        ),
+    )
+    .await;
+    let bytes = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(bytes, br#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#);
+    kernel.finish().await;
+}
+
+/// The legacy parser also keeps wildcard order and hides injected bounds.
+#[tokio::test]
+async fn mv00_legacy_window_wildcard_keeps_payload_order() {
+    mv00_window_sql_case("legacy-window", "SELECT *, sum(v) AS total FROM \"mv00/in/legacy-window\" GROUP BY COUNTWINDOW(2) ORDER BY v", &[r#"{"v":1,"b":2,"a":3}"#, r#"{"v":3,"b":4,"a":5}"#], r#"{"v":1,"b":2,"a":3,"total":4}"#).await;
+}
+
+/// A duplicate returns the reference code and keeps the live and stored rule.
+#[tokio::test]
+async fn mv00_api_error_duplicate_create_keeps_live_and_stored_rule() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "duplicate-error";
+    let sql = "SELECT b FROM \"mv00/in/duplicate-error\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, "SELECT a FROM \"mv00/in/duplicate-error\""),
+    )
+    .await;
+    assert_eq!(status, 400, "duplicate: {body}");
+    assert!(body["message"].is_string());
+    let duplicate_code = body["code"].as_str().expect("error code").to_string();
+    for phase in 0..2 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/rules/duplicate-error",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["sql"], sql, "duplicate kept the original SQL");
+        let mut subscriber = mv00_connect(&kernel, "mv00-duplicate-sub").await;
+        mv00_subscribe(&mut subscriber).await;
+        let mut publisher = mv00_connect(&kernel, "mv00-duplicate-pub").await;
+        mv00_assert_publish(
+            &mut publisher,
+            &mut subscriber,
+            id,
+            r#"{"a":1,"b":2}"#,
+            &[r#"{"b":2}"#],
+        )
+        .await;
+        drop(publisher);
+        drop(subscriber);
+        if phase == 0 {
+            mv00_restart(&mut kernel).await;
+        }
+    }
+    kernel.finish().await;
+    assert_eq!(duplicate_code, "BAD_REQUEST");
+}
+
+/// An absent stored-rule probe returns the reference code and creates no state.
+#[tokio::test]
+async fn mv00_api_error_missing_probe_keeps_store_empty() {
+    let mut kernel = spawn_kernel("").await;
+    let mut codes = Vec::new();
+    for phase in 0..2 {
+        for sample in [
+            serde_json::json!({"context": {
+                "event_type": "message_publish",
+                "topic": "mv00/in/missing",
+                "payload": r#"{"b":2}"#,
+            }}),
+            serde_json::Value::Null,
+        ] {
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::POST,
+                "/api/v5/rules/no-such-rule/test",
+                sample,
+            )
+            .await;
+            assert_eq!(status, 404, "absent rule: {body}");
+            assert!(body["message"].is_string());
+            codes.push(body["code"].as_str().expect("error code").to_string());
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/rules",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], serde_json::json!([]));
+        if phase == 0 {
+            mv00_restart(&mut kernel).await;
+        }
+    }
+    kernel.finish().await;
+    assert!(
+        codes.iter().all(|code| code == "RULE_NOT_FOUND"),
+        "absent-rule probe codes: {codes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MV-01/SB-03: action-owned runtime sinks. One action is one dispatch key
+// (`action:{id}`); the sink builds from the referenced connector's settings
+// plus the action's own parameters, and the fire path crosses to it.
+// ---------------------------------------------------------------------------
+
+/// Accept `expected` HTTP requests on the shared listener and return each
+/// (request path, request body) pair. One serve per POST.
+fn mv01_spawn_http_receiver(
+    listener: Arc<tokio::net::TcpListener>,
+    expected: usize,
+) -> tokio::task::JoinHandle<Vec<(String, Vec<u8>)>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let mut recorded = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            // A health probe opens and closes a bare TCP connection. Skip
+            // it; only a real HTTP request is a delivery.
+            let (mut socket, _) = loop {
+                let (socket, _) = listener.accept().await.expect("HTTP request accepted");
+                let mut probe = [0_u8; 1];
+                match socket.peek(&mut probe).await {
+                    Ok(0) | Err(_) => continue,
+                    Ok(_) => break (socket, ()),
+                }
+            };
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                socket
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("HTTP header byte");
+                request.push(byte[0]);
+                assert!(request.len() <= 16384, "bounded HTTP header");
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8(request).expect("HTTP headers");
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().expect("HTTP length"))
+                })
+                .expect("HTTP content length");
+            assert!(length <= 4096, "bounded body");
+            let mut body = vec![0_u8; length];
+            socket.read_exact(&mut body).await.expect("HTTP body");
+            let path = headers
+                .lines()
+                .next()
+                .expect("request line")
+                .split_whitespace()
+                .nth(1)
+                .expect("request path")
+                .to_string();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("HTTP response");
+            recorded.push((path, body));
+        }
+        recorded
+    })
+}
+
+/// Requests and peak active count from the concurrent HTTP receiver.
+type Mv01ActiveCapture = (Vec<(String, Vec<u8>)>, usize);
+
+/// Serve HTTP requests and record the peak number of requests handled at
+/// one time. Each response waits `hold`, so a concurrent client shows a
+/// peak above one. Returns the requests and the peak.
+fn mv01_spawn_http_receiver_active(
+    listener: Arc<tokio::net::TcpListener>,
+    expected: usize,
+    hold: std::time::Duration,
+) -> tokio::task::JoinHandle<Mv01ActiveCapture> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(Mutex::new(Vec::with_capacity(expected)));
+        let mut handlers = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            // A health probe opens and closes a bare TCP connection. Skip
+            // it; only a real HTTP request is a delivery.
+            let (mut socket, _) = loop {
+                let (socket, _) = listener.accept().await.expect("HTTP request accepted");
+                let mut probe = [0_u8; 1];
+                match socket.peek(&mut probe).await {
+                    Ok(0) | Err(_) => continue,
+                    Ok(_) => break (socket, ()),
+                }
+            };
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            let active = Arc::clone(&active);
+            let recorded = Arc::clone(&recorded);
+            handlers.push(tokio::spawn(async move {
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0_u8; 1];
+                    socket
+                        .read_exact(&mut byte)
+                        .await
+                        .expect("HTTP header byte");
+                    request.push(byte[0]);
+                    assert!(request.len() <= 16384, "bounded HTTP header");
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8(request).expect("HTTP headers");
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().expect("HTTP length"))
+                    })
+                    .expect("HTTP content length");
+                assert!(length <= 4096, "bounded body");
+                let mut body = vec![0_u8; length];
+                socket.read_exact(&mut body).await.expect("HTTP body");
+                let path = headers
+                    .lines()
+                    .next()
+                    .expect("request line")
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("request path")
+                    .to_string();
+                tokio::time::sleep(hold).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .expect("HTTP response");
+                active.fetch_sub(1, Ordering::SeqCst);
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((path, body));
+            }));
+        }
+        for handler in handlers {
+            handler.await.expect("HTTP handler task");
+        }
+        let recorded = Arc::try_unwrap(recorded)
+            .expect("sole owner")
+            .into_inner()
+            .expect("capture lock");
+        (recorded, max_active.load(Ordering::SeqCst))
+    })
+}
+
+/// Two actions on one connector each build their own sink and route to
+/// their own parameter shape; a delete stops only the deleted action.
+#[tokio::test]
+async fn mv01_webhook_action_sinks_route_independently_and_stop_on_delete() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-webhook",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    for (id, path) in [("mv01-a", "/a"), ("mv01-b", "/b")] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": id,
+                "type": "webhook",
+                "connector": "mv01-webhook",
+                "parameters": {"path": path},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "action {id} create: {body}");
+        assert_eq!(
+            body["status"], "connected",
+            "action {id} reads live: {body}"
+        );
+        assert!(body["status_reason"].is_null(), "action {id}: {body}");
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-rule",
+            "sql": "SELECT * FROM \"mv01/in/1\"",
+            "actions": ["mv01-a", "mv01-b"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/1", 0, 0, false, br#"{"k":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let mut paths: Vec<&str> = received.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec!["/a", "/b"],
+        "both action sinks routed: {received:?}"
+    );
+    for (_, body) in &received {
+        assert_eq!(body.as_slice(), &br#"{"k":1}"#[..]);
+    }
+    // A rule that still names the action holds the delete back.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 400, "referenced action delete: {body}");
+    // Remove the action from the rule, then delete it.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/1\"",
+            "actions": ["mv01-b"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule update: {body}");
+    // Deleting one action stops only that action's delivery.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/1", 0, 0, false, br#"{"k":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "only the surviving action delivers");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/b");
+    assert_eq!(body.as_slice(), &br#"{"k":2}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "deleted action reads absent: {body}");
+    kernel.finish().await;
+}
+
+/// An action whose connector does not resolve stores `disconnected` with
+/// the named reason and starts delivering once the connector arrives —
+/// creating the connector alone wires it.
+#[tokio::test]
+async fn mv01_http_action_dangling_connector_stores_disconnected_and_recovers() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-late",
+            "type": "webhook",
+            "connector": "webhook:mv01-late-link",
+            "parameters": {"path": "/late"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "dangling action stores: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let reason = body["status_reason"].as_str().expect("status reason");
+    assert!(
+        reason.contains("mv01-late-link"),
+        "reason names the missing connector: {reason}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-late-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-late",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the action wired with its connector: {body}"
+    );
+    assert!(body["status_reason"].is_null(), "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-late-rule",
+            "sql": "SELECT * FROM \"mv01/in/late\"",
+            "actions": ["mv01-late"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-late-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/late", 0, 0, false, br#"{"late":true}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/late");
+    assert_eq!(body.as_slice(), &br#"{"late":true}"#[..]);
+    kernel.finish().await;
+}
+
+/// Disabling an action stops its delivery; re-enabling restores it.
+#[tokio::test]
+async fn mv01_webhook_action_disable_stops_delivery_and_toggle_restores() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-onoff",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-onoff-action",
+            "type": "webhook",
+            "connector": "mv01-onoff",
+            "parameters": {"path": "/onoff"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-onoff-rule",
+            "sql": "SELECT * FROM \"mv01/in/onoff\"",
+            "actions": ["mv01-onoff-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-onoff-pub").await;
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/onoff", 0, 0, false, br#"{"e":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/onoff");
+    assert_eq!(body.as_slice(), &br#"{"e":1}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-onoff-action/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "disable: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-onoff-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    // A silenced receiver: nothing accepts while the action reads off.
+    let watch = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/onoff", 0, 0, false, br#"{"e":2}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !watch.is_finished(),
+        "a disabled action delivered: accept ended the promise"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-onoff-action/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "re-enable");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/onoff", 0, 0, false, br#"{"e":3}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, watch)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/onoff");
+    assert_eq!(body.as_slice(), &br#"{"e":3}"#[..]);
+    kernel.finish().await;
+}
+
+/// A connector update that breaks a dependent action's sink build is
+/// refused with the action and field named; the old sink keeps
+/// delivering and the stored connector stays untouched.
+#[tokio::test]
+async fn mv01_connector_update_dependent_build_failure_refuses_and_keeps_delivery() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-break",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-break-action",
+            "type": "webhook",
+            "connector": "mv01-break",
+            "parameters": {"path": "/break"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-break-rule",
+            "sql": "SELECT * FROM \"mv01/in/break\"",
+            "actions": ["mv01-break-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-break-pub").await;
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/break", 0, 0, false, br#"{"f":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].1.as_slice(), &br#"{"f":1}"#[..]);
+    // The URL only resolves through a file reference the environment
+    // cannot load: the dependent build fails closed and the update is
+    // refused with the action and field named.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-break",
+        serde_json::json!({
+            "name": "mv01-break",
+            "type": "webhook",
+            "url": "file:/nonexistent/indra-mv01-secret",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "dependent build failure refuses: {body}");
+    assert!(body["message"].is_string(), "{body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("mv01-break-action") && message.contains("url"),
+        "the refusal names the action and the field: {message}"
+    );
+    // The old generation kept delivering.
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/break", 0, 0, false, br#"{"f":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/break");
+    assert_eq!(body.as_slice(), &br#"{"f":2}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-break-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the refused update kept the wired action live: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// A restart rebuilds the owned sinks from the stored connector settings
+/// plus the stored action parameters and delivery resumes.
+#[tokio::test]
+async fn mv01_webhook_action_sink_survives_restart() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-restart",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-restart-action",
+            "type": "webhook",
+            "connector": "mv01-restart",
+            "parameters": {"path": "/after/restart"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-restart-rule",
+            "sql": "SELECT * FROM \"mv01/in/restart\"",
+            "actions": ["mv01-restart-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-restart-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/restart", 0, 0, false, br#"{"r":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/after/restart");
+    assert_eq!(body.as_slice(), &br#"{"r":1}"#[..]);
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-restart-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-restart-pub2").await;
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/restart", 0, 0, false, br#"{"r":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/after/restart");
+    assert_eq!(body.as_slice(), &br#"{"r":2}"#[..]);
+    kernel.finish().await;
+}
+
+/// RO-01: an action runtime applies its stored options through a real
+/// publish, keeps its counters per action, resets every counter and
+/// rebuilds the same runtime from the store after a restart.
+#[tokio::test]
+async fn ro01_action_runtime_applies_options_through_publish_and_restart() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-restart",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-restart-action",
+            "type": "webhook",
+            "connector": "ro01-restart",
+            "parameters": {"path": "/ro01"},
+            "resource_opts": {
+                "batch_size": 2,
+                "batch_time": "5s",
+                "inflight_window": 1,
+                "worker_pool_size": 2,
+                "max_buffer_bytes": "1MB",
+                "request_ttl": "30s",
+                "query_mode": "async",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-restart-rule",
+            "sql": "SELECT * FROM \"ro01/in/restart\"",
+            "actions": ["ro01-restart-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-restart-action/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["metrics"]["matched"], 0,
+        "counters start at zero: {body}"
+    );
+    assert_eq!(body["metrics"]["success"], 0, "{body}");
+    assert!(
+        body["metrics"].get("retried").is_none(),
+        "the invented retried counter is gone: {body}"
+    );
+    let mut publisher = mv00_connect(&kernel, "ro01-restart-pub").await;
+    let mut first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/restart", 0, 0, false, br#"{"r":1}"#),
+    )
+    .await;
+    // The runtime holds one row until the batch is full or the batch time
+    // elapses. A raw sink would deliver it now, so this assertion fails
+    // when the runtime is absent.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut first)
+            .await
+            .is_err(),
+        "one row waits in the bounded action buffer"
+    );
+    first.abort();
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/restart", 0, 0, false, br#"{"r":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2, "the batch reached the target");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-restart-action/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 2, "{body}");
+    assert_eq!(body["metrics"]["success"], 2, "{body}");
+    assert_eq!(body["metrics"]["failed"], 0, "{body}");
+    assert_eq!(body["metrics"]["queuing"], 0, "{body}");
+    assert_eq!(body["metrics"]["inflight"], 0, "{body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/ro01-restart-action/metrics/reset",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-restart-action/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    for counter in [
+        "total",
+        "matched",
+        "success",
+        "failed",
+        "dropped",
+        "dropped.queue_full",
+        "dropped.resource_not_found",
+        "dropped.resource_stopped",
+        "dropped.other",
+        "queuing",
+        "inflight",
+    ] {
+        assert_eq!(
+            body["metrics"][counter], 0,
+            "reset zeroes {counter}: {body}"
+        );
+    }
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-restart-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-restart-action/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["metrics"]["matched"], 0,
+        "restart starts at zero: {body}"
+    );
+    let mut publisher = mv00_connect(&kernel, "ro01-restart-pub2").await;
+    let mut first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/restart", 0, 0, false, br#"{"r":3}"#),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut first)
+            .await
+            .is_err(),
+        "the rebuilt runtime applies the stored batch size"
+    );
+    first.abort();
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/restart", 0, 0, false, br#"{"r":4}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery after restart in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2, "the rebuilt runtime delivered the batch");
+    kernel.finish().await;
+}
+
+/// RO-01/N1: a connector update rebuilds the dependent action sink through
+/// `wrap_action_runtime`, so the stored action options still apply.
+#[tokio::test]
+async fn ro01_connector_update_keeps_action_options() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let connector = serde_json::json!({
+        "name": "ro01-update",
+        "type": "webhook",
+        "url": format!("http://{address}"),
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        connector.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-update-action",
+            "type": "webhook",
+            "connector": "ro01-update",
+            "parameters": {"path": "/ro01-update"},
+            "resource_opts": {
+                "batch_size": 2,
+                "batch_time": "5s",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-update-rule",
+            "sql": "SELECT * FROM \"ro01/in/update\"",
+            "actions": ["ro01-update-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/ro01-update",
+        connector,
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    let mut publisher = mv00_connect(&kernel, "ro01-update-pub").await;
+    let mut first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/update", 0, 0, false, br#"{"u":1}"#),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut first)
+            .await
+            .is_err(),
+        "the rebuilt sink still holds one row for the batch"
+    );
+    first.abort();
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/update", 0, 0, false, br#"{"u":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2, "the rebuilt runtime delivered the batch");
+    kernel.finish().await;
+}
+
+/// RO-01/N1/B13: a stored pgsql action with the legacy integer
+/// `batch_timeout_ms` boots again and applies its batch size.
+#[tokio::test]
+async fn ro01_stored_pgsql_legacy_batch_timeout_boots() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured = Arc::new(Mutex::new(Vec::<(String, Vec<Vec<Vec<u8>>>)>::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, captured, "u", "pwd", "db", 2).await;
+        })
+    };
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-legacy-pg",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-legacy-pg-action",
+            "type": "pgsql",
+            "connector": "ro01-legacy-pg",
+            "parameters": {"sql": "RO01-LEGACY INSERT $1, $2, $3"},
+            "resource_opts": {
+                "batch_size": 2,
+                "batch_timeout_ms": 5000,
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-legacy-rule",
+            "sql": "SELECT * FROM \"ro01/in/legacy\"",
+            "actions": ["ro01-legacy-pg-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-legacy-pg-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the stored legacy action rebuilt at boot: {body}"
+    );
+    let mut publisher = mv00_connect(&kernel, "ro01-legacy-pub").await;
+    for value in [1, 2] {
+        let payload = format!("{{\"n\":{value}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("ro01/in/legacy", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    fake.await.expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    assert_eq!(captured.len(), 1, "one runtime batch reached the driver");
+    assert_eq!(
+        captured[0].1.len(),
+        2,
+        "the rebuilt runtime applied its stored batch size"
+    );
+    kernel.finish().await;
+}
+
+/// RO-01/P1: each applied resource option shows its effect through a real
+/// publish. One kernel and one connector serve six sequential actions. Each
+/// block would fail with a raw sink: the first rows would arrive at once,
+/// the overflow would not count drops, and the expired row would deliver.
+#[tokio::test]
+async fn ro01_action_resource_opts_fields_apply_through_publish() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-fields",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let mut publisher = mv00_connect(&kernel, "ro01-fields-pub").await;
+
+    // `batch_time` flushes a partial batch after the wait.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-f-time",
+            "type": "webhook",
+            "connector": "ro01-fields",
+            "parameters": {"path": "/f-time"},
+            "resource_opts": {
+                "batch_size": 100,
+                "batch_time": "100ms",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "time action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-f-time-rule",
+            "sql": "SELECT * FROM \"ro01/in/f-time\"",
+            "actions": ["ro01-f-time"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "time rule create: {body}");
+    let mut hold = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/f-time", 0, 0, false, br#"{"n":1}"#),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut hold)
+            .await
+            .is_err(),
+        "one row waits for the batch time"
+    );
+    hold.abort();
+    let delivered = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let received = tokio::time::timeout(STEP, delivered)
+        .await
+        .expect("batch time delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "the timer flushed the partial batch");
+    assert_eq!(
+        received[0].0, "/f-time",
+        "the time action path: {received:?}"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-f-time-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-f-time",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    // `max_buffer_bytes` drops the oldest rows and counts them.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-f-buf",
+            "type": "webhook",
+            "connector": "ro01-fields",
+            "parameters": {"path": "/f-buf"},
+            "resource_opts": {
+                "batch_size": 100,
+                "batch_time": "10s",
+                "max_buffer_bytes": "20B",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "buffer action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-f-buf-rule",
+            "sql": "SELECT * FROM \"ro01/in/f-buf\"",
+            "actions": ["ro01-f-buf"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "buffer rule create: {body}");
+    let mut hold = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    for value in [1, 2, 3] {
+        let payload = format!("{{\"n\":{value}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("ro01/in/f-buf", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut hold)
+            .await
+            .is_err(),
+        "a full buffer holds rows until the batch is full"
+    );
+    hold.abort();
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-f-buf/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 3, "{body}");
+    assert!(
+        body["metrics"]["dropped"].as_u64().unwrap_or(0) >= 1,
+        "overflow drops are counted: {body}"
+    );
+    assert!(
+        body["metrics"]["dropped.queue_full"].as_u64().unwrap_or(0) >= 1,
+        "queue-full drops are counted: {body}"
+    );
+    let buffered = body["metrics"]["queuing"].as_u64().unwrap_or(0) as usize;
+    let drained = mv01_spawn_http_receiver(Arc::clone(&listener), buffered);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-f-buf-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-f-buf",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let drained = tokio::time::timeout(STEP, drained)
+        .await
+        .expect("delete drains the buffered rows in time")
+        .expect("HTTP receiver task");
+    assert_eq!(
+        drained.len(),
+        buffered,
+        "delete delivers the buffered rows before the next block"
+    );
+
+    // `request_ttl` of zero expires every row before the send.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-f-ttl",
+            "type": "webhook",
+            "connector": "ro01-fields",
+            "parameters": {"path": "/f-ttl"},
+            "resource_opts": {
+                "batch_size": 1,
+                "batch_time": "0ms",
+                "request_ttl": "0ms",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "ttl action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-f-ttl-rule",
+            "sql": "SELECT * FROM \"ro01/in/f-ttl\"",
+            "actions": ["ro01-f-ttl"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "ttl rule create: {body}");
+    let mut hold = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/f-ttl", 0, 0, false, br#"{"n":1}"#),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut hold)
+            .await
+            .is_err(),
+        "an expired row never reaches the target"
+    );
+    hold.abort();
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-f-ttl/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert!(
+        body["metrics"]["dropped"].as_u64().unwrap_or(0) >= 1,
+        "expiry drops are counted: {body}"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-f-ttl-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-f-ttl",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    // `inflight_window` of one still batches two rows before the send.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-f-inflight",
+            "type": "webhook",
+            "connector": "ro01-fields",
+            "parameters": {"path": "/f-inflight"},
+            "resource_opts": {
+                "batch_size": 2,
+                "batch_time": "5s",
+                "inflight_window": 1,
+                "worker_pool_size": 2,
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "inflight action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-f-inflight-rule",
+            "sql": "SELECT * FROM \"ro01/in/f-inflight\"",
+            "actions": ["ro01-f-inflight"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "inflight rule create: {body}");
+    let mut hold = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/f-inflight", 0, 0, false, br#"{"n":1}"#),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut hold)
+            .await
+            .is_err(),
+        "one row waits for the inflight batch"
+    );
+    hold.abort();
+    let delivered = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/f-inflight", 0, 0, false, br#"{"n":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, delivered)
+        .await
+        .expect("inflight delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2, "both rows reached the target");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-f-inflight/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 2, "{body}");
+    assert_eq!(body["metrics"]["success"], 2, "{body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-f-inflight-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-f-inflight",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    // `query_mode` sync flushes one row before the publish returns.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-f-sync",
+            "type": "webhook",
+            "connector": "ro01-fields",
+            "parameters": {"path": "/f-sync"},
+            "resource_opts": {
+                "batch_size": 100,
+                "batch_time": "10s",
+                "query_mode": "sync",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "sync action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-f-sync-rule",
+            "sql": "SELECT * FROM \"ro01/in/f-sync\"",
+            "actions": ["ro01-f-sync"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "sync rule create: {body}");
+    let delivered = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/f-sync", 0, 0, false, br#"{"n":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, delivered)
+        .await
+        .expect("sync delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "sync flushes before it returns");
+    assert_eq!(
+        received[0].0, "/f-sync",
+        "the sync action path: {received:?}"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-f-sync-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-f-sync",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    // `worker_pool_size` of two still delivers a batch of four.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-f-worker",
+            "type": "webhook",
+            "connector": "ro01-fields",
+            "parameters": {"path": "/f-worker"},
+            "resource_opts": {
+                "batch_size": 4,
+                "batch_time": "5s",
+                "worker_pool_size": 2,
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "worker action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-f-worker-rule",
+            "sql": "SELECT * FROM \"ro01/in/f-worker\"",
+            "actions": ["ro01-f-worker"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "worker rule create: {body}");
+    let mut hold = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    for value in [1, 2, 3] {
+        let payload = format!("{{\"n\":{value}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("ro01/in/f-worker", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut hold)
+            .await
+            .is_err(),
+        "three rows wait for the worker batch"
+    );
+    hold.abort();
+    let delivered = mv01_spawn_http_receiver(Arc::clone(&listener), 4);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("ro01/in/f-worker", 0, 0, false, br#"{"n":4}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, delivered)
+        .await
+        .expect("worker delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 4, "the worker batch reached the target");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-f-worker/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 4, "{body}");
+    assert_eq!(body["metrics"]["success"], 4, "{body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-f-worker-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-f-worker",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// RO-01/A2-1/B2-1: `inflight_window` bounds the driver calls that run at
+/// one time through a real publish. A window of two with one row per call
+/// shows a peak of two concurrent HTTP requests. A sequential dispatch
+/// shows one; an ignored window shows four.
+#[tokio::test]
+async fn ro01_inflight_window_bounds_concurrent_driver_calls_through_publish() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-inflight-conn",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-inflight-action",
+            "type": "webhook",
+            "connector": "ro01-inflight-conn",
+            "parameters": {"path": "/inflight"},
+            "resource_opts": {
+                "batch_size": 4,
+                "batch_time": "5s",
+                "inflight_window": 2,
+                "worker_pool_size": 1,
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-inflight-rule",
+            "sql": "SELECT * FROM \"ro01/in/inflight\"",
+            "actions": ["ro01-inflight-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let receiver = mv01_spawn_http_receiver_active(
+        Arc::clone(&listener),
+        4,
+        std::time::Duration::from_millis(500),
+    );
+    let mut publisher = mv00_connect(&kernel, "ro01-inflight-pub").await;
+    for value in [1, 2, 3, 4] {
+        let payload = format!("{{\"n\":{value}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("ro01/in/inflight", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    let (received, peak) = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("inflight delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 4, "the batch reached the target");
+    assert_eq!(
+        peak, 2,
+        "the inflight window bounds the concurrent driver calls"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-inflight-action/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 4, "{body}");
+    assert_eq!(body["metrics"]["success"], 4, "{body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-inflight-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-inflight-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/ro01-inflight-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// RO-01/B2-2: `worker_pool_size` caps one driver batch through a real
+/// publish. Four rows with a worker size of two reach the driver as two
+/// batches of two. An ignored worker size sends one batch of four.
+#[tokio::test]
+async fn ro01_worker_pool_size_caps_driver_batches_through_publish() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured = Arc::new(Mutex::new(Vec::<(String, Vec<Vec<Vec<u8>>>)>::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 2).await;
+            }
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-worker-pg",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-worker-action",
+            "type": "pgsql",
+            "connector": "ro01-worker-pg",
+            "parameters": {"sql": "RO01-WORKER INSERT $1, $2, $3"},
+            "resource_opts": {
+                "batch_size": 4,
+                "batch_time": "5s",
+                "inflight_window": 1,
+                "worker_pool_size": 2,
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-worker-rule",
+            "sql": "SELECT * FROM \"ro01/in/worker\"",
+            "actions": ["ro01-worker-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "ro01-worker-pub").await;
+    for value in [1, 2, 3, 4] {
+        let payload = format!("{{\"n\":{value}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("ro01/in/worker", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    tokio::time::timeout(STEP, fake)
+        .await
+        .expect("both driver batches in time")
+        .expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    assert_eq!(
+        captured.len(),
+        2,
+        "worker_pool_size two splits four rows into two driver batches"
+    );
+    assert!(
+        captured.iter().all(|(_, rows)| rows.len() == 2),
+        "each driver batch holds two rows"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/ro01-worker-action/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metrics"]["matched"], 4, "{body}");
+    assert_eq!(body["metrics"]["success"], 4, "{body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-worker-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-worker-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/ro01-worker-pg",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// RO-01: each refused resource option answers 400 with the field name
+/// and stores nothing through the management API.
+#[tokio::test]
+async fn ro01_action_resource_opts_refusals_through_the_api() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-refusal-hook",
+            "type": "webhook",
+            "url": "http://127.0.0.1:9",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let above_max = (tokio::sync::Semaphore::MAX_PERMITS as u64) + 1;
+    let cases = [
+        (
+            "dispatch_strategy",
+            serde_json::json!({"dispatch_strategy": "random"}),
+        ),
+        (
+            "health_check_interval_jitter",
+            serde_json::json!({"health_check_interval_jitter": "1s"}),
+        ),
+        (
+            "health_check_timeout",
+            serde_json::json!({"health_check_timeout": "30s"}),
+        ),
+        ("no_such_option", serde_json::json!({"no_such_option": 1})),
+        ("batch_time", serde_json::json!({"batch_time": "infinity"})),
+        (
+            "max_buffer_bytes",
+            serde_json::json!({"max_buffer_bytes": "0"}),
+        ),
+        (
+            "inflight_window",
+            serde_json::json!({"inflight_window": above_max}),
+        ),
+    ];
+    for (field, opts) in cases {
+        let name = format!("ro01-refused-{field}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": name,
+                "type": "webhook",
+                "connector": "ro01-refusal-hook",
+                "parameters": {"path": "/new"},
+                "resource_opts": opts,
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{field} is refused: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains(field),
+            "the refusal names {field}: {body}"
+        );
+        let (status, _) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{name}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 404, "a refused create stores nothing: {field}");
+    }
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/ro01-refusal-hook",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+// -- Fake PostgreSQL for the action-owned pgsql sink -----------------------
+
+/// Read one PostgreSQL message (tag plus body) from the fake server stream.
+async fn mv01_pg_read_msg(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0_u8; 5];
+    stream.read_exact(&mut header).await.expect("pg head");
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut body = vec![0_u8; len - 4];
+    stream.read_exact(&mut body).await.expect("pg body");
+    (header[0], body)
+}
+
+/// Write one PostgreSQL message to the fake server stream.
+async fn mv01_pg_write_msg(stream: &mut tokio::net::TcpStream, tag: u8, body: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let mut frame = vec![tag];
+    frame.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(body);
+    stream.write_all(&frame).await.expect("pg write");
+}
+
+/// Read the startup parameter block and return the (key, value) pairs.
+async fn mv01_pg_read_startup(stream: &mut tokio::net::TcpStream) -> Vec<(String, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0_u8; 4];
+    stream.read_exact(&mut len_buf).await.expect("startup len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0_u8; len - 4];
+    stream.read_exact(&mut body).await.expect("startup body");
+    mv01_pg_startup_params(&body)
+}
+
+/// Parse one startup body (protocol version plus parameters).
+fn mv01_pg_startup_params(body: &[u8]) -> Vec<(String, String)> {
+    assert_eq!(
+        &body[..4],
+        &196608_i32.to_be_bytes(),
+        "startup protocol 3.0"
+    );
+    let mut params = Vec::new();
+    let mut parts = body[4..].split(|b| *b == 0);
+    while let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+        if key.is_empty() {
+            break;
+        }
+        params.push((
+            String::from_utf8_lossy(key).into_owned(),
+            String::from_utf8_lossy(value).into_owned(),
+        ));
+    }
+    params
+}
+
+async fn mv01_pg_ready(stream: &mut tokio::net::TcpStream) {
+    mv01_pg_write_msg(stream, b'Z', b"I").await;
+}
+
+/// One captured engine row per statement: the bound statement plus the
+/// rows the sink flushed (each row: topic, QoS, payload).
+type PgCaptured = Arc<Mutex<Vec<(String, Vec<Vec<Vec<u8>>>)>>>;
+
+/// Accept one real protocol connection. A reachability probe connects
+/// and closes without a byte; skip it so the fake serves the driver.
+async fn mv01_pg_accept(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    loop {
+        let (stream, _) = listener.accept().await.expect("pg backend accepted");
+        let mut probe = [0_u8; 8];
+        match stream.peek(&mut probe).await {
+            Ok(0) | Err(_) => continue,
+            Ok(_) => return stream,
+        }
+    }
+}
+
+/// One fake backend. It checks the password, then speaks the extended
+/// query protocol that the maintained driver sends: Parse, Describe,
+/// Sync for a prepared statement, then Bind, Execute, Sync for each row.
+/// Every row of one connection is captured under its statement.
+async fn mv01_pg_serve_one(
+    mut stream: tokio::net::TcpStream,
+    captured: PgCaptured,
+    expected_user: &str,
+    expected_password: &str,
+    expected_database: &str,
+    expected_rows: usize,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut probe = [0_u8; 8];
+    if stream.read_exact(&mut probe).await.is_err() {
+        return;
+    }
+    // A real server accepts both an SSLRequest and a direct plaintext
+    // startup message. The maintained driver sends a startup message
+    // directly when TLS is off.
+    let params = if probe[4..8] == 80877103_i32.to_be_bytes() {
+        stream.write_all(b"N").await.expect("ssl deny");
+        mv01_pg_read_startup(&mut stream).await
+    } else {
+        let len = i32::from_be_bytes([probe[0], probe[1], probe[2], probe[3]]) as usize;
+        let mut body = probe[4..8].to_vec();
+        let rest = len.saturating_sub(8);
+        let mut tail = vec![0_u8; rest];
+        stream.read_exact(&mut tail).await.expect("startup body");
+        body.extend_from_slice(&tail);
+        mv01_pg_startup_params(&body)
+    };
+    // The connection settings come from the connector document alone.
+    assert!(
+        params
+            .iter()
+            .any(|(k, v)| k == "user" && v == expected_user),
+        "the fake checks the user: {params:?}"
+    );
+    assert!(
+        params
+            .iter()
+            .any(|(k, v)| k == "database" && v == expected_database),
+        "the fake checks the database: {params:?}"
+    );
+    // Cleartext password authentication: the driver sends the password as
+    // a PasswordMessage. The fake verifies it before it answers OK.
+    mv01_pg_write_msg(&mut stream, b'R', &3_i32.to_be_bytes()).await;
+    let (tag, body) = mv01_pg_read_msg(&mut stream).await;
+    assert_eq!(tag, b'p', "the driver answers the password request");
+    let sent_password = body
+        .strip_suffix(&[0])
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        sent_password, expected_password,
+        "the fake checks the password"
+    );
+    mv01_pg_write_msg(&mut stream, b'R', &0_i32.to_be_bytes()).await;
+    mv01_pg_ready(&mut stream).await;
+    let mut statement = String::new();
+    let mut rows = Vec::new();
+    loop {
+        let mut header = [0_u8; 5];
+        if stream.read_exact(&mut header).await.is_err() {
+            break;
+        }
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut body = vec![0_u8; len - 4];
+        stream.read_exact(&mut body).await.expect("pg body");
+        match header[0] {
+            b'P' => {
+                let mut cursor = &body[..];
+                let take_cstr = |cur: &mut &[u8]| {
+                    let end = cur.iter().position(|&b| b == 0).expect("cstr");
+                    let text = String::from_utf8_lossy(&cur[..end]).into_owned();
+                    *cur = &cur[end + 1..];
+                    text
+                };
+                let name = take_cstr(&mut cursor);
+                statement = format!("{name}|{}", take_cstr(&mut cursor));
+                mv01_pg_write_msg(&mut stream, b'1', &[]).await;
+            }
+            b'D' => {
+                if body.first() == Some(&b'S') {
+                    // ParameterDescription: three text parameters (oid 25).
+                    let mut types = Vec::new();
+                    types.extend_from_slice(&3_u16.to_be_bytes());
+                    types.extend_from_slice(&25_i32.to_be_bytes());
+                    types.extend_from_slice(&25_i32.to_be_bytes());
+                    types.extend_from_slice(&25_i32.to_be_bytes());
+                    mv01_pg_write_msg(&mut stream, b't', &types).await;
+                }
+                // An INSERT returns no rows; NoData ends the description.
+                mv01_pg_write_msg(&mut stream, b'n', &[]).await;
+            }
+            b'S' => {
+                mv01_pg_ready(&mut stream).await;
+                if !rows.is_empty() && rows.len() >= expected_rows {
+                    break;
+                }
+            }
+            b'B' => {
+                let mut cursor = &body[..];
+                let skip_cstr = |cursor: &mut &[u8]| {
+                    let end = cursor.iter().position(|&b| b == 0).expect("cstr");
+                    *cursor = &cursor[end + 1..];
+                };
+                skip_cstr(&mut cursor);
+                skip_cstr(&mut cursor);
+                let formats = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+                cursor = &cursor[2 + formats * 2..];
+                let count = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+                cursor = &cursor[2..];
+                let mut row = Vec::new();
+                for _ in 0..count {
+                    let len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+                    cursor = &cursor[4..];
+                    row.push(cursor[..len as usize].to_vec());
+                    cursor = &cursor[len as usize..];
+                }
+                rows.push(row);
+                mv01_pg_write_msg(&mut stream, b'2', &[]).await;
+            }
+            b'E' => mv01_pg_write_msg(&mut stream, b'C', b"INSERT 0 1\0").await,
+            b'X' => break,
+            _ => {}
+        }
+    }
+    captured
+        .lock()
+        .expect("capture lock")
+        .push((statement, rows));
+}
+
+/// Two `pgsql` actions on one connector own separate statement shapes: each
+/// delivers the engine row (topic, QoS, payload) under its own Parameters,
+/// and the per-action counters attribute the fires.
+#[tokio::test]
+async fn mv01_pgsql_action_delivers_engine_rows_to_connector_settings() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured = Arc::new(Mutex::new(Vec::<(String, Vec<Vec<Vec<u8>>>)>::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 1).await;
+            }
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    for (suffix, sentinel) in [("a", "MV01-A-SQL"), ("b", "MV01-B-SQL")] {
+        let id = format!("mv01-pg-{suffix}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": id,
+                "type": "pgsql",
+                "connector": "mv01-pg",
+                "parameters": {"sql": format!("{sentinel} INSERT $1, $2, $3")},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "action {id} create: {body}");
+        assert_eq!(body["status"], "connected", "action {id}: {body}");
+        let rule_id = format!("mv01-pg-rule-{suffix}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": rule_id,
+                "sql": format!("SELECT * FROM \"mv01/in/{suffix}\""),
+                "actions": [id],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "rule {rule_id} create: {body}");
+    }
+    // One publish per action fires its own rule; each action's pool dials
+    // the fake backend and flushes its own statement with the engine row.
+    for (suffix, payload) in [("a", &b"{\"v\":1}"[..]), ("b", &b"{\"v\":2}"[..])] {
+        let mut publisher = mv00_connect(&kernel, &format!("mv01-pg-pub-{suffix}")).await;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv01/in/{suffix}"), 0, 0, false, payload),
+        )
+        .await;
+        drop(publisher);
+    }
+    // The sink flusher outside this test drives both pools; bound the wait.
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let arrived = captured.lock().expect("capture lock").len() == 2;
+        assert!(
+            std::time::Instant::now() < deadline || arrived,
+            "both pgsql actions flushed in time"
+        );
+        if arrived {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    fake.await.expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    // Per-action counters attributed one success each.
+    for suffix in ["a", "b"] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/mv01-pg-{suffix}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "action {suffix} metrics: {body}");
+        assert_eq!(body["metrics"]["success"], serde_json::json!(1), "{body}");
+        assert_eq!(body["metrics"]["failed"], serde_json::json!(0), "{body}");
+    }
+    // Both actions delivered under their own statements with the engine
+    // row (topic, QoS, payload) bound by the sink.
+    assert_eq!(captured.len(), 2);
+    for (statement, rows) in &captured {
+        assert!(rows.len() == 1, "one row per statement: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.len(), 3, "topic, qos, payload bound: {row:?}");
+        assert_eq!(row[1], &b"0"[..]);
+        let (topic, payload) = if statement.contains("MV01-A-SQL") {
+            ("mv01/in/a", "{\"v\":1}".as_bytes())
+        } else if statement.contains("MV01-B-SQL") {
+            ("mv01/in/b", "{\"v\":2}".as_bytes())
+        } else {
+            unreachable!("each connection binds its action's statement: {statement:?}");
+        };
+        assert_eq!(row[0], topic.as_bytes());
+        assert_eq!(row[2], payload);
+    }
+    kernel.finish().await;
+}
+
+/// An action update swaps the statement live (new publishes use it); a
+/// refused update (missing `sql`) answers 400 naming the field and the
+/// old statement keeps delivering.
+#[tokio::test]
+async fn mv01_pgsql_action_update_swaps_statement_and_refusal_keeps_old() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured = Arc::new(Mutex::new(Vec::<(String, Vec<Vec<Vec<u8>>>)>::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 1).await;
+            }
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "pgsql",
+            "connector": "mv01-pg-up",
+            "parameters": {"sql": "MV01-PGUP-V1 INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-up-rule",
+            "sql": "SELECT * FROM \"mv01/in/up\"",
+            "actions": ["mv01-pg-up"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-up-pub").await;
+    // The first publish flushes the created statement.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":1}"#),
+    )
+    .await;
+    // An update that drops `sql` is refused with the field named; the
+    // stored action and the delivering statement are untouched.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-up",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "pgsql",
+            "connector": "mv01-pg-up",
+            "parameters": {},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "missing sql refuses: {body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("mv01-pg-up") && message.contains("parameters.sql"),
+        "the refusal names the action and the field: {message}"
+    );
+    // The old generation kept delivering (a fresh backend connection).
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":2}"#),
+    )
+    .await;
+    // Wait for the refused-update publish to flush on the old sink before
+    // the replacement swaps it. A publish still in the broker task would
+    // otherwise land on the new statement.
+    mv01_wait_pg_batches(&captured, 2).await;
+    // A full replacement swaps the statement in for the next publish.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-up",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "pgsql",
+            "connector": "mv01-pg-up",
+            "parameters": {"sql": "MV01-PGUP-V2 INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "action update: {body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":3}"#),
+    )
+    .await;
+    // Bound the wait for all three flushes.
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let arrived = captured.lock().expect("capture lock").len() == 3;
+        assert!(
+            std::time::Instant::now() < deadline || arrived,
+            "all three statements flushed in time"
+        );
+        if arrived {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    fake.await.expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    // Flush order follows connection order: created, refused-update
+    // still old, updated new. The prepared statement carries the
+    // driver's generated name; the sql follows after the separator.
+    let sql_of = |index: usize| -> String {
+        captured[index]
+            .0
+            .split_once('|')
+            .expect("statement capture")
+            .1
+            .to_string()
+    };
+    assert_eq!(sql_of(0), "MV01-PGUP-V1 INSERT $1, $2, $3");
+    assert_eq!(sql_of(1), "MV01-PGUP-V1 INSERT $1, $2, $3");
+    assert_eq!(sql_of(2), "MV01-PGUP-V2 INSERT $1, $2, $3");
+    // Every flush carries the engine row (topic, QoS, payload) bound by
+    // the action to its own publish.
+    let payloads: [&[u8]; 3] = [br#"{"u":1}"#, br#"{"u":2}"#, br#"{"u":3}"#];
+    for (index, expected_payload) in payloads.iter().enumerate() {
+        let rows = &captured[index].1;
+        assert!(rows.len() == 1, "one row per flush: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.len(), 3, "topic, qos, payload bound: {row:?}");
+        assert_eq!(row[0], &b"mv01/in/up"[..]);
+        assert_eq!(row[1], &b"0"[..]);
+        assert_eq!(row[2], *expected_payload);
+    }
+    kernel.finish().await;
+}
+
+/// Wait for one more captured PostgreSQL batch. The fake flushes one
+/// batch per connection, so the count is the number of completed sends.
+async fn mv01_wait_pg_batches(captured: &PgCaptured, count: usize) {
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        if captured.lock().expect("capture lock").len() >= count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pgsql batches arrived in time: wanted {count}, got {}",
+            captured.lock().expect("capture lock").len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A pgsql action stops on disable, resumes on enable and stops on delete.
+#[tokio::test]
+async fn mv01_pgsql_action_disable_enable_delete() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-life",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-life",
+            "type": "pgsql",
+            "connector": "mv01-pg-life",
+            "parameters": {"sql": "MV01-LIFE INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-life-rule",
+            "sql": "SELECT * FROM \"mv01/in/life\"",
+            "actions": ["mv01-pg-life"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-life-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-life/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "disable: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":2}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        captured.lock().expect("capture lock").len(),
+        1,
+        "a disabled action delivers nothing"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-life/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "enable: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":3}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 2).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/mv01-pg-life-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "rule delete: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-pg-life",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":4}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        captured.lock().expect("capture lock").len(),
+        2,
+        "a deleted action delivers nothing"
+    );
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A pgsql action stores while its server is down, reports `disconnected`
+/// from the real attempt, and delivers after the server starts.
+#[tokio::test]
+async fn mv01_pgsql_down_server_reports_disconnected_and_delivers_when_up() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let address = reserve.local_addr().expect("reserved address");
+    drop(reserve);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-down",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-down",
+            "type": "pgsql",
+            "connector": "mv01-pg-down",
+            "parameters": {"sql": "MV01-DOWN INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "a down target still stores: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-down-rule",
+            "sql": "SELECT * FROM \"mv01/in/pgdown\"",
+            "actions": ["mv01-pg-down"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("the server starts on the reserved port");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-down-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgdown", 0, 0, false, br#"{"up":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A pgsql action delivers after a broker restart from the stored
+/// connector and action.
+#[tokio::test]
+async fn mv01_pgsql_action_survives_restart() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-restart",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-restart",
+            "type": "pgsql",
+            "connector": "mv01-pg-restart",
+            "parameters": {"sql": "MV01-RESTART INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-restart-rule",
+            "sql": "SELECT * FROM \"mv01/in/pgrestart\"",
+            "actions": ["mv01-pg-restart"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-restart-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrestart", 0, 0, false, br#"{"r":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-pg-restart",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "connected", "the replay rebuilt it: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-restart-pub2").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrestart", 0, 0, false, br#"{"r":2}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 2).await;
+    {
+        let captured = captured.lock().expect("capture lock");
+        assert!(captured[0].0.contains("MV01-RESTART"));
+        assert!(captured[1].0.contains("MV01-RESTART"));
+    }
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A connector update refuses when one dependent pgsql action cannot use
+/// the new settings; the old statement keeps delivering and the refused
+/// attempt leaks no connection or task.
+#[tokio::test]
+async fn mv01_pgsql_refused_connector_update_keeps_old_and_leaks_nothing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let fake_captured = Arc::clone(&captured);
+    let fake_accepted = Arc::clone(&accepted);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            fake_accepted.fetch_add(1, Ordering::SeqCst);
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-refuse",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-refuse",
+            "type": "pgsql",
+            "connector": "mv01-pg-refuse",
+            "parameters": {"sql": "MV01-REFUSE INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-refuse-rule",
+            "sql": "SELECT * FROM \"mv01/in/pgrefuse\"",
+            "actions": ["mv01-pg-refuse"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-refuse-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrefuse", 0, 0, false, br#"{"v":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    let accepted_before = accepted.load(Ordering::SeqCst);
+    let tasks_before = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    // The new body drops `database`, so the dependent action cannot build.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-pg-refuse",
+        serde_json::json!({
+            "name": "mv01-pg-refuse",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "the dependent build refuses: {body}");
+    let message = body["message"].as_str().expect("refusal message");
+    assert!(
+        message.contains("mv01-pg-refuse") && message.contains("database"),
+        "the refusal names the action and the field: {message}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        accepted_before,
+        "the refused update opens no connection"
+    );
+    let deadline = std::time::Instant::now() + STEP;
+    let tasks_after = loop {
+        let alive = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        if alive <= tasks_before || std::time::Instant::now() >= deadline {
+            break alive;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(
+        tasks_after <= tasks_before,
+        "the refused update leaks no task: before {tasks_before}, after {tasks_after}"
+    );
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrefuse", 0, 0, false, br#"{"v":2}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 2).await;
+    {
+        let captured = captured.lock().expect("capture lock");
+        assert!(captured[1].0.contains("MV01-REFUSE"));
+    }
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A successful connector update keeps two dependent actions on their own
+/// statements.
+#[tokio::test]
+async fn mv01_pgsql_connector_update_keeps_two_action_statements() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-two",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "pool_size": 2,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    for (id, sql) in [
+        ("mv01-pg-two-a", "MV01-TWO-A INSERT $1, $2, $3"),
+        ("mv01-pg-two-b", "MV01-TWO-B INSERT $1, $2, $3"),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": id,
+                "type": "pgsql",
+                "connector": "mv01-pg-two",
+                "parameters": {"sql": sql},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "action {id}: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": format!("{id}-rule"),
+                "sql": format!("SELECT * FROM \"mv01/in/two/{id}\""),
+                "actions": [id],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "rule {id}: {body}");
+    }
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-two-pub").await;
+    for id in ["mv01-pg-two-a", "mv01-pg-two-b"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv01/in/two/{id}"), 0, 0, false, id.as_bytes()),
+        )
+        .await;
+    }
+    mv01_wait_pg_batches(&captured, 2).await;
+    // A second server observes the rebuild: after the update every row
+    // must reach the new target. A no-op connector update fails here.
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("second pg fake binds");
+    let address2 = listener2.local_addr().expect("second pg fake address");
+    let captured2: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake2_captured = Arc::clone(&captured2);
+    let fake2 = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener2).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake2_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-pg-two",
+        serde_json::json!({
+            "name": "mv01-pg-two",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address2.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "pool_size": 4,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    for id in ["mv01-pg-two-a", "mv01-pg-two-b"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv01/in/two/{id}"), 0, 0, false, id.as_bytes()),
+        )
+        .await;
+    }
+    mv01_wait_pg_batches(&captured2, 2).await;
+    {
+        let captured2 = captured2.lock().expect("capture lock");
+        let statements: Vec<&str> = captured2
+            .iter()
+            .map(|(statement, _)| {
+                statement
+                    .split_once('|')
+                    .map(|(_, sql)| sql)
+                    .unwrap_or(statement.as_str())
+            })
+            .collect();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("MV01-TWO-A"))
+                .count(),
+            1,
+            "action A rebuilt onto the new server: {statements:?}"
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("MV01-TWO-B"))
+                .count(),
+            1,
+            "action B rebuilt onto the new server: {statements:?}"
+        );
+    }
+    fake.abort();
+    fake2.abort();
+    kernel.finish().await;
+}
+
+/// A stored pgsql action whose password reference disappears reports the
+/// error state and raises the build alarm at boot.
+#[tokio::test]
+async fn mv01_pgsql_failed_boot_wiring_reports_error_and_alarm() {
+    let mut kernel = spawn_kernel("").await;
+    let secret = kernel.scratch.join("mv01-pg-password");
+    std::fs::write(&secret, "pwd").expect("secret file");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-boot",
+            "type": "postgres",
+            "server": "127.0.0.1:9",
+            "database": "db",
+            "username": "u",
+            "password": format!("file:{}", secret.display()),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-boot",
+            "type": "pgsql",
+            "connector": "mv01-pg-boot",
+            "parameters": {"sql": "MV01-BOOT INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    std::fs::remove_file(&secret).expect("remove the secret");
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-pg-boot",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "the failed action stays readable: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let reason = body["status_reason"].as_str().expect("status reason");
+    assert!(
+        reason.contains("password"),
+        "the reason names the field: {reason}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/alarms",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "alarms read: {body}");
+    let alarm = body["data"]
+        .as_array()
+        .expect("alarm rows")
+        .iter()
+        .find(|row| row["name"] == "action_build_failed:mv01-pg-boot")
+        .expect("the boot failure raised its alarm");
+    assert!(
+        alarm["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("password")),
+        "the alarm carries the build reason: {alarm}"
+    );
+    kernel.finish().await;
+}
+
+/// A password and a database that contain URL delimiters reach the
+/// driver as values, not as a hand-joined URL.
+#[tokio::test]
+async fn mv01_pgsql_special_password_and_database_reach_driver() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(
+                stream,
+                Arc::clone(&fake_captured),
+                "u",
+                "p@ss/w?rd#1",
+                "db@x/y?z#w",
+                1,
+            )
+            .await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-special",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db@x/y?z#w",
+            "username": "u",
+            "password": "p@ss/w?rd#1",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-special",
+            "type": "pgsql",
+            "connector": "mv01-pg-special",
+            "parameters": {"sql": "MV01-SPECIAL INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-special-rule",
+            "sql": "SELECT * FROM \"mv01/in/special\"",
+            "actions": ["mv01-pg-special"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-special-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/special", 0, 0, false, br#"{"s":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// Waits until the action holds `rows` rows in its buffer. A QoS 0 publish
+/// reaches the buffer after the PUBLISH is sent, so a test that changes the
+/// action at once can race the rule engine.
+async fn mv01_wait_queued(kernel: &Kernel, action: &str, rows: u64) {
+    let deadline = tokio::time::Instant::now() + STEP;
+    loop {
+        let (status, body) = mv00_api(
+            kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{action}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "action metrics: {body}");
+        if body["metrics"]["queuing"].as_u64() == Some(rows) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "action {action} did not buffer {rows} rows in time: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A buffered batch survives an update, a disable and a delete: each
+/// swap drains the old runtime before it stops it.
+#[tokio::test]
+async fn mv01_action_buffer_drains_on_update_disable_and_delete() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-drain",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let opts = serde_json::json!({
+        "batch_size": 3,
+        "batch_time": "10s",
+        "health_check_interval": "1h",
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-drain",
+            "type": "webhook",
+            "connector": "mv01-drain",
+            "parameters": {"path": "/drain"},
+            "resource_opts": opts,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-drain-rule",
+            "sql": "SELECT * FROM \"mv01/in/drain\"",
+            "actions": ["mv01-drain"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-drain-pub").await;
+    // One row waits in the old buffer; the update drains it to /drain.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/drain", 0, 0, false, br#"{"d":1}"#),
+    )
+    .await;
+    mv01_wait_queued(&kernel, "mv01-drain", 1).await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-drain",
+        serde_json::json!({
+            "name": "mv01-drain",
+            "type": "webhook",
+            "connector": "mv01-drain",
+            "parameters": {"path": "/after"},
+            "resource_opts": opts,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "action update: {body}");
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("updated sink drained in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].0, "/drain");
+    assert_eq!(received[0].1.as_slice(), &br#"{"d":1}"#[..]);
+    // Two rows wait in the new buffer; the disable drains them.
+    for n in [2, 3] {
+        let payload = format!("{{\"d\":{n}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("mv01/in/drain", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    mv01_wait_queued(&kernel, "mv01-drain", 2).await;
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-drain/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "disable: {body}");
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("disabled sink drained in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2);
+    assert!(received.iter().all(|(path, _)| path == "/after"));
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-drain/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "enable: {body}");
+    // Two rows wait again; the delete drains them after the rule detach.
+    for n in [4, 5] {
+        let payload = format!("{{\"d\":{n}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("mv01/in/drain", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-drain-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/drain\"",
+            "actions": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule detach: {body}");
+    let third = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-drain",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete: {body}");
+    let received = tokio::time::timeout(STEP, third)
+        .await
+        .expect("deleted sink drained in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2);
+    assert!(received.iter().all(|(path, _)| path == "/after"));
+    kernel.finish().await;
+}
+
+/// A connector disable stops every dependent action; enable restores
+/// them. Deleting a connector that an action still uses is refused and
+/// leaves both records in place.
+#[tokio::test]
+async fn mv01_connector_disable_mirrors_dependents_and_delete_guards_references() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-cd",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-cd-action",
+            "type": "webhook",
+            "connector": "mv01-cd",
+            "parameters": {"path": "/cd"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-cd-rule",
+            "sql": "SELECT * FROM \"mv01/in/cd\"",
+            "actions": ["mv01-cd-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-cd-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/cd", 0, 0, false, br#"{"d":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/cd");
+    assert_eq!(received[0].1.as_slice(), &br#"{"d":1}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-cd/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "connector disable: {body}");
+    let watch = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/cd", 0, 0, false, br#"{"d":2}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !watch.is_finished(),
+        "a disabled connector still delivered through its dependent action"
+    );
+    watch.abort();
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-cd/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "connector enable: {body}");
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/cd", 0, 0, false, br#"{"d":3}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/cd");
+    assert_eq!(received[0].1.as_slice(), &br#"{"d":3}"#[..]);
+    // The used connector cannot be deleted while the action points at it.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mv01-cd",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 400, "used connector delete refuses: {body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("mv01-cd-action") && message.contains("action"),
+        "the refusal names the dependent action: {message}"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-cd",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "the refused delete keeps the connector");
+    // Detach the rule, then the action and its connector can go.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-cd-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/cd\"",
+            "actions": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule detach: {body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-cd-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete after detach");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mv01-cd",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "connector delete after the action is gone");
+    kernel.finish().await;
+}
+
+/// Publishes continue across an action update: every message reaches
+/// exactly one statement, and a later delete stops the action.
+#[tokio::test]
+async fn mv01_concurrent_publish_update_and_delete_keep_each_message_once() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-conc",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-conc-action",
+            "type": "webhook",
+            "connector": "mv01-conc",
+            "parameters": {"path": "/before"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-conc-rule",
+            "sql": "SELECT * FROM \"mv01/in/conc\"",
+            "actions": ["mv01-conc-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let payloads: Vec<String> = (0..16).map(|index| format!("{{\"n\":{index}}}")).collect();
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), payloads.len());
+    let publisher = mv00_connect(&kernel, "mv01-conc-pub").await;
+    let send_payloads = payloads.clone();
+    let publisher_task = tokio::spawn(async move {
+        let mut publisher = publisher;
+        for payload in send_payloads {
+            send_mqtt(
+                &mut publisher,
+                &sy02_publish311("mv01/in/conc", 0, 0, false, payload.as_bytes()),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-conc-action",
+        serde_json::json!({
+            "name": "mv01-conc-action",
+            "type": "webhook",
+            "connector": "mv01-conc",
+            "parameters": {"path": "/after"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "action update during publishes: {body}");
+    publisher_task.await.expect("publisher task");
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(
+        received.len(),
+        payloads.len(),
+        "every publish delivered once"
+    );
+    let mut got: Vec<String> = received
+        .iter()
+        .map(|(_, body)| String::from_utf8(body.clone()).expect("payload text"))
+        .collect();
+    let mut want = payloads.clone();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "no publish lost or duplicated across the swap");
+    for (path, _) in &received {
+        assert!(
+            path.as_str() == "/before" || path.as_str() == "/after",
+            "unexpected delivery path {path}"
+        );
+    }
+    // Detach the rule, then delete the action; a later publish is silent.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-conc-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/conc\"",
+            "actions": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule detach: {body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-conc-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-conc-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "the deleted action reads absent");
+    let watch = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mv01-conc-pub2").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/conc", 0, 0, false, br#"{"n":"gone"}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!watch.is_finished(), "a deleted action still delivered");
+    watch.abort();
+    kernel.finish().await;
+}
+
+/// A persistence failure on an action update keeps the old sink and the
+/// old stored parameters, and answers 500.
+#[tokio::test]
+async fn mv01_action_persist_failure_keeps_the_old_sink_delivering() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-persist",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-persist-action",
+            "type": "webhook",
+            "connector": "mv01-persist",
+            "parameters": {"path": "/persist"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-persist-rule",
+            "sql": "SELECT * FROM \"mv01/in/persist\"",
+            "actions": ["mv01-persist-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-persist-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/persist", 0, 0, false, br#"{"p":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].1.as_slice(), &br#"{"p":1}"#[..]);
+    // Block the atomic save: the state path becomes a directory, so the
+    // temp-file rename fails for every later persist.
+    let state_path = kernel.scratch.join("state.toml");
+    std::fs::remove_file(&state_path).expect("state file exists after the writes");
+    std::fs::create_dir(&state_path).expect("state path blocks the rename");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-persist-action",
+        serde_json::json!({
+            "name": "mv01-persist-action",
+            "type": "webhook",
+            "connector": "mv01-persist",
+            "parameters": {"path": "/persist-new"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 500, "the persistence failure answers 500: {body}");
+    assert_eq!(body["code"], "INTERNAL_ERROR", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-persist-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["parameters"]["path"], "/persist", "{body}");
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/persist", 0, 0, false, br#"{"p":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/persist");
+    assert_eq!(received[0].1.as_slice(), &br#"{"p":2}"#[..]);
+    kernel.finish().await;
+}
+
+/// A persistence failure on connector create and update keeps the store
+/// and every sink as they were.
+#[tokio::test]
+async fn mv01_connector_persist_failure_keeps_the_previous_generation() {
+    let old_listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("old receiver binds"),
+    );
+    let old_address = old_listener.local_addr().expect("old receiver address");
+    let new_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("new receiver binds");
+    let new_address = new_listener.local_addr().expect("new receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-conn-persist",
+            "type": "webhook",
+            "url": format!("http://{old_address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-conn-persist",
+            "type": "webhook",
+            "connector": "mv01-conn-persist",
+            "parameters": {"path": "/keep"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-conn-persist-rule",
+            "sql": "SELECT * FROM \"mv01/in/connpersist\"",
+            "actions": ["mv01-conn-persist"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-conn-persist-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&old_listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/connpersist", 0, 0, false, br#"{"c":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].1.as_slice(), &br#"{"c":1}"#[..]);
+    // Block the atomic save for every later write.
+    let state_path = kernel.scratch.join("state.toml");
+    std::fs::remove_file(&state_path).expect("state file exists after the writes");
+    std::fs::create_dir(&state_path).expect("state path blocks the rename");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-conn-persist",
+        serde_json::json!({
+            "name": "mv01-conn-persist",
+            "type": "webhook",
+            "url": format!("http://{new_address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 500, "the update persist failure: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-conn-persist",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["url"],
+        serde_json::json!(format!("http://{old_address}")),
+        "the stored connector is unchanged: {body}"
+    );
+    let second = mv01_spawn_http_receiver(Arc::clone(&old_listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/connpersist", 0, 0, false, br#"{"c":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/keep");
+    assert_eq!(received[0].1.as_slice(), &br#"{"c":2}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-conn-persist-new",
+            "type": "webhook",
+            "url": format!("http://{new_address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 500, "the create persist failure: {body}");
+    let (status, _body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-conn-persist-new",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "the uncommitted connector is not stored");
+    kernel.finish().await;
+}
+
+/// One rule mixes an owned `pgsql` action, an owned `webhook` action and
+/// a kind with no owned runtime: both owned sinks deliver and the
+/// refused kind counts one failed fire.
+#[tokio::test]
+async fn mv01_mixed_kind_rule_delivers_owned_actions_and_counts_refused_failure() {
+    let pg_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let pg_address = pg_listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let pg_captured = Arc::clone(&captured);
+    let pg_fake = tokio::spawn(async move {
+        let stream = mv01_pg_accept(&pg_listener).await;
+        mv01_pg_serve_one(stream, pg_captured, "u", "pwd", "db", 1).await;
+    });
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-mixed-pg",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", pg_address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "pgsql connector: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mixed-pg-act",
+            "type": "pgsql",
+            "connector": "mv01-mixed-pg",
+            "parameters": {"sql": "MV01-MIXED INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "pgsql action: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-mixed-wh",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "webhook connector: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mixed-wh-act",
+            "type": "webhook",
+            "connector": "mv01-mixed-wh",
+            "parameters": {"path": "/mixed"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "webhook action: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mixed-refused",
+            "type": "console",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "unowned kind action stores: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-mixed-rule",
+            "sql": "SELECT * FROM \"mv01/in/mixed\"",
+            "actions": ["mv01-mixed-pg-act", "mv01-mixed-wh-act", "mv01-mixed-refused"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "mixed rule create: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mv01-mixed-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/mixed", 0, 0, false, br#"{"m":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/mixed");
+    assert_eq!(received[0].1.as_slice(), &br#"{"m":1}"#[..]);
+    tokio::time::timeout(STEP, pg_fake)
+        .await
+        .expect("pgsql delivery in time")
+        .expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    assert_eq!(captured.len(), 1, "the pgsql action delivered once");
+    assert_eq!(captured[0].1.len(), 1, "one engine row");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-mixed-refused/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "refused-kind metrics: {body}");
+    assert_eq!(body["metrics"]["success"], serde_json::json!(0), "{body}");
+    assert_eq!(body["metrics"]["failed"], serde_json::json!(1), "{body}");
+    kernel.finish().await;
+}
+
+/// A stored action whose sink cannot build at boot reports the error state
+/// and raises the build alarm through the production `/alarms` entry.
+#[tokio::test]
+async fn mv01_failed_boot_action_wiring_reports_error_and_alarm() {
+    let mut kernel = spawn_kernel("").await;
+    let secret = kernel.scratch.join("mv01-boot-url");
+    std::fs::write(&secret, "http://127.0.0.1:9").expect("secret file");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-boot-link",
+            "type": "webhook",
+            "url": format!("file:{}", secret.display()),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-boot-fail",
+            "type": "webhook",
+            "connector": "mv01-boot-link",
+            "parameters": {"path": "/boot"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the secret resolves to a down target and the probe reports it: {body}"
+    );
+    // The secret disappears before the restart, so the boot replay cannot
+    // rebuild the action sink.
+    std::fs::remove_file(&secret).expect("remove the secret");
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-boot-fail",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "the failed action stays readable: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let reason = body["status_reason"].as_str().expect("status reason");
+    assert!(
+        reason.contains("url"),
+        "the reason names the field: {reason}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/alarms",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "alarms read: {body}");
+    let alarm = body["data"]
+        .as_array()
+        .expect("alarm rows")
+        .iter()
+        .find(|row| row["name"] == "action_build_failed:mv01-boot-fail")
+        .expect("the boot failure raised its alarm");
+    assert!(
+        alarm["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("url")),
+        "the alarm carries the build reason: {alarm}"
+    );
+    kernel.finish().await;
+}
+
+/// A valid webhook server that is down at write time does not refuse the
+/// action; the stored action delivers once the server starts.
+#[tokio::test]
+async fn mv01_down_webhook_server_stores_the_action_and_delivers_when_up() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let address = reserve.local_addr().expect("reserved address");
+    let kernel = spawn_kernel("").await;
+    drop(reserve);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-down",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-down-action",
+            "type": "webhook",
+            "connector": "mv01-down",
+            "parameters": {"path": "/down"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "a down target still stores: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "a real connection attempt reports the down target: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-down-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["parameters"]["path"], "/down", "{body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the read keeps the real probe result: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-down-rule",
+            "sql": "SELECT * FROM \"mv01/in/down\"",
+            "actions": ["mv01-down-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-down-pub").await;
+    // The server is down: the fire fails, but the broker keeps serving.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/down", 0, 0, false, br#"{"down":1}"#),
+    )
+    .await;
+    // Wait for that failed fire to finish before the server starts, so the
+    // first message cannot arrive at the receiver below.
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let (_, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/actions/mv01-down-action/metrics",
+            serde_json::Value::Null,
+        )
+        .await;
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the down-target fire failed in time: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind(address)
+            .await
+            .expect("the server starts on the reserved port"),
+    );
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/down", 0, 0, false, br#"{"down":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/down");
+    assert_eq!(received[0].1.as_slice(), &br#"{"down":2}"#[..]);
+    kernel.finish().await;
+}
+
+/// A v5 action and a v1 connector may share a name; typed and bare v5
+/// action ids resolve to the same sink, and both paths survive a restart.
+#[tokio::test]
+async fn mv01_v5_action_and_v1_connector_share_a_name_and_survive_restart() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v1/connectors",
+        serde_json::json!({
+            "id": "shared",
+            "kind": "webhook",
+            "config": {"url": format!("http://{address}/v1"), "batch_size": 1},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v1 connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-ns-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v5 connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "shared",
+            "type": "webhook",
+            "connector": "mv01-ns-link",
+            "parameters": {"path": "/v5"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v5 action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v1/rules",
+        serde_json::json!({
+            "name": "mv01-ns-v1",
+            "topic_filter": "mv01/ns/v1",
+            "sql_query": "SELECT * FROM \"mv01/ns/v1\"",
+            "actions": [{"type": "forwardconnector", "connector_id": "shared"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v1 rule create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-ns-typed",
+            "sql": "SELECT * FROM \"mv01/ns/typed\"",
+            "actions": ["webhook:shared"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "typed v5 rule create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-ns-bare",
+            "sql": "SELECT * FROM \"mv01/ns/bare\"",
+            "actions": ["shared"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "bare v5 rule create: {body}");
+    let topics = ["mv01/ns/v1", "mv01/ns/typed", "mv01/ns/bare"];
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), topics.len());
+    let mut publisher = mv00_connect(&kernel, "mv01-ns-pub").await;
+    for topic in topics {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(topic, 0, 0, false, topic.as_bytes()),
+        )
+        .await;
+    }
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let mut paths: Vec<&str> = received.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec!["/v1", "/v5", "/v5"],
+        "same-name v1 connector and v5 action routed separately: {received:?}"
+    );
+    // The v1 forward on the same bare name does not inflate the v5 action
+    // metrics: only the two v5 fires count.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/shared/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "action metrics: {body}");
+    assert_eq!(body["metrics"]["matched"], serde_json::json!(2), "{body}");
+    assert_eq!(body["metrics"]["success"], serde_json::json!(2), "{body}");
+    // Restart: the v5 action replay rebuilds under its dispatch key. The
+    // v1 path stays in its own memory-only name space, as it did before
+    // MV-01, so it does not write a v5 connector row and does not resume.
+    mv00_restart(&mut kernel).await;
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let mut publisher = mv00_connect(&kernel, "mv01-ns-pub2").await;
+    for topic in topics {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(topic, 0, 0, false, format!("{topic}-restart").as_bytes()),
+        )
+        .await;
+    }
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let mut paths: Vec<&str> = received.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec!["/v5", "/v5"],
+        "the v5 actions resumed and the v1 row stayed out of the v5 store: {received:?}"
+    );
+    // The v1 rule fired on the same bare name after the restart too. Its
+    // forward must not credit the v5 action's metrics.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/shared/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "post-restart action metrics: {body}");
+    assert_eq!(
+        body["metrics"]["matched"],
+        serde_json::json!(2),
+        "only the two v5 fires count after restart: {body}"
+    );
+    assert_eq!(
+        body["metrics"]["success"],
+        serde_json::json!(2),
+        "only the two v5 fires succeed after restart: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// A webhook connector that is down reads `disconnected` from its own
+/// probe at create and at read time, and `connected` after the update
+/// points it at a live target and probes it again.
+#[tokio::test]
+async fn mv01_down_webhook_connector_reads_disconnected_from_probe() {
+    let kernel = spawn_kernel("").await;
+    // The down target uses the discard port. Nothing listens there,
+    // so the probe always fails. A reserved-then-freed port can be
+    // taken by a parallel kernel before the probe dials.
+    let connector = serde_json::json!({
+        "name": "mv01-probe-link",
+        "type": "webhook",
+        "url": "http://127.0.0.1:9",
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        connector.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the create probe reports the down target: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-probe-link",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "connector read: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the read keeps the probe result: {body}"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the live target binds");
+    let live = listener.local_addr().expect("live target address");
+    let connector = serde_json::json!({
+        "name": "mv01-probe-link",
+        "type": "webhook",
+        "url": format!("http://{live}"),
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-probe-link",
+        connector,
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the update probe reports the live target: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-probe-link",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "connector read: {body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    drop(listener);
+    kernel.finish().await;
+}
+
+/// A not-ready action kind is refused at the KC-00 map with the create
+/// code `ALREADY_EXISTS` and the update code `BAD_REQUEST`.
+#[tokio::test]
+async fn mv01_action_readiness_refusals_keep_the_documented_codes() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mqtt-not-ready",
+            "type": "mqtt",
+            "connector": "mv01-missing-link",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "a not-ready kind is refused: {body}");
+    assert_eq!(body["code"], "ALREADY_EXISTS", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-ready-link",
+            "type": "webhook",
+            "url": "http://127.0.0.1:9",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-ready-action",
+            "type": "webhook",
+            "connector": "mv01-ready-link",
+            "parameters": {"path": "/ready"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "ready action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-ready-action",
+        serde_json::json!({
+            "name": "mv01-ready-action",
+            "type": "mqtt",
+            "connector": "mv01-ready-link",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "the update refuses the not-ready kind: {body}");
+    assert_eq!(body["code"], "BAD_REQUEST", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-ready-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the refused update keeps the old action: {body}"
+    );
+    assert_eq!(body["type"], "webhook", "{body}");
+    kernel.finish().await;
+}
+
+/// An invalid header value is refused without echoing the value.
+#[tokio::test]
+async fn mv01_action_header_value_is_not_echoed_in_the_error() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-header-link",
+            "type": "webhook",
+            "url": "http://127.0.0.1:9",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-header-action",
+            "type": "webhook",
+            "connector": "mv01-header-link",
+            "parameters": {
+                "path": "/header",
+                "headers": {"X-Secret": "super-secret\nvalue"},
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "the invalid header value is refused: {body}");
+    assert_eq!(body["code"], "ALREADY_EXISTS", "{body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(message.contains("X-Secret"), "the key is named: {message}");
+    assert!(
+        message.contains("parameters.headers"),
+        "the field is named: {message}"
+    );
+    assert!(
+        !message.contains("super-secret"),
+        "the header value is not echoed: {message}"
+    );
+    kernel.finish().await;
+}
+
+/// The action request timeout comes from `resource_opts.request_ttl`, not
+/// from the sink's 5 s default.
+#[tokio::test]
+async fn mv01_action_request_ttl_bounds_the_http_request() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = mv01_spawn_http_receiver_active(
+        Arc::clone(&listener),
+        1,
+        std::time::Duration::from_secs(3),
+    );
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-ttl-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-ttl-action",
+            "type": "webhook",
+            "connector": "mv01-ttl-link",
+            "parameters": {"path": "/ttl"},
+            "resource_opts": {
+                "batch_size": 1,
+                "batch_time": "0ms",
+                "request_ttl": "1s",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-ttl-rule",
+            "sql": "SELECT * FROM \"mv01/in/ttl\"",
+            "actions": ["mv01-ttl-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-ttl-pub").await;
+    let start = std::time::Instant::now();
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/ttl", 0, 0, false, br#"{"ttl":1}"#),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/actions/mv01-ttl-action/metrics",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "metrics: {body}");
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the request timed out from request_ttl, not the 5 s default: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(2500),
+        "the 1 s request TTL applies"
+    );
+    receiver.abort();
+    kernel.finish().await;
+}
+
+/// The pgsql transport applies `ssl.verify = verify_peer` and refuses
+/// `verify_none` instead of accepting a value it cannot apply.
+#[tokio::test]
+async fn mv01_pgsql_tls_verify_is_applied_or_refused() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "postgres",
+            "server": "127.0.0.1:9",
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "ssl": {"enable": true, "verify": "verify_none"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "pgsql",
+            "connector": "mv01-pg-tls",
+            "parameters": {"sql": "MV01-TLS INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "verify_none is refused: {body}");
+    assert_eq!(body["code"], "ALREADY_EXISTS", "{body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("ssl.verify") && message.contains("verify_none"),
+        "the refusal names the setting: {message}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-pg-tls",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "postgres",
+            "server": "127.0.0.1:9",
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "ssl": {"enable": true, "verify": "verify_peer"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "pgsql",
+            "connector": "mv01-pg-tls",
+            "parameters": {"sql": "MV01-TLS INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "verify_peer builds: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    kernel.finish().await;
+}
+
+/// A `file:` password reference resolves before the driver dials, and the
+/// fake server checks the real password.
+#[tokio::test]
+async fn mv01_pgsql_secret_password_reaches_driver() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(
+                stream,
+                Arc::clone(&fake_captured),
+                "u",
+                "pwd-from-file",
+                "db",
+                1,
+            )
+            .await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let secret = kernel.scratch.join("mv01-pg-password");
+    std::fs::write(&secret, "pwd-from-file").expect("secret file");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-secret",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": format!("file:{}", secret.display()),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-secret",
+            "type": "pgsql",
+            "connector": "mv01-pg-secret",
+            "parameters": {"sql": "MV01-SECRET INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-secret-rule",
+            "sql": "SELECT * FROM \"mv01/in/secret\"",
+            "actions": ["mv01-pg-secret"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-secret-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/secret", 0, 0, false, br#"{"secret":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A connector create must not rebuild an unrelated action from a stale
+/// snapshot. Action updates and connector creates run together; after the
+/// churn the sink that delivers matches the stored action.
+#[tokio::test]
+async fn mv01_connector_rebuild_does_not_overwrite_an_action_update() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let drain_listener = Arc::clone(&listener);
+    let drain = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = drain_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut byte = [0_u8; 1];
+                let _ = socket.read_exact(&mut byte).await;
+            });
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-churn-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let action_body = |path: &str| {
+        serde_json::json!({
+            "name": "mv01-churn-action",
+            "type": "webhook",
+            "connector": "mv01-churn-link",
+            "parameters": {"path": path},
+        })
+    };
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        action_body("/p0"),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-churn-rule",
+            "sql": "SELECT * FROM \"mv01/in/churn\"",
+            "actions": ["mv01-churn-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let updates = async {
+        for index in 1..30 {
+            let path = format!("/p{index}");
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::PUT,
+                "/api/v5/actions/mv01-churn-action",
+                action_body(&path),
+            )
+            .await;
+            assert_eq!(status, 200, "action update: {body}");
+        }
+    };
+    let creates = async {
+        for index in 0..15 {
+            let name = format!("mv01-churn-{index}");
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::POST,
+                "/api/v5/connectors",
+                serde_json::json!({
+                    "name": name,
+                    "type": "webhook",
+                    "url": format!("http://{address}"),
+                }),
+            )
+            .await;
+            assert_eq!(status, 201, "unrelated connector create: {body}");
+            let path = format!("/api/v5/connectors/{name}");
+            let (status, _) = mv00_api(
+                &kernel,
+                reqwest::Method::DELETE,
+                &path,
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, 204, "unrelated connector delete");
+        }
+    };
+    tokio::join!(updates, creates);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-churn-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "action read: {body}");
+    let stored_path = body["parameters"]["path"]
+        .as_str()
+        .expect("stored path")
+        .to_string();
+    drain.abort();
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mv01-churn-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/churn", 0, 0, false, br#"{"churn":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "one delivery");
+    assert_eq!(
+        received[0].0, stored_path,
+        "the delivering sink matches the stored action"
+    );
+    kernel.finish().await;
+}
+
+/// MV-02a is accepted: the six relational kinds are `ready`, so the
+/// probe no longer refuses them as pending. A bare probe carries no
+/// target, and a ready non-document kind reads 204.
+#[tokio::test]
+async fn mv02a_ready_kinds_probe_without_target_reads_no_content() {
+    let kinds = [
+        "mysql",
+        "alloydb",
+        "cockroachdb",
+        "mssql",
+        "oracle",
+        "redshift",
+    ];
+    for kind in kinds {
+        let kernel = spawn_kernel("").await;
+        let (status, _) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors_probe",
+            serde_json::json!({ "type": kind }),
+        )
+        .await;
+        assert_eq!(status, 204, "{kind} bare probe reads 204, got {status}");
+        kernel.finish().await;
+    }
+}
+
+/// A ready kind dials its target: a dead target fails the probe with
+/// 400 TEST_FAILED. A pending kind would fail with the refusal text
+/// instead of a dial error.
+#[tokio::test]
+async fn mv02a_ready_kinds_probe_dead_target_fails() {
+    let kinds = [
+        "mysql",
+        "alloydb",
+        "cockroachdb",
+        "mssql",
+        "oracle",
+        "redshift",
+    ];
+    for kind in kinds {
+        let kernel = spawn_kernel("").await;
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors_probe",
+            serde_json::json!({ "type": kind, "server": "127.0.0.1:9" }),
+        )
+        .await;
+        assert_eq!(status, 400, "{kind} dead-target probe: {body}");
+        assert_eq!(body["code"], "TEST_FAILED", "{kind} probe code: {body}");
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not available in this broker"),
+            "{kind} probe dialled instead of refusing: {body}"
+        );
+        kernel.finish().await;
+    }
+}
+
+/// MV-02a is accepted: the six relational kinds are `ready`, so a
+/// complete connector create stores (201) and reads back. The sink
+/// registers lazily, so a dead server still stores.
+#[tokio::test]
+async fn mv02a_ready_kinds_create_stores() {
+    let kinds = [
+        ("mysql", "mysql"),
+        ("alloydb", "alloydb"),
+        ("cockroachdb", "cockroachdb"),
+        ("mssql", "sqlserver"),
+        ("oracle", "oracle"),
+        ("redshift", "redshift"),
+    ];
+    for (kind, connector_type) in kinds {
+        let kernel = spawn_kernel("").await;
+        let name = format!("mv02a-up-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            serde_json::json!({
+                "name": name,
+                "type": connector_type,
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} connector create: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/connectors/{name}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} connector read: {body}");
+        assert_eq!(
+            body["type"],
+            serde_json::json!(connector_type),
+            "{kind} type round-trips: {body}"
+        );
+        kernel.finish().await;
+    }
+}
+
+/// MV-02a is accepted: the six relational kinds are `ready`, so an
+/// action on a stored connector stages its owned sink and stores
+/// (201). Each statement uses the placeholders of its driver.
+#[tokio::test]
+async fn mv02a_ready_kinds_action_create_stores() {
+    let kinds = [
+        (
+            "mysql",
+            "mysql",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)",
+        ),
+        (
+            "alloydb",
+            "alloydb",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+        (
+            "cockroachdb",
+            "cockroachdb",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+        (
+            "mssql",
+            "mssql",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($2, $4, $5)",
+        ),
+        (
+            "oracle",
+            "oracle",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "username": "u",
+                "service_name": "XE",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)",
+        ),
+        (
+            "redshift",
+            "redshift",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+    ];
+    for (kind, action_type, fields, sql) in kinds {
+        let kernel = spawn_kernel("").await;
+        let connector = format!("mv02a-up-{kind}");
+        let mut connector_body = serde_json::json!({
+            "name": connector,
+            "type": action_type,
+        });
+        for (field, value) in fields.as_object().expect("connector fields") {
+            connector_body[field] = value.clone();
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            connector_body,
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} connector create: {body}");
+        let name = format!("mv02a-act-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": name,
+                "type": action_type,
+                "connector": connector,
+                "parameters": {"sql": sql},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} action create: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{name}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} action read: {body}");
+        assert_eq!(
+            body["type"],
+            serde_json::json!(action_type),
+            "{kind} type round-trips: {body}"
+        );
+        kernel.finish().await;
+    }
+}
+
+/// MV-02a is accepted: the kinds are `ready`, so option validation
+/// runs in the action builder. Each combination below reaches the
+/// builder and fails with the field named. The connector create
+/// stores (201); the action create answers 400 and stores nothing.
+#[tokio::test]
+async fn mv02a_ready_kinds_action_builders_refuse_bad_options() {
+    let cases = [
+        (
+            "redshift",
+            "redshift",
+            serde_json::json!({
+                "server": "127.0.0.1:5439",
+                "database": "db",
+                "username": "u",
+                "disable_prepared_statements": true,
+            }),
+            "INSERT INTO t VALUES ($1, $2, $3)",
+            "disable_prepared_statements",
+        ),
+        (
+            "cockroachdb",
+            "cockroachdb",
+            serde_json::json!({
+                "server": "127.0.0.1:26257",
+                "database": "db",
+                "username": "u",
+                "application_name": "app",
+            }),
+            "INSERT INTO t VALUES ($1, $2, $3)",
+            "application_name",
+        ),
+        (
+            "mysql",
+            "mysql",
+            serde_json::json!({
+                "server": "127.0.0.1:3306",
+                "database": "db",
+                "ssl": { "enable": true },
+            }),
+            "INSERT INTO t VALUES (?, ?, ?)",
+            "ssl.enable",
+        ),
+        (
+            "oracle",
+            "oracle",
+            serde_json::json!({
+                "server": "127.0.0.1:1521",
+                "username": "u",
+            }),
+            "INSERT INTO t VALUES (:1)",
+            "service_name",
+        ),
+        (
+            "mssql",
+            "mssql",
+            serde_json::json!({
+                "server": "127.0.0.1:1433",
+                "database": "db",
+                "driver": "FreeTDS",
+            }),
+            "INSERT INTO t VALUES ($2)",
+            "driver",
+        ),
+    ];
+    for (kind, action_type, fields, sql, field) in cases {
+        let kernel = spawn_kernel("").await;
+        let connector = format!("mv02a-opt-conn-{kind}");
+        let mut connector_body = serde_json::json!({
+            "name": connector,
+            "type": action_type,
+        });
+        for (key, value) in fields.as_object().expect("connector fields") {
+            connector_body[key] = value.clone();
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            connector_body,
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} connector create: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": format!("mv02a-opt-act-{kind}"),
+                "type": action_type,
+                "connector": connector,
+                "parameters": {"sql": sql},
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{kind} bad option refused: {body}");
+        assert_eq!(
+            body["code"], "ALREADY_EXISTS",
+            "{kind} refusal code: {body}"
+        );
+        assert!(
+            body["message"].as_str().unwrap_or("").contains(field),
+            "{kind} refusal names {field}: {body}"
+        );
+        kernel.finish().await;
+    }
+}
+
+/// MV-02a N1: the pg-family kinds deliver the engine row through the broker.
+/// Each action fires on its own publish. The fake backend captures the
+/// statement and the bound row. A quote in the payload stays bound.
+#[tokio::test]
+async fn mv02a_pg_family_delivers_bound_rows_through_broker() {
+    let kinds = [
+        ("alloydb", "alloydb"),
+        ("cockroachdb", "cockroachdb"),
+        ("redshift", "redshift"),
+    ];
+    for (kind, action_type) in kinds {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pg fake binds");
+        let address = listener.local_addr().expect("pg fake address");
+        let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+        let fake = {
+            let captured = Arc::clone(&captured);
+            tokio::spawn(async move {
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 1).await;
+            })
+        };
+        let kernel = spawn_kernel("").await;
+        let connector = format!("mv02a-pg-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            serde_json::json!({
+                "name": connector,
+                "type": action_type,
+                "server": format!("127.0.0.1:{}", address.port()),
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} connector create: {body}");
+        let action = format!("mv02a-pg-act-{kind}");
+        let sentinel = format!("MV02A-{kind}-SQL");
+        let sql = format!("{sentinel} INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": action,
+                "type": action_type,
+                "connector": connector,
+                "parameters": {"sql": sql},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} action create: {body}");
+        let rule = format!("mv02a-pg-rule-{kind}");
+        let topic = format!("mv02a/in/pg-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": rule,
+                "sql": format!("SELECT * FROM \"{topic}\""),
+                "actions": [action.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} rule create: {body}");
+        let mut publisher = mv00_connect(&kernel, &format!("mv02a-pg-pub-{kind}")).await;
+        let payload = br#"{"v":"a\"b"}"#;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&topic, 0, 0, false, payload),
+        )
+        .await;
+        drop(publisher);
+        let deadline = std::time::Instant::now() + STEP;
+        loop {
+            let done = captured.lock().expect("capture lock").len() == 1;
+            assert!(
+                std::time::Instant::now() < deadline || done,
+                "{kind} pg fake got one batch"
+            );
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        fake.await.expect("pg fake task");
+        let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+            .expect("capture lock");
+        assert_eq!(captured.len(), 1, "{kind} one batch");
+        let (statement, rows) = &captured[0];
+        assert!(
+            statement.contains(&sentinel),
+            "{kind} statement carries sentinel: {statement}"
+        );
+        assert!(
+            statement.contains("$1") && statement.contains("$3"),
+            "{kind} markers stay: {statement}"
+        );
+        assert_eq!(rows.len(), 1, "{kind} one row");
+        assert_eq!(rows[0].len(), 3, "{kind} topic, qos, payload");
+        assert_eq!(rows[0][0], topic.as_bytes(), "{kind} topic bound");
+        assert_eq!(rows[0][1], b"0", "{kind} qos bound");
+        assert_eq!(rows[0][2], payload, "{kind} quote stays bound");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{action}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} metrics: {body}");
+        assert_eq!(
+            body["metrics"]["success"],
+            serde_json::json!(1),
+            "{kind} success: {body}"
+        );
+        assert_eq!(
+            body["metrics"]["failed"],
+            serde_json::json!(0),
+            "{kind} failed: {body}"
+        );
+        kernel.finish().await;
+    }
+}
+
+/// Reads one MySQL packet (seq plus body) from the fake server stream.
+/// Returns `None` for a reachability probe that connects and closes
+/// without a byte, so the fake skips it and serves the driver.
+async fn mv02a_mysql_read_packet(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0_u8; 4];
+    if stream.read_exact(&mut header).await.is_err() {
+        return None;
+    }
+    let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+    let mut body = vec![0_u8; 1 + len];
+    body[0] = header[3];
+    if stream.read_exact(&mut body[1..]).await.is_err() {
+        return None;
+    }
+    Some(body)
+}
+
+/// Writes one MySQL packet with the given seq to the fake server stream.
+/// Returns false when the peer closed, so the caller skips it.
+async fn mv02a_mysql_write_packet(
+    stream: &mut tokio::net::TcpStream,
+    seq: u8,
+    body: &[u8],
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let len = body.len() as u32;
+    let mut frame = vec![
+        (len & 0xFF) as u8,
+        ((len >> 8) & 0xFF) as u8,
+        ((len >> 16) & 0xFF) as u8,
+        seq,
+    ];
+    frame.extend_from_slice(body);
+    stream.write_all(&frame).await.is_ok()
+}
+
+/// Decodes one length-encoded integer from the fake server cursor.
+fn mv02a_mysql_decode_lenenc(cursor: &[u8]) -> (usize, &[u8]) {
+    match cursor[0] {
+        0xFC => (
+            u16::from_le_bytes([cursor[1], cursor[2]]) as usize,
+            &cursor[3..],
+        ),
+        0xFD => (
+            u32::from_le_bytes([cursor[1], cursor[2], cursor[3], 0]) as usize,
+            &cursor[4..],
+        ),
+        0xFE => (
+            u64::from_le_bytes([
+                cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6], cursor[7],
+                cursor[8],
+            ]) as usize,
+            &cursor[9..],
+        ),
+        byte => (byte as usize, &cursor[1..]),
+    }
+}
+
+/// Writes one MySQL column definition with catalog `def`.
+/// It matches the real wire the driver parses.
+async fn mv02a_mysql_write_column_def(stream: &mut tokio::net::TcpStream, seq: u8, name: &[u8]) {
+    let mut def = vec![0x03, b'd', b'e', b'f'];
+    def.push(0);
+    def.push(0);
+    def.push(0);
+    def.push(name.len() as u8);
+    def.extend_from_slice(name);
+    def.push(0);
+    def.push(0x0C);
+    def.extend_from_slice(&33_u16.to_le_bytes());
+    def.extend_from_slice(&1024_u32.to_le_bytes());
+    def.push(0xFD);
+    def.extend_from_slice(&0_u16.to_le_bytes());
+    def.push(0);
+    def.extend_from_slice(&[0, 0]);
+    mv02a_mysql_write_packet(stream, seq, &def).await;
+}
+
+/// Answers one driver settings probe (`COM_QUERY`, for example
+/// `SELECT @@socket`). Each selected column gets one NULL value.
+/// The driver only reads the values by position.
+async fn mv02a_mysql_answer_settings_query(stream: &mut tokio::net::TcpStream, sql: &[u8]) {
+    let columns = sql.iter().filter(|&&b| b == b',').count() + 1;
+    let columns = columns.min(8) as u8;
+    mv02a_mysql_write_packet(stream, 1, &[columns]).await;
+    for index in 0..columns {
+        mv02a_mysql_write_column_def(stream, 2 + index, b"").await;
+    }
+    mv02a_mysql_write_packet(stream, 2 + columns, &[0xFE, 0, 0, 2, 0]).await;
+    mv02a_mysql_write_packet(stream, 3 + columns, &vec![0xFB; columns as usize]).await;
+    mv02a_mysql_write_packet(stream, 4 + columns, &[0xFE, 0, 0, 2, 0]).await;
+}
+
+/// One fake MySQL backend: greeting, accept-any handshake, driver
+/// settings probe, one prepare capture, one execute capture. It
+/// proves delivery, not auth.
+async fn mv02a_mysql_serve_one(
+    mut stream: tokio::net::TcpStream,
+    captured_sql: Arc<Mutex<String>>,
+    captured_rows: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
+) {
+    let seed_part1 = b"12345678";
+    let seed_part2 = b"ABCDEFGHJKLM";
+    let mut greeting = vec![10_u8];
+    greeting.extend_from_slice(b"8.0.36-test\0");
+    greeting.extend_from_slice(&42_u32.to_le_bytes());
+    greeting.extend_from_slice(seed_part1);
+    greeting.push(0);
+    // No SSL bit: the fake speaks plaintext only, so it clears
+    // CLIENT_SSL (0x0800) from the low caps. It advertises
+    // CLIENT_PROTOCOL_41 and CLIENT_SECURE_CONNECTION, and
+    // CLIENT_PLUGIN_AUTH in the high caps for mysql_native_password.
+    greeting.extend_from_slice(&0xF7FF_u16.to_le_bytes());
+    greeting.push(33);
+    greeting.extend_from_slice(&0x0002_u16.to_le_bytes());
+    greeting.extend_from_slice(&0x0008_u16.to_le_bytes());
+    greeting.push(21);
+    greeting.extend_from_slice(&[0_u8; 10]);
+    greeting.extend_from_slice(seed_part2);
+    greeting.push(0);
+    greeting.extend_from_slice(b"mysql_native_password\0");
+    if !mv02a_mysql_write_packet(&mut stream, 0, &greeting).await {
+        return;
+    }
+    let Some(_handshake) = mv02a_mysql_read_packet(&mut stream).await else {
+        return;
+    };
+    if !mv02a_mysql_write_packet(&mut stream, 2, &[0x00, 0, 0, 0, 0, 0, 0]).await {
+        return;
+    }
+    let request = loop {
+        let Some(request) = mv02a_mysql_read_packet(&mut stream).await else {
+            return;
+        };
+        if request[1] == 0x03 {
+            mv02a_mysql_answer_settings_query(&mut stream, &request[2..]).await;
+            continue;
+        }
+        break request;
+    };
+    assert_eq!(request[1], 0x16, "prepare parses the action statement");
+    captured_sql
+        .lock()
+        .expect("sql lock")
+        .push_str(std::str::from_utf8(&request[2..]).expect("sql"));
+    let mut prepare_ok = vec![0x00];
+    prepare_ok.extend_from_slice(&7_u32.to_le_bytes());
+    prepare_ok.extend_from_slice(&0_u16.to_le_bytes());
+    prepare_ok.extend_from_slice(&3_u16.to_le_bytes());
+    prepare_ok.extend_from_slice(&0_u16.to_le_bytes());
+    prepare_ok.extend_from_slice(&[0_u8; 3]);
+    mv02a_mysql_write_packet(&mut stream, 1, &prepare_ok).await;
+    for seq in [2_u8, 3, 4] {
+        mv02a_mysql_write_column_def(&mut stream, seq, b"").await;
+    }
+    mv02a_mysql_write_packet(&mut stream, 5, &[0xFE, 0, 0, 0, 0]).await;
+    let Some(request) = mv02a_mysql_read_packet(&mut stream).await else {
+        return;
+    };
+    assert_eq!(request[1], 0x17, "execute binds one engine row");
+    let stmt_id = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+    assert_eq!(stmt_id, 7, "execute uses the prepared statement");
+    let mut cursor = &request[6 + 1 + 4 + 1 + 1..];
+    cursor = &cursor[6..];
+    let mut row = Vec::new();
+    for _ in 0..3 {
+        let (len, rest) = mv02a_mysql_decode_lenenc(cursor);
+        row.push(rest[..len].to_vec());
+        cursor = &rest[len..];
+    }
+    captured_rows.lock().expect("rows lock").push(row);
+    mv02a_mysql_write_packet(&mut stream, 1, &[0x00, 1, 0, 0, 0, 0, 0]).await;
+}
+
+/// MV-02a N1: MySQL delivers the engine row through the broker. The fake
+/// backend captures the statement and the bound row. A quote stays bound.
+#[tokio::test]
+async fn mv02a_mysql_delivers_bound_rows_through_broker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mysql fake binds");
+    let address = listener.local_addr().expect("mysql fake address");
+    let captured_sql = Arc::new(Mutex::new(String::new()));
+    let captured_rows: Arc<Mutex<Vec<Vec<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let fake = {
+        let captured_sql = Arc::clone(&captured_sql);
+        let captured_rows = Arc::clone(&captured_rows);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("mysql backend accepted");
+                mv02a_mysql_serve_one(
+                    stream,
+                    Arc::clone(&captured_sql),
+                    Arc::clone(&captured_rows),
+                )
+                .await;
+                let done = !captured_sql.lock().expect("sql lock").is_empty()
+                    && !captured_rows.lock().expect("rows lock").is_empty();
+                if done {
+                    break;
+                }
+            }
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv02a-my",
+            "type": "mysql",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let sentinel = "MV02A-MYSQL-SQL";
+    let sql = format!("{sentinel} INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv02a-my-act",
+            "type": "mysql",
+            "connector": "mv02a-my",
+            "parameters": {"sql": sql},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let topic = "mv02a/in/mysql";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv02a-my-rule",
+            "sql": format!("SELECT * FROM \"{topic}\""),
+            "actions": ["mv02a-my-act"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv02a-my-pub").await;
+    let payload = br#"{"v":"a\"b"}"#;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(topic, 0, 0, false, payload),
+    )
+    .await;
+    drop(publisher);
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let done = captured_rows.lock().expect("rows lock").len() == 1;
+        assert!(
+            std::time::Instant::now() < deadline || done,
+            "mysql fake got one row"
+        );
+        if done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    fake.await.expect("mysql fake task");
+    let statement = captured_sql.lock().expect("sql lock").clone();
+    assert!(
+        statement.contains(sentinel),
+        "statement carries sentinel: {statement}"
+    );
+    assert!(statement.contains("?, ?, ?"), "markers stay: {statement}");
+    let rows = captured_rows.lock().expect("rows lock").clone();
+    assert_eq!(rows.len(), 1, "one row");
+    assert_eq!(rows[0].len(), 3, "topic, qos, payload");
+    assert_eq!(rows[0][0], topic.as_bytes(), "topic bound");
+    assert_eq!(rows[0][1], b"0", "qos bound");
+    assert_eq!(rows[0][2], payload, "quote stays bound");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv02a-my-act/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "metrics: {body}");
+    assert_eq!(
+        body["metrics"]["success"],
+        serde_json::json!(1),
+        "success: {body}"
+    );
+    assert_eq!(
+        body["metrics"]["failed"],
+        serde_json::json!(0),
+        "failed: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// Encodes text as UCS-2 (UTF-16LE) for the MSSQL fake assertions.
+fn mv02a_ucs2(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// Reads one TDS packet body from the fake MSSQL server stream.
+async fn mv02a_mssql_read_packet(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0_u8; 8];
+    stream.read_exact(&mut header).await.expect("tds head");
+    let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let mut body = vec![0_u8; length - 8];
+    stream.read_exact(&mut body).await.expect("tds body");
+    body
+}
+
+/// Writes one TDS reply packet from the fake MSSQL server stream.
+async fn mv02a_mssql_write_reply(stream: &mut tokio::net::TcpStream, payload: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let mut packet = vec![0x04_u8, 0x01];
+    packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    packet.extend_from_slice(payload);
+    stream.write_all(&packet).await.expect("tds reply");
+}
+
+/// One fake MSSQL backend: prelogin, login, one RPC capture. It proves
+/// delivery, not auth. The RPC bytes carry the bound values.
+async fn mv02a_mssql_serve_one(mut stream: tokio::net::TcpStream, captured: Arc<Mutex<Vec<u8>>>) {
+    use tokio::io::AsyncWriteExt;
+    let request = mv02a_mssql_read_packet(&mut stream).await;
+    assert!(!request.is_empty(), "prelogin arrives");
+    // Full prelogin reply: VERSION, ENCRYPTION (NOT_SUP, plaintext
+    // only), INSTOPT (empty default instance), THREADID and MARS,
+    // so a maintained driver accepts it. The delivery and auth
+    // checks below are unchanged.
+    let mut reply = Vec::new();
+    let mut offset: u16 = 5 * 5 + 1;
+    for (id, data_len) in [
+        (0x00_u8, 6_usize),
+        (0x01, 1),
+        (0x02, 1),
+        (0x03, 4),
+        (0x04, 1),
+    ] {
+        reply.push(id);
+        reply.extend_from_slice(&offset.to_be_bytes());
+        reply.extend_from_slice(&(data_len as u16).to_be_bytes());
+        offset += data_len as u16;
+    }
+    reply.push(0xFF);
+    reply.extend_from_slice(&[0x0F, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    reply.push(0x02);
+    reply.push(0x00);
+    reply.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    reply.push(0x00);
+    mv02a_mssql_write_reply(&mut stream, &reply).await;
+    let login = mv02a_mssql_read_packet(&mut stream).await;
+    assert!(login.len() > 64, "login arrives");
+    let needle = mv02a_ucs2("sa");
+    assert!(
+        login.windows(needle.len()).any(|w| w == needle.as_slice()),
+        "login carries the user"
+    );
+    let mut loginack = vec![0xAD_u8];
+    // Wire-valid LOGINACK the driver parses: interface, TDS
+    // version, program name, server version.
+    let mut login_body = vec![0x01_u8];
+    login_body.extend_from_slice(&0x74000004_u32.to_be_bytes());
+    login_body.push(0x05);
+    for unit in "mssql".encode_utf16() {
+        login_body.extend_from_slice(&unit.to_le_bytes());
+    }
+    login_body.extend_from_slice(&0_u32.to_le_bytes());
+    loginack.extend_from_slice(&(login_body.len() as u16).to_le_bytes());
+    loginack.extend_from_slice(&login_body);
+    let mut done = vec![0xFD_u8];
+    done.extend_from_slice(&0_u16.to_le_bytes());
+    done.extend_from_slice(&0_u16.to_le_bytes());
+    done.extend_from_slice(&0_u64.to_le_bytes());
+    let mut payload = loginack;
+    payload.extend_from_slice(&done);
+    mv02a_mssql_write_reply(&mut stream, &payload).await;
+    let batch = mv02a_mssql_read_packet(&mut stream).await;
+    assert!(batch.len() > 16, "rpc arrives");
+    *captured.lock().expect("capture lock") = batch;
+    let mut done = vec![0xFD_u8];
+    done.extend_from_slice(&0_u16.to_le_bytes());
+    done.extend_from_slice(&0_u16.to_le_bytes());
+    done.extend_from_slice(&1_u64.to_le_bytes());
+    mv02a_mssql_write_reply(&mut stream, &done).await;
+    let _ = stream.shutdown().await;
+}
+
+/// MV-02a N1: MSSQL delivers the engine row through the broker. The fake
+/// backend captures the RPC. Topic and payload ride as bound params.
+#[tokio::test]
+async fn mv02a_mssql_delivers_bound_rows_through_broker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mssql fake binds");
+    let address = listener.local_addr().expect("mssql fake address");
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let stream = mv01_pg_accept(&listener).await;
+            mv02a_mssql_serve_one(stream, Arc::clone(&captured)).await;
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv02a-ms",
+            "type": "mssql",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "sa",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let sentinel = "MV02A-MSSQL-SQL";
+    let sql = format!("{sentinel} INSERT INTO t(topic, qos, payload) VALUES ($2, $4, $5)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv02a-ms-act",
+            "type": "mssql",
+            "connector": "mv02a-ms",
+            "parameters": {"sql": sql},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let topic = "mv02a/in/mssql";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv02a-ms-rule",
+            "sql": format!("SELECT * FROM \"{topic}\""),
+            "actions": ["mv02a-ms-act"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv02a-ms-pub").await;
+    let payload = br#"{"v":"a\"b"}"#;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(topic, 0, 0, false, payload),
+    )
+    .await;
+    drop(publisher);
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let done = !captured.lock().expect("capture lock").is_empty();
+        assert!(
+            std::time::Instant::now() < deadline || done,
+            "mssql fake got one rpc"
+        );
+        if done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    fake.await.expect("mssql fake task");
+    let batch = captured.lock().expect("capture lock").clone();
+    let topic_ucs2 = mv02a_ucs2(topic);
+    assert!(
+        batch
+            .windows(topic_ucs2.len())
+            .any(|w| w == topic_ucs2.as_slice()),
+        "rpc carries the topic bound"
+    );
+    let payload_text = String::from_utf8_lossy(payload).into_owned();
+    let payload_ucs2 = mv02a_ucs2(&payload_text);
+    assert!(
+        batch
+            .windows(payload_ucs2.len())
+            .any(|w| w == payload_ucs2.as_slice()),
+        "rpc carries the payload with the quote bound"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv02a-ms-act/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "metrics: {body}");
+    assert_eq!(
+        body["metrics"]["success"],
+        serde_json::json!(1),
+        "success: {body}"
+    );
+    assert_eq!(
+        body["metrics"]["failed"],
+        serde_json::json!(0),
+        "failed: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// MV-02a N2: an Oracle action against a dead server counts one failed
+/// forward. The broker keeps serving. The payload carries a quote.
+#[tokio::test]
+async fn mv02a_oracle_down_server_counts_failure_and_keeps_state() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv02a-ora-down",
+            "type": "oracle",
+            "server": "127.0.0.1:1",
+            "username": "u",
+            "password": "pwd",
+            "service_name": "XE",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let sql = "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv02a-ora-down-act",
+            "type": "oracle",
+            "connector": "mv02a-ora-down",
+            "parameters": {"sql": sql},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv02a-ora-down-act",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "action read: {body}");
+    assert_eq!(body["parameters"]["sql"], serde_json::json!(sql), "{body}");
+    let topic = "mv02a/in/ora-down";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv02a-ora-down-rule",
+            "sql": format!("SELECT * FROM \"{topic}\""),
+            "actions": ["mv02a-ora-down-act"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv02a-ora-down-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(topic, 0, 0, false, br#"{"v":"a\"b"}"#),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let (_, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/actions/mv02a-ora-down-act/metrics",
+            serde_json::Value::Null,
+        )
+        .await;
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dead-target fire failed in time: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv02a-ora-down-act/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "metrics: {body}");
+    assert_eq!(
+        body["metrics"]["success"],
+        serde_json::json!(0),
+        "success stays zero: {body}"
+    );
+    assert_eq!(
+        body["metrics"]["failed"],
+        serde_json::json!(1),
+        "one fire counts one failed: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// MV-02a N2: every relational kind counts a dead-server fire as failed.
+/// The broker keeps serving. This proves the Limits claim per kind.
+#[tokio::test]
+async fn mv02a_relational_dead_server_counts_failed_for_all_kinds() {
+    let kinds: &[(&str, &str, serde_json::Value, &str)] = &[
+        (
+            "mysql",
+            "mysql",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)",
+        ),
+        (
+            "alloydb",
+            "alloydb",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+        (
+            "cockroachdb",
+            "cockroachdb",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+        (
+            "mssql",
+            "mssql",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($2, $4, $5)",
+        ),
+        (
+            "oracle",
+            "oracle",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "username": "u",
+                "service_name": "XE",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)",
+        ),
+        (
+            "redshift",
+            "redshift",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+    ];
+    for (kind, action_type, fields, sql) in kinds {
+        let kernel = spawn_kernel("").await;
+        let connector = format!("mv02a-dead-{kind}");
+        let mut connector_body = serde_json::json!({
+            "name": connector,
+            "type": *action_type,
+        });
+        for (key, value) in fields.as_object().expect("connector fields") {
+            connector_body[key] = value.clone();
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            connector_body,
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} connector create: {body}");
+        let action = format!("mv02a-dead-act-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": action,
+                "type": *action_type,
+                "connector": connector,
+                "parameters": {"sql": *sql},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} action create: {body}");
+        let topic = format!("mv02a/in/dead-{kind}");
+        let rule = format!("mv02a-dead-rule-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": rule,
+                "sql": format!("SELECT * FROM \"{topic}\""),
+                "actions": [action.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} rule create: {body}");
+        let mut publisher = mv00_connect(&kernel, &format!("mv02a-dead-pub-{kind}")).await;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&topic, 0, 0, false, br#"{"v":"a\"b"}"#),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + STEP;
+        loop {
+            let (_, body) = mv00_api(
+                &kernel,
+                reqwest::Method::GET,
+                &format!("/api/v5/actions/{action}/metrics"),
+                serde_json::Value::Null,
+            )
+            .await;
+            if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{kind} dead-target fire failed in time: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{action}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} metrics: {body}");
+        assert_eq!(
+            body["metrics"]["failed"],
+            serde_json::json!(1),
+            "{kind} one fire counts one failed: {body}"
+        );
+        kernel.finish().await;
+    }
+}
+
+/// MV-02a N3: an accepted action update swaps the statement, a refused
+/// update keeps the old delivery, and a restart keeps the state. This
+/// runs for all six kinds against a dead server through the broker.
+#[tokio::test]
+async fn mv02a_relational_update_and_restart_for_all_kinds() {
+    let kinds: &[(&str, &str, serde_json::Value, &str, &str)] = &[
+        (
+            "mysql",
+            "mysql",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)",
+            "INSERT INTO t2(topic, qos, payload) VALUES (?, ?, ?)",
+        ),
+        (
+            "alloydb",
+            "alloydb",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+            "INSERT INTO t2(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+        (
+            "cockroachdb",
+            "cockroachdb",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+                "password": "pwd",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+            "INSERT INTO t2(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+        (
+            "mssql",
+            "mssql",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($2, $4, $5)",
+            "INSERT INTO t2(topic, qos, payload) VALUES ($2, $4, $5)",
+        ),
+        (
+            "oracle",
+            "oracle",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "username": "u",
+                "service_name": "XE",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)",
+            "INSERT INTO t2(topic, qos, payload) VALUES (:1, :2, :3)",
+        ),
+        (
+            "redshift",
+            "redshift",
+            serde_json::json!({
+                "server": "127.0.0.1:1",
+                "database": "db",
+                "username": "u",
+            }),
+            "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+            "INSERT INTO t2(topic, qos, payload) VALUES ($1, $2, $3)",
+        ),
+    ];
+    for (kind, action_type, fields, sql_v1, sql_v2) in kinds {
+        let mut kernel = spawn_kernel("").await;
+        let connector = format!("mv02a-upd-{kind}");
+        let mut connector_body = serde_json::json!({
+            "name": connector,
+            "type": *action_type,
+        });
+        for (key, value) in fields.as_object().expect("connector fields") {
+            connector_body[key] = value.clone();
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            connector_body,
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} connector create: {body}");
+        let action = format!("mv02a-upd-act-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": action,
+                "type": *action_type,
+                "connector": connector,
+                "parameters": {"sql": *sql_v1},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} action create: {body}");
+        let topic = format!("mv02a/in/upd-{kind}");
+        let rule = format!("mv02a-upd-rule-{kind}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": rule,
+                "sql": format!("SELECT * FROM \"{topic}\""),
+                "actions": [action.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{kind} rule create: {body}");
+        let mut publisher = mv00_connect(&kernel, &format!("mv02a-upd-pub-{kind}")).await;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&topic, 0, 0, false, br#"{"u":1}"#),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + STEP;
+        loop {
+            let (_, body) = mv00_api(
+                &kernel,
+                reqwest::Method::GET,
+                &format!("/api/v5/actions/{action}/metrics"),
+                serde_json::Value::Null,
+            )
+            .await;
+            if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{kind} first fire failed in time: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::PUT,
+            &format!("/api/v5/actions/{action}"),
+            serde_json::json!({
+                "name": action,
+                "type": *action_type,
+                "connector": connector,
+                "parameters": {"sql": *sql_v2},
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} accepted update: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{action}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} action read: {body}");
+        assert_eq!(
+            body["parameters"]["sql"],
+            serde_json::json!(*sql_v2),
+            "{body}"
+        );
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&topic, 0, 0, false, br#"{"u":2}"#),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + STEP;
+        loop {
+            let (_, body) = mv00_api(
+                &kernel,
+                reqwest::Method::GET,
+                &format!("/api/v5/actions/{action}/metrics"),
+                serde_json::Value::Null,
+            )
+            .await;
+            if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{kind} updated fire failed in time: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::PUT,
+            &format!("/api/v5/actions/{action}"),
+            serde_json::json!({
+                "name": action,
+                "type": *action_type,
+                "connector": connector,
+                "parameters": {},
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{kind} missing sql refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains(&action)
+                && body["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("parameters.sql"),
+            "{kind} refusal names the action and the field: {body}"
+        );
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&topic, 0, 0, false, br#"{"u":3}"#),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + STEP;
+        loop {
+            let (_, body) = mv00_api(
+                &kernel,
+                reqwest::Method::GET,
+                &format!("/api/v5/actions/{action}/metrics"),
+                serde_json::Value::Null,
+            )
+            .await;
+            if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{kind} refused-update fire kept delivery: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        mv00_restart(&mut kernel).await;
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/{action}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{kind} action survives restart: {body}");
+        assert_eq!(
+            body["parameters"]["sql"],
+            serde_json::json!(*sql_v2),
+            "{body}"
+        );
+        let mut publisher = mv00_connect(&kernel, &format!("mv02a-upd-pub2-{kind}")).await;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&topic, 0, 0, false, br#"{"u":4}"#),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + STEP;
+        loop {
+            let (_, body) = mv00_api(
+                &kernel,
+                reqwest::Method::GET,
+                &format!("/api/v5/actions/{action}/metrics"),
+                serde_json::Value::Null,
+            )
+            .await;
+            if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{kind} post-restart fire failed in time: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        kernel.finish().await;
+    }
+}
+/// CASE WHEN/THEN/ELSE evaluates per-message through MQTT ingress.
+#[tokio::test]
+async fn mv00_case_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "case";
+    let sql =
+        "SELECT CASE WHEN temperature > 40 THEN 'hot' ELSE 'ok' END AS state FROM \"mv00/in/case\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "CASE create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-case-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-case-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"temperature": 72.5}"#,
+        &[r#"{"state":"hot"}"#],
+    )
+    .await;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"temperature": 20.0}"#,
+        &[r#"{"state":"ok"}"#],
+    )
+    .await;
+
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": "mv00/in/case", "payload": r#"{"temperature": 72.5}"#},
+    })).await;
+    assert_eq!(status, 200, "CASE HTTP: {body}");
+    assert_eq!(body["projected"].to_string(), r#"{"state":"hot"}"#);
+
+    kernel.finish().await;
+}
+
+/// Nested expressions (parenthesised arithmetic) evaluate per-message through MQTT.
+#[tokio::test]
+async fn mv00_nested_expressions_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "nested";
+    let sql = "SELECT (a + b) * 2 AS x, abs(a - b) AS d FROM \"mv00/in/nested\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "nested create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-nested-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-nested-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"a":3,"b":5}"#,
+        &[r#"{"x":16,"d":2}"#],
+    )
+    .await;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"a":10,"b":3}"#,
+        &[r#"{"x":26,"d":7}"#],
+    )
+    .await;
+
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": "mv00/in/nested", "payload": r#"{"a":3,"b":5}"#},
+    })).await;
+    assert_eq!(status, 200, "nested HTTP: {body}");
+    assert_eq!(body["projected"].to_string(), r#"{"x":16,"d":2}"#);
+
+    kernel.finish().await;
+}
+
+/// `$events/client_connected` is accepted as a rule source and evaluates via rule_test.
+#[tokio::test]
+async fn mv00_events_client_connected_rule_test() {
+    let kernel = spawn_kernel("").await;
+    let sql = "SELECT clientid, username FROM \"$events/client_connected\"";
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "client_connected", "topic": "$events/client_connected", "payload": r#"{"clientid":"c1","username":"u1"}"#},
+    })).await;
+    assert_eq!(status, 200, "$events rule_test: {body}");
+    assert_eq!(
+        body["projected"].to_string(),
+        r#"{"clientid":"c1","username":"u1"}"#
+    );
+    kernel.finish().await;
+}
+
+/// FOREACH survives a rule replace (same shape) and a kernel restart.
+#[tokio::test]
+async fn mv00_foreach_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "foreach-update";
+    let sql_v1 = "FOREACH payload.items DO item.b AS z, item.a FROM \"mv00/in/foreach-update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "FOREACH v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-foreach-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-foreach-upd-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"items":[{"b":2,"a":1},{"b":4,"a":3}]}"#,
+        &[r#"{"z":2,"a":1}"#, r#"{"z":4,"a":3}"#],
+    )
+    .await;
+
+    // Replace with same-shape FOREACH (alias change only): accepted, output keeps flowing.
+    let sql_v2 =
+        "FOREACH payload.items DO item.b AS x, item.a AS y FROM \"mv00/in/foreach-update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/foreach-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "FOREACH replace: {body}");
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"items":[{"b":8,"a":5}]}"#,
+        &[r#"{"x":8,"y":5}"#],
+    )
+    .await;
+
+    // Restart: rule is restored from durable state and still fires.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-foreach-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-foreach-upd-pub2").await;
+    mv00_assert_publish(
+        &mut publisher2,
+        &mut subscriber2,
+        id,
+        r#"{"items":[{"b":1,"a":9}]}"#,
+        &[r#"{"x":1,"y":9}"#],
+    )
+    .await;
+
+    kernel.finish().await;
+}
+
+/// Window (GROUP BY COUNTWINDOW) survives a rule replace and a kernel restart.
+#[tokio::test]
+async fn mv00_window_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "window-update";
+    let sql_v1 =
+        "SELECT sum(v) AS s, count(*) AS n FROM \"mv00/in/window-update\" GROUP BY COUNTWINDOW(2)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "window v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-window-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-window-upd-pub").await;
+
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":1}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":3}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"s":4,"n":2}"#.as_bytes());
+
+    // Replace with same-shape window: accepted.
+    let sql_v2 = "SELECT sum(v) AS total, count(*) AS cnt FROM \"mv00/in/window-update\" GROUP BY COUNTWINDOW(2)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/window-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "window replace: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":2}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":4}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"total":6,"cnt":2}"#.as_bytes());
+
+    // Restart: rule restored and still aggregates.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-window-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-window-upd-pub2").await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":5}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":7}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber2).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"total":12,"cnt":2}"#.as_bytes());
+
+    kernel.finish().await;
+}
+
+/// GROUP BY survives a rule replace and a kernel restart.
+#[tokio::test]
+async fn mv00_group_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "group-update";
+    let sql_v1 = "SELECT k AS key, sum(v) AS s FROM \"mv00/in/group-update\" GROUP BY k";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "group v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-group-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-group-upd-pub").await;
+
+    for input in [
+        r#"{"k":"x","v":1}"#,
+        r#"{"k":"y","v":2}"#,
+        r#"{"k":"x","v":3}"#,
+    ] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        got.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+    }
+    got.sort();
+    assert_eq!(got, vec![r#"{"key":"x","s":4}"#, r#"{"key":"y","s":2}"#]);
+
+    // Replace with same-shape group: accepted.
+    let sql_v2 = "SELECT k AS key, sum(v) AS total FROM \"mv00/in/group-update\" GROUP BY k";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/group-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "group replace: {body}");
+    for input in [r#"{"k":"x","v":10}"#, r#"{"k":"z","v":5}"#] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        got.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![r#"{"key":"x","total":10}"#, r#"{"key":"z","total":5}"#]
+    );
+
+    // Restart: rule restored and still groups.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-group-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-group-upd-pub2").await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"k":"x","v":1}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"k":"x","v":2}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber2).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"key":"x","total":3}"#.as_bytes());
+
+    kernel.finish().await;
 }

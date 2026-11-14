@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-std_base64_encode"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT std_base64_encode('ab') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "YWI="}'
+
+[[case]]
+sql = "SELECT std_base64_encode(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT std_base64_encode() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

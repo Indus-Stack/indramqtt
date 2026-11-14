@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-topic"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT topic() AS t FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"t": "sensors/kitchen"}'
+
+[[case]]
+sql = 'SELECT topic(9) AS t FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"t": null}'

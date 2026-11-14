@@ -48,6 +48,23 @@ pub enum ApiError {
     ConnectionFailed(String),
     /// Missing, expired, or malformed bearer token / API key.
     Unauthorized(String),
+    /// Unknown dashboard user in the `/users` routes.
+    UserNotFound(String),
+    /// The old password of a password change does not match.
+    ErrorPwdNotMatch(String),
+    /// An operation on a dashboard user that the broker does not allow,
+    /// such as removing the last administrator.
+    NotAllowed(String),
+    /// Backup import validation failed (snapshot content invalid).
+    ValidationFailed(String),
+    /// Backup import apply or persist failed (internal error).
+    InternalError(String),
+    /// Backup import rejected because a store is not yet initialised.
+    StoreNotReady(String),
+    /// Malformed query or paging input the spec names `INVALID_PARAMETER`.
+    InvalidParameter(String),
+    /// Monitor query the node cannot serve, named `BAD_RPC` by the spec.
+    BadRpc(String),
 }
 
 impl ApiError {
@@ -68,6 +85,14 @@ impl ApiError {
             Self::TestFailed(_) => "TEST_FAILED",
             Self::ConnectionFailed(_) => "CONNECTION_FAILED",
             Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::UserNotFound(_) => "USER_NOT_FOUND",
+            Self::ErrorPwdNotMatch(_) => "ERROR_PWD_NOT_MATCH",
+            Self::NotAllowed(_) => "NOT_ALLOWED",
+            Self::ValidationFailed(_) => "VALIDATION_FAILED",
+            Self::InternalError(_) => "INTERNAL_ERROR",
+            Self::StoreNotReady(_) => "STORE_NOT_READY",
+            Self::InvalidParameter(_) => "INVALID_PARAMETER",
+            Self::BadRpc(_) => "BAD_RPC",
         }
     }
 
@@ -87,7 +112,15 @@ impl ApiError {
             | Self::BadNode(message)
             | Self::TestFailed(message)
             | Self::ConnectionFailed(message)
-            | Self::Unauthorized(message) => message,
+            | Self::Unauthorized(message)
+            | Self::UserNotFound(message)
+            | Self::ErrorPwdNotMatch(message)
+            | Self::NotAllowed(message)
+            | Self::ValidationFailed(message)
+            | Self::InternalError(message)
+            | Self::StoreNotReady(message)
+            | Self::InvalidParameter(message)
+            | Self::BadRpc(message) => message,
         }
     }
 
@@ -97,16 +130,24 @@ impl ApiError {
             Self::NotFound(_)
             | Self::ClientIdNotFound(_)
             | Self::BadListenerId(_)
-            | Self::BadNode(_) => StatusCode::NOT_FOUND,
+            | Self::BadNode(_)
+            | Self::UserNotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_)
+            | Self::ErrorPwdNotMatch(_)
+            | Self::NotAllowed(_)
             | Self::AlreadyExists(_)
             | Self::TestFailed(_)
-            | Self::ConnectionFailed(_) => StatusCode::BAD_REQUEST,
+            | Self::ConnectionFailed(_)
+            | Self::ValidationFailed(_)
+            | Self::StoreNotReady(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidParameter(_) => StatusCode::BAD_REQUEST,
+            Self::BadRpc(_) => StatusCode::BAD_REQUEST,
             Self::BadUsernameOrPwd(_) | Self::NamePwdError(_) | Self::Unauthorized(_) => {
                 StatusCode::UNAUTHORIZED
             }
             Self::NotAuthorized(_) | Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -128,6 +169,14 @@ impl ApiError {
             Self::TestFailed(_) => Self::TestFailed(message),
             Self::ConnectionFailed(_) => Self::ConnectionFailed(message),
             Self::Unauthorized(_) => Self::Unauthorized(message),
+            Self::UserNotFound(_) => Self::UserNotFound(message),
+            Self::ErrorPwdNotMatch(_) => Self::ErrorPwdNotMatch(message),
+            Self::NotAllowed(_) => Self::NotAllowed(message),
+            Self::ValidationFailed(_) => Self::ValidationFailed(message),
+            Self::InternalError(_) => Self::InternalError(message),
+            Self::StoreNotReady(_) => Self::StoreNotReady(message),
+            Self::InvalidParameter(_) => Self::InvalidParameter(message),
+            Self::BadRpc(_) => Self::BadRpc(message),
         }
     }
 }
@@ -177,6 +226,14 @@ mod tests {
             ApiError::TestFailed("rule did not match".to_string()),
             ApiError::ConnectionFailed("target unreachable".to_string()),
             ApiError::Unauthorized("no token".to_string()),
+            ApiError::UserNotFound("no such user".to_string()),
+            ApiError::ErrorPwdNotMatch("old password differs".to_string()),
+            ApiError::NotAllowed("not allowed".to_string()),
+            ApiError::ValidationFailed("validation failed".to_string()),
+            ApiError::InternalError("internal error".to_string()),
+            ApiError::StoreNotReady("store not ready".to_string()),
+            ApiError::InvalidParameter("invalid parameter".to_string()),
+            ApiError::BadRpc("bad rpc".to_string()),
         ]
     }
 
@@ -197,6 +254,14 @@ mod tests {
             ("TEST_FAILED", StatusCode::BAD_REQUEST),
             ("CONNECTION_FAILED", StatusCode::BAD_REQUEST),
             ("UNAUTHORIZED", StatusCode::UNAUTHORIZED),
+            ("USER_NOT_FOUND", StatusCode::NOT_FOUND),
+            ("ERROR_PWD_NOT_MATCH", StatusCode::BAD_REQUEST),
+            ("NOT_ALLOWED", StatusCode::BAD_REQUEST),
+            ("VALIDATION_FAILED", StatusCode::BAD_REQUEST),
+            ("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
+            ("STORE_NOT_READY", StatusCode::BAD_REQUEST),
+            ("INVALID_PARAMETER", StatusCode::BAD_REQUEST),
+            ("BAD_RPC", StatusCode::BAD_REQUEST),
         ];
         let variants = every_variant();
         assert_eq!(variants.len(), expected.len());
@@ -282,6 +347,14 @@ mod tests {
             ApiError::TestFailed(_) => "TEST_FAILED",
             ApiError::ConnectionFailed(_) => "CONNECTION_FAILED",
             ApiError::Unauthorized(_) => "UNAUTHORIZED",
+            ApiError::UserNotFound(_) => "USER_NOT_FOUND",
+            ApiError::ErrorPwdNotMatch(_) => "ERROR_PWD_NOT_MATCH",
+            ApiError::NotAllowed(_) => "NOT_ALLOWED",
+            ApiError::ValidationFailed(_) => "VALIDATION_FAILED",
+            ApiError::InternalError(_) => "INTERNAL_ERROR",
+            ApiError::StoreNotReady(_) => "STORE_NOT_READY",
+            ApiError::InvalidParameter(_) => "INVALID_PARAMETER",
+            ApiError::BadRpc(_) => "BAD_RPC",
         }
     }
 

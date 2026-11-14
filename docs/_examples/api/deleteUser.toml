@@ -1,0 +1,23 @@
+[example]
+area = "api"
+item = "deleteUser"
+kind = "api"
+request = "DELETE /api/v1/auth/users/doc-user-delete for a user that the flow creates"
+expect = "deleted"
+expected = "The broker deletes the user, lists no matching user, and returns 404 for a second delete."
+
+script = '''
+from config_probe import http
+
+body = {"username": "doc-user-delete", "password": "DocsDeletePw1!"}
+status, _ = http("POST", "/api/v1/auth/users", body)
+assert status == 201, status
+code, _ = http("DELETE", "/api/v1/auth/users/doc-user-delete")
+assert code == 204, code
+status, users = http("GET", "/api/v1/auth/users")
+assert status == 200, (status, users)
+assert not [user for user in users if user.get("username") == "doc-user-delete"], users
+code, _ = http("DELETE", "/api/v1/auth/users/doc-user-delete")
+assert code == 404, code
+print("deleted")
+'''

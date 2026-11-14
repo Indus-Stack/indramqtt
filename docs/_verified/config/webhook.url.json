@@ -1,0 +1,9 @@
+{
+  "action": "Connect anonymously and with a password while the webhook endpoint stays unreachable.",
+  "config": "[auth]\nallow_anonymous = true\n\n[webhook]\nurl = \"http://127.0.0.1:9/hook\"\n",
+  "item": "webhook.url",
+  "kind": "setting",
+  "output": "anonymous-refused credential-denied",
+  "returncode": 0,
+  "verified": true
+}

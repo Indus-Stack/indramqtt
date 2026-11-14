@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "qos": 1
+      },
+      "projected": {
+        "q": 1
+      },
+      "sql": "SELECT qos() AS q FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "q": null
+      },
+      "sql": "SELECT qos() AS q FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-qos",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

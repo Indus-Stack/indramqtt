@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "http"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-http",
+        "name": "dx2-action-http",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "http"
+      },
+      "name": "dx2-action-http",
+      "status": 201,
+      "type": "http"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-http\" already exists"
+      },
+      "name": "dx2-action-http",
+      "status": 400,
+      "type": "http"
+    }
+  ],
+  "item": "action-http",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

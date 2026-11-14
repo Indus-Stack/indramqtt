@@ -491,6 +491,7 @@ const MAX_REDIRECT_HOPS: usize = 5;
 /// what keeps the load idempotent across the hop.
 pub struct HttpDorisTransport {
     base: String,
+    fe_host: String,
     client: reqwest::Client,
     timeout: Duration,
     redirects: AtomicU64,
@@ -501,6 +502,7 @@ impl HttpDorisTransport {
         config.validate()?;
         Ok(Self {
             base: format!("http://{}:{}", config.fe_host, config.http_port),
+            fe_host: config.fe_host.clone(),
             client,
             timeout: config.timeout(),
             redirects: AtomicU64::new(0),
@@ -566,6 +568,7 @@ impl DorisTransport for HttpDorisTransport {
                     })?
                     .to_string();
                 url = join_redirect_url(&url, &location)?;
+                url = rewrite_loopback_redirect(&self.fe_host, &url);
                 self.redirects.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -610,6 +613,32 @@ fn join_redirect_url(current: &str, location: &str) -> Result<String> {
     base.join(location)
         .map(|joined| joined.to_string())
         .map_err(|e| ConnectorError::Dispatch(format!("doris bad redirect {location:?}: {e}")))
+}
+
+/// Rewrite a loopback host in a redirect URL to the FE host.
+///
+/// A single-node container reports the BE node as loopback
+/// (`127.0.0.1`). Loopback names the server host, not the client
+/// host, so the hop stays on the FE host with the BE port.
+/// Non-loopback hosts pass through unchanged.
+fn rewrite_loopback_redirect(fe_host: &str, url: &str) -> String {
+    let mut parsed: reqwest::Url = match url.parse() {
+        Ok(parsed) => parsed,
+        Err(_) => return url.to_string(),
+    };
+    let host = parsed.host_str().unwrap_or_default().to_string();
+    let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
+    if !is_loopback {
+        return url.to_string();
+    }
+    let fe_is_loopback = fe_host == "127.0.0.1" || fe_host == "localhost" || fe_host == "::1";
+    if fe_is_loopback || fe_host.trim().is_empty() {
+        return url.to_string();
+    }
+    if parsed.set_host(Some(fe_host)).is_err() {
+        return url.to_string();
+    }
+    parsed.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,6 +1223,22 @@ mod tests {
         assert!(join_redirect_url("not a url", "/api/db/t/_be_load").is_err());
     }
 
+    #[test]
+    fn test_loopback_redirect_uses_fe_host() {
+        assert_eq!(
+            rewrite_loopback_redirect("172.17.0.5", "http://127.0.0.1:8040/api/db/t/_stream_load"),
+            "http://172.17.0.5:8040/api/db/t/_stream_load"
+        );
+        assert_eq!(
+            rewrite_loopback_redirect("172.17.0.5", "http://10.0.0.2:8040/api/db/t/_stream_load"),
+            "http://10.0.0.2:8040/api/db/t/_stream_load"
+        );
+        assert_eq!(
+            rewrite_loopback_redirect("127.0.0.1", "http://127.0.0.1:8040/api/db/t/_stream_load"),
+            "http://127.0.0.1:8040/api/db/t/_stream_load"
+        );
+    }
+
     fn qual_env(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.trim().is_empty())
     }
@@ -1252,7 +1297,8 @@ mod tests {
             .ip_or_hostname(fe_host.clone())
             .tcp_port(mysql_port)
             .user(Some(username.clone()))
-            .pass(Some(password.clone()));
+            .pass(Some(password.clone()))
+            .prefer_socket(false);
         let pool = mysql_async::Pool::new(mysql_async::Opts::from(builder));
         let mut conn = pool.get_conn().await.expect("qual mysql connect");
 
@@ -1318,7 +1364,7 @@ mod tests {
         let topic = Topic::new("qual/doris/b315").unwrap();
         for seq in 0..ROWS {
             let payload = Bytes::from(format!(
-                r#"{{"seq": {seq}, "device": "dev-{:02}}}"#,
+                r#"{{"seq": {seq}, "device": "dev-{:02}"}}"#,
                 seq % 16
             ));
             manager

@@ -4,9 +4,11 @@
 Runs every scenario in ``scenarios.json`` end to end against a running
 stack and writes the results JSON. Each scenario spawns ``mqtt_bench.py``
 as a subprocess with the scenario's parameters, while broker resource
-usage (RSS + CPU for the ``indramqtt`` kernel process and the ``beam.smp``
-edge process) is sampled inside the stack container through ``exec_helper.sh
-exec`` (``/proc`` scan loop, no extra tooling needed in the container).
+usage (RSS + CPU for the ``indramqtt`` kernel process only) is sampled
+inside the stack container through ``exec_helper.sh exec`` (``/proc``
+scan loop, no extra tooling needed in the container). Old result files
+may carry legacy ``beam_*`` fields. The runner reads them when present
+and writes ``None`` for new runs.
 
 Usage (from the repo root)::
 
@@ -48,6 +50,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN_SH = r"""
 SAMPLES=%d
 INTERVAL=%d
+# Sample the kernel process. Keep the legacy edge name.
 for i in $(seq 1 $SAMPLES); do
   echo "SAMPLE $i"
   head -1 /proc/stat
@@ -93,6 +96,7 @@ def parse_samples(out, ncpu=1):
     if cur is not None:
         samples.append(cur)
     agg = {}
+    # Aggregate the kernel process. Read the legacy name only for old output.
     for comm in ("indramqtt", "beam.smp"):
         rss_peak = 0.0
         avg_cpus, peak_cpus = [], []
@@ -250,13 +254,13 @@ def main():
             pass
         if sampler is not None:
             sampler.join()
-        agg = res if res else {"indramqtt": {"rss_kb_peak": 0, "cpu_avg": None, "cpu_peak": None},
-                              "beam.smp": {"rss_kb_peak": 0, "cpu_avg": None, "cpu_peak": None}}
+        agg = res if res else {"indramqtt": {"rss_kb_peak": 0, "cpu_avg": None, "cpu_peak": None}}
         rust = agg.get("indramqtt", {})
+        # The legacy edge entry is optional. Old output keeps it.
         beam = agg.get("beam.smp", {})
         rust_cpu = rust.get("cpu_avg")
-        beam_cpu = beam.get("cpu_avg")
-        combined = (rust_cpu or 0) + (beam_cpu or 0) if (rust_cpu is not None or beam_cpu is not None) else None
+        # New runs report the kernel process only.
+        combined = rust_cpu
         cores_used = combined / 100.0 if combined is not None else None
         stack_cpus = stack_ncpu or None
         total_tps = rep["in_rate"] + rep["out_rate"]
@@ -283,14 +287,14 @@ def main():
             "rust_avg_cpu": rust_cpu,
             "rust_peak_cpu": rust.get("cpu_peak"),
             "rust_rss_mb": (rust.get("rss_kb_peak") or 0) / 1024.0 if sampling else None,
-            "beam_avg_cpu": beam_cpu,
+            # Legacy edge fields stay so old files keep loading. New runs write None.
+            "beam_avg_cpu": beam.get("cpu_avg"),
             "beam_peak_cpu": beam.get("cpu_peak"),
-            "beam_rss_mb": (beam.get("rss_kb_peak") or 0) / 1024.0 if sampling else None,
+            "beam_rss_mb": (beam.get("rss_kb_peak") or 0) / 1024.0 if beam.get("rss_kb_peak") else None,
             "combined_cpu_pct": combined,
-            "combined_peak_cpu_pct": ((rust.get("cpu_peak") or 0) + (beam.get("cpu_peak") or 0))
-            if (rust.get("cpu_peak") is not None or beam.get("cpu_peak") is not None) else None,
+            "combined_peak_cpu_pct": rust.get("cpu_peak"),
             "cores_utilized": cores_used,
-            "combined_ram_mb": ((rust.get("rss_kb_peak") or 0) + (beam.get("rss_kb_peak") or 0)) / 1024.0
+            "combined_ram_mb": (rust.get("rss_kb_peak") or 0) / 1024.0
             if sampling else None,
             "tps_per_core_allocated": total_tps / stack_cpus if stack_cpus else None,
             "tps_per_core_utilized": total_tps / cores_used if cores_used else None,
@@ -312,7 +316,7 @@ def main():
               f"delivered={rep['delivered_pct']:.1f}% in={rep['in_rate']:.0f}/s out={rep['out_rate']:.0f}/s "
               f"avg={lat['avg'] and round(lat['avg'], 1)}ms p99={lat['p99'] and round(lat['p99'], 1)}ms "
               f"neg={rep.get('latency_invalid_count', 0)} skips={rep['framing_skips']} "
-              f"rust_cpu={rust_cpu and round(rust_cpu, 1)} beam_cpu={beam_cpu and round(beam_cpu, 1)}", flush=True)
+               f"rust_cpu={rust_cpu and round(rust_cpu, 1)}", flush=True)
         if n < len(scenarios) - 1:
             time.sleep(args.settle_sec)
 

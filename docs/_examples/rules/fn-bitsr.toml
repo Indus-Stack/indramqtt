@@ -1,0 +1,32 @@
+[example]
+area = "rules"
+item = "fn-bitsr"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT bitsr(8, 3) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 1}'
+
+[[case]]
+sql = 'SELECT bitsr(-8, 1) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": -4}'
+
+[[case]]
+sql = 'SELECT bitsr(8, -1) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = 'SELECT bitsr(4.9, 1) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 2}'

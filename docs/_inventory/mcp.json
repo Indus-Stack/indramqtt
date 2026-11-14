@@ -1,0 +1,10 @@
+{
+  "hits": [
+    "crates/broker-api/src/lib.rs",
+    "crates/broker-api/src/mcp/catalog.rs",
+    "crates/broker-api/src/mcp/mod.rs",
+    "crates/broker-api/src/v5/api_keys.rs"
+  ],
+  "note": "Tree has no MCP endpoint.",
+  "tools": []
+}

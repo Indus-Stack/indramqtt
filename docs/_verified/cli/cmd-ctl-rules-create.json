@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "rules",
+    "--help"
+  ],
+  "item": "cmd-ctl-rules-create",
+  "match": "create",
+  "output": "Routing rules: list, show, create, delete\n  create  Create one rule. Actions come from `--actions` (a JSON array in the management API shape) or, exclusively, from the `--log`, `--forward` and `--republish` conveniences, which are appended in the order log, forwards, republishes",
+  "output_bytes": 564,
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "connectors",
+    "--help"
+  ],
+  "item": "cmd-ctl-connectors-create",
+  "match": "create",
+  "output": "Data connectors: list, show, create, delete\n  create  Create one connector. Extra family fields come from `--params` (a JSON object) or `--params-file`; both are sent verbatim and the server validates them, naming the missing field",
+  "output_bytes": 609,
+  "returncode": 0,
+  "verified": true
+}

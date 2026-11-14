@@ -1,0 +1,9 @@
+{
+  "action": "Run one secure WebSocket upgrade on the configured bind, then read `GET /api/v5/listeners/wss:default`.",
+  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\n",
+  "item": "listeners.wss.bind",
+  "kind": "setting",
+  "output": "bind=127.0.0.1:28884",
+  "returncode": 0,
+  "verified": true
+}

@@ -8,27 +8,17 @@
 //! ([`DriverPgTransport`]): values travel bound out-of-band through the
 //! driver's extended-protocol path, so SQL injection is structurally
 //! impossible. The [`PgTransport`] boundary keeps unit tests
-//! broker-free ([`MemoryPgTransport`]); [`TcpPgTransport`] is the
-//! hand-written framing (startup, trust/MD5/SCRAM-SHA-256 auth, batched
-//! extended-protocol inserts) retained for offline unit tests only.
+//! broker-free ([`MemoryPgTransport`]).
 
 use super::{ConnectorError, Result, Sink};
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
-use md5::Digest as Md5Digest;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-
-fn md5_hex(data: &[u8]) -> String {
-    format!("{:x}", md5::Md5::digest(data))
-}
 
 fn default_pool_size() -> usize {
     10
@@ -279,232 +269,6 @@ impl PgTransport for MemoryPgTransport {
 // PostgreSQL wire protocol (startup, auth, extended query).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct PgEndpoint {
-    host: String,
-    port: u16,
-    user: String,
-    password: String,
-    database: String,
-}
-
-/// Parse `postgresql://[user[:password]@]host[:port][/dbname][?params]`.
-/// `sslmode=require` is rejected: this transport is cleartext-only by
-/// design (terminate TLS upstream instead of silently downgrading).
-fn parse_endpoint(url: &str) -> Result<PgEndpoint> {
-    let rest = url.strip_prefix("postgresql://").ok_or_else(|| {
-        ConnectorError::Dispatch(format!(
-            "postgres url must start with postgresql://: {url:?}"
-        ))
-    })?;
-    let (authority_path, query) = match rest.split_once('?') {
-        Some((left, query)) => (left, query),
-        None => (rest, ""),
-    };
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, _) = pair.split_once('=').unwrap_or((pair, ""));
-        if key.eq_ignore_ascii_case("sslmode") {
-            let value = pair.split_once('=').map(|(_, v)| v).unwrap_or("");
-            if value.eq_ignore_ascii_case("require") || value.eq_ignore_ascii_case("verify-full") {
-                return Err(ConnectorError::Dispatch(
-                    "postgres TLS is not supported by this transport; terminate upstream or use sslmode=disable"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-    let (authority, dbname) = match authority_path.split_once('/') {
-        Some((authority, dbname)) => (authority, dbname),
-        None => (authority_path, ""),
-    };
-    let (credentials, hostport) = match authority.rsplit_once('@') {
-        Some((credentials, hostport)) => (credentials, hostport),
-        None => ("", authority),
-    };
-    let (user, password) = match credentials.split_once(':') {
-        Some((user, pass)) => (user.to_string(), pass.to_string()),
-        None => (credentials.to_string(), String::new()),
-    };
-    let user = if user.is_empty() {
-        "postgres".to_string()
-    } else {
-        user
-    };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((host, port)) => (
-            host.to_string(),
-            port.parse::<u16>()
-                .map_err(|_| ConnectorError::Dispatch(format!("postgres bad port in {url:?}")))?,
-        ),
-        None => (hostport.to_string(), 5432),
-    };
-    if host.is_empty() {
-        return Err(ConnectorError::Dispatch(format!(
-            "postgres url needs a host: {url:?}"
-        )));
-    }
-    let database = if dbname.is_empty() {
-        user.clone()
-    } else {
-        dbname.to_string()
-    };
-    Ok(PgEndpoint {
-        host,
-        port,
-        user,
-        password,
-        database,
-    })
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut padded = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        padded[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        padded[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= padded[i];
-        opad[i] ^= padded[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_hash);
-    outer.finalize().into()
-}
-
-fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    let mut block = Vec::with_capacity(salt.len() + 4);
-    block.extend_from_slice(salt);
-    block.extend_from_slice(&1u32.to_be_bytes());
-    let mut u = hmac_sha256(password, &block);
-    let mut result = u;
-    for _ in 1..iterations {
-        u = hmac_sha256(password, &u);
-        for (slot, byte) in result.iter_mut().zip(u.iter()) {
-            *slot ^= *byte;
-        }
-    }
-    result
-}
-
-/// Pure SCRAM-SHA-256 proof/signature derivation shared by the live
-/// exchange and the RFC vector test: salted password, client proof
-/// and server signature for one `auth_message`.
-fn scram_proof_and_server_signature(
-    password: &[u8],
-    salt: &[u8],
-    iterations: u32,
-    auth_message: &str,
-) -> ([u8; 32], [u8; 32]) {
-    let salted = pbkdf2_sha256(password, salt, iterations);
-    let client_key = hmac_sha256(&salted, b"Client Key");
-    let mut hasher = Sha256::new();
-    hasher.update(client_key);
-    let stored_key: [u8; 32] = hasher.finalize().into();
-    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-    let mut proof = client_key;
-    for (slot, byte) in proof.iter_mut().zip(client_signature.iter()) {
-        *slot ^= *byte;
-    }
-    let server_key = hmac_sha256(&salted, b"Server Key");
-    let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
-    (proof, server_signature)
-}
-
-fn escape_scram_name(name: &str) -> String {
-    name.replace('=', "=3D").replace(',', "=2C")
-}
-
-static SCRAM_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-fn scram_nonce() -> String {
-    use base64::Engine;
-    let counter = SCRAM_NONCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut raw = counter.to_be_bytes().to_vec();
-    raw.extend_from_slice(&now.to_be_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
-}
-
-async fn read_msg(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
-    let mut header = [0u8; 5];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut header))
-        .await
-        .map_err(|_| ConnectorError::Connection("postgres read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("postgres read failed: {e}")))?;
-    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if !(4..=16 * 1024 * 1024).contains(&len) {
-        return Err(ConnectorError::Connection(format!(
-            "postgres bad message length: {len}"
-        )));
-    }
-    let mut body = vec![0u8; len - 4];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut body))
-        .await
-        .map_err(|_| ConnectorError::Connection("postgres read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("postgres read failed: {e}")))?;
-    Ok((header[0], body))
-}
-
-async fn write_msg(stream: &mut TcpStream, tag: u8, body: &[u8]) -> Result<()> {
-    let mut frame = Vec::with_capacity(5 + body.len());
-    frame.push(tag);
-    frame.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
-    frame.extend_from_slice(body);
-    stream
-        .write_all(&frame)
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres write failed: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres flush failed: {e}")))?;
-    Ok(())
-}
-
-/// Extract the human message from an ErrorResponse body, prefixed with
-/// the SQLSTATE (`C` field) when the server sent one.
-fn error_message(body: &[u8]) -> String {
-    let mut code: Option<String> = None;
-    let mut message: Option<String> = None;
-    let mut cursor = body;
-    while cursor.len() >= 2 {
-        let field = cursor[0];
-        cursor = &cursor[1..];
-        let end = cursor.iter().position(|&b| b == 0).unwrap_or(cursor.len());
-        let value = String::from_utf8_lossy(&cursor[..end]).to_string();
-        cursor = &cursor[end.min(cursor.len())..];
-        if !cursor.is_empty() {
-            cursor = &cursor[1..];
-        }
-        match field {
-            b'C' if code.is_none() && !value.is_empty() => code = Some(value),
-            b'M' if message.is_none() && !value.is_empty() => message = Some(value),
-            _ => {}
-        }
-    }
-    match (code, message) {
-        (Some(code), Some(message)) => format!("SQLSTATE {code}: {message}"),
-        (None, Some(message)) => message,
-        _ => "postgres error (no message field)".to_string(),
-    }
-}
-
 /// True when `message` carries a data-rejection SQLSTATE: class `22` or
 /// `23`, or `42703` (undefined column) / `42804` (datatype mismatch),
 /// matched as a whole 5-character token (bounded by a non-alphanumeric
@@ -535,332 +299,10 @@ fn is_pg_data_error(message: &str) -> bool {
     false
 }
 
-/// Drain server messages until ReadyForQuery, surfacing the first error.
-async fn drain_to_ready(stream: &mut TcpStream) -> Result<()> {
-    let mut failure: Option<String> = None;
-    loop {
-        let (tag, body) = read_msg(stream).await?;
-        match tag {
-            b'Z' => break,
-            b'E' if failure.is_none() => {
-                failure = Some(error_message(&body));
-            }
-            _ => {}
-        }
-    }
-    match failure {
-        Some(message) => Err(ConnectorError::Dispatch(format!("postgres: {message}"))),
-        None => Ok(()),
-    }
-}
-
-struct PgConn {
-    stream: TcpStream,
-}
-
-async fn startup_handshake(endpoint: &PgEndpoint, stream: &mut TcpStream) -> Result<()> {
-    // SSLRequest first: proceed only on explicit 'N' (cleartext).
-    let mut probe = (8i32).to_be_bytes().to_vec();
-    probe.extend_from_slice(&80877103i32.to_be_bytes());
-    stream
-        .write_all(&probe)
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres write failed: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres flush failed: {e}")))?;
-    let mut answer = [0u8; 1];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut answer))
-        .await
-        .map_err(|_| ConnectorError::Connection("postgres SSL probe timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("postgres read failed: {e}")))?;
-    if answer[0] == b'S' {
-        return Err(ConnectorError::Connection(
-            "postgres server demands TLS; this transport is cleartext-only".to_string(),
-        ));
-    }
-
-    // StartupMessage: protocol 3.0 + user/database/client_encoding.
-    let mut params = Vec::new();
-    for (key, value) in [
-        ("user", endpoint.user.as_str()),
-        ("database", endpoint.database.as_str()),
-        ("client_encoding", "UTF8"),
-        ("application_name", "indramqtt"),
-    ] {
-        params.extend_from_slice(key.as_bytes());
-        params.push(0);
-        params.extend_from_slice(value.as_bytes());
-        params.push(0);
-    }
-    params.push(0);
-    let mut startup = (params.len() as i32 + 8).to_be_bytes().to_vec();
-    startup.extend_from_slice(&196608i32.to_be_bytes());
-    startup.extend_from_slice(&params);
-    stream
-        .write_all(&startup)
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres write failed: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres flush failed: {e}")))?;
-
-    // Authentication loop.
-    loop {
-        let (tag, body) = read_msg(stream).await?;
-        match tag {
-            b'R' => {
-                if body.len() < 4 {
-                    return Err(ConnectorError::Connection(
-                        "truncated auth request".to_string(),
-                    ));
-                }
-                let kind = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                match kind {
-                    0 => break, // AuthenticationOk
-                    5 => {
-                        // MD5: md5(md5(password + user) + salt).
-                        if body.len() < 8 {
-                            return Err(ConnectorError::Connection(
-                                "truncated md5 salt".to_string(),
-                            ));
-                        }
-                        let salt = &body[4..8];
-                        let mut first = endpoint.password.clone();
-                        first.push_str(&endpoint.user);
-                        let inner = md5_hex(first.as_bytes());
-                        let mut outer = inner;
-                        outer.push_str(&hex(salt));
-                        let response = format!("md5{}", md5_hex(outer.as_bytes()));
-                        let mut msg = response.into_bytes();
-                        msg.push(0);
-                        write_msg(stream, b'p', &msg).await?;
-                    }
-                    10 => {
-                        // SASL: require SCRAM-SHA-256, then run the exchange.
-                        if !body[4..].split(|b| *b == 0).any(|m| m == b"SCRAM-SHA-256") {
-                            return Err(ConnectorError::Connection(
-                                "postgres offers no SCRAM-SHA-256".to_string(),
-                            ));
-                        }
-                        scram_exchange(&endpoint.user, endpoint.password.as_bytes(), stream)
-                            .await?;
-                    }
-                    _ => {
-                        return Err(ConnectorError::Connection(format!(
-                            "unsupported postgres auth method {kind}"
-                        )));
-                    }
-                }
-            }
-            b'E' => {
-                return Err(ConnectorError::Connection(format!(
-                    "postgres startup failed: {}",
-                    error_message(&body)
-                )));
-            }
-            _ => {}
-        }
-    }
-
-    // ParameterStatus / BackendKeyData until ReadyForQuery.
-    drain_to_ready(stream).await?;
-    Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> Result<()> {
-    use base64::Engine;
-    let client_nonce = scram_nonce();
-    let client_first_bare = format!("n={},r={}", escape_scram_name(user), client_nonce);
-
-    // SASLInitialResponse: mechanism + initial response. RFC 5802
-    // requires the GS2 header (`n,,` with no channel binding) in the
-    // client-first-message; `auth_message` keeps the bare form.
-    let client_first = format!("n,,{client_first_bare}");
-    let mut initial = b"SCRAM-SHA-256\0".to_vec();
-    initial.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
-    initial.extend_from_slice(client_first.as_bytes());
-    write_msg(stream, b'p', &initial).await?;
-
-    // AuthenticationSASLContinue: server-first-message.
-    let (tag, body) = read_msg(stream).await?;
-    if tag == b'E' {
-        return Err(ConnectorError::Connection(format!(
-            "postgres SCRAM authentication failed: {}",
-            error_message(&body)
-        )));
-    }
-    if tag != b'R'
-        || body.len() < 4
-        || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 11
-    {
-        return Err(ConnectorError::Connection(
-            "expected SASL continue".to_string(),
-        ));
-    }
-    let server_first = std::str::from_utf8(&body[4..])
-        .map_err(|_| ConnectorError::Connection("non-utf8 SASL message".to_string()))?;
-    let mut combined_nonce = String::new();
-    let mut salt_b64 = String::new();
-    let mut iterations = 0u32;
-    for part in server_first.split(',') {
-        let (key, value) = part
-            .split_once('=')
-            .ok_or_else(|| ConnectorError::Connection("malformed SASL server-first".to_string()))?;
-        match key {
-            "r" => combined_nonce = value.to_string(),
-            "s" => salt_b64 = value.to_string(),
-            "i" => {
-                iterations = value.parse().map_err(|_| {
-                    ConnectorError::Connection("malformed SASL iteration count".to_string())
-                })?
-            }
-            _ => {}
-        }
-    }
-    if !combined_nonce.starts_with(&client_nonce) || salt_b64.is_empty() || iterations == 0 {
-        return Err(ConnectorError::Connection(
-            "invalid SASL server-first message".to_string(),
-        ));
-    }
-    let salt = base64::engine::general_purpose::STANDARD
-        .decode(&salt_b64)
-        .map_err(|_| ConnectorError::Connection("bad SASL salt".to_string()))?;
-
-    let client_final_without_proof = format!("c=biws,r={combined_nonce}");
-    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
-    let (proof, expected_server_signature) =
-        scram_proof_and_server_signature(password, &salt, iterations, &auth_message);
-    let client_final = format!(
-        "{client_final_without_proof},p={}",
-        base64::engine::general_purpose::STANDARD.encode(proof)
-    );
-    write_msg(stream, b'p', client_final.as_bytes()).await?;
-
-    // AuthenticationSASLFinal: verify the server signature (no blind trust).
-    let (tag, body) = read_msg(stream).await?;
-    if tag == b'E' {
-        return Err(ConnectorError::Connection(format!(
-            "postgres SCRAM authentication failed: {}",
-            error_message(&body)
-        )));
-    }
-    if tag != b'R'
-        || body.len() < 4
-        || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 12
-    {
-        return Err(ConnectorError::Connection(
-            "expected SASL final".to_string(),
-        ));
-    }
-    let server_final = std::str::from_utf8(&body[4..])
-        .map_err(|_| ConnectorError::Connection("non-utf8 SASL final".to_string()))?;
-    let server_signature = server_final
-        .strip_prefix("v=")
-        .ok_or_else(|| ConnectorError::Connection("malformed SASL final".to_string()))?;
-    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_server_signature);
-    if expected_b64 != server_signature {
-        return Err(ConnectorError::Connection(
-            "postgres server signature mismatch".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// TCP transport with a tiny round-robin pool. Connections establish
-/// lazily on first use (creation never blocks on external brokers).
-pub struct TcpPgTransport {
-    endpoint: PgEndpoint,
-    pool: Vec<AsyncMutex<Option<PgConn>>>,
-    cursor: AtomicU64,
-}
-
-impl TcpPgTransport {
-    pub fn new(url: &str, pool_size: usize) -> Result<Self> {
-        if pool_size == 0 {
-            return Err(ConnectorError::Dispatch(
-                "postgres pool_size must be >= 1".to_string(),
-            ));
-        }
-        Ok(Self {
-            endpoint: parse_endpoint(url)?,
-            pool: (0..pool_size).map(|_| AsyncMutex::new(None)).collect(),
-            cursor: AtomicU64::new(0),
-        })
-    }
-
-    async fn dial(&self) -> Result<PgConn> {
-        let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("postgres connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("postgres connect failed: {e}")))?;
-        startup_handshake(&self.endpoint, &mut stream).await?;
-        Ok(PgConn { stream })
-    }
-}
-
-#[async_trait]
-impl PgTransport for TcpPgTransport {
-    async fn execute_batch(&self, batch: &PgBatch) -> Result<()> {
-        if batch.rows.is_empty() {
-            return Ok(());
-        }
-        // Round-robin checkout with reconnect-once for I/O failures. A
-        // server data error (Dispatch: ErrorResponse then ReadyForQuery)
-        // leaves the connection healthy, so it is returned immediately
-        // with the connection kept and nothing replayed.
-        let slot = (self.cursor.fetch_add(1, Ordering::SeqCst) as usize) % self.pool.len();
-        let mut guard = self.pool[slot].lock().await;
-        let mut last_error: Option<ConnectorError> = None;
-        for _ in 0..2 {
-            if guard.is_none() {
-                *guard = Some(self.dial().await?);
-            }
-            let stream = &mut guard.as_mut().expect("connected").stream;
-            match execute_extended(stream, batch).await {
-                Ok(()) => return Ok(()),
-                Err(ConnectorError::Connection(message)) => {
-                    *guard = None;
-                    last_error = Some(ConnectorError::Connection(message));
-                }
-                Err(other) => return Err(other),
-            }
-        }
-        Err(match last_error {
-            Some(ConnectorError::Connection(message)) => ConnectorError::Connection(format!(
-                "postgres batch failed after reconnect: {message}"
-            )),
-            Some(other) => other,
-            None => ConnectorError::Connection("postgres batch failed after reconnect".to_string()),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Production transport on the maintained `tokio-postgres` driver.
-// ---------------------------------------------------------------------------
-
-/// Checkout timeout for one driver connection: 5 s matches the legacy
-/// [`TcpPgTransport`] dial timeout (the protocol requirement is a
-/// bounded handshake, not a specific value).
-const PG_DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Per-batch statement timeout: 10 s matches the legacy `read_msg`
-/// timeout on the same path.
-const PG_DRIVER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Split `postgresql://[user[:password]@]host[:port][/dbname][?params]`
 /// into (host, port, user, password, database, use_tls). Both the
 /// `postgresql://` and the `postgres://` spellings are accepted so
-/// stored configuration written with either spelling keeps working;
-/// the legacy [`parse_endpoint`] accepts only `postgresql://`.
+/// stored configuration written with either spelling keeps working.
 fn parse_driver_endpoint(url: &str) -> Result<(String, u16, String, String, String, bool)> {
     let rest = url
         .strip_prefix("postgresql://")
@@ -934,6 +376,13 @@ fn parse_driver_endpoint(url: &str) -> Result<(String, u16, String, String, Stri
     };
     Ok((host, port, user, password, database, use_tls))
 }
+
+/// Checkout timeout for one driver connection: 5 s bounds the handshake.
+const PG_DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-statement timeout: 10 s bounds one execute call so a stalled
+/// server cannot hold a pooled connection indefinitely.
+const PG_DRIVER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `tokio-postgres` connection config from parsed endpoint
 /// fields. Field-by-field construction (never the driver's own URL
@@ -1195,9 +644,7 @@ impl tokio_postgres::types::ToSql for PgPayloadParam {
 /// MD5 and SCRAM-SHA-256 authentication and the extended query protocol
 /// (Parse/Bind/Describe/Execute/Sync) all run inside the driver;
 /// parameters travel bound (`$1` topic, `$2` QoS, `$3` payload), so
-/// values stay out-of-band exactly as on the legacy path. The legacy
-/// [`TcpPgTransport`] stays for offline unit tests only; production
-/// wiring uses this transport.
+/// values stay out-of-band. Production wiring uses this transport.
 ///
 /// Bound: the pool holds at most `pool_size` driver clients plus the
 /// sink buffer in front of it; no background queue. `pool_size`
@@ -1212,6 +659,20 @@ pub struct DriverPgTransport {
     cursor: AtomicU64,
 }
 
+/// Connection fields for one PostgreSQL target. The action-owned sink
+/// builds these from the connector document, so a password or database
+/// with a URL delimiter (`@`, `/`, `?`, `#`) reaches the driver as a
+/// value instead of a hand-joined URL.
+#[derive(Debug, Clone)]
+pub struct PgConnectionSettings {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+    pub use_tls: bool,
+}
+
 impl DriverPgTransport {
     pub fn new(url: &str, pool_size: usize) -> Result<Self> {
         if pool_size == 0 {
@@ -1220,8 +681,79 @@ impl DriverPgTransport {
             ));
         }
         let (host, port, user, password, database, use_tls) = parse_driver_endpoint(url)?;
+        Self::from_settings(
+            PgConnectionSettings {
+                host,
+                port,
+                user,
+                password,
+                database,
+                use_tls,
+            },
+            pool_size,
+        )
+    }
+
+    /// Build the pool from explicit connection fields. The driver's
+    /// config struct receives each value verbatim, so no value needs URL
+    /// escaping and no delimiter in a password or database name can
+    /// change the target.
+    pub fn from_settings(settings: PgConnectionSettings, pool_size: usize) -> Result<Self> {
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "postgres pool_size must be >= 1".to_string(),
+            ));
+        }
         Ok(Self {
-            pg_config: pg_connect_config(&host, port, &user, &password, &database),
+            pg_config: pg_connect_config(
+                &settings.host,
+                settings.port,
+                &settings.user,
+                &settings.password,
+                &settings.database,
+            ),
+            use_tls: settings.use_tls,
+            pool: (0..pool_size).map(|_| AsyncMutex::new(None)).collect(),
+            cursor: AtomicU64::new(0),
+        })
+    }
+
+    /// Build from discrete connection fields instead of a URL. Password
+    /// and database travel as values (never formatted into a URL), so a
+    /// value with URL delimiters (`@`, `:`, `/`, `?`, `#`) or a quote
+    /// reaches the driver verbatim. `use_tls` selects the maintained
+    /// rustls connector with the system trust store.
+    pub fn from_parts(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+        pool_size: usize,
+        use_tls: bool,
+    ) -> Result<Self> {
+        if host.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "postgres host must not be empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(ConnectorError::Dispatch(
+                "postgres port must be 1..=65535".to_string(),
+            ));
+        }
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "postgres pool_size must be >= 1".to_string(),
+            ));
+        }
+        let user = if user.is_empty() {
+            "postgres".to_string()
+        } else {
+            user.to_string()
+        };
+        Ok(Self {
+            pg_config: pg_connect_config(host, port, &user, password, database),
             use_tls,
             pool: (0..pool_size).map(|_| AsyncMutex::new(None)).collect(),
             cursor: AtomicU64::new(0),
@@ -1345,80 +877,15 @@ impl PgTransport for DriverPgTransport {
     }
 }
 
-/// Run one batch through the extended protocol, pipelined in a single
-/// write: Parse once, then Bind/Describe/Execute per row, then Sync.
-/// Values travel as TEXT params; the server casts (e.g. `$3::jsonb`).
-fn encode_extended_batch(batch: &PgBatch) -> Vec<u8> {
-    fn push_msg(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
-        out.push(tag);
-        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
-        out.extend_from_slice(body);
-    }
-
-    let mut out = Vec::new();
-    // Parse: unnamed statement, inferred param types.
-    let mut parse = Vec::new();
-    parse.push(0);
-    parse.extend_from_slice(batch.sql.as_bytes());
-    parse.push(0);
-    parse.extend_from_slice(&0u16.to_be_bytes());
-    push_msg(&mut out, b'P', &parse);
-
-    for (index, row) in batch.rows.iter().enumerate() {
-        let portal = format!("indra_{index}");
-        // Bind: named portal, unnamed statement, all-TEXT formats.
-        let mut bind = Vec::new();
-        bind.extend_from_slice(portal.as_bytes());
-        bind.push(0);
-        bind.push(0);
-        bind.extend_from_slice(&(row.len() as u16).to_be_bytes());
-        for _ in row {
-            bind.extend_from_slice(&0u16.to_be_bytes());
-        }
-        bind.extend_from_slice(&(row.len() as u16).to_be_bytes());
-        for value in row {
-            bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
-            bind.extend_from_slice(value);
-        }
-        bind.extend_from_slice(&0u16.to_be_bytes());
-        push_msg(&mut out, b'B', &bind);
-        // Describe portal (drains parameter/row descriptions).
-        let mut describe = vec![b'P'];
-        describe.extend_from_slice(portal.as_bytes());
-        describe.push(0);
-        push_msg(&mut out, b'D', &describe);
-        // Execute to completion.
-        let mut execute = Vec::new();
-        execute.extend_from_slice(portal.as_bytes());
-        execute.push(0);
-        execute.extend_from_slice(&0i32.to_be_bytes());
-        push_msg(&mut out, b'E', &execute);
-    }
-    push_msg(&mut out, b'S', &[]);
-    out
-}
-
-async fn execute_extended(stream: &mut TcpStream, batch: &PgBatch) -> Result<()> {
-    let bytes = encode_extended_batch(batch);
-    stream
-        .write_all(&bytes)
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres write failed: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("postgres flush failed: {e}")))?;
-    drain_to_ready(stream).await
-}
-
-// ---------------------------------------------------------------------------
-// Sink.
-// ---------------------------------------------------------------------------
-
 /// PostgreSQL sink: buffers MQTT events as 3-column rows
 /// (`$1` topic, `$2` QoS, `$3` payload) and flushes full or stale
 /// batches through the transport. Transport failures back off
 /// exponentially (capped) without losing buffered rows.
+///
+/// The kind label stays `postgres` unless an action builder sets its
+/// own protocol kind (AlloyDB, CockroachDB and Redshift speak the
+/// same wire protocol): the label only names the sink for display,
+/// delivery never branches on it.
 pub struct PostgreSqlSink {
     config: PostgreSqlSinkConfig,
     transport: Arc<dyn PgTransport>,
@@ -1426,6 +893,7 @@ pub struct PostgreSqlSink {
     backoff: parking_lot::Mutex<super::BackoffState>,
     sent_batches: AtomicU64,
     rejected_rows: AtomicU64,
+    kind: &'static str,
 }
 
 impl PostgreSqlSink {
@@ -1439,7 +907,15 @@ impl PostgreSqlSink {
             backoff: parking_lot::Mutex::new(super::BackoffState::default()),
             sent_batches: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
+            kind: "postgres",
         })
+    }
+
+    /// Name this sink for display (a PostgreSQL-protocol family kind
+    /// sharing the wire format). Delivery never branches on the label.
+    pub fn with_kind(mut self, kind: &'static str) -> Self {
+        self.kind = kind;
+        self
     }
 
     pub fn config(&self) -> &PostgreSqlSinkConfig {
@@ -1553,8 +1029,18 @@ impl Sink for PostgreSqlSink {
         Ok(())
     }
 
+    async fn send_batch(&self, items: &[super::SinkBatchItem]) -> super::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            self.buffer_row(&item.topic, &item.payload, item.qos);
+        }
+        self.flush().await
+    }
+
     fn kind(&self) -> &'static str {
-        "postgres"
+        self.kind
     }
 }
 
@@ -1600,27 +1086,6 @@ mod tests {
         config.sql_template =
             "INSERT INTO t (topic) VALUES ($1) -- trailing $8 comment".to_string();
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_endpoint_parsing() {
-        let endpoint =
-            parse_endpoint("postgresql://user:pass@db.internal:5433/telemetry").expect("parses");
-        assert_eq!(endpoint.host, "db.internal");
-        assert_eq!(endpoint.port, 5433);
-        assert_eq!(endpoint.user, "user");
-        assert_eq!(endpoint.password, "pass");
-        assert_eq!(endpoint.database, "telemetry");
-
-        let endpoint = parse_endpoint("postgresql://dbhost").expect("defaults");
-        assert_eq!(endpoint.port, 5432);
-        assert_eq!(endpoint.user, "postgres");
-        assert_eq!(endpoint.database, "postgres");
-
-        assert!(parse_endpoint("mysql://h/db").is_err());
-        assert!(parse_endpoint("postgresql://h/db?sslmode=require").is_err());
-        assert!(parse_endpoint("postgresql://h:notaport/db").is_err());
-        assert!(parse_endpoint("postgresql://:pass@/db").is_err());
     }
 
     fn test_sink(config: PostgreSqlSinkConfig) -> (PostgreSqlSink, Arc<MemoryPgTransport>) {
@@ -1704,410 +1169,6 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 2);
     }
 
-    /// RFC 7677 section 3 SCRAM-SHA-256 vector: pure computation through
-    /// the same helper the live exchange uses (no fake server involved).
-    #[test]
-    fn test_scram_sha256_rfc7677_vector() {
-        use base64::Engine;
-        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
-        let server_first =
-            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-        let client_final_without_proof =
-            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
-        let salt = base64::engine::general_purpose::STANDARD
-            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
-            .expect("vector salt decodes");
-        let auth_message =
-            format!("{client_first_bare},{server_first},{client_final_without_proof}");
-        let (proof, server_signature) =
-            scram_proof_and_server_signature(b"pencil", &salt, 4096, &auth_message);
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD.encode(proof),
-            "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
-        );
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD.encode(server_signature),
-            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
-        );
-    }
-
-    // -- Fake PostgreSQL server helpers ----------------------------------
-
-    async fn read_pg_msg(stream: &mut TcpStream) -> (u8, Vec<u8>) {
-        let mut header = [0u8; 5];
-        stream.read_exact(&mut header).await.expect("pg head");
-        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-        let mut body = vec![0u8; len - 4];
-        stream.read_exact(&mut body).await.expect("pg body");
-        (header[0], body)
-    }
-
-    async fn write_pg_msg(stream: &mut TcpStream, tag: u8, body: &[u8]) {
-        let mut frame = vec![tag];
-        frame.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
-        frame.extend_from_slice(body);
-        stream.write_all(&frame).await.expect("pg write");
-    }
-
-    fn startup_params(body: &[u8]) -> Vec<(String, String)> {
-        // `body` is the parameter block after the protocol version.
-        let mut params = Vec::new();
-        let mut parts = body.split(|b| *b == 0);
-        while let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-            if key.is_empty() {
-                break;
-            }
-            params.push((
-                String::from_utf8_lossy(key).to_string(),
-                String::from_utf8_lossy(value).to_string(),
-            ));
-        }
-        params
-    }
-
-    async fn read_startup(stream: &mut TcpStream) -> Vec<(String, String)> {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.expect("startup len");
-        let len = i32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0u8; len - 4];
-        stream.read_exact(&mut body).await.expect("startup body");
-        assert_eq!(&body[..4], &196608i32.to_be_bytes(), "protocol 3.0");
-        startup_params(&body[4..])
-    }
-
-    async fn send_ready(stream: &mut TcpStream) {
-        write_pg_msg(stream, b'Z', b"I").await;
-    }
-
-    /// In-process fake PostgreSQL: scripted MD5 handshake, then one
-    /// extended-protocol batch whose bound parameters are captured.
-    #[tokio::test]
-    async fn test_tcp_md5_auth_and_batch_params() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let captured = Arc::new(parking_lot::Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
-        let captured_rx = captured.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // SSLRequest -> 'N' (cleartext).
-            let mut probe = [0u8; 8];
-            stream.read_exact(&mut probe).await.expect("ssl probe");
-            assert_eq!(&probe[4..8], &80877103i32.to_be_bytes());
-            stream.write_all(b"N").await.expect("ssl deny");
-            // Startup params carry user + database.
-            let params = read_startup(&mut stream).await;
-            assert!(params.contains(&("user".to_string(), "u".to_string())));
-            assert!(params.contains(&("database".to_string(), "db".to_string())));
-            // MD5 challenge with a fixed salt; verify the client digest.
-            let salt = [0x11u8, 0x22, 0x33, 0x44];
-            let mut auth = 5i32.to_be_bytes().to_vec();
-            auth.extend_from_slice(&salt);
-            write_pg_msg(&mut stream, b'R', &auth).await;
-            let (tag, body) = read_pg_msg(&mut stream).await;
-            assert_eq!(tag, b'p');
-            let presented = std::str::from_utf8(&body[..body.len() - 1]).expect("utf8");
-            let inner = md5_hex(b"pwdu");
-            let expected = format!(
-                "md5{}",
-                md5_hex(format!("{inner}{}", hex(&salt)).as_bytes())
-            );
-            assert_eq!(presented, expected, "MD5 digest must verify");
-            write_pg_msg(&mut stream, b'R', &0i32.to_be_bytes()).await;
-            send_ready(&mut stream).await;
-            // Extended batch: Parse, then per-row Bind/Describe/Execute.
-            let (tag, _) = read_pg_msg(&mut stream).await;
-            assert_eq!(tag, b'P');
-            let mut rows = Vec::new();
-            loop {
-                let (tag, body) = read_pg_msg(&mut stream).await;
-                match tag {
-                    b'B' => {
-                        // Bind: portal\0 stmt\0 formats, values, result formats.
-                        let mut cursor = &body[..];
-                        let skip_cstr = |cursor: &mut &[u8]| {
-                            let end = cursor.iter().position(|&b| b == 0).expect("cstr");
-                            *cursor = &cursor[end + 1..];
-                        };
-                        skip_cstr(&mut cursor); // portal
-                        skip_cstr(&mut cursor); // statement
-                        let formats = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
-                        cursor = &cursor[2 + formats * 2..];
-                        let count = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
-                        cursor = &cursor[2..];
-                        let mut row = Vec::new();
-                        for _ in 0..count {
-                            let len =
-                                i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-                            cursor = &cursor[4..];
-                            row.push(cursor[..len as usize].to_vec());
-                            cursor = &cursor[len as usize..];
-                        }
-                        rows.push(row);
-                    }
-                    b'D' | b'E' => {}
-                    b'S' => break,
-                    other => panic!("unexpected tag {other}"),
-                }
-            }
-            captured_rx.lock().extend(rows);
-            // CommandComplete per Execute + ReadyForQuery.
-            for _ in 0..2 {
-                let mut complete = b"INSERT 0 1\0".to_vec();
-                let _ = &mut complete;
-                write_pg_msg(&mut stream, b'C', b"INSERT 0 1\0").await;
-            }
-            send_ready(&mut stream).await;
-        });
-
-        let transport = TcpPgTransport::new(&format!("postgresql://u:pwd@127.0.0.1:{port}/db"), 1)
-            .expect("valid transport");
-        let mut config = test_config();
-        config.batch_size = 2;
-        let sink = PostgreSqlSink::new(config, Arc::new(transport)).expect("valid sink");
-        let topic = Topic::new("sensors/temp").unwrap();
-        sink.send(
-            &topic,
-            &Bytes::from_static(br#"{ "v": 1 }"#),
-            QoS::AtLeastOnce,
-        )
-        .await
-        .expect("row one");
-        sink.send(
-            &topic,
-            &Bytes::from_static(br#"{ "v": 2 }"#),
-            QoS::AtLeastOnce,
-        )
-        .await
-        .expect("row two triggers flush");
-        assert_eq!(sink.sent_batches(), 1);
-
-        let mut done = false;
-        for _ in 0..500 {
-            if server.is_finished() {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(done, "fake broker never finished");
-        server.await.expect("fake broker task");
-        let rows = captured.lock().clone();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0], b"sensors/temp");
-        assert_eq!(rows[0][1], b"1");
-        assert_eq!(rows[0][2], br#"{ "v": 1 }"#);
-        assert_eq!(rows[1][2], br#"{ "v": 2 }"#);
-    }
-
-    /// SCRAM-SHA-256 flow with an independently verifying fake server.
-    #[tokio::test]
-    async fn test_tcp_scram_auth_verifies_proof() {
-        use base64::Engine;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut probe = [0u8; 8];
-            stream.read_exact(&mut probe).await.expect("ssl probe");
-            stream.write_all(b"N").await.expect("ssl deny");
-            let _params = read_startup(&mut stream).await;
-            // Offer SCRAM-SHA-256 only.
-            let mut auth = 10i32.to_be_bytes().to_vec();
-            auth.extend_from_slice(b"SCRAM-SHA-256\0\0");
-            write_pg_msg(&mut stream, b'R', &auth).await;
-            // Read SASLInitialResponse; extract the client nonce.
-            let (tag, body) = read_pg_msg(&mut stream).await;
-            assert_eq!(tag, b'p');
-            let mech_end = body.iter().position(|&b| b == 0).expect("mech");
-            assert_eq!(&body[..mech_end], b"SCRAM-SHA-256");
-            let rest = &body[mech_end + 1..];
-            let initial_len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-            let initial = std::str::from_utf8(&rest[4..4 + initial_len]).expect("utf8");
-            // Strict GS2 check (RFC 5802): a real server rejects a
-            // header-less client-first-message with an ErrorResponse.
-            if !initial.starts_with("n,,") {
-                let mut err_body = Vec::new();
-                err_body.extend_from_slice(b"SERROR\0");
-                err_body.extend_from_slice(b"Mmissing GS2 header in SCRAM client-first-message\0");
-                err_body.push(0);
-                write_pg_msg(&mut stream, b'E', &err_body).await;
-                panic!("client-first-message missing GS2 header n,,: {initial:?}");
-            }
-            let client_first_bare = initial
-                .strip_prefix("n,,")
-                .expect("strip GS2 header")
-                .to_string();
-            assert!(client_first_bare.starts_with("n=user,r="));
-            let client_nonce = client_first_bare["n=user,r=".len()..].to_string();
-            // Server-first with a fixed salt + low iteration count.
-            let salt = b"testsalt";
-            let iterations = 4096u32;
-            let server_first = format!(
-                "r={client_nonce}SERVER,s={},i={iterations}",
-                base64::engine::general_purpose::STANDARD.encode(salt)
-            );
-            let mut msg = 11i32.to_be_bytes().to_vec();
-            msg.extend_from_slice(server_first.as_bytes());
-            write_pg_msg(&mut stream, b'R', &msg).await;
-            // Client-final: verify the proof independently (server-side
-            // derivation from the known password, not the client's math).
-            let (tag, body) = read_pg_msg(&mut stream).await;
-            assert_eq!(tag, b'p');
-            let client_final = std::str::from_utf8(&body).expect("utf8");
-            assert!(client_final.starts_with("c=biws,r="));
-            let proof_b64 = client_final.rsplit(",p=").next().expect("proof");
-            let without_proof = &client_final[..client_final.len() - proof_b64.len() - 3];
-            let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
-            let salted = pbkdf2_sha256(b"pwd", salt, iterations);
-            let mut hasher = Sha256::new();
-            hasher.update(hmac_sha256(&salted, b"Client Key"));
-            let stored: [u8; 32] = hasher.finalize().into();
-            // proof XOR signature must recover the client key.
-            let presented = base64::engine::general_purpose::STANDARD
-                .decode(proof_b64)
-                .expect("b64 proof");
-            assert_eq!(presented.len(), 32);
-            let signature = hmac_sha256(&stored, auth_message.as_bytes());
-            let mut derived_key = presented;
-            for (slot, byte) in derived_key.iter_mut().zip(signature.iter()) {
-                *slot ^= *byte;
-            }
-            let mut check = Sha256::new();
-            check.update(&derived_key);
-            let check_stored: [u8; 32] = check.finalize().into();
-            assert_eq!(check_stored, stored, "client proof must verify");
-            // Server-final with the matching signature.
-            let server_key = hmac_sha256(&salted, b"Server Key");
-            let server_sig = hmac_sha256(&server_key, auth_message.as_bytes());
-            let final_msg = format!(
-                "v={}",
-                base64::engine::general_purpose::STANDARD.encode(server_sig)
-            );
-            let mut msg = 12i32.to_be_bytes().to_vec();
-            msg.extend_from_slice(final_msg.as_bytes());
-            write_pg_msg(&mut stream, b'R', &msg).await;
-            // AuthenticationOk precedes ReadyForQuery, as on the wire.
-            write_pg_msg(&mut stream, b'R', &0i32.to_be_bytes()).await;
-            send_ready(&mut stream).await;
-            // Serve one extended-protocol batch: count Executes, then
-            // acknowledge each plus ReadyForQuery.
-            let mut executes = 0;
-            loop {
-                let (tag, _) = read_pg_msg(&mut stream).await;
-                match tag {
-                    b'E' => executes += 1,
-                    b'S' => break,
-                    _ => {}
-                }
-            }
-            assert_eq!(executes, 1, "one row flushed");
-            write_pg_msg(&mut stream, b'C', b"INSERT 0 1\0").await;
-            send_ready(&mut stream).await;
-        });
-
-        let transport =
-            TcpPgTransport::new(&format!("postgresql://user:pwd@127.0.0.1:{port}/db"), 1)
-                .expect("valid transport");
-        let sink = PostgreSqlSink::new(test_config(), Arc::new(transport)).expect("valid sink");
-        // A single row flush exercises the handshake plus one batch.
-        sink.send(
-            &Topic::new("t").unwrap(),
-            &Bytes::from_static(b"{}"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .expect("buffered");
-        match sink.flush().await {
-            Ok(()) => {}
-            Err(e) => panic!("scram flush failed: {e}"),
-        }
-        assert_eq!(sink.sent_batches(), 1);
-
-        tokio::time::timeout(Duration::from_secs(10), server)
-            .await
-            .expect("fake broker finishes")
-            .expect("fake broker task");
-    }
-
-    /// A SASL ErrorResponse must surface the server's message text
-    /// instead of the generic "expected SASL continue/final".
-    #[tokio::test]
-    async fn test_scram_server_error_is_surfaced() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut probe = [0u8; 8];
-            stream.read_exact(&mut probe).await.expect("ssl probe");
-            stream.write_all(b"N").await.expect("ssl deny");
-            let _params = read_startup(&mut stream).await;
-            let mut auth = 10i32.to_be_bytes().to_vec();
-            auth.extend_from_slice(b"SCRAM-SHA-256\0\0");
-            write_pg_msg(&mut stream, b'R', &auth).await;
-            // Consume the SASLInitialResponse, then reject with an error.
-            let (tag, _) = read_pg_msg(&mut stream).await;
-            assert_eq!(tag, b'p');
-            let mut err_body = Vec::new();
-            err_body.extend_from_slice(b"SERROR\0");
-            err_body.extend_from_slice(b"VERROR\0");
-            err_body.extend_from_slice(b"Mpassword authentication failed for user \"x\"\0");
-            err_body.push(0);
-            write_pg_msg(&mut stream, b'E', &err_body).await;
-        });
-
-        let transport = TcpPgTransport::new(&format!("postgresql://x:pwd@127.0.0.1:{port}/db"), 1)
-            .expect("valid transport");
-        let sink = PostgreSqlSink::new(test_config(), Arc::new(transport)).expect("valid sink");
-        sink.send(
-            &Topic::new("t").unwrap(),
-            &Bytes::from_static(b"{}"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .expect("buffered");
-        let err = sink.flush().await.expect_err("server error must fail");
-        let text = format!("{err}");
-        assert!(
-            text.contains(r#"password authentication failed for user "x""#),
-            "server message must surface, got: {text}"
-        );
-
-        tokio::time::timeout(Duration::from_secs(10), server)
-            .await
-            .expect("fake broker finishes")
-            .expect("fake broker task");
-    }
-
-    #[test]
-    fn test_error_message_includes_sqlstate() {
-        let mut body = Vec::new();
-        body.extend_from_slice(b"SERROR\0");
-        body.extend_from_slice(b"C23514\0");
-        body.extend_from_slice(b"Mnew row violates check constraint\0");
-        body.push(0);
-        assert_eq!(
-            error_message(&body),
-            "SQLSTATE 23514: new row violates check constraint"
-        );
-        // No SQLSTATE: bare message, as before.
-        let mut bare = Vec::new();
-        bare.extend_from_slice(b"Mjust the message\0");
-        bare.push(0);
-        assert_eq!(error_message(&bare), "just the message");
-        // No message field: existing fallback.
-        let mut empty = Vec::new();
-        empty.extend_from_slice(b"C23514\0");
-        empty.push(0);
-        assert_eq!(error_message(&empty), "postgres error (no message field)");
-    }
-
     #[tokio::test]
     async fn test_bad_row_rejected_rest_written() {
         let transport = Arc::new(MemoryPgTransport::new());
@@ -2175,76 +1236,6 @@ mod tests {
         assert_eq!(batches.len(), 1, "only the first retried row was written");
         assert_eq!(batches[0].rows.len(), 1);
         assert_eq!(batches[0].rows[0][2], b"t3-r0-good");
-    }
-
-    /// A data error (ErrorResponse + ReadyForQuery) must not trigger a
-    /// reconnect: the connection is healthy and the server text (with
-    /// SQLSTATE) must surface.
-    #[tokio::test]
-    async fn test_tcp_data_error_keeps_connection_and_surfaces_sqlstate() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let connections = Arc::new(AtomicU64::new(0));
-        let connections_rx = connections.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            connections_rx.fetch_add(1, Ordering::SeqCst);
-            // SSLRequest -> 'N' (cleartext).
-            let mut probe = [0u8; 8];
-            stream.read_exact(&mut probe).await.expect("ssl probe");
-            stream.write_all(b"N").await.expect("ssl deny");
-            let _params = read_startup(&mut stream).await;
-            write_pg_msg(&mut stream, b'R', &0i32.to_be_bytes()).await;
-            send_ready(&mut stream).await;
-            // Read the pipelined batch up to Sync, then answer with a
-            // check-violation ErrorResponse followed by ReadyForQuery.
-            loop {
-                let (tag, _) = read_pg_msg(&mut stream).await;
-                if tag == b'S' {
-                    break;
-                }
-            }
-            let mut err_body = Vec::new();
-            err_body.extend_from_slice(b"SERROR\0");
-            err_body.extend_from_slice(b"C23514\0");
-            err_body.extend_from_slice(b"Mnew row violates check constraint\0");
-            err_body.push(0);
-            write_pg_msg(&mut stream, b'E', &err_body).await;
-            send_ready(&mut stream).await;
-            // The client must keep this connection: a second accept
-            // (a reconnect) must never arrive.
-            let second = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
-            assert!(second.is_err(), "client reconnected after a data error");
-        });
-
-        let transport = TcpPgTransport::new(&format!("postgresql://u:pwd@127.0.0.1:{port}/db"), 1)
-            .expect("valid transport");
-        let batch = PgBatch {
-            sql: "INSERT INTO t (payload) VALUES ($1, $2, $3)".to_string(),
-            rows: vec![vec![b"t".to_vec(), b"0".to_vec(), b"{}".to_vec()]],
-        };
-        let err = transport
-            .execute_batch(&batch)
-            .await
-            .expect_err("data error must fail");
-        let text = format!("{err}");
-        assert!(text.contains("23514"), "SQLSTATE must surface, got: {text}");
-        assert!(
-            matches!(err, ConnectorError::Dispatch(_)),
-            "data error must not become a connection error, got: {text}"
-        );
-
-        tokio::time::timeout(Duration::from_secs(10), server)
-            .await
-            .expect("fake broker finishes")
-            .expect("fake broker task");
-        assert_eq!(
-            connections.load(Ordering::SeqCst),
-            1,
-            "no reconnect after a data error"
-        );
     }
 
     #[test]

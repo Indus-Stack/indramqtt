@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-license-key",
+  "match": "--license-key",
+  "output": "      --license-key <LICENSE_KEY>\n      --license-keys <LICENSE_KEYS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

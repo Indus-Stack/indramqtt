@@ -1,0 +1,111 @@
+[
+  {
+    "operation": "GET /mqtt/delayed",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/delayed",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "enable": true,
+      "max_delayed_messages": 10000
+    },
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/delayed/messages",
+    "path_params": {},
+    "query": {
+      "page": 1,
+      "limit": 20
+    },
+    "expect_status": 200,
+    "setup": [
+      {
+        "mqtt_connect": {
+          "clientid": "conf-delayed-1"
+        }
+      },
+      {
+        "mqtt_publish": {
+          "clientid": "conf-delayed-1",
+          "topic": "$delayed/600/conf/delayed/chain",
+          "qos": 1,
+          "payload": "hello-delayed",
+          "packet_id": 11
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-delayed-1"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "DELETE /mqtt/delayed/messages/{node}/{msgid}",
+    "path_params": {
+      "node": "$from:GET /nodes#/0/node",
+      "msgid": "4242424242"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/delayed/messages/{node}/{msgid}",
+    "path_params": {
+      "node": "$from:GET /nodes#/0/node",
+      "msgid": "$from:GET /mqtt/delayed/messages#/data/0/msgid"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /mqtt/delayed/messages/{topic}",
+    "path_params": {
+      "topic": "conf/delayed/chain"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [
+      {
+        "mqtt_connect": {
+          "clientid": "conf-delayed-del"
+        }
+      },
+      {
+        "mqtt_publish": {
+          "clientid": "conf-delayed-del",
+          "topic": "$delayed/600/conf/delayed/chain",
+          "qos": 1,
+          "payload": "hello-delayed",
+          "packet_id": 13
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-delayed-del"
+        }
+      }
+    ]
+  }
+]

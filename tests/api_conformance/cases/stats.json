@@ -5,10 +5,21 @@
     "query": {},
     "body": null,
     "expect_status": 200,
+    "expect_json": {
+      "/0/delayed.count": {"gte": 1}
+    },
     "setup": [
       {
         "mqtt_connect": {
           "clientid": "conf-stats-1"
+        }
+      },
+      {
+        "mqtt_publish": {
+          "clientid": "conf-stats-1",
+          "topic": "$delayed/300/conf/stats/later",
+          "qos": 0,
+          "payload": "later"
         }
       }
     ],
@@ -16,6 +27,27 @@
       {
         "mqtt_disconnect": {
           "clientid": "conf-stats-1"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "GET /stats",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {
+        "mqtt_connect": {
+          "clientid": "conf-stats-2"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-stats-2"
         }
       }
     ]

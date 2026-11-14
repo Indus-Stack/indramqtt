@@ -1,0 +1,32 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "flags": {
+          "retain": true
+        }
+      },
+      "projected": {
+        "f": {
+          "retain": true
+        }
+      },
+      "sql": "SELECT flags() AS f FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "f": {}
+      },
+      "sql": "SELECT flags() AS f FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-flags",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

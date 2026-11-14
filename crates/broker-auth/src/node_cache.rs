@@ -170,6 +170,23 @@ impl NodeAuthCache {
         inner.order.clear();
     }
 
+    /// Evict one username after its credential changes or leaves.
+    /// Missing names succeed with no change. Management-plane only:
+    /// one short write lock; the CONNECT path keeps recording under
+    /// its own lock and publish/deliver never touch this store.
+    /// The bound stays: at most the capped entries remain.
+    pub fn remove_user(&self, username: &str) {
+        if username.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write();
+        if inner.entries.remove(username).is_some() {
+            if let Some(pos) = inner.order.iter().position(|name| name == username) {
+                inner.order.remove(pos);
+            }
+        }
+    }
+
     /// Default entry cap stated next to the bound above.
     pub fn default_max() -> usize {
         DEFAULT_AUTHN_NODE_CACHE_MAX
@@ -221,6 +238,20 @@ mod tests {
         let cache = NodeAuthCache::new();
         cache.record_success("alice");
         cache.record_success("alice");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn remove_user_evicts_only_that_name() {
+        let cache = NodeAuthCache::new();
+        cache.record_success("alice");
+        cache.record_success("bob");
+        assert_eq!(cache.len(), 2);
+        cache.remove_user("alice");
+        assert_eq!(cache.len(), 1);
+        cache.remove_user("alice");
+        assert_eq!(cache.len(), 1);
+        cache.remove_user("");
         assert_eq!(cache.len(), 1);
     }
 

@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "rules_engine.window_channel_depth"
+kind = "setting"
+expect = "depth=1024"
+expected = "The broker applies the channel depth and reports it from the live engine."
+source = "`crates/broker-node/src/main.rs` applies the file value, and `GET /api/v1/nodes` reports the live depth."
+action = "Start the broker with a custom channel depth and read the live depth from `GET /api/v1/nodes`."
+config = '''
+[rules_engine]
+window_channel_depth = 1024
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/api/v1/nodes")
+assert status == 200, (status, body)
+assert body["window_channel_depth"] == 1024, body
+print("depth=1024")
+'''

@@ -16,64 +16,212 @@ use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
 /// Documented `GET /clients` filters. Every field is optional; unknown
-/// query keys are ignored by the `Query` extractor and unknown
-/// `conn_state` values match everything, so new spec filters degrade to
-/// an unfiltered page instead of a 400.
+/// query keys are ignored by the `Query` extractor. `conn_state` holds
+/// a documented value (`connected`, `idle` or `disconnected`); any
+/// other value fails with 400 `INVALID_PARAMETER`. `tenant` keeps one
+/// tenant: an unknown tenant matches no row, never another tenant's row.
 #[derive(Deserialize, Default)]
 pub struct ClientFilters {
     #[serde(default)]
     pub conn_state: Option<String>,
     #[serde(default)]
     pub clientid: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// One optional tenant scope for a per-client read (`GET
+/// /clients/:clientid` and its subscription list). Absent or empty
+/// reads the default tenant first, then the one other tenant that
+/// holds the id. A set value reads that tenant only; an unknown
+/// tenant misses, never another tenant's session. Two namesakes in
+/// two non-default tenants miss, so a bare read never picks another
+/// tenant's row; the caller then sets `?tenant=` to select one.
+#[derive(Deserialize, Default)]
+pub struct TenantScope {
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// Resolve one bare client id to its owning tenant plus session.
+/// Default tenant first, so old callers keep their shape. Else the
+/// one hit in another tenant. No hit or several hits miss, so a bare
+/// read never takes another tenant's row. Management-plane only.
+fn resolve_bare_client(
+    state: &ApiState,
+    client_id: &str,
+) -> Option<(String, std::sync::Arc<broker_session::Session>)> {
+    if let Some(session) = state.sessions.get(client_id) {
+        return Some((
+            broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+            session,
+        ));
+    }
+    let mut hits = state.sessions.sessions_for_client(client_id);
+    hits.retain(|(tenant, _)| tenant.as_str() != broker_session::tenant::DEFAULT_TENANT_ID);
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        None
+    }
+}
+
+/// Resolve one scoped per-client read to its owning tenant plus
+/// session. A set scope reads that tenant only. A bare scope uses
+/// the bare-id rule above. Management-plane only.
+fn resolve_scoped_client(
+    state: &ApiState,
+    client_id: &str,
+    scope: &TenantScope,
+) -> Option<(String, std::sync::Arc<broker_session::Session>)> {
+    match scope.tenant.as_deref() {
+        None | Some("") => resolve_bare_client(state, client_id),
+        Some(tenant) => state
+            .sessions
+            .get_in_tenant(tenant, client_id)
+            .map(|session| (tenant.to_string(), session)),
+    }
+}
+
+/// Fallback keepalive when the session record is gone.
+/// Reason: 0 disables the timer on the wire, so a raced read
+/// reports no demand instead of a made-up interval.
+/// The read uses it only during a snapshot race.
+const MISSING_SESSION_KEEPALIVE_SECS: u16 = 0;
+
+/// Resolve one list filter to the tenant to keep, if any. `None` means
+/// no filter (the global list the reference API documents). An empty
+/// value also means no filter, so `?tenant=` keeps the current shape.
+// TODO(parity): does an empty `tenant` value select the default tenant
+// or no filter? The rulebook does not decide the empty-filter policy;
+// the current choice keeps no filter so old callers work.
+fn list_tenant(filters: &ClientFilters) -> Option<&str> {
+    match filters.tenant.as_deref() {
+        None => None,
+        Some("") => None,
+        Some(raw) => Some(raw),
+    }
+}
+
+/// Resolve the tenant filter of the global subscription list to the
+/// tenant to keep, if any. `None` means no filter (the global list the
+/// reference API documents). An empty value also means no filter.
+fn subscription_list_tenant(query: &SubscriptionsQuery) -> Option<&str> {
+    match query.tenant.as_deref() {
+        None => None,
+        Some("") => None,
+        Some(raw) => Some(raw),
+    }
 }
 
 /// Render one client session in the documented detail shape.
 ///
+/// `mountpoint` carries the owning tenant id (the reference API
+/// documents `mountpoint` on the client; the console reads it). The
+/// default tenant renders as `default`, its true stored id.
 /// `connected_at` is the instant recorded where the session is already
 /// being written (creation, reconnect, bind), omitted for sessions that
-/// predate timestamp recording rather than substituted.
+/// predate timestamp recording rather than substituted. `ip_address`
+/// comes from the stored peer address, `proto_ver` from the negotiated
+/// version, `clean_start` and `expiry_interval` from the bind, and the
+/// counts from the live queues. Fields without a stored value stay
+/// omitted, never substituted.
 fn client_detail_json(
     client_id: &str,
+    tenant: &str,
     session: Option<&std::sync::Arc<broker_session::Session>>,
     is_connected: bool,
     keepalive: u16,
 ) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(15);
+    let mut map = serde_json::Map::with_capacity(20);
     map.insert("clientid".to_string(), serde_json::Value::from(client_id));
-    let username = session
-        .and_then(|s| s.username.read().clone())
-        .unwrap_or_else(|| client_id.to_string());
-    map.insert("username".to_string(), serde_json::Value::from(username));
+    map.insert("mountpoint".to_string(), serde_json::Value::from(tenant));
+    // The API types `username` as a string. Omit the field for
+    // an anonymous session, never send null.
+    if let Some(name) = session.and_then(|s| s.username.read().clone()) {
+        map.insert("username".to_string(), serde_json::Value::from(name));
+    }
     map.insert(
         "connected".to_string(),
         serde_json::Value::from(is_connected),
     );
-    map.insert(
-        "ip_address".to_string(),
-        serde_json::Value::from("127.0.0.1"),
-    );
-    map.insert("port".to_string(), serde_json::Value::from(54321));
+    if let Some(ip) = session.and_then(|s| s.peerhost.read().clone()) {
+        map.insert("ip_address".to_string(), serde_json::Value::from(ip));
+    }
     map.insert("keepalive".to_string(), serde_json::Value::from(keepalive));
-    map.insert("proto_type".to_string(), serde_json::Value::from("MQTT"));
-    map.insert("proto_ver".to_string(), serde_json::Value::from(5));
-    map.insert("clean_start".to_string(), serde_json::Value::from(true));
-    map.insert("expiry_interval".to_string(), serde_json::Value::from(7200));
+    let proto_ver = session.map(|s| s.protocol_version()).unwrap_or(5);
+    let proto_name = if proto_ver == 3 { "MQIsdp" } else { "MQTT" };
+    map.insert(
+        "proto_name".to_string(),
+        serde_json::Value::from(proto_name),
+    );
+    map.insert("proto_ver".to_string(), serde_json::Value::from(proto_ver));
+    let clean_start = session.map(|s| s.clean_start).unwrap_or(true);
+    map.insert(
+        "clean_start".to_string(),
+        serde_json::Value::from(clean_start),
+    );
+    map.insert("durable".to_string(), serde_json::Value::from(!clean_start));
+    // Reason for the value: the CONNECT expiry the session stored.
+    if let Some(s) = session {
+        map.insert(
+            "expiry_interval".to_string(),
+            serde_json::Value::from(s.session_expiry()),
+        );
+    }
     if let Some(ms) = session.and_then(|s| *s.connected_at_ms.read()) {
         map.insert(
             "connected_at".to_string(),
             serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
         );
     }
-    map.insert("is_bridge".to_string(), serde_json::Value::from(false));
-    map.insert("inflight_cnt".to_string(), serde_json::Value::from(0));
-    map.insert("awaiting_rel_cnt".to_string(), serde_json::Value::from(0));
+    // Reason for the value: the detach instant the session stamped.
+    // It is valid only while disconnected.
+    if !is_connected {
+        if let Some(ms) = session.and_then(|s| *s.ended_at_ms.read()) {
+            map.insert(
+                "disconnected_at".to_string(),
+                serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
+            );
+        }
+    }
+    // Reason for the value: live QoS 1 downlinks the session tracks.
+    if let Some(s) = session {
+        map.insert(
+            "inflight_cnt".to_string(),
+            serde_json::Value::from(s.inflight_total_len() as u64),
+        );
+    }
+    // Reason for the value: live QoS 2 inbound entries the session holds.
+    if let Some(s) = session {
+        map.insert(
+            "awaiting_rel_cnt".to_string(),
+            serde_json::Value::from(s.qos2_inbound_len() as u64),
+        );
+    }
+    // Reason for the value: the per-session QoS 2 inbound bound.
+    map.insert(
+        "awaiting_rel_max".to_string(),
+        serde_json::Value::from(broker_session::MAX_QOS2_INBOUND as u64),
+    );
+    // Reason for the value: the per-session QoS 1 window bound.
+    if let Some(s) = session {
+        map.insert(
+            "inflight_max".to_string(),
+            serde_json::Value::from(s.max_inflight() as u64),
+        );
+    }
     map.insert(
         "mqueue_len".to_string(),
         serde_json::Value::from(session.map(|s| s.offline_len()).unwrap_or(0) as u64),
     );
     map.insert(
+        "subscriptions_cnt".to_string(),
+        serde_json::Value::from(session.map(|s| s.subscriptions.read().len()).unwrap_or(0) as u64),
+    );
+    map.insert(
         "node".to_string(),
-        serde_json::Value::from("indramqtt@127.0.0.1"),
+        serde_json::Value::from(crate::node_scope::local_node_name()),
     );
     serde_json::Value::Object(map)
 }
@@ -83,17 +231,42 @@ pub async fn list_clients(
     params: PageParams,
     Query(filters): Query<ClientFilters>,
 ) -> Response {
-    // Indexed session snapshot: `active_client_ids` returns the sorted
-    // ids of connected sessions from the session map. Management-plane
-    // read only; no per-message work, no full scan per message, and the
-    // snapshot is bounded by the live connection count.
-    let all_client_ids = state.sessions.active_client_ids();
+    // Tenant-scoped session snapshot over live sessions only. Each live
+    // session yields one row keyed by its own `(tenant, client id)`, so
+    // the same client id in two tenants renders two rows with two tenant
+    // ids. A `tenant` filter keeps that tenant only; an unknown tenant
+    // matches no row, never another tenant's row. Without a filter the
+    // list stays global, as the reference API documents. Management-plane
+    // read only; the snapshot is bounded by the live connection count,
+    // with no per-message work and no full scan per message.
+    let wanted = list_tenant(&filters);
+    let mut keys: Vec<(String, String)> = state
+        .sessions
+        .active_sessions()
+        .iter()
+        .map(|session| (session.tenant_id.read().clone(), session.client_id.clone()))
+        .collect();
+    keys.sort();
+    if let Some(tenant) = wanted {
+        keys.retain(|(row_tenant, _)| row_tenant.as_str() == tenant);
+    }
 
+    // The documented filter accepts only the three named states. Any
+    // other value is a client error (400 `INVALID_PARAMETER`).
+    if let Some(state_filter) = filters.conn_state.as_deref() {
+        if state_filter != "connected" && state_filter != "idle" && state_filter != "disconnected" {
+            return ApiError::InvalidParameter(
+                "query parameter `conn_state` must be `connected`, `idle` or `disconnected`"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    }
     // Filter first, then paginate: slicing before filtering would drop
     // matching rows that fall outside the raw page window and report a
     // pre-filter count in `meta`.
-    let mut matching: Vec<(String, bool)> = Vec::new();
-    for cid in all_client_ids {
+    let mut matching: Vec<(String, String, bool)> = Vec::new();
+    for (tenant, cid) in keys {
         if let Some(want) = filters.clientid.as_deref() {
             if cid != want {
                 continue;
@@ -101,33 +274,37 @@ pub async fn list_clients(
         }
         let is_connected = state
             .sessions
-            .get(&cid)
+            .get_in_tenant(&tenant, &cid)
             .as_ref()
             .map(|s| *s.connected.read())
             .unwrap_or(false);
         if let Some(state_filter) = filters.conn_state.as_deref() {
-            if (state_filter == "connected" && !is_connected)
-                || (state_filter == "disconnected" && is_connected)
-            {
+            // `idle` names connected sessions: the broker keeps no
+            // idle tracking, so idle reads as the connected set.
+            let wants_connected = state_filter != "disconnected";
+            if wants_connected != is_connected {
                 continue;
             }
         }
-        matching.push((cid, is_connected));
+        matching.push((tenant, cid, is_connected));
     }
     let total = matching.len();
     let page_ids = paginate(&matching, params.page, params.limit);
 
     let mut data = Vec::new();
-    for (cid, is_connected) in page_ids {
-        let session = state.sessions.get(cid);
+    for (tenant, cid, is_connected) in page_ids {
+        let session = state.sessions.get_in_tenant(tenant, cid);
 
+        // Use the fallback only during a snapshot race.
+        // Reason lives at `MISSING_SESSION_KEEPALIVE_SECS`.
         let keepalive = session
             .as_ref()
             .map(|s| *s.keepalive_secs.read())
-            .unwrap_or(60);
+            .unwrap_or(MISSING_SESSION_KEEPALIVE_SECS);
 
         data.push(client_detail_json(
             cid,
+            tenant,
             session.as_ref(),
             *is_connected,
             keepalive,
@@ -144,34 +321,31 @@ pub async fn list_clients(
         .into_response()
 }
 
-pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
-    let session = state.sessions.get(&client_id);
-    let is_connected = session
-        .as_ref()
-        .map(|s| *s.connected.read())
-        .unwrap_or(false);
+pub async fn get_client(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    Query(scope): Query<TenantScope>,
+) -> Response {
+    // Tenant-scoped detail read. A set scope reads that tenant only.
+    // A bare id reads the default tenant first, then the one other
+    // tenant that holds the id. A miss answers not-found, never
+    // another tenant's row.
+    let (tenant, session) = match resolve_scoped_client(&state, &client_id, &scope) {
+        Some(hit) => hit,
+        None => {
+            return ApiError::ClientIdNotFound("Client not found".to_string()).into_response();
+        }
+    };
+    let is_connected = *session.connected.read();
 
-    if session.is_none() && !is_connected {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "code": "CLIENT_NOT_FOUND",
-                "message": "Client not found"
-            })),
-        )
-            .into_response();
-    }
-
-    let keepalive = session
-        .as_ref()
-        .map(|s| *s.keepalive_secs.read())
-        .unwrap_or(60);
+    let keepalive = *session.keepalive_secs.read();
 
     (
         StatusCode::OK,
         Json(client_detail_json(
             &client_id,
-            session.as_ref(),
+            tenant.as_str(),
+            Some(&session),
             is_connected,
             keepalive,
         )),
@@ -194,8 +368,11 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
 /// into its registration tenant. The detach itself never fires, so the
 /// edge's later death notice finds an empty slot and cannot double-fire.
 fn kick_one(state: &ApiState, client_id: &str) -> (bool, Option<broker_session::StoredWill>) {
-    let session = match state.sessions.get(client_id) {
-        Some(session) => session,
+    // Bare-id rule: default tenant first, then the one other tenant
+    // that holds the id. The detach runs in the owning tenant, so one
+    // tenant's kick never drops another tenant's namesake session.
+    let (tenant, session) = match resolve_bare_client(state, client_id) {
+        Some(hit) => hit,
         None => return (false, None),
     };
     let conn_id = *session.conn_id.read();
@@ -231,7 +408,9 @@ fn kick_one(state: &ApiState, client_id: &str) -> (bool, Option<broker_session::
         ),
     }
     state.conns.unregister(conn_id);
-    state.sessions.unbind_connection(client_id, conn_id);
+    state
+        .sessions
+        .unbind_connection_in_tenant(&tenant, client_id, conn_id);
     (true, will)
 }
 
@@ -248,6 +427,9 @@ pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<St
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `POST /clients/kickout/bulk`: disconnect many clients. The reference
+/// API documents one success status, 204 with no body. An id that has no
+/// live connection is skipped.
 pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> Response {
     let client_ids: Vec<String> = match serde_json::from_slice(&body[..]) {
         Ok(ids) => ids,
@@ -258,32 +440,21 @@ pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> R
     };
     // Bounded fan-out over the request itself: one synchronous close
     // frame per id through the shared single-kick routine, no extra
-    // buffering beyond the result list and no spawned tasks. The result
-    // list is management-plane only; the per-message path stays free of
-    // new allocation (empty metadata and payload frames). Taken wills
-    // fire after their kick (a kick is an unexpected disconnect, MT-05).
-    let mut results = Vec::with_capacity(client_ids.len());
+    // buffering beyond the taken wills and no spawned tasks. The per-message
+    // path stays free of new allocation (empty metadata and payload
+    // frames). Taken wills fire after their kick (a kick is an unexpected
+    // disconnect, MT-05).
     let mut fired_wills = Vec::new();
     for client_id in &client_ids {
         let (closed, will) = kick_one(&state, client_id);
-        if closed {
-            results.push(serde_json::json!({"clientid": client_id, "result": "ok"}));
-            if let Some(will) = will {
-                fired_wills.push(will);
-            }
-        } else {
-            results.push(serde_json::json!({
-                "clientid": client_id,
-                "result": "not_found",
-                "code": "CLIENTID_NOT_FOUND",
-                "message": "client not found"
-            }));
+        if let (true, Some(will)) = (closed, will) {
+            fired_wills.push(will);
         }
     }
     for will in fired_wills {
         fire_kicked_will(&state, will).await;
     }
-    (StatusCode::OK, Json(results)).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Deliver a kicked client's taken will into its registration tenant
@@ -322,15 +493,23 @@ async fn fire_kicked_will(state: &ApiState, will: broker_session::StoredWill) {
 /// clones at most this many rows under a short lock, sorted by topic for
 /// a deterministic order; per-connection state itself stays bounded by
 /// live subscribe/unsubscribe writes. Management-plane only: the
-/// delivery path never takes this lock.
+/// delivery path never takes this lock. Reason for 1000: it covers
+/// the largest console page with headroom, while one read clones at
+/// most 1000 small rows so one request cannot balloon the node.
 const MAX_CLIENT_SUBSCRIPTIONS: usize = 1000;
 
 pub async fn get_client_subscriptions(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
+    Query(scope): Query<TenantScope>,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // Tenant-scoped per-client list. A set scope reads that tenant
+    // only. A bare id reads the default tenant first, then the one
+    // other tenant that holds the id. A miss answers not-found, never
+    // another tenant's rows. Rows keep the documented shape (no
+    // tenant field here), so the tenant selects the rows only.
+    let (_tenant, session) = match resolve_scoped_client(&state, &client_id, &scope) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -355,6 +534,7 @@ pub async fn get_client_subscriptions(
     if entries.len() > MAX_CLIENT_SUBSCRIPTIONS {
         entries.truncate(MAX_CLIENT_SUBSCRIPTIONS);
     }
+    let durable = !session.clean_start;
     let subs: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(topic, qos, nl, rap, rh)| {
@@ -364,8 +544,9 @@ pub async fn get_client_subscriptions(
                 "nl": nl,
                 "rap": rap,
                 "rh": rh,
-                "node": "indramqtt@127.0.0.1",
+                "node": crate::node_scope::local_node_name(),
                 "clientid": client_id,
+                "durable": durable,
             })
         })
         .collect();
@@ -374,44 +555,45 @@ pub async fn get_client_subscriptions(
 }
 
 /// One management subscribe against the real router and session index.
-///
-/// Shared by the single and bulk routes; bulk reuses this per entry so
-/// both paths register the same state. It touches the session map and
-/// the router trie and nothing on the message path. Work is bounded by
-/// the request itself: one map insert plus one trie insert per entry,
-/// plus a result list of the same length for bulk. No new buffering is
-/// added to fan-out or fan-in; management-plane only.
+/// The router copy and the session mirror both land in the owning
+/// tenant, so one tenant's subscribe never registers another tenant's
+/// row.
 fn apply_single_subscribe(
     state: &ApiState,
     client_id: &str,
     entry: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let session = match state.sessions.get(client_id) {
-        Some(session) => session,
+    let (tenant, session) = match resolve_bare_client(state, client_id) {
+        Some(hit) => hit,
         None => {
             return Err(ApiError::ClientIdNotFound("client not found".to_string()));
         }
     };
     let (filter, qos, nl, rap, rh) = parse_subscribe_entry(entry)?;
-    // Live connection owns the router copy; offline subscribes keep a
-    // placeholder until a live re-subscribe replaces it (the trie holds
-    // at most one `conn_id` per `(filter node, client_id)`).
-    let conn_id = (*session.conn_id.read()).unwrap_or(1);
+    // Offline sessions use 0 until a live re-subscribe replaces it.
+    let conn_id = (*session.conn_id.read()).unwrap_or(0);
 
     // B4-08 bound: a new entry past the subscription-table cap is denied
     // fail closed with the documented quota error, registering nothing
     // and changing no session state (no session mirror on failure).
-    let stored = state
-        .router
-        .subscribe(&filter, Subscription::new(client_id, conn_id, qos));
+    let stored = state.router.subscribe(
+        &filter,
+        Subscription::new_in_tenant(client_id, conn_id, qos, &tenant),
+    );
     if !stored {
         return Err(ApiError::TooManyRequests(
             "subscription table full".to_string(),
         ));
     }
-    state
-        .sessions
-        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
+    state.sessions.add_subscription_with_options_in_tenant(
+        &tenant,
+        client_id,
+        filter.clone(),
+        qos,
+        nl,
+        rap,
+        rh,
+    );
 
     Ok(serde_json::json!({
         "clientid": client_id,
@@ -420,7 +602,8 @@ fn apply_single_subscribe(
         "nl": nl,
         "rap": rap,
         "rh": rh,
-        "node": "indramqtt@127.0.0.1",
+        "node": crate::node_scope::local_node_name(),
+        "durable": !session.clean_start,
     }))
 }
 
@@ -526,44 +709,24 @@ pub async fn bulk_subscribe(
                 .into_response();
         }
     };
-    // Unknown clients fail the whole batch with not-found; malformed
-    // entries fail per entry while the good ones still land. The result
-    // list is bounded by the request length; no extra buffering.
-    if state.sessions.get(&client_id).is_none() {
+    // Unknown clients fail with not-found. Each entry installs one
+    // subscription. Bad entries are skipped. The answer holds only
+    // subscription objects.
+    if resolve_bare_client(&state, &client_id).is_none() {
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
     let mut results = Vec::with_capacity(entries.len());
     for entry in &entries {
-        match apply_single_subscribe(&state, &client_id, entry) {
-            Ok(item) => results.push(item),
-            Err(ApiError::BadRequest(message)) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": "BAD_REQUEST",
-                    "message": message,
-                }));
-            }
-            Err(error) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": error.code(),
-                    "message": error.message(),
-                }));
-            }
+        if let Ok(item) = apply_single_subscribe(&state, &client_id, entry) {
+            results.push(item);
         }
     }
     (StatusCode::OK, Json(results)).into_response()
 }
 
 /// One management unsubscribe against the real router and session index.
+/// The router copy and the session mirror both clear in the owning
+/// tenant, so one tenant's teardown never clears another tenant's row.
 ///
 /// Shared by the single and bulk routes; bulk reuses this per entry so
 /// both paths remove the same state. It touches the session map and the
@@ -577,12 +740,19 @@ fn apply_single_unsubscribe(
     client_id: &str,
     entry: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    if state.sessions.get(client_id).is_none() {
-        return Err(ApiError::ClientIdNotFound("client not found".to_string()));
-    }
+    let (tenant, _session) = match resolve_bare_client(state, client_id) {
+        Some(hit) => hit,
+        None => {
+            return Err(ApiError::ClientIdNotFound("client not found".to_string()));
+        }
+    };
     let filter = parse_unsubscribe_entry(entry)?;
-    state.sessions.remove_subscription(client_id, &filter);
-    state.router.unsubscribe(&filter, client_id);
+    state
+        .sessions
+        .remove_subscription_in_tenant(&tenant, client_id, &filter);
+    state
+        .router
+        .unsubscribe_in_tenant(&filter, client_id, &tenant);
     Ok(serde_json::json!({
         "topic": filter.as_str(),
     }))
@@ -639,109 +809,236 @@ pub async fn bulk_unsubscribe(
                 .into_response();
         }
     };
-    // Unknown clients fail the whole batch with not-found; malformed
-    // entries fail per entry while the good ones still remove. Absent
-    // subscriptions succeed per entry. The result list is bounded by the
-    // request length; no extra buffering.
-    if state.sessions.get(&client_id).is_none() {
+    // Unknown clients fail with not-found. Each entry removes one
+    // filter. One bad entry fails the batch. Absent filters still succeed.
+    if resolve_bare_client(&state, &client_id).is_none() {
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
-    let mut results = Vec::with_capacity(entries.len());
     for entry in &entries {
-        match apply_single_unsubscribe(&state, &client_id, entry) {
-            Ok(item) => results.push(item),
-            Err(ApiError::BadRequest(message)) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": "BAD_REQUEST",
-                    "message": message,
-                }));
-            }
-            Err(error) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": error.code(),
-                    "message": error.message(),
-                }));
-            }
+        if let Err(error) = apply_single_unsubscribe(&state, &client_id, entry) {
+            return error.into_response();
         }
     }
-    (StatusCode::OK, Json(results)).into_response()
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Query of the per-client message lists.
+///
+/// The console sends `position` plus `limit`. Older callers send
+/// `page` plus `limit`. Both are honoured: an explicit `position`
+/// wins, otherwise the page window applies. `payload` selects the
+/// payload encoding (`plain`, `base64`, `none`). Unknown keys are
+/// ignored so new parameters degrade instead of failing.
+#[derive(Deserialize, Default)]
+pub struct ClientMessagesQuery {
+    #[serde(default)]
+    pub position: Option<String>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    #[serde(default)]
+    pub max_payload_bytes: Option<String>,
+}
+
+/// Parse the limit with the shared bound (1..=1000, default 100).
+fn messages_limit(raw: Option<u32>) -> u32 {
+    raw.unwrap_or(crate::pagination::DEFAULT_LIMIT)
+        .clamp(1, crate::pagination::MAX_LIMIT)
+}
+
+/// Parse the start index from `position` (`none`/absent is 0).
+fn messages_start(raw: Option<&str>) -> usize {
+    match raw {
+        None => 0,
+        Some(text) if text == "none" || text.is_empty() => 0,
+        Some(text) => text.parse::<usize>().unwrap_or(0),
+    }
+}
+
+/// Parse a byte size such as `1MB`, `512KB` or plain bytes.
+fn parse_max_payload_bytes(raw: Option<&str>) -> Option<u64> {
+    let text = raw?.trim().to_uppercase().replace(' ', "");
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(num) = text.strip_suffix("MB") {
+        return num.parse::<u64>().ok().map(|v| v * 1024 * 1024);
+    }
+    if let Some(num) = text.strip_suffix("KB") {
+        return num.parse::<u64>().ok().map(|v| v * 1024);
+    }
+    if let Some(num) = text.strip_suffix('B') {
+        return num.parse::<u64>().ok();
+    }
+    text.parse::<u64>().ok()
+}
+
+/// Encode one payload for the message lists.
+fn encode_list_payload(payload: &[u8], mode: &str) -> Option<String> {
+    match mode {
+        "none" => None,
+        "base64" => {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            Some(STANDARD.encode(payload))
+        }
+        _ => Some(String::from_utf8_lossy(payload).into_owned()),
+    }
+}
+
+/// Build the continuation `meta` the console reads, plus the page
+/// fields the shared checker asserts. `start` names the first
+/// returned row, `position` names the next row or `end_of_data`.
+fn messages_meta(
+    page: u32,
+    limit: u32,
+    total: usize,
+    start_token: &str,
+    next_token: &str,
+) -> serde_json::Value {
+    let mut meta = meta_page(page, limit, total);
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("start".to_string(), serde_json::Value::from(start_token));
+        obj.insert("position".to_string(), serde_json::Value::from(next_token));
+    }
+    meta
+}
+
+/// Format one insert instant as nanoseconds since the Unix epoch.
+/// The queue stamps millis; the read scales to nanos for the console.
+fn inserted_at_str(ms: u64) -> String {
+    ((ms as u128) * 1_000_000).to_string()
 }
 
 pub async fn get_client_inflight(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
-    params: PageParams,
+    Query(query): Query<ClientMessagesQuery>,
 ) -> Response {
     // Unknown clients read as not-found with the documented error shape.
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id reads the owning session in any tenant (default first,
+    // then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
+    if let Some(mode) = query.payload.as_deref() {
+        if mode != "plain" && mode != "base64" && mode != "none" {
+            return ApiError::InvalidParameter(
+                "query parameter `payload` must be one of none, base64, plain".to_string(),
+            )
+            .into_response();
+        }
+    }
     // Bounded per-client view over the real QoS 1 tracker: the window
     // snapshot plus the spill snapshot (oldest-first, window then spill),
-    // clones at most window + spill entries under short read locks, then
-    // paginates with the W0 helper. Management-plane read only;
-    // the delivery hot path never takes a management lock (it takes the
-    // session write lock only to track/ack, never to serve this view).
+    // clones at most window + spill entries under short read locks.
+    // Management-plane read only; the delivery hot path never takes a
+    // management lock (it takes the session write lock only to
+    // track/ack, never to serve this view).
     let mut snapshot = session.inflight_snapshot();
     snapshot.extend(session.inflight_spill_snapshot());
     let total = snapshot.len();
-    let page_items = paginate(&snapshot, params.page, params.limit);
-    let data: Vec<serde_json::Value> = page_items
-        .iter()
-        .map(|m| {
-            serde_json::json!({
-                "topic": m.topic.as_str(),
-                "packet_id": m.packet_id,
-                "msgid": m.packet_id.to_string(),
-                "qos": u8::from(m.qos),
-                "payload": String::from_utf8_lossy(&m.payload),
-            })
-        })
-        .collect();
+    let limit = messages_limit(query.limit);
+    let page = query.page.unwrap_or(1).max(1);
+    let start_index = match query.position.as_deref() {
+        Some(_) => messages_start(query.position.as_deref()),
+        None => {
+            if query.page.is_some() {
+                ((u64::from(page) - 1) * u64::from(limit)).min(total as u64) as usize
+            } else {
+                0
+            }
+        }
+    }
+    .min(total);
+    let mode = query.payload.as_deref().unwrap_or("plain");
+    let budget = parse_max_payload_bytes(query.max_payload_bytes.as_deref());
+    let mut data = Vec::new();
+    let mut used: u64 = 0;
+    let mut end = start_index;
+    for m in snapshot.iter().skip(start_index) {
+        if data.len() as u32 >= limit {
+            break;
+        }
+        if let Some(cap) = budget {
+            let next = used + m.payload.len() as u64;
+            if !data.is_empty() && next > cap {
+                break;
+            }
+            used = next;
+        }
+        let mut entry = serde_json::Map::with_capacity(8);
+        entry.insert(
+            "topic".to_string(),
+            serde_json::Value::from(m.topic.as_str()),
+        );
+        // Reason for the value: the downlink packet id the session tracks.
+        entry.insert(
+            "msgid".to_string(),
+            serde_json::Value::from(m.packet_id.to_string()),
+        );
+        entry.insert("qos".to_string(), serde_json::Value::from(u8::from(m.qos)));
+        if let Some(text) = encode_list_payload(&m.payload, mode) {
+            entry.insert("payload".to_string(), serde_json::Value::from(text));
+        }
+        // Omitted: `from_clientid` and `from_username`.
+        if let Some(ms) = m.publish_at_ms {
+            entry.insert("publish_at".to_string(), serde_json::Value::from(ms));
+            entry.insert(
+                "inserted_at".to_string(),
+                serde_json::Value::from(inserted_at_str(ms)),
+            );
+        }
+        data.push(serde_json::Value::Object(entry));
+        end += 1;
+    }
+    let start_token = if data.is_empty() {
+        "none".to_string()
+    } else {
+        start_index.to_string()
+    };
+    let next_token = if end >= total {
+        "end_of_data".to_string()
+    } else {
+        end.to_string()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": meta_page(params.page, params.limit, total),
+            "meta": messages_meta(page, limit, total, &start_token, &next_token),
         })),
     )
         .into_response()
 }
 
-/// Render one offline-queue entry in the documented mqueue shape.
-///
-/// `publish_at` is the instant recorded where the message was already
-/// being written (offline queue insert), omitted for entries that predate
-/// timestamp recording rather than substituted.
-fn mqueue_entry_json(qm: &broker_session::QueuedMessage, msgid: String) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(5);
-    map.insert("msgid".to_string(), serde_json::Value::from(msgid));
+/// Render one offline-queue entry in the documented shape. The queue
+/// entry holds no message identifier, so the entry omits `msgid`.
+/// The specification leaves `msgid` optional. A caller that needs the
+/// identifier uses the inflight list. The inflight list carries the
+/// downlink packet id as the true value. The queue keeps no publisher
+/// name, so the entry omits `from_clientid` and `from_username`. The
+/// queue keeps no priority, so the entry omits `mqueue_priority`.
+fn mqueue_entry_json(qm: &broker_session::QueuedMessage, payload_mode: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(8);
     map.insert(
         "topic".to_string(),
         serde_json::Value::from(qm.topic.as_str()),
     );
     map.insert("qos".to_string(), serde_json::Value::from(u8::from(qm.qos)));
-    map.insert(
-        "payload".to_string(),
-        serde_json::Value::from(String::from_utf8_lossy(&qm.payload).into_owned()),
-    );
+    if let Some(text) = encode_list_payload(&qm.payload, payload_mode) {
+        map.insert("payload".to_string(), serde_json::Value::from(text));
+    }
     if let Some(ms) = qm.publish_at_ms {
+        map.insert("publish_at".to_string(), serde_json::Value::from(ms));
         map.insert(
-            "publish_at".to_string(),
-            serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
+            "inserted_at".to_string(),
+            serde_json::Value::from(inserted_at_str(ms)),
         );
     }
     serde_json::Value::Object(map)
@@ -750,79 +1047,113 @@ fn mqueue_entry_json(qm: &broker_session::QueuedMessage, msgid: String) -> serde
 pub async fn get_client_mqueue(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
-    params: PageParams,
+    Query(query): Query<ClientMessagesQuery>,
 ) -> Response {
     // Unknown clients read as not-found with the documented error shape.
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id reads the owning session in any tenant (default first,
+    // then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
+    if let Some(mode) = query.payload.as_deref() {
+        if mode != "plain" && mode != "base64" && mode != "none" {
+            return ApiError::InvalidParameter(
+                "query parameter `payload` must be one of none, base64, plain".to_string(),
+            )
+            .into_response();
+        }
+    }
     // Bounded per-client view over the real offline queue: the snapshot
     // clones at most `MAX_OFFLINE_QUEUE` (1024) entries under a short read
-    // lock, then paginates with the W0 helper. Management-plane read only;
-    // no new buffering on the delivery path and the delivery hot path
-    // never takes a management lock.
+    // lock. Management-plane read only; no new buffering on the delivery
+    // path and the delivery hot path never takes a management lock.
     let snapshot: Vec<broker_session::QueuedMessage> =
         session.offline_queue.read().iter().cloned().collect();
     let total = snapshot.len();
-    let page_items = paginate(&snapshot, params.page, params.limit);
-    let start =
-        ((u64::from(params.page.max(1)) - 1) * u64::from(params.limit)).min(total as u64) as usize;
-    let data: Vec<serde_json::Value> = page_items
-        .iter()
-        .enumerate()
-        .map(|(i, qm)| mqueue_entry_json(qm, (start + i + 1).to_string()))
-        .collect();
+    let limit = messages_limit(query.limit);
+    let page = query.page.unwrap_or(1).max(1);
+    let start_index = match query.position.as_deref() {
+        Some(_) => messages_start(query.position.as_deref()),
+        None => {
+            if query.page.is_some() {
+                ((u64::from(page) - 1) * u64::from(limit)).min(total as u64) as usize
+            } else {
+                0
+            }
+        }
+    }
+    .min(total);
+    let mode = query.payload.as_deref().unwrap_or("plain");
+    let budget = parse_max_payload_bytes(query.max_payload_bytes.as_deref());
+    let mut data = Vec::new();
+    let mut used: u64 = 0;
+    let mut end = start_index;
+    for qm in snapshot.iter().skip(start_index) {
+        if data.len() as u32 >= limit {
+            break;
+        }
+        if let Some(cap) = budget {
+            let next = used + qm.payload.len() as u64;
+            if !data.is_empty() && next > cap {
+                break;
+            }
+            used = next;
+        }
+        data.push(mqueue_entry_json(qm, mode));
+        end += 1;
+    }
+    let start_token = if data.is_empty() {
+        "none".to_string()
+    } else {
+        start_index.to_string()
+    };
+    let next_token = if end >= total {
+        "end_of_data".to_string()
+    } else {
+        end.to_string()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": meta_page(params.page, params.limit, total),
+            "meta": messages_meta(page, limit, total, &start_token, &next_token),
         })),
     )
         .into_response()
 }
 
-/// Per-client authorization decision cache read (W2-01, C01-10).
-///
-/// Renders the decisions recorded on the session by the publish and
-/// subscribe authorization events as a bare list (no paging): each entry
-/// carries `access` (`action_type`, `qos`, `retain`), `topic`, `result`
-/// (`allow` or `deny`) and `updated_time` (millis since the Unix epoch).
-/// An empty cache returns `[]`, not an error; unknown client ids return
-/// the documented not-found shape. Unknown query keys are ignored: the
-/// handler takes no paging params so extra keys never become a 400.
-/// Management-plane read only: one short lock on the per-session cache,
-/// which the delivery fan-out path never touches.
-// TODO(parity): is the empty-cache shape a bare list or an envelope, and
-// does a disconnected-but-known session read as empty or as 404? The
-// rulebook does not decide the disconnected policy; current choice follows
-// the neighbouring per-client reads (known session returns, unknown 404).
+/// Per-client authorization decision cache read.
 pub async fn get_client_authz_cache(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
     Query(_ignored): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id reads the owning session in any tenant (default
+    // first, then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
-    // Bounded snapshot over real state: at most
-    // `MAX_AUTHZ_DECISIONS_PER_CLIENT` (1024) small entries, oldest first.
+    // Snapshot holds at most 1024 entries, oldest first. Fresh entries
+    // only: expired entries per the stored TTL read as evicted.
+    let snap = state.authz_settings.snapshot();
+    let ttl_ms = broker_config::parse_settings_duration_to_ms(&snap.cache.ttl);
+    let now = broker_session::now_ms();
     let data: Vec<serde_json::Value> = session
         .authz_cache_snapshot()
         .iter()
+        .filter(|entry| match ttl_ms {
+            Some(ttl) => now.saturating_sub(entry.updated_ms) <= ttl,
+            None => true,
+        })
         .map(|entry| {
             serde_json::json!({
-                "access": {
-                    "action_type": entry.action,
-                    "qos": entry.qos,
-                    "retain": entry.retain,
-                },
+                "access": entry.action,
                 "topic": entry.topic,
                 "result": if entry.allow { "allow" } else { "deny" },
                 "updated_time": entry.updated_ms,
@@ -832,18 +1163,15 @@ pub async fn get_client_authz_cache(
     (StatusCode::OK, Json(data)).into_response()
 }
 
-/// Per-client authorization decision cache clear (W2-01, C01-09).
-///
-/// Evicts every cached decision for the client so a subsequent read shows
-/// empty; clearing an already-empty cache still succeeds (204). Unknown
-/// client ids return the documented not-found shape. A background map
-/// removal only: no work on the publish or deliver path.
+/// Per-client authorization decision cache clear.
 pub async fn clear_client_authz_cache(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id clears the owning session in any tenant (default
+    // first, then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -852,20 +1180,107 @@ pub async fn clear_client_authz_cache(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Global subscription list as a bare array (W1-14).
+/// Update the keepalive of one connected client.
+pub async fn put_client_keepalive(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    // A bare id writes the owning session in any tenant (default
+    // first, then the one other tenant that holds the id).
+    let (tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid keepalive body: {error}"))
+                .into_response();
+        }
+    };
+    let interval = value.get("interval").cloned();
+    let interval = match interval {
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(v) if v <= u64::from(u16::MAX) => v as u16,
+            _ => {
+                return ApiError::BadRequest(
+                    "field `interval` must be an integer 0..=65535".to_string(),
+                )
+                .into_response();
+            }
+        },
+        _ => {
+            return ApiError::BadRequest("field `interval` is required".to_string())
+                .into_response();
+        }
+    };
+    // Reason for the bound: the wire field is 16 bits, so 0..=65535 is
+    // the full protocol range; 0 disables the timer. One short write
+    // lock on live session state; the per-message path never takes it.
+    *session.keepalive_secs.write() = interval;
+    let is_connected = *session.connected.read();
+    (
+        StatusCode::OK,
+        Json(client_detail_json(
+            &client_id,
+            tenant.as_str(),
+            Some(&session),
+            is_connected,
+            interval,
+        )),
+    )
+        .into_response()
+}
+
+/// Query of the global subscription list.
 ///
-/// Reads the session-mirror index via
-/// [`broker_session::SessionManager::global_subscriptions`], not the
-/// router trie, so list reads never block the routing path. The snapshot
-/// is bounded by [`broker_session::MAX_GLOBAL_SUBSCRIPTIONS`] (100_000
-/// rows, sorted by `(client_id, topic)` for a deterministic page order)
-/// and then sliced with the W0 `page`/`limit` helper; unknown query keys
-/// are ignored by the extractor so new parameters degrade to the full
-/// first page instead of a 400. Management-plane only: no new buffering
-/// on fan-out or fan-in. Returns a bare list to match the documented
-/// shape (no `data`/`meta` envelope).
-pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParams) -> Response {
-    let rows = state.sessions.global_subscriptions();
+/// Reads the session mirror, not the router trie.
+/// The snapshot is bounded and sorted.
+/// Unknown query keys are ignored.
+/// Returns a bare list with no envelope.
+/// `qos` narrows the read; a `qos` outside 0, 1 or 2 fails with 400
+/// `BAD_REQUEST`. `tenant` keeps one tenant; an unknown tenant matches
+/// no row, never another tenant's row. Without it the list stays global,
+/// as the reference API documents. Rows keep the documented shape (the
+/// reference API has no tenant field here), so the tenant selects the
+/// rows only.
+#[derive(Deserialize, Default)]
+pub struct SubscriptionsQuery {
+    #[serde(default)]
+    pub qos: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+pub async fn list_subscriptions(
+    State(state): State<ApiState>,
+    params: PageParams,
+    Query(query): Query<SubscriptionsQuery>,
+) -> Response {
+    let qos_filter: Option<u8> = match query.qos.as_deref() {
+        None => None,
+        Some(raw) => match raw.trim().parse::<u8>() {
+            Ok(value) if value <= 2 => Some(value),
+            _ => {
+                return ApiError::BadRequest("query parameter `qos` must be 0, 1 or 2".to_string())
+                    .into_response();
+            }
+        },
+    };
+    let rows = match subscription_list_tenant(&query) {
+        None => state.sessions.global_subscriptions(),
+        Some(tenant) => state.sessions.global_subscriptions_in_tenant(tenant),
+    };
+    let rows: Vec<_> = match qos_filter {
+        None => rows,
+        Some(want) => rows
+            .into_iter()
+            .filter(|entry| u8::from(entry.options.qos) == want)
+            .collect(),
+    };
     let page_items = paginate(&rows, params.page, params.limit);
     let data: Vec<serde_json::Value> = page_items
         .iter()
@@ -877,7 +1292,7 @@ pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParam
                 "nl": entry.options.nl,
                 "rap": entry.options.rap,
                 "rh": entry.options.rh,
-                "node": "indramqtt@127.0.0.1"
+                "node": crate::node_scope::local_node_name()
             })
         })
         .collect();
@@ -906,7 +1321,7 @@ pub async fn list_topics(State(state): State<ApiState>, params: PageParams) -> R
         .map(|t| {
             serde_json::json!({
                 "topic": t,
-                "node": "indramqtt@127.0.0.1"
+                "node": crate::node_scope::local_node_name()
             })
         })
         .collect();
@@ -924,56 +1339,66 @@ pub async fn list_topics(State(state): State<ApiState>, params: PageParams) -> R
 ///
 /// Looks up the topic index with an exact match on the percent-decoded
 /// path parameter: no wildcard, prefix or filter matching. Known
-/// topics return the documented record; unknown topics return the
-/// documented not-found shape (`NOT_FOUND`, 404). Management-plane
+/// topics return a JSON array with one row per node that holds the topic
+/// (one row on this single node), as the reference API documents; unknown
+/// topics return the documented 404 `TOPIC_NOT_FOUND`. Management-plane
 /// read only: one short lock on the topic set, no work on fan-out or
 /// fan-in.
 pub async fn get_topic(State(state): State<ApiState>, Path(topic): Path<String>) -> Response {
     if !state.router.contains_topic(&topic) {
-        return ApiError::NotFound("topic not found".to_string()).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "TOPIC_NOT_FOUND",
+                "message": "topic not found"
+            })),
+        )
+            .into_response();
     }
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(serde_json::json!([{
             "topic": topic,
-            "node": "indramqtt@127.0.0.1"
-        })),
+            "node": crate::node_scope::local_node_name()
+        }])),
     )
         .into_response()
 }
 
-/// Documented `GET /sessions_count` scoping. Only `node` narrows the
-/// count; every other query key is ignored by the `Query` extractor so
-/// new parameters degrade to the full count instead of a 400.
+/// Query of `GET /sessions_count`. The reference API documents `since`, a
+/// UNIX time in seconds. Other query keys are ignored, so new parameters
+/// degrade to the plain count instead of a 400.
 #[derive(Deserialize, Default)]
 pub struct SessionsCountQuery {
     #[serde(default)]
-    pub node: Option<String>,
+    pub since: Option<String>,
 }
 
-/// Live-session count as a small `{"count": N}` object.
+/// `GET /sessions_count`: the number of sessions that have not expired.
 ///
-/// Constant-time read over indexed session state: one atomic maintained
-/// by the session manager, no scan of the session map. Counts connected
-/// sessions only. An explicit `node` value for another node narrows to
-/// zero on this single node; unknown query keys are ignored.
-/// Management-plane only; never touched on fan-out or fan-in.
+/// The reference API documents the body as a JSON string that holds the
+/// number, for example `"3"`. The count covers sessions held in memory,
+/// connected or detached. The broker keeps no history of expired sessions,
+/// so `since` adds no expired sessions: the count is the same for every
+/// valid `since`. A `since` that is not a whole number of seconds fails
+/// with 400 `BAD_REQUEST`.
+/// Management-plane only: one short read lock over the session maps;
+/// never touched on fan-out or fan-in.
 pub async fn get_sessions_count(
     State(state): State<ApiState>,
     Query(params): Query<SessionsCountQuery>,
 ) -> Response {
-    let total = state.sessions.connected_count();
-    let count = match params.node.as_deref() {
-        Some(want)
-            if !want.is_empty()
-                && want != state.node_id.as_str()
-                && want != "indramqtt@127.0.0.1" =>
-        {
-            0
+    if let Some(since) = params.since.as_deref() {
+        if since.parse::<u64>().is_err() {
+            return ApiError::BadRequest(
+                "query parameter `since` must be a non-negative whole number of seconds"
+                    .to_string(),
+            )
+            .into_response();
         }
-        _ => total,
-    };
-    (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response()
+    }
+    let count = state.sessions.session_count();
+    (StatusCode::OK, Json(count.to_string())).into_response()
 }
 
 /// Management-plane publish fan-out shared by `POST /publish` and the
@@ -1053,6 +1478,7 @@ fn build_publish_deliveries_in_tenant(
                                 retain,
                                 payload: payload.clone(),
                                 enqueued_at: std::time::Instant::now(),
+                                publish_at_ms: None,
                             }) {
                                 broker_session::InflightTrackOutcome::Tracked => {}
                                 broker_session::InflightTrackOutcome::Spilled => {
@@ -1258,25 +1684,35 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
+        self.publish_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            topic,
+            payload,
+            qos,
+            retain,
+        )
+        .await
+    }
+    /// Fan out one derived message inside one tenant. The match and
+    /// the session reads use that tenant only, so output never
+    /// leaves it.
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
         let qos_raw = u8::from(qos);
         let topic_str = topic.as_str();
         let mut frames = Vec::new();
         let mut offline_failed = false;
-        // Tenant scope (MT-02, MT-03): rule republishes fan out in the
-        // default tenant only (fail closed, single-tenant behaviour
-        // unchanged); the tenant attribution for derived messages is open
-        // until the rule engine dispatches per tenant.
-        let (matched, _tenant_skipped) = self.router.matches_in_tenant_counted(
-            &topic,
-            None,
-            broker_session::tenant::DEFAULT_TENANT_ID,
-        );
+        let (matched, _tenant_skipped) =
+            self.router.matches_in_tenant_counted(&topic, None, tenant);
         for sub in matched {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-            match self.sessions.get_in_tenant(
-                broker_session::tenant::DEFAULT_TENANT_ID,
-                sub.client_id.as_ref(),
-            ) {
+            match self.sessions.get_in_tenant(tenant, sub.client_id.as_ref()) {
                 Some(session) => {
                     let connected = *session.connected.read();
                     let live = *session.conn_id.read();
@@ -1299,6 +1735,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                                         retain,
                                         payload: payload.clone(),
                                         enqueued_at: std::time::Instant::now(),
+                                        publish_at_ms: None,
                                     },
                                 ) {
                                     broker_session::InflightTrackOutcome::Tracked => {}
@@ -1428,11 +1865,9 @@ async fn handle_mgmt_retained(
     retain: bool,
     payload: &Bytes,
 ) {
-    // TODO(parity): management publishes carry no client tenant yet, so the
-    // mirror stores in the default tenant only (fail closed: never another
-    // tenant's; single-tenant behaviour unchanged). The open question is the
-    // tenant attribution for management publishes once authenticated callers
-    // carry a tenant.
+    // Management publishes carry no client tenant. The mirror stores
+    // in the default tenant only (fail closed: never another tenant's).
+    // Single-tenant behaviour stays unchanged.
     handle_mgmt_retained_in_tenant(
         state,
         topic,
@@ -1457,10 +1892,10 @@ async fn handle_mgmt_retained_in_tenant(
     }
     // Per-tenant accounting: the global `backend.max_retained_messages` cap
     // (and the hard `broker_storage::MAX_RETAINED_MESSAGES` cap inside the
-    // store) counts `(tenant, topic)` pairs across all tenants, so every
-    // tenant's retained usage counts toward the same finite bound with no
-    // second unlimited default. Consults state the store already holds with
-    // one short-lock lookup, never a scan, so the per-lookup cost stays flat.
+    // store) counts `(tenant, topic)` pairs across all tenants. The
+    // per-tenant bound drops the new topic in its own tenant only, while
+    // delivery keeps working. One short-lock lookup per check, never a
+    // scan. Management-plane only; the deliver path takes no lock here.
     if payload.is_empty() {
         if state
             .retained
@@ -1491,6 +1926,32 @@ async fn handle_mgmt_retained_in_tenant(
             return;
         }
     }
+    let tenant_cap = state.retained.retained_cap_for_tenant(tenant);
+    if tenant_cap > 0 {
+        let already = state
+            .retained
+            .get_retained_in_tenant(topic, tenant)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !already {
+            let used = state
+                .retained
+                .count_retained_in_tenant(tenant)
+                .await
+                .unwrap_or(usize::MAX);
+            if used >= tenant_cap {
+                state.metrics.inc_tenant_retained_dropped();
+                tracing::warn!(
+                    tenant = %tenant,
+                    topic = %topic.as_str(),
+                    "tenant retained limit reached: dropping new retained topic"
+                );
+                return;
+            }
+        }
+    }
     if state
         .retained
         .set_retained_in_tenant(topic.clone(), qos, payload.clone(), tenant)
@@ -1517,7 +1978,7 @@ async fn do_mgmt_publish(
     payload: &Bytes,
     qos: QoS,
     retain: bool,
-) -> usize {
+) -> (usize, u64, usize) {
     state.metrics.inc_messages_received();
     state.metrics.inc_publish_received();
     match qos {
@@ -1543,14 +2004,24 @@ async fn do_mgmt_publish(
         .dispatch_ingress(topic, payload, qos, &sink)
         .await;
     state.metrics.inc_rules_executed_by(rules_fired as u64);
+    // Agent collects (MC-04): hand accepted ingress to running
+    // collects in the default tenant. Idle publishes pay one atomic
+    // load inside `feed`; feeds clone only for matching collects.
+    state.collectors.feed(
+        broker_storage::DEFAULT_TENANT_ID,
+        topic,
+        qos,
+        retain,
+        payload,
+    );
     // Topic index (W1-15): remember the concrete publish topic before
     // fan-out so the list/detail reads observe it. Bounded short-lock
     // insert; delivery proceeds even when the index is full.
     // Management-plane index only, no work on fan-out or fan-in.
     state.router.record_topic(topic.as_str());
-    let (frames, _offline, matched) = build_publish_deliveries(state, topic, qos, retain, payload);
-    route_publish_frames(state, frames);
-    matched
+    let (frames, offline, matched) = build_publish_deliveries(state, topic, qos, retain, payload);
+    let enqueued = route_publish_frames(state, frames);
+    (matched, enqueued, offline)
 }
 
 pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Response {
@@ -1560,11 +2031,38 @@ pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Resp
             return ApiError::BadRequest(format!("invalid publish body: {error}")).into_response();
         }
     };
-    let (topic, payload, qos, retain) = match parse_publish_entry(&value) {
+    handle_publish_value(&state, &value).await
+}
+
+/// Shared publish path for `POST /publish` and the `publish` agent
+/// tool (MC-04): validate, inject, then render. Both callers observe
+/// identical validation, rule, retained and fan-out behaviour.
+pub(crate) async fn handle_publish_value(state: &ApiState, value: &serde_json::Value) -> Response {
+    let (topic, payload, qos, retain) = match parse_publish_entry(value) {
         Ok(parts) => parts,
         Err(message) => return ApiError::BadRequest(message).into_response(),
     };
-    do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+    let (matched, enqueued, offline) = do_mgmt_publish(state, &topic, &payload, qos, retain).await;
+    if matched == 0 {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "message": "no_matching_subscribers",
+                "reason_code": 16,
+            })),
+        )
+            .into_response();
+    }
+    if enqueued == 0 && offline == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "message": "failed to deliver the message to subscriber(s)",
+                "reason_code": 131,
+            })),
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({ "id": publish_id() })),
@@ -1577,13 +2075,13 @@ pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Resp
 /// Takes a JSON array of publish entries (same shape as `POST /publish`)
 /// and injects each through `parse_publish_entry` plus `do_mgmt_publish`,
 /// so bulk output observes identical validation, rule, retained and
-/// fan-out semantics. One bad entry never fails the batch: it is marked
-/// with the documented error shape in the result while the good ones
-/// still deliver. A wholly malformed body (invalid JSON or not an array)
-/// is a client error. Bounded iteration over the request itself: one
-/// parse plus one fan-out per entry, plus a result list of the same
-/// length. No extra buffering beyond the request and result lists;
-/// management-plane only.
+/// fan-out semantics. A wholly malformed body (invalid JSON or not an
+/// array) is a client error. One invalid entry fails the batch with 400;
+/// otherwise one undelivered entry reports 202 and one failed delivery
+/// reports 503, mirroring `POST /publish` per entry. Bounded iteration
+/// over the request itself: one parse plus one fan-out per entry, plus a
+/// result list of the same length. No extra buffering beyond the request
+/// and result lists; management-plane only.
 pub async fn publish_bulk(State(state): State<ApiState>, body: Bytes) -> Response {
     let entries: Vec<serde_json::Value> = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1593,27 +2091,57 @@ pub async fn publish_bulk(State(state): State<ApiState>, body: Bytes) -> Respons
         }
     };
     let mut results = Vec::with_capacity(entries.len());
+    let mut has_invalid = false;
+    let mut has_no_match = false;
+    let mut has_failed = false;
     for entry in &entries {
         match parse_publish_entry(entry) {
             Ok((topic, payload, qos, retain)) => {
-                do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
-                results.push(serde_json::json!({
-                    "topic": topic.as_str(),
-                    "id": publish_id(),
-                }));
+                let (matched, enqueued, offline) =
+                    do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+                if matched == 0 {
+                    has_no_match = true;
+                    results.push(serde_json::json!({
+                        "topic": topic.as_str(),
+                        "message": "no_matching_subscribers",
+                        "reason_code": 16,
+                    }));
+                } else if enqueued == 0 && offline == 0 {
+                    has_failed = true;
+                    results.push(serde_json::json!({
+                        "topic": topic.as_str(),
+                        "message": "failed to deliver the message to subscriber(s)",
+                        "reason_code": 131,
+                    }));
+                } else {
+                    results.push(serde_json::json!({
+                        "topic": topic.as_str(),
+                        "id": publish_id(),
+                    }));
+                }
             }
             Err(message) => {
+                has_invalid = true;
                 let topic = entry
                     .get("topic")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
                 results.push(serde_json::json!({
                     "topic": topic,
-                    "code": "BAD_REQUEST",
                     "message": message,
+                    "reason_code": 144,
                 }));
             }
         }
+    }
+    if has_invalid {
+        return (StatusCode::BAD_REQUEST, Json(results)).into_response();
+    }
+    if has_failed {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(results)).into_response();
+    }
+    if has_no_match {
+        return (StatusCode::ACCEPTED, Json(results)).into_response();
     }
     (StatusCode::OK, Json(results)).into_response()
 }
@@ -1644,28 +2172,35 @@ mod tests {
         use broker_protocol::{QoS, Topic};
 
         let state = standalone_state();
+        // Connect a durable session through the broker, then detach it.
+        // The session keeps replayable state for the broker publish below.
         let (session, _) = state.sessions.get_or_create("b110-mqueue", false);
-        *session.connected.write() = false;
-        *session.conn_id.write() = None;
+        state.sessions.bind_session(&session, 9001);
+        let entry = serde_json::json!({"topic": "conf/mqueue/b110", "qos": 1});
+        apply_single_subscribe(&state, "b110-mqueue", &entry).expect("broker subscribe lands");
+        state.sessions.unbind_connection("b110-mqueue", 9001);
 
+        // Publish through the broker fan-out, not the store alone.
         let before = crate::v5::retainer::now_ms();
-        session.push_offline(broker_session::QueuedMessage {
-            topic: Topic::new("conf/mqueue/b110").expect("valid topic"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            payload: bytes::Bytes::from_static(b"hello-b110"),
-            publish_at_ms: None,
-        });
+        do_mgmt_publish(
+            &state,
+            &Topic::new("conf/mqueue/b110").expect("valid topic"),
+            &bytes::Bytes::from_static(b"hello-b110"),
+            QoS::AtLeastOnce,
+            false,
+        )
+        .await;
         let after = crate::v5::retainer::now_ms();
 
         let (status, body) = response_parts(
             get_client_mqueue(
                 State(state),
                 Path("b110-mqueue".to_string()),
-                PageParams {
-                    page: 1,
-                    limit: 100,
-                },
+                Query(ClientMessagesQuery {
+                    page: Some(1),
+                    limit: Some(100),
+                    ..Default::default()
+                }),
             )
             .await,
         )
@@ -1674,15 +2209,23 @@ mod tests {
         let entry = &body["data"][0];
         let published = entry
             .get("publish_at")
-            .and_then(|v| v.as_str())
+            .and_then(|v| v.as_u64())
             .expect("queued entry carries publish_at");
-        assert_ne!(published, "2026-09-13T21:00:00Z");
-        assert_ne!(published, "2026-09-20T00:00:00Z");
-        let parsed =
-            crate::v5::retainer::parse_rfc3339_ms(published).expect("publish_at is RFC3339");
         assert!(
-            parsed >= before.saturating_sub(1000) && parsed <= after + 1000,
-            "publish_at {published} ({parsed}) must be the queue time [{before}, {after}]"
+            published >= before.saturating_sub(1000) && published <= after + 1000,
+            "publish_at {published} must be the queue time [{before}, {after}]"
+        );
+        assert!(
+            entry.get("inserted_at").and_then(|v| v.as_str()).is_some(),
+            "queued entry carries inserted_at: {entry}"
+        );
+        assert!(
+            entry.get("mqueue_priority").is_none(),
+            "queued entry omits mqueue_priority: the queue keeps no priority: {entry}"
+        );
+        assert!(
+            entry.get("msgid").is_none(),
+            "queued entry omits msgid: the queue keeps no identifier: {entry}"
         );
     }
 
@@ -1697,22 +2240,127 @@ mod tests {
             payload: bytes::Bytes::from_static(b"old"),
             publish_at_ms: None,
         };
-        let rendered = mqueue_entry_json(&qm, "1".to_string());
+        let rendered = mqueue_entry_json(&qm, "plain");
         assert!(
             rendered.get("publish_at").is_none(),
             "entries predating timestamp recording must omit publish_at: {rendered}"
         );
+        assert!(
+            rendered.get("msgid").is_none(),
+            "queued entries hold no identifier and must omit msgid: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_publish_at_is_track_time_not_a_constant() {
+        use broker_protocol::{QoS, Topic};
+
+        let state = standalone_state();
+        // Connect a live session through the broker bind path.
+        let (session, _) = state.sessions.get_or_create("b110-inflight", true);
+        state.sessions.bind_session(&session, 9003);
+        let entry = serde_json::json!({"topic": "conf/inflight/b110", "qos": 1});
+        apply_single_subscribe(&state, "b110-inflight", &entry).expect("broker subscribe lands");
+
+        // Publish QoS 1 through the broker fan-out, not the store alone.
+        let before = crate::v5::retainer::now_ms();
+        do_mgmt_publish(
+            &state,
+            &Topic::new("conf/inflight/b110").expect("valid topic"),
+            &bytes::Bytes::from_static(b"hello-inflight"),
+            QoS::AtLeastOnce,
+            false,
+        )
+        .await;
+        let after = crate::v5::retainer::now_ms();
+
+        let (status, body) = response_parts(
+            get_client_inflight(
+                State(state.clone()),
+                Path("b110-inflight".to_string()),
+                Query(ClientMessagesQuery {
+                    page: Some(1),
+                    limit: Some(100),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let item = &body["data"][0];
+        let published = item
+            .get("publish_at")
+            .and_then(|v| v.as_u64())
+            .expect("inflight entry carries publish_at");
+        assert!(
+            published >= before.saturating_sub(1000) && published <= after + 1000,
+            "publish_at {published} must be the track time [{before}, {after}]"
+        );
+        assert!(
+            item.get("inserted_at").and_then(|v| v.as_str()).is_some(),
+            "inflight entry carries inserted_at: {item}"
+        );
+        assert!(
+            item.get("msgid").and_then(|v| v.as_str()).is_some(),
+            "inflight entry carries the downlink packet id as msgid: {item}"
+        );
+
+        // The detail read reports the live inflight count from the broker.
+        let (status, detail) = response_parts(
+            get_client(
+                State(state),
+                Path("b110-inflight".to_string()),
+                Query(TenantScope::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["inflight_cnt"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn keepalive_update_goes_through_the_broker_session() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("b110-keep", true);
+        state.sessions.bind_session(&session, 9004);
+
+        let body = Bytes::from_static(b"{\"interval\": 90}");
+        let (status, rendered) = response_parts(
+            put_client_keepalive(State(state.clone()), Path("b110-keep".to_string()), body).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rendered["keepalive"], serde_json::json!(90));
+        assert_eq!(*session.keepalive_secs.read(), 90);
+
+        let missing = Bytes::from_static(b"{\"interval\": 60}");
+        let (status, _) = response_parts(
+            put_client_keepalive(State(state), Path("b110-missing".to_string()), missing).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn connected_at_is_bind_time_not_a_constant() {
         let state = standalone_state();
         let before = crate::v5::retainer::now_ms();
-        state.sessions.get_or_create("b110-conn", true);
+        // Connect through the broker bind path, not the store alone.
+        let (session, _) = state.sessions.get_or_create("b110-conn", true);
+        state.sessions.bind_session(&session, 9002);
         let after = crate::v5::retainer::now_ms();
 
-        let (status, body) =
-            response_parts(get_client(State(state), Path("b110-conn".to_string())).await).await;
+        let (status, body) = response_parts(
+            get_client(
+                State(state),
+                Path("b110-conn".to_string()),
+                Query(TenantScope::default()),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let connected = body
             .get("connected_at")
@@ -1732,7 +2380,7 @@ mod tests {
         let state = standalone_state();
         let (session, _) = state.sessions.get_or_create("b110-legacy", true);
         *session.connected_at_ms.write() = None;
-        let rendered = client_detail_json("b110-legacy", Some(&session), true, 60);
+        let rendered = client_detail_json("b110-legacy", "default", Some(&session), true, 60);
         assert!(
             rendered.get("connected_at").is_none(),
             "sessions predating timestamp recording must omit connected_at: {rendered}"
@@ -1800,6 +2448,32 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(rendered["code"], serde_json::json!("TOO_MANY_REQUESTS"));
+    }
+
+    // Prove the per-client list bound holds through the broker.
+    #[tokio::test]
+    async fn client_subscriptions_truncate_at_bound() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("trunc-client", true);
+        *session.conn_id.write() = Some(4243);
+        for i in 0..(MAX_CLIENT_SUBSCRIPTIONS + 5) {
+            let entry = serde_json::json!({"topic": format!("conf/trunc/{i:05}"), "qos": 0});
+            apply_single_subscribe(&state, "trunc-client", &entry).expect("broker subscribe lands");
+        }
+        let (status, body) = response_parts(
+            get_client_subscriptions(
+                State(state),
+                Path("trunc-client".to_string()),
+                Query(TenantScope::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let subs = body.as_array().expect("subscriptions list");
+        assert_eq!(subs.len(), MAX_CLIENT_SUBSCRIPTIONS);
+        // List stays sorted so the bound keeps the first rows.
+        assert_eq!(subs[0]["topic"], serde_json::json!("conf/trunc/00000"));
     }
     #[tokio::test]
     async fn mgmt_retained_publish_stays_in_default_tenant() {
@@ -2014,5 +2688,470 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(rx_a.try_recv().is_err(), "will fires at most once");
         assert_eq!(state.conns.qos0_len(5002), 0, "no second fire queued");
+    }
+
+    /// TM-09 broker-path harness: real HTTP through the production
+    /// router. Setup writes mirror the kernel bind and subscribe
+    /// writes. Each proof reads through the API, never the store.
+    struct Tm09Server {
+        port: u16,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Tm09Server {
+        async fn start() -> (Self, ApiState) {
+            let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+                16,
+                broker_rules::BackpressurePolicy::DropOldest,
+            ));
+            let state = ApiState::standalone(engine);
+            state
+                .admin_users
+                .create(
+                    "tm09-admin",
+                    "Tm09-admin-pass!",
+                    crate::admin_users::AdminRole::Administrator,
+                    "",
+                )
+                .expect("admin creates");
+            state
+                .admin_users
+                .create(
+                    "tm09-viewer",
+                    "Tm09-viewer-pass!",
+                    crate::admin_users::AdminRole::Viewer,
+                    "",
+                )
+                .expect("viewer creates");
+            let inner = state.clone();
+            let app = crate::router(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve test app");
+            });
+            (Self { port, task }, inner)
+        }
+
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            token: Option<&str>,
+        ) -> (u16, serde_json::Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let mut head = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
+            if let Some(token) = token {
+                head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .expect("connect test server");
+            stream
+                .write_all(head.as_bytes())
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let text = String::from_utf8(buf).expect("response is UTF-8");
+            let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+            let status: u16 = head.lines().next().expect("status line")[9..12]
+                .parse()
+                .expect("status code");
+            let json = if body.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body).expect("response body is JSON")
+            };
+            (status, json)
+        }
+    }
+
+    impl Drop for Tm09Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Seed one connected session with one subscription in one tenant.
+    /// The writes mirror the kernel bind hook (create, pin the edge
+    /// connection, record the keepalive) and the subscribe path (one
+    /// router copy plus one session mirror row).
+    fn tm09_seed(state: &ApiState, tenant: &str, client_id: &str, conn_id: u64, filter: &str) {
+        let (session, _) = state
+            .sessions
+            .get_or_create_in_tenant(tenant, client_id, true);
+        state.sessions.bind_session(&session, conn_id);
+        *session.keepalive_secs.write() = 60;
+        let parsed = TopicFilter::new(filter).expect("seed filter is valid");
+        state.router.subscribe(
+            &parsed,
+            Subscription::new_in_tenant(client_id, conn_id, QoS::AtMostOnce, tenant),
+        );
+        state.sessions.add_subscription_with_options_in_tenant(
+            tenant,
+            client_id,
+            parsed,
+            QoS::AtMostOnce,
+            0,
+            0,
+            0,
+        );
+    }
+
+    fn tm09_admin(state: &ApiState) -> String {
+        state
+            .tokens
+            .issue("tm09-admin", crate::admin_users::AdminRole::Administrator)
+    }
+
+    fn tm09_viewer(state: &ApiState) -> String {
+        state
+            .tokens
+            .issue("tm09-viewer", crate::admin_users::AdminRole::Viewer)
+    }
+
+    /// Two clients with the same client id in two tenants render two
+    /// records with two tenant ids through the API.
+    #[tokio::test]
+    async fn tm09_same_id_in_two_tenants_renders_two_tenant_rows() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7201, "tm09/check");
+        tm09_seed(&state, "tm09-b", "tm09-dup", 7202, "tm09/check");
+        tm09_seed(
+            &state,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "tm09-base",
+            7203,
+            "tm09/base",
+        );
+
+        let (status, body) = server.request("GET", "/api/v5/clients", Some(&admin)).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("client list has data");
+        let mut dups: Vec<&str> = Vec::new();
+        for row in data.iter().filter(|row| row["clientid"] == "tm09-dup") {
+            dups.push(row["mountpoint"].as_str().expect("row carries mountpoint"));
+        }
+        dups.sort_unstable();
+        assert_eq!(dups, vec!["tm09-a", "tm09-b"]);
+        let base = data
+            .iter()
+            .find(|row| row["clientid"] == "tm09-base")
+            .expect("default client listed");
+        assert_eq!(base["mountpoint"], serde_json::json!("default"));
+    }
+
+    /// A read filtered by one tenant returns that tenant rows only.
+    /// An unknown tenant returns an empty page, never another tenant.
+    #[tokio::test]
+    async fn tm09_tenant_filter_keeps_own_rows_only() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7211, "tm09/check");
+        tm09_seed(&state, "tm09-b", "tm09-dup", 7212, "tm09/check");
+
+        for tenant in ["tm09-a", "tm09-b"] {
+            let (status, body) = server
+                .request(
+                    "GET",
+                    &format!("/api/v5/clients?tenant={tenant}"),
+                    Some(&admin),
+                )
+                .await;
+            assert_eq!(status, 200, "filter {tenant}");
+            let data = body["data"].as_array().expect("client list has data");
+            assert!(!data.is_empty(), "filter {tenant} keeps its rows");
+            for row in data {
+                assert_eq!(row["mountpoint"], serde_json::json!(tenant));
+            }
+            assert!(
+                data.iter().all(|row| row["clientid"] == "tm09-dup"),
+                "only the tenant rows show"
+            );
+        }
+        let (status, body) = server
+            .request("GET", "/api/v5/clients?tenant=tm09-ghost", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], serde_json::json!([]));
+        assert_eq!(body["meta"]["count"], serde_json::json!(0));
+
+        // Client id plus tenant selects one of the two namesakes.
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients?clientid=tm09-dup&tenant=tm09-a",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("client list has data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["mountpoint"], serde_json::json!("tm09-a"));
+    }
+
+    /// A per-client read with a tenant scope selects that tenant only.
+    /// A bare id keeps the default tenant. A miss answers not-found,
+    /// never another tenant session.
+    #[tokio::test]
+    async fn tm09_tenant_scope_selects_per_client_reads() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7221, "tm09/a");
+        tm09_seed(&state, "tm09-b", "tm09-dup", 7222, "tm09/b");
+
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup?tenant=tm09-a",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mountpoint"], serde_json::json!("tm09-a"));
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup?tenant=tm09-b",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mountpoint"], serde_json::json!("tm09-b"));
+
+        // No default-tenant namesake exists, so the bare read misses.
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-dup", Some(&admin))
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], serde_json::json!("CLIENTID_NOT_FOUND"));
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup?tenant=tm09-ghost",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], serde_json::json!("CLIENTID_NOT_FOUND"));
+
+        // Subscription rows keep the documented shape and scope.
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup/subscriptions?tenant=tm09-a",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["topic"], serde_json::json!("tm09/a"));
+        assert!(rows[0].get("tenant").is_none());
+        assert!(rows[0].get("mountpoint").is_none());
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup/subscriptions?tenant=tm09-b",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["topic"], serde_json::json!("tm09/b"));
+        let (status, _) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup/subscriptions",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    /// A bare id finds the one tenant that holds it. Two namesakes
+    /// in two tenants still miss, so a bare read never picks another
+    /// tenant's row.
+    #[tokio::test]
+    async fn tm09_bare_id_finds_single_non_default_session() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-lone", 7261, "tm09/lone");
+
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-lone", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], serde_json::json!("tm09-lone"));
+        assert_eq!(body["mountpoint"], serde_json::json!("tm09-a"));
+
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-lone/subscriptions",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["topic"], serde_json::json!("tm09/lone"));
+
+        tm09_seed(&state, "tm09-b", "tm09-lone", 7262, "tm09/lone-b");
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-lone", Some(&admin))
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], serde_json::json!("CLIENTID_NOT_FOUND"));
+    }
+
+    /// The global subscription list keeps its shape without a filter
+    /// and keeps one tenant with a filter. The rows carry no tenant
+    /// field (the reference API has none there).
+    #[tokio::test]
+    async fn tm09_subscription_list_filter_keeps_shape_and_scope() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-sub-a", 7231, "tm09/a");
+        tm09_seed(&state, "tm09-b", "tm09-sub-b", 7232, "tm09/b");
+
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.get("tenant").is_none());
+            assert!(row.get("mountpoint").is_none());
+            assert!(row.get("clientid").is_some());
+            assert!(row.get("topic").is_some());
+            assert!(row.get("node").is_some());
+        }
+
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions?tenant=tm09-a", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["clientid"], serde_json::json!("tm09-sub-a"));
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions?tenant=tm09-b", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["clientid"], serde_json::json!("tm09-sub-b"));
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/subscriptions?tenant=tm09-ghost",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// Default-tenant reads keep the current shapes. Client rows add
+    /// only the documented tenant field; subscription, topic and
+    /// session-count reads change nothing.
+    #[tokio::test]
+    async fn tm09_default_tenant_reads_keep_current_shapes() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(
+            &state,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "tm09-base",
+            7241,
+            "tm09/base",
+        );
+        state.router.record_topic("tm09/known");
+
+        let (status, body) = server.request("GET", "/api/v5/clients", Some(&admin)).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("client list has data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["clientid"], serde_json::json!("tm09-base"));
+        assert_eq!(data[0]["mountpoint"], serde_json::json!("default"));
+        assert!(data[0].get("node").is_some());
+
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-base", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mountpoint"], serde_json::json!("default"));
+
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("tenant").is_none());
+
+        let (status, body) = server.request("GET", "/api/v5/topics", Some(&admin)).await;
+        assert_eq!(status, 200);
+        let topics: Vec<&str> = body["data"]
+            .as_array()
+            .expect("topic list has data")
+            .iter()
+            .filter_map(|row| row["topic"].as_str())
+            .collect();
+        assert!(topics.contains(&"tm09/known"));
+
+        let (status, body) = server
+            .request("GET", "/api/v5/sessions_count", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, serde_json::json!("1"));
+    }
+
+    /// Each changed read needs a token. A viewer reads but never
+    /// writes on the changed paths.
+    #[tokio::test]
+    async fn tm09_changed_reads_need_token_and_viewer_reads_only() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        let viewer = tm09_viewer(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7251, "tm09/check");
+
+        let paths = [
+            "/api/v5/clients",
+            "/api/v5/clients?tenant=tm09-a",
+            "/api/v5/clients/tm09-dup?tenant=tm09-a",
+            "/api/v5/clients/tm09-dup/subscriptions?tenant=tm09-a",
+            "/api/v5/subscriptions",
+            "/api/v5/subscriptions?tenant=tm09-a",
+        ];
+        for path in paths {
+            let (status, body) = server.request("GET", path, None).await;
+            assert_eq!(status, 401, "no token on {path}");
+            assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+            let (status, _) = server.request("GET", path, Some(&viewer)).await;
+            assert_eq!(status, 200, "viewer reads {path}");
+            let (status, _) = server.request("GET", path, Some(&admin)).await;
+            assert_eq!(status, 200, "admin reads {path}");
+        }
+
+        // A viewer never kicks; an admin kick of an unknown id misses.
+        let (status, body) = server
+            .request("DELETE", "/api/v5/clients/tm09-ghost", Some(&viewer))
+            .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+        let (status, _) = server
+            .request("DELETE", "/api/v5/clients/tm09-ghost", Some(&admin))
+            .await;
+        assert_eq!(status, 404);
     }
 }
