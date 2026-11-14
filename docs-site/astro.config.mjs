@@ -1,5 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { fileURLToPath } from 'node:url';
+import remarkMdLinks from './remark-md-links.mjs';
 
 // Static site for the user documentation. It reads `docs/` at build
 // time (see the `sync-docs` script in `package.json`).
@@ -7,6 +9,10 @@ export default defineConfig({
   // The docs mark expected command output with `output` fences.
   // This name joins the highlighter so the build prints no warning.
   markdown: {
+    // Turns the file links of the docs (`./sql.md`) into page URLs (`/rules/sql/`).
+    remarkPlugins: [
+      [remarkMdLinks, { docsRoot: fileURLToPath(new URL('./src/content/docs', import.meta.url)) }],
+    ],
     shikiConfig: {
       langs: [
         {
