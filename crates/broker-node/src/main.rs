@@ -1214,6 +1214,9 @@ async fn verify_jwks_connect(
 struct ChainAllow {
     /// Id of the entry that allowed. Drives per-entry success counts.
     id: String,
+    /// The built-in local table verified the password. Stamps the
+    /// verified identity.
+    via_local: bool,
     /// The directory cast the deciding verdict. Selects quota handling.
     via_ldap: bool,
     /// Kerberos cast the deciding verdict. Selects quota handling.
@@ -1237,6 +1240,7 @@ impl ChainAllow {
     fn none(id: String) -> Self {
         Self {
             id,
+            via_local: false,
             via_ldap: false,
             via_kerberos: false,
             via_jwks: false,
@@ -1318,7 +1322,9 @@ async fn decide_chain_auth(
                     .await
                     .is_ok();
                 if ok {
-                    return Ok(ChainAllow::none(entry.id.clone()));
+                    let mut allow = ChainAllow::none(entry.id.clone());
+                    allow.via_local = true;
+                    return Ok(allow);
                 }
                 return Err(deny());
             }
@@ -1535,6 +1541,9 @@ async fn apply_bind_request_inner(
     // block on JWKS success and read by the ownership stamp below.
     // CONNECT-only, never on the delivery path.
     let mut jwks_subject: Option<String> = None;
+    // Verified identity for the ownership stamp. Set only when a backend
+    // verified the credential. Open mode leaves it `None`.
+    let mut verified_connect_username: Option<String> = None;
     // B4-05: the CONNACK-negotiated inbound alias bound rides every
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
@@ -1731,6 +1740,7 @@ async fn apply_bind_request_inner(
                 password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
             let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
             let looks_jwt = password.is_some_and(JwksAuthenticator::looks_like_jwt);
+            let mut via_local = false;
             let mut via_ldap = false;
             let mut via_kerberos = false;
             let mut via_jwks = false;
@@ -1756,6 +1766,7 @@ async fn apply_bind_request_inner(
                 .await
                 {
                     Ok(allow) => {
+                        via_local = allow.via_local;
                         via_ldap = allow.via_ldap;
                         via_kerberos = allow.via_kerberos;
                         via_jwks = allow.via_jwks;
@@ -1821,6 +1832,7 @@ async fn apply_bind_request_inner(
                     .is_ok();
                 if local_ok {
                     // Local credential accepted; quotas apply below.
+                    via_local = true;
                 } else if req
                     .username
                     .as_deref()
@@ -2384,6 +2396,15 @@ async fn apply_bind_request_inner(
             } else if local_has_users {
                 shared.authn_chain.record_built_in_success();
             }
+            verified_connect_username = if via_kerberos {
+                kerberos_principal.clone()
+            } else if via_jwks {
+                jwks_subject.clone()
+            } else if via_local || via_ldap || via_db || via_webhook {
+                req.username.clone()
+            } else {
+                None
+            };
         }
     }
     // Tenant assignment (MT-01..MT-03): resolve the tenant BEFORE session
@@ -2657,10 +2678,12 @@ async fn apply_bind_request_inner(
     if !stale.1.is_empty() {
         refresh_subscription_stats(shared);
     }
-    // Stamp ownership for quota release and publish attribution. Kerberos
-    // CONNECTs stamp the verified client principal (not the MQTT username
-    // string, which the ticket supersedes); all other paths keep the MQTT
-    // username. The principal was verified above, never re-verified here.
+    // Stamp the effective username for quota release and event
+    // attribution, and the verified identity for the superuser check.
+    // Kerberos and JWT CONNECTs use the verified principal or subject.
+    // A local, directory, database or webhook CONNECT uses the username
+    // that backend verified. Open mode verifies nothing, so it stamps no
+    // verified identity. The values were verified above, never here.
     if let Ok(req) = parsed.clone() {
         if let Some(session) = shared
             .sessions
@@ -2675,6 +2698,12 @@ async fn apply_bind_request_inner(
             } else if let Some(username) = &req.username {
                 *session.username.write() = Some(username.clone());
             }
+            // Cache the superuser flag at bind. The publish path reads
+            // one atomic, never a lock or a clone.
+            let is_superuser = verified_connect_username
+                .as_deref()
+                .is_some_and(|name| shared.auth.is_superuser(name));
+            session.set_verified_identity(verified_connect_username.clone(), is_superuser);
         }
         // Stamp the peer address for publish-time ban checks (B1-03):
         // only overwritten when the edge forwarded one, so a rebind
@@ -2750,6 +2779,19 @@ async fn apply_auto_subscribe(
     // never observe another tenant's topics. Resolved from the bound
     // connection's own session. Runs once per bind, never per message.
     let tenant = session_tenant_for_conn(shared, conn_id, client_id);
+    // Fast superuser flag first (one atomic, no lock, no clone).
+    // Only a superuser bypass needs the verified name for metrics.
+    let session_for_auth = session_for_conn_if_client(shared, conn_id, client_id);
+    let is_superuser = session_for_auth
+        .as_ref()
+        .is_some_and(|session| session.verified_is_superuser.load(Ordering::Relaxed));
+    let verified_username = if is_superuser {
+        session_for_auth
+            .as_ref()
+            .and_then(|session| session.verified_username.read().clone())
+    } else {
+        None
+    };
     let mut applied = false;
     for entry in &entries {
         let rendered =
@@ -2765,7 +2807,12 @@ async fn apply_auto_subscribe(
         // denied client receives nothing through auto-subscribe (D2).
         if shared
             .auth
-            .authorize_subscribe_in_tenant(&tenant, client_id, &filter)
+            .authorize_subscribe_in_tenant_as(
+                &tenant,
+                client_id,
+                verified_username.as_deref(),
+                &filter,
+            )
             .await
             .is_err()
         {
@@ -6355,11 +6402,34 @@ async fn apply_subscribe(
         });
         let local_denied = match cached_subscribe {
             Some(allow) => !allow,
-            None => shared
-                .auth
-                .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
-                .await
-                .is_err(),
+            None => {
+                // Fast superuser flag first (one atomic, no lock).
+                // Only the rare superuser bypass clones the name.
+                let is_superuser = owner
+                    .as_ref()
+                    .is_some_and(|session| session.verified_is_superuser.load(Ordering::Relaxed));
+                if is_superuser {
+                    let verified = owner
+                        .as_ref()
+                        .and_then(|s| s.verified_username.read().clone());
+                    shared
+                        .auth
+                        .authorize_subscribe_in_tenant_as(
+                            &tenant,
+                            &client_id,
+                            verified.as_deref(),
+                            &filter,
+                        )
+                        .await
+                        .is_err()
+                } else {
+                    shared
+                        .auth
+                        .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
+                        .await
+                        .is_err()
+                }
+            }
         };
         if local_denied {
             // Per-client decision cache (W2-01): record the denial on the
@@ -7309,11 +7379,34 @@ async fn apply_publish(
         });
         let allowed = match cached_publish {
             Some(allow) => allow,
-            None => shared
-                .auth
-                .authorize_publish_in_tenant(tenant, &publisher, topic)
-                .await
-                .is_ok(),
+            None => {
+                // Fast superuser flag first (one atomic, no lock).
+                // Only the rare superuser bypass clones the name.
+                let is_superuser = publisher_session
+                    .as_ref()
+                    .is_some_and(|session| session.verified_is_superuser.load(Ordering::Relaxed));
+                if is_superuser {
+                    let verified_username = publisher_session
+                        .as_ref()
+                        .and_then(|session| session.verified_username.read().clone());
+                    shared
+                        .auth
+                        .authorize_publish_in_tenant_as(
+                            tenant,
+                            &publisher,
+                            verified_username.as_deref(),
+                            topic,
+                        )
+                        .await
+                        .is_ok()
+                } else {
+                    shared
+                        .auth
+                        .authorize_publish_in_tenant(tenant, &publisher, topic)
+                        .await
+                        .is_ok()
+                }
+            }
         };
         // Per-client decision cache (W2-01): record the publish decision
         // so the management read observes edge publishers. One bounded
@@ -9903,6 +9996,7 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     // Capture the publish-time identity before detaching (the detach
     // clears the binding the checks below read).
     let username = session.username.read().clone();
+    let verified_username = session.verified_username.read().clone();
     let peerhost = session.peerhost.read().clone();
     let tenant = session.tenant_id.read().clone();
     let will = session.take_last_will();
@@ -9975,7 +10069,12 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         Some(allow) => allow,
         None => shared
             .auth
-            .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
+            .authorize_publish_in_tenant_as(
+                &tenant,
+                &client_id,
+                verified_username.as_deref(),
+                &will.topic,
+            )
             .await
             .is_ok(),
     };
@@ -11589,9 +11688,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     shared.auth.set_policy(hash_policy);
-    // Superusers (MV-09a): apply the configured list from boot.
-    // An empty list keeps current behaviour with no bypass.
-    shared.auth.set_superusers(cfg.auth.superusers.clone());
+    // Superusers (MV-09a): apply the configured list from boot while
+    // authentication is enabled. With `auth.enabled = false` the list
+    // does not apply, so a matching username gets no bypass. An empty
+    // list keeps current behaviour with no bypass.
+    let superusers = if cfg.auth.enabled {
+        cfg.auth.superusers.clone()
+    } else {
+        Vec::new()
+    };
+    shared.auth.set_superusers(superusers);
     // Authenticator chain (W2-02): seed the shared chain in place (the
     // same instance `serve_api` shares with `ApiState`), so the CONNECT
     // consult enforces the persisted chain from the first connection.

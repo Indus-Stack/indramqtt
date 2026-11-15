@@ -1465,6 +1465,10 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // The connector's flag rides along with this operation. A stopped
+    // connector keeps its dependent action off even when the action
+    // starts, exactly like the enable route.
+    let connector_on = crate::v5::action_sinks::action_connector_enable(&state.connectors, &stored);
     let enable = match operation {
         "start" => true,
         "stop" => false,
@@ -1485,7 +1489,9 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
     // starts/stops delivery through the connector without touching the
     // publish path itself. MV-01: the key is the action's dispatch key.
     let key = broker_config::v5_action_sink_key(&bare);
-    state.engine.set_action_enabled(&key, enable);
+    state
+        .engine
+        .set_action_enabled(&key, enable && connector_on);
     if !enable {
         if let Some(sink) = state.engine.connectors().get(&key) {
             let _ = sink.flush().await;

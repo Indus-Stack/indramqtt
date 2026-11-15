@@ -146,6 +146,8 @@ fn redacted_root(name: &str, snapshot: &FullSnapshot) -> Value {
                 "description": user.description,
                 "must_change_password": user.must_change_password,
                 "mfa_enabled": user.mfa_enabled,
+                "scopes": user.scopes,
+                "scopes_set": user.scopes.is_some(),
             })).collect::<Vec<_>>(),
         }),
         "mqtt_users" => json!({

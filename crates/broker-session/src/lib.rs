@@ -238,9 +238,19 @@ pub struct Session {
     /// decide the transport-death policy; current choice avoids spurious
     /// publishes while the edge may still hold the socket.
     pub last_will: RwLock<Option<StoredWill>>,
-    /// Authenticated username that owns this session, if any. Maintained
-    /// by the edge at bind time; drives per-user quota accounting.
+    /// Effective username that owns this session, if any. Maintained by
+    /// the edge at bind time; drives per-user quota accounting and event
+    /// attribution. In open mode this value is the claimed MQTT username.
     pub username: RwLock<Option<String>>,
+    /// Username that a backend verified at CONNECT, if any. `None` means
+    /// the session has no verified identity. Only this value may select a
+    /// superuser. Maintained by the edge at bind time.
+    pub verified_username: RwLock<Option<String>>,
+    /// True when the verified identity is a configured superuser.
+    /// Set once at bind from the verified identity. The publish path
+    /// reads one relaxed atomic (no lock, no allocation).
+    /// Reason: the superuser check runs on every publish and subscribe.
+    pub verified_is_superuser: AtomicBool,
     /// Tenant id assigned once per connecting client at connect
     /// (MT-01). Rendered from the tenant registry against the connect
     /// context; `"default"` preserves the pre-tenancy behaviour until
@@ -765,6 +775,8 @@ impl Session {
             tenant_id: RwLock::new(crate::tenant::DEFAULT_TENANT_ID.to_string()),
             tenant_is_default: AtomicBool::new(true),
             username: RwLock::new(None),
+            verified_username: RwLock::new(None),
+            verified_is_superuser: AtomicBool::new(false),
             peerhost: RwLock::new(None),
             connected_at_ms: RwLock::new(Some(now_ms())),
             ended_at_ms: RwLock::new(None),
@@ -789,6 +801,16 @@ impl Session {
         let is_default = tenant_id == tenant::DEFAULT_TENANT_ID;
         *self.tenant_id.write() = tenant_id;
         self.tenant_is_default.store(is_default, Ordering::Relaxed);
+    }
+
+    /// Record the verified identity at bind. Single writer (bind),
+    /// lock-free readers on publish: stores the verified name and the
+    /// superuser flag together so the publish path reads one atomic.
+    /// Off the hot path (bind only).
+    pub fn set_verified_identity(&self, verified: Option<String>, is_superuser: bool) {
+        *self.verified_username.write() = verified;
+        self.verified_is_superuser
+            .store(is_superuser, Ordering::Relaxed);
     }
 
     /// Negotiated protocol level for this session (X1-02): 4 or 5.

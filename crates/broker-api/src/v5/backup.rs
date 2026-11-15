@@ -251,6 +251,8 @@ struct FileAdminUser {
     must_change_password: bool,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    #[serde(default)]
+    scopes_set: bool,
 }
 
 // Reference rows for the verify-only roots. Secrets stay live.
@@ -610,8 +612,9 @@ fn merge_mqtt_users(value: &Value, previous: &MqttUsersConf) -> Result<MqttUsers
 }
 
 // Merge file admin users with live verifiers. The file is authoritative
-// for membership, roles and descriptions; live fills each password
-// hash and MFA secret. Unknown names are refused.
+// for membership, roles, descriptions and explicit scopes; live fills
+// each password hash and MFA secret. A row with no scope field keeps the
+// live scopes. Unknown names are refused.
 // TODO(parity): which error does the spec require for unknown names?
 // The rulebook leaves the choice open.
 // Refusal stays until the checker pins it.
@@ -640,6 +643,21 @@ fn merge_admin_users(value: &Value, previous: &AdminUsersConf) -> Result<AdminUs
                 row.username
             )));
         };
+        // A row from an older release carries no scope field. Keep the
+        // stored scopes then. A scope field that is present is
+        // authoritative: the export writes both `scopes` and
+        // `scopes_set`, so a missing list with the flag set is an
+        // explicit empty list.
+        let carries_scopes = item
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("scopes") || obj.contains_key("scopes_set"));
+        let scopes = if !carries_scopes {
+            live.scopes.clone()
+        } else if row.scopes_set && row.scopes.is_none() {
+            Some(Vec::new())
+        } else {
+            row.scopes
+        };
         users.push(broker_config::AdminUser {
             username: row.username,
             password_hash: live.password_hash.clone(),
@@ -649,7 +667,7 @@ fn merge_admin_users(value: &Value, previous: &AdminUsersConf) -> Result<AdminUs
             mfa_secret: live.mfa_secret.clone(),
             mfa_enabled: live.mfa_enabled && !live.mfa_secret.is_empty(),
             mfa_last_step: live.mfa_last_step,
-            scopes: row.scopes,
+            scopes,
         });
     }
     let conf = AdminUsersConf { users };
@@ -665,6 +683,34 @@ fn merge_admin_users(value: &Value, previous: &AdminUsersConf) -> Result<AdminUs
         ));
     }
     Ok(conf)
+}
+
+/// True when an imported `admin_users` part changes a role, a scope list
+/// or the membership of the dashboard users. Description, password-change
+/// flag and MFA state do not raise rights, so they do not need a full
+/// administrator.
+fn admin_user_rights_change(candidate: &AdminUsersConf, previous: &AdminUsersConf) -> bool {
+    if candidate.users.len() != previous.users.len() {
+        return true;
+    }
+    let previous_names: HashSet<&str> = previous
+        .users
+        .iter()
+        .map(|user| user.username.as_str())
+        .collect();
+    candidate.users.iter().any(|user| {
+        if !previous_names.contains(user.username.as_str()) {
+            return true;
+        }
+        match previous
+            .users
+            .iter()
+            .find(|entry| entry.username == user.username)
+        {
+            Some(entry) => entry.role != user.role || entry.scopes != user.scopes,
+            None => true,
+        }
+    })
 }
 
 // Parse and validate the banned table rows. Duplicates fail whole.
@@ -1455,9 +1501,18 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
 // documents. It shows in later reads and survives a restart through each
 // store's own persistence.
 //
+// An import that changes a dashboard user's role, scopes or membership
+// needs a full administrator. Any other caller gets 403 `FORBIDDEN` and
+// nothing changes. An archive from an older release that carries no
+// scope field keeps the stored scopes, so it never widens a user.
+//
 // Management-plane only: short management locks, never the publish or
 // deliver path.
-pub async fn import_data(State(state): State<ApiState>, body: Bytes) -> Response {
+pub async fn import_data(
+    State(state): State<ApiState>,
+    full_admin: Option<axum::Extension<crate::api_auth::FullAdministrator>>,
+    body: Bytes,
+) -> Response {
     // Refuse import while the node is not ready. Reason: the stores
     // are not initialised yet.
     if !state.readiness.is_ready() {
@@ -1512,6 +1567,17 @@ pub async fn import_data(State(state): State<ApiState>, body: Bytes) -> Response
                 .into_response();
         }
     };
+    if let Some(candidate) = &pending.admin_users {
+        let previous = state.config.snapshot();
+        let is_full_admin = full_admin.is_some_and(|flag| flag.0 .0);
+        if !is_full_admin && admin_user_rights_change(candidate, &previous.admin_users) {
+            return ApiError::Forbidden(
+                "this import changes dashboard user roles, scopes or membership: a full administrator is required"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    }
     match apply_materialized(&state, &pending).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),

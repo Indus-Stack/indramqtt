@@ -8109,14 +8109,14 @@ pub async fn update_connector(
     state.engine.set_action_enabled(&bare, enable);
     // MV-01/R2: the replace can flip the enable flag along with the
     // settings; the dependent actions' delivery follows it.
-    mirror_dependent_actions(&state, &bare, enable);
+    mirror_dependent_actions(&state, &bare);
     if let Err(error) = state.connectors.persist() {
         // Nothing swapped: drop the staged generation, restore the
         // stored row and the flags, and keep every old sink delivering.
         state.engine.connectors().abort_stage();
         state.connectors.replace(&bare, stored.clone());
         state.engine.set_action_enabled(&bare, old_enable);
-        mirror_dependent_actions(&state, &bare, old_enable);
+        mirror_dependent_actions(&state, &bare);
         return connector_persist_error(error);
     }
     // Publish the new generation in one step (staged build, persist,
@@ -8297,14 +8297,16 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
 // checker pins it.
 /// MV-01/R2: a connector disable stops every dependent action's
 /// delivery; a connector enable restores them. Each dependent action's
-/// dispatch flag rides `action.enable && connector.enable`. Actions
-/// that target other connectors are untouched.
-fn mirror_dependent_actions(state: &ApiState, bare: &str, enable: bool) {
+/// dispatch flag rides `action.enable && every referenced connector
+/// enable`. Actions that target other connectors are untouched. The
+/// store already holds the new flag at each call.
+fn mirror_dependent_actions(state: &ApiState, bare: &str) {
     for record in state.actions.snapshot() {
         if crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, bare) {
             state.engine.set_action_enabled(
                 &broker_config::v5_action_sink_key(&record.id),
-                record.enable && enable,
+                record.enable
+                    && crate::v5::action_sinks::action_connector_enable(&state.connectors, &record),
             );
         }
     }
@@ -8352,7 +8354,7 @@ pub async fn set_connector_enabled(
     // MV-01/R2: a connector disable stops every dependent action's
     // delivery; an enable restores them (the flap rides the same
     // mirror, before persist, after the store flip).
-    mirror_dependent_actions(&state, &bare, enable);
+    mirror_dependent_actions(&state, &bare);
     if !enable {
         flush_dependent_actions(&state, &bare).await;
     }
@@ -8523,7 +8525,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
         .set_action_enabled(&broker_config::v5_action_sink_key(&bare), enable);
     // MV-01/R2: a connector disable stops every dependent action's
     // delivery; an enable restores them.
-    mirror_dependent_actions(state, &bare, enable);
+    mirror_dependent_actions(state, &bare);
     if !enable {
         flush_dependent_actions(state, &bare).await;
     }

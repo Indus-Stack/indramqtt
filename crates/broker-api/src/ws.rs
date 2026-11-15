@@ -22,7 +22,7 @@ use axum::{
     },
     response::Response,
 };
-use broker_auth::{Authenticator, Authorizer};
+use broker_auth::Authenticator;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::Subscription;
 use brokerlink::{BrokerFrame, OpCode};
@@ -279,6 +279,7 @@ pub async fn ws_mqtt_handler(ws: WebSocketUpgrade, State(state): State<ApiState>
 
 struct WsSession {
     client_id: String,
+    username: Option<String>,
     subscriptions: Vec<TopicFilter>,
 }
 
@@ -544,12 +545,23 @@ async fn handle_packet(
                     return Err(());
                 }
             }
+            // Only a backend-verified username can select a superuser.
+            // Open mode (empty user store) verifies nothing.
+            let verified_username = if conn.username.is_some() && state.auth.user_count() > 0 {
+                conn.username.clone()
+            } else {
+                None
+            };
+            let verified_is_superuser = verified_username
+                .as_deref()
+                .is_some_and(|name| state.auth.is_superuser(name));
             let (stored, present) = state
                 .sessions
                 .get_or_create(&conn.client_id, conn.clean_start);
             *stored.conn_id.write() = Some(conn_id);
             *stored.keepalive_secs.write() = conn.keepalive_secs;
             *stored.username.write() = conn.username.clone();
+            stored.set_verified_identity(verified_username.clone(), verified_is_superuser);
             state.metrics.inc_connections();
             state.conns.register(conn_id, tx.clone());
             // D1-02: label the mailbox for per-client shed accounting and
@@ -558,6 +570,7 @@ async fn handle_packet(
             state.conns.set_waker(conn_id, waker);
             *session = Some(WsSession {
                 client_id: conn.client_id,
+                username: verified_username,
                 subscriptions: Vec::new(),
             });
             if !send_bin(socket, encode_connack(present, 0)).await {
@@ -609,7 +622,12 @@ async fn handle_subscribe(
                     0x80
                 } else if state
                     .auth
-                    .authorize_subscribe(&sess.client_id, &filter)
+                    .authorize_subscribe_in_tenant_as(
+                        broker_session::tenant::DEFAULT_TENANT_ID,
+                        &sess.client_id,
+                        sess.username.as_deref(),
+                        &filter,
+                    )
                     .await
                     .is_err()
                 {
@@ -724,7 +742,12 @@ async fn handle_publish(
     // on the console publish event only; delivery never touches it.
     let publish_allowed = state
         .auth
-        .authorize_publish(&sess.client_id, &topic)
+        .authorize_publish_in_tenant_as(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            &sess.client_id,
+            sess.username.as_deref(),
+            &topic,
+        )
         .await
         .is_ok();
     if let Some(session) = state.sessions.get(&sess.client_id) {

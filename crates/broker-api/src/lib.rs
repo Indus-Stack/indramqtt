@@ -30644,6 +30644,142 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn action_start_keeps_the_connector_stop() {
+        // SR-01 item 4: starting a stopped action must not resume
+        // delivery through a stopped connector. Broker-through: the
+        // connector, action and rule are written through HTTP, every
+        // publish enters through the HTTP publish route, and the
+        // destination is a registered sink counted at the rule path.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "sr01-conn", "type": "webhook",
+                       "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "connector create: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sr01-act", "type": "console", "server": "127.0.0.1:1883",
+                       "connector": "sr01-conn"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "action create: {body}");
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("sr01-act"),
+            counter.clone(),
+        );
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "sr01-act-rule",
+                    "sql": "SELECT * FROM \"sr01/action\"",
+                    "actions": ["sr01-act"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule create: {rule_body}");
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let publish = |payload: &'static str| json!({"topic": "sr01/action", "payload": payload, "qos": 0, "retain": false});
+        let (status, body) = server
+            .post_auth("/api/v5/publish", publish("first"), &token)
+            .await;
+        assert_eq!(status, 202, "first publish: {body}");
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "an enabled action delivers once"
+        );
+
+        // Stop the connector, then start the action. The action's own
+        // flag is true again, but the connector still holds delivery off.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sr01-conn/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .send("POST", "/api/v5/actions/sr01-act/start", None, Some(&token))
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth("/api/v5/publish", publish("stopped"), &token)
+            .await;
+        assert_eq!(status, 202, "publish while stopped: {body}");
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "a stopped connector must keep the restarted action off"
+        );
+
+        // Start the connector again: delivery resumes.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sr01-conn/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth("/api/v5/publish", publish("resumed"), &token)
+            .await;
+        assert_eq!(status, 202, "publish after connector start: {body}");
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "a started connector restores delivery"
+        );
+
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server.delete_auth("/api/v5/actions/sr01-act", &token).await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/sr01-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn node_action_operation_round_trip() {
         // W3-09 (C06-13) broker-through test: create an action via the
         // W3-02 route, run `stop`/`start` through the node-scoped route
@@ -37058,6 +37194,223 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn backup_import_rights_change_needs_full_administrator() {
+        // SR-01 item 2: a system-scoped administrator cannot raise its
+        // own rights through an import. The same archive applies for a
+        // full administrator. Broker-through: user create, login, upload
+        // and import all use the served API.
+        use base64::Engine as _;
+        let dir = unique_data_dir("sr01-import-rights");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let admin = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "sr01-scoped", "password": "Scoped-pass-1a",
+                       "role": "administrator", "scopes": ["system"]}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "scoped user create: {body}");
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "sr01-scoped", "password": "Scoped-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "scoped login: {body}");
+        let scoped = body["token"].as_str().expect("scoped token").to_string();
+
+        let file = build_test_backup(
+            "sr01-rights-0",
+            &["admin_users"],
+            &[(
+                "snapshot/admin_users.json",
+                json!({"users": [
+                    {"username": "admin", "role": "administrator", "description": "",
+                     "must_change_password": false, "scopes": null, "scopes_set": false},
+                    {"username": "sr01-scoped", "role": "administrator", "description": "",
+                     "must_change_password": false, "scopes": null, "scopes_set": false},
+                ]}),
+            )],
+        );
+        let content = base64::engine::general_purpose::STANDARD.encode(&file);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "conf-sr01-rights.tar.gz", "content": content}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // The scoped administrator may not widen its own row.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "conf-sr01-rights.tar.gz"}),
+                &scoped,
+            )
+            .await;
+        assert_eq!(status, 403, "scoped import must be refused: {body}");
+        assert_eq!(body["code"], json!("FORBIDDEN"));
+        assert_eq!(body.as_object().expect("error shape").len(), 2);
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-scoped"))
+            .expect("scoped user stays");
+        assert_eq!(row["scopes"], json!(["system"]), "the old scopes stay");
+
+        // A full administrator applies the same archive.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "conf-sr01-rights.tar.gz"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204, "full administrator import: {body}");
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-scoped"))
+            .expect("scoped user stays");
+        assert_eq!(
+            row["scopes"],
+            json!("unset"),
+            "the full administrator import applies the new default"
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/data/files/conf-sr01-rights.tar.gz", &admin)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn backup_export_and_old_import_keep_dashboard_scopes() {
+        // SR-01 item 3: the export writes the explicit scopes and the
+        // flag, so a round trip keeps a restricted administrator
+        // restricted. An archive from an older release carries no scope
+        // field and keeps the stored scopes. Broker-through: every step
+        // uses the served API or the export file it wrote.
+        let dir = unique_data_dir("sr01-export-scopes");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let admin = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "sr01-restricted", "password": "Restricted-pass-1a",
+                       "role": "administrator", "scopes": ["system"]}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "restricted user create: {body}");
+
+        let (status, body) = server
+            .post_auth("/api/v5/data/export", json!({}), &admin)
+            .await;
+        assert_eq!(status, 200);
+        let filename = body["filename"].as_str().expect("export names file");
+        let path = dir.join("backup").join(filename);
+        let parts = read_backup_file(&path);
+        let admin_part = parts
+            .iter()
+            .find(|(name, _)| name.ends_with("/snapshot/admin_users.json"))
+            .expect("admin users part ships");
+        let exported: Value = serde_json::from_str(&admin_part.1).expect("admin part is JSON");
+        let row = exported["users"]
+            .as_array()
+            .expect("users array")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-restricted"))
+            .expect("restricted user ships");
+        assert_eq!(row["scopes"], json!(["system"]), "the export keeps scopes");
+        assert_eq!(row["scopes_set"], json!(true), "the export names the list");
+
+        // Import the unchanged archive: the restriction stays.
+        let (status, body) = server
+            .post_auth("/api/v5/data/import", json!({"filename": filename}), &admin)
+            .await;
+        assert_eq!(status, 204, "round-trip import: {body}");
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-restricted"))
+            .expect("restricted user stays");
+        assert_eq!(
+            row["scopes"],
+            json!(["system"]),
+            "the round trip keeps the restriction"
+        );
+
+        // An archive with no scope field keeps the stored scopes.
+        let old = build_test_backup(
+            "sr01-old-scopes-0",
+            &["admin_users"],
+            &[(
+                "snapshot/admin_users.json",
+                json!({"users": [
+                    {"username": "admin", "role": "administrator", "description": "",
+                     "must_change_password": false},
+                    {"username": "sr01-restricted", "role": "administrator", "description": "",
+                     "must_change_password": false},
+                ]}),
+            )],
+        );
+        use base64::Engine as _;
+        let content = base64::engine::general_purpose::STANDARD.encode(&old);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "conf-sr01-old.tar.gz", "content": content}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "conf-sr01-old.tar.gz"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204, "old archive import: {body}");
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-restricted"))
+            .expect("restricted user stays");
+        assert_eq!(
+            row["scopes"],
+            json!(["system"]),
+            "an old archive never widens stored scopes"
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/data/files/conf-sr01-old.tar.gz", &admin)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn backup_import_unknown_root_is_refused_through_broker() {
         // An unknown root is refused whole through the API.
         // Broker-through: upload and import go through the served API.
@@ -37173,7 +37526,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             serde_json::to_vec(&json!({"filename": "any.tar.gz"})).expect("body is JSON"),
         );
         let response =
-            crate::v5::backup::import_data(axum::extract::State(state.clone()), body).await;
+            crate::v5::backup::import_data(axum::extract::State(state.clone()), None, body).await;
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         let raw = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
@@ -37187,7 +37540,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let body = bytes::Bytes::from(
             serde_json::to_vec(&json!({"filename": "missing-file.tar.gz"})).expect("body is JSON"),
         );
-        let response = crate::v5::backup::import_data(axum::extract::State(state), body).await;
+        let response =
+            crate::v5::backup::import_data(axum::extract::State(state), None, body).await;
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
         let raw = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
