@@ -697,6 +697,18 @@ impl ConnectorManager {
         self.connectors.write().remove(id).is_some()
     }
 
+    /// Flush every live sink once for an orderly lifecycle stop.
+    /// Reason: a buffered batch must reach its target before exit.
+    pub async fn flush_all(&self) {
+        let sinks: Vec<Arc<dyn Sink>> = {
+            let live = self.connectors.read();
+            live.values().map(|entry| Arc::clone(&entry.sink)).collect()
+        };
+        for sink in sinks {
+            let _ = sink.flush().await;
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<dyn Sink>> {
         self.connectors
             .read()

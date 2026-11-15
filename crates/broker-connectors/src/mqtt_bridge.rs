@@ -933,6 +933,12 @@ impl Sink for MqttBridgeSink {
         Ok(())
     }
 
+    /// Drain the buffer through the lifecycle entry.
+    /// Reason: a replaced or stopped sink must lose no row.
+    async fn flush(&self) -> Result<()> {
+        MqttBridgeSink::flush(self).await
+    }
+
     fn kind(&self) -> &'static str {
         "mqtt_bridge"
     }

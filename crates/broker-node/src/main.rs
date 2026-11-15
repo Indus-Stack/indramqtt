@@ -580,6 +580,10 @@ const SHUTDOWN_DISCONNECT_RC: u8 = 0x8B;
 /// Reason: the removal plan bounds the orderly stop at ten seconds.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Longest wait to drain connector buffers during the stop.
+/// Reason: a down target must not hold the process open.
+const SHUTDOWN_CONNECTOR_FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Server-side reason string for one CONNACK return code (X1-02).
 /// Our own wording, written for this broker (never copied): success
 /// and identifier-rejected omit the property (`None`) to keep the
@@ -10980,6 +10984,12 @@ async fn shutdown(shared: &Shared) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // Drain each connector buffer so a partial batch reaches its target.
+    let _ = tokio::time::timeout(
+        SHUTDOWN_CONNECTOR_FLUSH,
+        shared.engine.connectors().flush_all(),
+    )
+    .await;
     // Flush durable state. Each append already flushes and fsyncs, so
     // only the directory entry still needs a sync for renames.
     if let Some(store) = shared.sessions.offline_store() {

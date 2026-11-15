@@ -1,0 +1,6723 @@
+{
+  "generated_by": "tools/connector_inventory.py",
+  "connector_count": 47,
+  "item_count": 775,
+  "connectors": [
+    {
+      "kind": "alloydb",
+      "crate": "broker-connectors-enterprise",
+      "module": "alloydb",
+      "source": "crates/broker-connectors-enterprise/src/alloydb.rs",
+      "direction": "sink",
+      "config": "AlloydbConfig",
+      "items": [
+        {
+          "id": "alloydb.host",
+          "field": "host",
+          "path": "host",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.port",
+          "field": "port",
+          "path": "port",
+          "type": "u16",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.username",
+          "field": "username",
+          "path": "username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "AlloydbAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.auth.Password",
+          "field": "Password",
+          "path": "auth.Password",
+          "type": "AlloydbAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "alloydb.auth.IamToken",
+          "field": "IamToken",
+          "path": "auth.IamToken",
+          "type": "AlloydbAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "alloydb.auth.IamAuto",
+          "field": "IamAuto",
+          "path": "auth.IamAuto",
+          "type": "AlloydbAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "alloydb.table",
+          "field": "table",
+          "path": "table",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.column_mappings",
+          "field": "column_mappings",
+          "path": "column_mappings",
+          "type": "Vec<AlloydbColumnMapping>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.column_mappings.source_field",
+          "field": "source_field",
+          "path": "column_mappings.source_field",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.column_mappings.db_column",
+          "field": "db_column",
+          "path": "column_mappings.db_column",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.column_mappings.data_type",
+          "field": "data_type",
+          "path": "column_mappings.data_type",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "Option<bool>",
+          "category": "tls",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.ca_bundle_pem",
+          "field": "ca_bundle_pem",
+          "path": "ca_bundle_pem",
+          "type": "Option<String>",
+          "category": "tls",
+          "origin": "config"
+        },
+        {
+          "id": "alloydb.tls_ca_file",
+          "field": "tls_ca_file",
+          "path": "tls_ca_file",
+          "type": "Option<String>",
+          "category": "tls",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "aws_iot",
+      "crate": "broker-connectors-enterprise",
+      "module": "aws_iot",
+      "source": "crates/broker-connectors-enterprise/src/aws_iot.rs",
+      "direction": "both",
+      "config": "AwsIotConfig",
+      "items": [
+        {
+          "id": "aws_iot.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.region",
+          "field": "region",
+          "path": "region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.client_id",
+          "field": "client_id",
+          "path": "client_id",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "AwsIotAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.auth.Mtls",
+          "field": "Mtls",
+          "path": "auth.Mtls",
+          "type": "AwsIotAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "aws_iot.auth.SigV4",
+          "field": "SigV4",
+          "path": "auth.SigV4",
+          "type": "AwsIotAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "aws_iot.topic_mappings",
+          "field": "topic_mappings",
+          "path": "topic_mappings",
+          "type": "Vec<BridgeTopicMapping>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.topic_mappings.local_topic",
+          "field": "local_topic",
+          "path": "topic_mappings.local_topic",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.topic_mappings.remote_topic",
+          "field": "remote_topic",
+          "path": "topic_mappings.remote_topic",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.topic_mappings.direction",
+          "field": "direction",
+          "path": "topic_mappings.direction",
+          "type": "BridgeDirection",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.topic_mappings.direction.LocalToRemote",
+          "field": "LocalToRemote",
+          "path": "topic_mappings.direction.LocalToRemote",
+          "type": "BridgeDirection",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "aws_iot.topic_mappings.direction.RemoteToLocal",
+          "field": "RemoteToLocal",
+          "path": "topic_mappings.direction.RemoteToLocal",
+          "type": "BridgeDirection",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "aws_iot.topic_mappings.direction.BiDirectional",
+          "field": "BiDirectional",
+          "path": "topic_mappings.direction.BiDirectional",
+          "type": "BridgeDirection",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "aws_iot.shadow_sync",
+          "field": "shadow_sync",
+          "path": "shadow_sync",
+          "type": "Option<ShadowSyncConfig>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.shadow_sync.thing_name_template",
+          "field": "thing_name_template",
+          "path": "shadow_sync.thing_name_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.connect_timeout_ms",
+          "field": "connect_timeout_ms",
+          "path": "connect_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.handshake_timeout_ms",
+          "field": "handshake_timeout_ms",
+          "path": "handshake_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.ca_bundle_pem",
+          "field": "ca_bundle_pem",
+          "path": "ca_bundle_pem",
+          "type": "Option<String>",
+          "category": "tls",
+          "origin": "config"
+        },
+        {
+          "id": "aws_iot.alpn_protocols",
+          "field": "alpn_protocols",
+          "path": "alpn_protocols",
+          "type": "Option<Vec<String>>",
+          "category": "mapping",
+          "origin": "config"
+        }
+      ],
+      "status": "out-of-mvp"
+    },
+    {
+      "kind": "azure_blob",
+      "crate": "broker-connectors-enterprise",
+      "module": "azure_blob",
+      "source": "crates/broker-connectors-enterprise/src/azure_blob.rs",
+      "direction": "sink",
+      "config": "AzureBlobSinkConfig",
+      "items": [
+        {
+          "id": "azure_blob.account_name",
+          "field": "account_name",
+          "path": "account_name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.container_name",
+          "field": "container_name",
+          "path": "container_name",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "AzureBlobAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.auth.SharedKey",
+          "field": "SharedKey",
+          "path": "auth.SharedKey",
+          "type": "AzureBlobAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_blob.auth.SasToken",
+          "field": "SasToken",
+          "path": "auth.SasToken",
+          "type": "AzureBlobAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_blob.auth.BearerToken",
+          "field": "BearerToken",
+          "path": "auth.BearerToken",
+          "type": "AzureBlobAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_blob.blob_path_template",
+          "field": "blob_path_template",
+          "path": "blob_path_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.compression",
+          "field": "compression",
+          "path": "compression",
+          "type": "AzureBlobCompression",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.compression.None",
+          "field": "None",
+          "path": "compression.None",
+          "type": "AzureBlobCompression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_blob.compression.Gzip",
+          "field": "Gzip",
+          "path": "compression.Gzip",
+          "type": "AzureBlobCompression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_blob.max_records_per_blob",
+          "field": "max_records_per_blob",
+          "path": "max_records_per_blob",
+          "type": "Option<usize>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.max_bytes_per_blob",
+          "field": "max_bytes_per_blob",
+          "path": "max_bytes_per_blob",
+          "type": "Option<usize>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.flush_interval_secs",
+          "field": "flush_interval_secs",
+          "path": "flush_interval_secs",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_blob.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "azure_eventhubs",
+      "crate": "broker-connectors-enterprise",
+      "module": "azure_eventhubs",
+      "source": "crates/broker-connectors-enterprise/src/azure_eventhubs.rs",
+      "direction": "sink",
+      "config": "AzureEventHubsSinkConfig",
+      "items": [
+        {
+          "id": "azure_eventhubs.namespace",
+          "field": "namespace",
+          "path": "namespace",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.event_hub",
+          "field": "event_hub",
+          "path": "event_hub",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.shared_access_key_name",
+          "field": "shared_access_key_name",
+          "path": "shared_access_key_name",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.shared_access_key",
+          "field": "shared_access_key",
+          "path": "shared_access_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.user_properties",
+          "field": "user_properties",
+          "path": "user_properties",
+          "type": "HashMap<String, String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.token_ttl_secs",
+          "field": "token_ttl_secs",
+          "path": "token_ttl_secs",
+          "type": "u64",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_eventhubs.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "azure_iot",
+      "crate": "broker-connectors-enterprise",
+      "module": "azure_iot",
+      "source": "crates/broker-connectors-enterprise/src/azure_iot.rs",
+      "direction": "both",
+      "config": "AzureIotConfig",
+      "items": [
+        {
+          "id": "azure_iot.iot_hub_name",
+          "field": "iot_hub_name",
+          "path": "iot_hub_name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.device_id",
+          "field": "device_id",
+          "path": "device_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.module_id",
+          "field": "module_id",
+          "path": "module_id",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "AzureIotAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.auth.SharedAccessKey",
+          "field": "SharedAccessKey",
+          "path": "auth.SharedAccessKey",
+          "type": "AzureIotAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_iot.auth.SasToken",
+          "field": "SasToken",
+          "path": "auth.SasToken",
+          "type": "AzureIotAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_iot.auth.X509",
+          "field": "X509",
+          "path": "auth.X509",
+          "type": "AzureIotAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "azure_iot.api_version",
+          "field": "api_version",
+          "path": "api_version",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.direct_methods_enabled",
+          "field": "direct_methods_enabled",
+          "path": "direct_methods_enabled",
+          "type": "bool",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.twin_sync_enabled",
+          "field": "twin_sync_enabled",
+          "path": "twin_sync_enabled",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.connect_timeout_ms",
+          "field": "connect_timeout_ms",
+          "path": "connect_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.handshake_timeout_ms",
+          "field": "handshake_timeout_ms",
+          "path": "handshake_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.ca_bundle_pem",
+          "field": "ca_bundle_pem",
+          "path": "ca_bundle_pem",
+          "type": "Option<String>",
+          "category": "tls",
+          "origin": "config"
+        },
+        {
+          "id": "azure_iot.sas_ttl_secs",
+          "field": "sas_ttl_secs",
+          "path": "sas_ttl_secs",
+          "type": "Option<u64>",
+          "category": "auth",
+          "origin": "config"
+        }
+      ],
+      "status": "out-of-mvp"
+    },
+    {
+      "kind": "bigquery",
+      "crate": "broker-connectors-enterprise",
+      "module": "bigquery",
+      "source": "crates/broker-connectors-enterprise/src/bigquery.rs",
+      "direction": "sink",
+      "config": "BigQuerySinkConfig",
+      "items": [
+        {
+          "id": "bigquery.project_id",
+          "field": "project_id",
+          "path": "project_id",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.dataset_id",
+          "field": "dataset_id",
+          "path": "dataset_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.auth.None",
+          "field": "None",
+          "path": "auth.None",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "bigquery.auth.AccessToken",
+          "field": "AccessToken",
+          "path": "auth.AccessToken",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "bigquery.auth.ServiceAccountKey",
+          "field": "ServiceAccountKey",
+          "path": "auth.ServiceAccountKey",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "bigquery.ignore_unknown_values",
+          "field": "ignore_unknown_values",
+          "path": "ignore_unknown_values",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.skip_invalid_rows",
+          "field": "skip_invalid_rows",
+          "path": "skip_invalid_rows",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.template_suffix",
+          "field": "template_suffix",
+          "path": "template_suffix",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "bigquery.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "cassandra",
+      "crate": "broker-connectors-enterprise",
+      "module": "cassandra",
+      "source": "crates/broker-connectors-enterprise/src/cassandra.rs",
+      "direction": "sink",
+      "config": "CassandraSinkConfig",
+      "items": [
+        {
+          "id": "cassandra.contact_points",
+          "field": "contact_points",
+          "path": "contact_points",
+          "type": "Vec<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.keyspace",
+          "field": "keyspace",
+          "path": "keyspace",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "CassandraAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.auth.None",
+          "field": "None",
+          "path": "auth.None",
+          "type": "CassandraAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "cassandra.auth.Password",
+          "field": "Password",
+          "path": "auth.Password",
+          "type": "CassandraAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "cassandra.consistency",
+          "field": "consistency",
+          "path": "consistency",
+          "type": "CqlConsistency",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.consistency.One",
+          "field": "One",
+          "path": "consistency.One",
+          "type": "CqlConsistency",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "cassandra.consistency.Quorum",
+          "field": "Quorum",
+          "path": "consistency.Quorum",
+          "type": "CqlConsistency",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "cassandra.consistency.LocalQuorum",
+          "field": "LocalQuorum",
+          "path": "consistency.LocalQuorum",
+          "type": "CqlConsistency",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "cassandra.consistency.All",
+          "field": "All",
+          "path": "consistency.All",
+          "type": "CqlConsistency",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "cassandra.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.cql_statement_template",
+          "field": "cql_statement_template",
+          "path": "cql_statement_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.ttl_secs",
+          "field": "ttl_secs",
+          "path": "ttl_secs",
+          "type": "Option<u32>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "cassandra.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "clickhouse",
+      "crate": "broker-connectors",
+      "module": "clickhouse",
+      "source": "crates/broker-connectors/src/clickhouse.rs",
+      "direction": "sink",
+      "config": "ClickHouseSinkConfig",
+      "items": [
+        {
+          "id": "clickhouse.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.table",
+          "field": "table",
+          "path": "table",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.format",
+          "field": "format",
+          "path": "format",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.username",
+          "field": "username",
+          "path": "username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.password",
+          "field": "password",
+          "path": "password",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.request_timeout_ms",
+          "field": "request_timeout_ms",
+          "path": "request_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "clickhouse.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "cockroachdb",
+      "crate": "broker-connectors-enterprise",
+      "module": "cockroachdb",
+      "source": "crates/broker-connectors-enterprise/src/cockroachdb.rs",
+      "direction": "sink",
+      "config": "CockroachDbConfig",
+      "items": [
+        {
+          "id": "cockroachdb.connection_string",
+          "field": "connection_string",
+          "path": "connection_string",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.table",
+          "field": "table",
+          "path": "table",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.upsert_conflict_columns",
+          "field": "upsert_conflict_columns",
+          "path": "upsert_conflict_columns",
+          "type": "Vec<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.max_retry_attempts",
+          "field": "max_retry_attempts",
+          "path": "max_retry_attempts",
+          "type": "usize",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "cockroachdb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "confluent",
+      "crate": "broker-connectors-enterprise",
+      "module": "confluent",
+      "source": "crates/broker-connectors-enterprise/src/confluent.rs",
+      "direction": "sink",
+      "config": "ConfluentKafkaConfig",
+      "items": [
+        {
+          "id": "confluent.bootstrap_servers",
+          "field": "bootstrap_servers",
+          "path": "bootstrap_servers",
+          "type": "Vec<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.api_key",
+          "field": "api_key",
+          "path": "api_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.api_secret",
+          "field": "api_secret",
+          "path": "api_secret",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.auth_mechanism",
+          "field": "auth_mechanism",
+          "path": "auth_mechanism",
+          "type": "SaslMechanism",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.auth_mechanism.Plain",
+          "field": "Plain",
+          "path": "auth_mechanism.Plain",
+          "type": "SaslMechanism",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.auth_mechanism.ScramSha256",
+          "field": "ScramSha256",
+          "path": "auth_mechanism.ScramSha256",
+          "type": "SaslMechanism",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.auth_mechanism.ScramSha512",
+          "field": "ScramSha512",
+          "path": "auth_mechanism.ScramSha512",
+          "type": "SaslMechanism",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.security_protocol",
+          "field": "security_protocol",
+          "path": "security_protocol",
+          "type": "ConfluentSecurityProtocol",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.security_protocol.SaslSsl",
+          "field": "SaslSsl",
+          "path": "security_protocol.SaslSsl",
+          "type": "ConfluentSecurityProtocol",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.security_protocol.SaslPlaintext",
+          "field": "SaslPlaintext",
+          "path": "security_protocol.SaslPlaintext",
+          "type": "ConfluentSecurityProtocol",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.topic_template",
+          "field": "topic_template",
+          "path": "topic_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.schema_registry",
+          "field": "schema_registry",
+          "path": "schema_registry",
+          "type": "Option<ConfluentSchemaRegistryConfig>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.schema_registry.endpoint",
+          "field": "endpoint",
+          "path": "schema_registry.endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.schema_registry.api_key",
+          "field": "api_key",
+          "path": "schema_registry.api_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.schema_registry.api_secret",
+          "field": "api_secret",
+          "path": "schema_registry.api_secret",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.schema_registry.schema_id",
+          "field": "schema_id",
+          "path": "schema_registry.schema_id",
+          "type": "u32",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.partitions",
+          "field": "partitions",
+          "path": "partitions",
+          "type": "u32",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.acks",
+          "field": "acks",
+          "path": "acks",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.random_partition",
+          "field": "random_partition",
+          "path": "random_partition",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.headers_template",
+          "field": "headers_template",
+          "path": "headers_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.extra_headers",
+          "field": "extra_headers",
+          "path": "extra_headers",
+          "type": "Vec<(String, String)>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.header_encode_mode",
+          "field": "header_encode_mode",
+          "path": "header_encode_mode",
+          "type": "ConfluentHeaderEncodeMode",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.header_encode_mode.None",
+          "field": "None",
+          "path": "header_encode_mode.None",
+          "type": "ConfluentHeaderEncodeMode",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.header_encode_mode.Json",
+          "field": "Json",
+          "path": "header_encode_mode.Json",
+          "type": "ConfluentHeaderEncodeMode",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "confluent.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "confluent.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "console",
+      "crate": "broker-connectors",
+      "module": "lib",
+      "source": "crates/broker-connectors/src/lib.rs",
+      "direction": "sink",
+      "config": "none",
+      "items": [],
+      "status": "mvp"
+    },
+    {
+      "kind": "couchbase",
+      "crate": "broker-connectors-enterprise",
+      "module": "couchbase",
+      "source": "crates/broker-connectors-enterprise/src/couchbase.rs",
+      "direction": "sink",
+      "config": "CouchbaseSinkConfig",
+      "items": [
+        {
+          "id": "couchbase.connection_string",
+          "field": "connection_string",
+          "path": "connection_string",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.bucket",
+          "field": "bucket",
+          "path": "bucket",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.scope",
+          "field": "scope",
+          "path": "scope",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.collection",
+          "field": "collection",
+          "path": "collection",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "CouchbaseAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.auth.username",
+          "field": "username",
+          "path": "auth.username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.auth.password",
+          "field": "password",
+          "path": "auth.password",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.doc_id_template",
+          "field": "doc_id_template",
+          "path": "doc_id_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.sql_template",
+          "field": "sql_template",
+          "path": "sql_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.operation",
+          "field": "operation",
+          "path": "operation",
+          "type": "CouchbaseOperation",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.operation.Upsert",
+          "field": "Upsert",
+          "path": "operation.Upsert",
+          "type": "CouchbaseOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "couchbase.operation.Insert",
+          "field": "Insert",
+          "path": "operation.Insert",
+          "type": "CouchbaseOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "couchbase.operation.Replace",
+          "field": "Replace",
+          "path": "operation.Replace",
+          "type": "CouchbaseOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "couchbase.expiry_secs",
+          "field": "expiry_secs",
+          "path": "expiry_secs",
+          "type": "Option<u32>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "couchbase.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "databricks",
+      "crate": "broker-connectors-enterprise",
+      "module": "databricks",
+      "source": "crates/broker-connectors-enterprise/src/databricks.rs",
+      "direction": "sink",
+      "config": "DatabricksSinkConfig",
+      "items": [
+        {
+          "id": "databricks.host",
+          "field": "host",
+          "path": "host",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.token",
+          "field": "token",
+          "path": "token",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.catalog",
+          "field": "catalog",
+          "path": "catalog",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.schema",
+          "field": "schema",
+          "path": "schema",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.http_path",
+          "field": "http_path",
+          "path": "http_path",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.column_mappings",
+          "field": "column_mappings",
+          "path": "column_mappings",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "databricks.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "datalayers",
+      "crate": "broker-connectors-enterprise",
+      "module": "datalayers",
+      "source": "crates/broker-connectors-enterprise/src/datalayers.rs",
+      "direction": "sink",
+      "config": "DatalayersConfig",
+      "items": [
+        {
+          "id": "datalayers.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.table",
+          "field": "table",
+          "path": "table",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.auth_token",
+          "field": "auth_token",
+          "path": "auth_token",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.username",
+          "field": "username",
+          "path": "username",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.password",
+          "field": "password",
+          "path": "password",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.timestamp_field",
+          "field": "timestamp_field",
+          "path": "timestamp_field",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.tag_columns",
+          "field": "tag_columns",
+          "path": "tag_columns",
+          "type": "Vec<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.field_columns",
+          "field": "field_columns",
+          "path": "field_columns",
+          "type": "Vec<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.precision",
+          "field": "precision",
+          "path": "precision",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "datalayers.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "disk_log",
+      "crate": "broker-connectors",
+      "module": "disk_log",
+      "source": "crates/broker-connectors/src/disk_log.rs",
+      "direction": "sink",
+      "config": "DiskLogSinkConfig",
+      "items": [
+        {
+          "id": "disk_log.directory",
+          "field": "directory",
+          "path": "directory",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.filename_prefix",
+          "field": "filename_prefix",
+          "path": "filename_prefix",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.filename_extension",
+          "field": "filename_extension",
+          "path": "filename_extension",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.format",
+          "field": "format",
+          "path": "format",
+          "type": "DiskLogFormat",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.format.Ndjson",
+          "field": "Ndjson",
+          "path": "format.Ndjson",
+          "type": "DiskLogFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.format.Raw",
+          "field": "Raw",
+          "path": "format.Raw",
+          "type": "DiskLogFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.format.Csv",
+          "field": "Csv",
+          "path": "format.Csv",
+          "type": "DiskLogFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.max_file_size_bytes",
+          "field": "max_file_size_bytes",
+          "path": "max_file_size_bytes",
+          "type": "Option<u64>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.max_file_age_secs",
+          "field": "max_file_age_secs",
+          "path": "max_file_age_secs",
+          "type": "Option<u64>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.compression",
+          "field": "compression",
+          "path": "compression",
+          "type": "DiskLogCompression",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.compression.None",
+          "field": "None",
+          "path": "compression.None",
+          "type": "DiskLogCompression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.compression.Gzip",
+          "field": "Gzip",
+          "path": "compression.Gzip",
+          "type": "DiskLogCompression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.max_backup_files",
+          "field": "max_backup_files",
+          "path": "max_backup_files",
+          "type": "Option<usize>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.max_retention_days",
+          "field": "max_retention_days",
+          "path": "max_retention_days",
+          "type": "Option<u32>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.sync_mode",
+          "field": "sync_mode",
+          "path": "sync_mode",
+          "type": "DiskSyncMode",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "disk_log.sync_mode.EveryBatch",
+          "field": "EveryBatch",
+          "path": "sync_mode.EveryBatch",
+          "type": "DiskSyncMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.sync_mode.Interval",
+          "field": "Interval",
+          "path": "sync_mode.Interval",
+          "type": "DiskSyncMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.sync_mode.OsDefault",
+          "field": "OsDefault",
+          "path": "sync_mode.OsDefault",
+          "type": "DiskSyncMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "disk_log.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "doris",
+      "crate": "broker-connectors-enterprise",
+      "module": "doris",
+      "source": "crates/broker-connectors-enterprise/src/doris.rs",
+      "direction": "sink",
+      "config": "DorisSinkConfig",
+      "items": [
+        {
+          "id": "doris.fe_host",
+          "field": "fe_host",
+          "path": "fe_host",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "doris.http_port",
+          "field": "http_port",
+          "path": "http_port",
+          "type": "u16",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "doris.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "doris.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "doris.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "DorisAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "doris.auth.username",
+          "field": "username",
+          "path": "auth.username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "doris.auth.password",
+          "field": "password",
+          "path": "auth.password",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "doris.format",
+          "field": "format",
+          "path": "format",
+          "type": "DorisFormat",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "doris.format.Json",
+          "field": "Json",
+          "path": "format.Json",
+          "type": "DorisFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "doris.format.Csv",
+          "field": "Csv",
+          "path": "format.Csv",
+          "type": "DorisFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "doris.jsonpaths",
+          "field": "jsonpaths",
+          "path": "jsonpaths",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "doris.strip_outer_array",
+          "field": "strip_outer_array",
+          "path": "strip_outer_array",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "doris.max_filter_ratio",
+          "field": "max_filter_ratio",
+          "path": "max_filter_ratio",
+          "type": "Option<f64>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "doris.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "doris.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "doris.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "doris.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "doris.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "doris.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "doris.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "doris.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "dynamodb",
+      "crate": "broker-connectors-enterprise",
+      "module": "dynamodb",
+      "source": "crates/broker-connectors-enterprise/src/dynamodb.rs",
+      "direction": "sink",
+      "config": "DynamoDbSinkConfig",
+      "items": [
+        {
+          "id": "dynamodb.table_name",
+          "field": "table_name",
+          "path": "table_name",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.region",
+          "field": "region",
+          "path": "region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.access_key_id",
+          "field": "access_key_id",
+          "path": "access_key_id",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.secret_access_key",
+          "field": "secret_access_key",
+          "path": "secret_access_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.session_token",
+          "field": "session_token",
+          "path": "session_token",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.partition_key",
+          "field": "partition_key",
+          "path": "partition_key",
+          "type": "DynamoKeyConfig",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.partition_key.name",
+          "field": "name",
+          "path": "partition_key.name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.partition_key.template",
+          "field": "template",
+          "path": "partition_key.template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.partition_key.key_type",
+          "field": "key_type",
+          "path": "partition_key.key_type",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.sort_key",
+          "field": "sort_key",
+          "path": "sort_key",
+          "type": "Option<DynamoKeyConfig>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.sort_key.name",
+          "field": "name",
+          "path": "sort_key.name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.sort_key.template",
+          "field": "template",
+          "path": "sort_key.template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.sort_key.key_type",
+          "field": "key_type",
+          "path": "sort_key.key_type",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.ttl_attribute",
+          "field": "ttl_attribute",
+          "path": "ttl_attribute",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.ttl_secs",
+          "field": "ttl_secs",
+          "path": "ttl_secs",
+          "type": "Option<u64>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.attributes_mapping",
+          "field": "attributes_mapping",
+          "path": "attributes_mapping",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.undefined_vars_as_null",
+          "field": "undefined_vars_as_null",
+          "path": "undefined_vars_as_null",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "dynamodb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "elasticsearch",
+      "crate": "broker-connectors",
+      "module": "elasticsearch",
+      "source": "crates/broker-connectors/src/elasticsearch.rs",
+      "direction": "sink",
+      "config": "ElasticsearchSinkConfig",
+      "items": [
+        {
+          "id": "elasticsearch.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.index_template",
+          "field": "index_template",
+          "path": "index_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.doc_id_template",
+          "field": "doc_id_template",
+          "path": "doc_id_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.operation",
+          "field": "operation",
+          "path": "operation",
+          "type": "ElasticsearchOperation",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.operation.Index",
+          "field": "Index",
+          "path": "operation.Index",
+          "type": "ElasticsearchOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.operation.Create",
+          "field": "Create",
+          "path": "operation.Create",
+          "type": "ElasticsearchOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.operation.Update",
+          "field": "Update",
+          "path": "operation.Update",
+          "type": "ElasticsearchOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.operation.Delete",
+          "field": "Delete",
+          "path": "operation.Delete",
+          "type": "ElasticsearchOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.doc_template",
+          "field": "doc_template",
+          "path": "doc_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.overwrite",
+          "field": "overwrite",
+          "path": "overwrite",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.doc_as_upsert",
+          "field": "doc_as_upsert",
+          "path": "doc_as_upsert",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.require_alias",
+          "field": "require_alias",
+          "path": "require_alias",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.routing",
+          "field": "routing",
+          "path": "routing",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "ElasticsearchAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.auth.None",
+          "field": "None",
+          "path": "auth.None",
+          "type": "ElasticsearchAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.auth.Basic",
+          "field": "Basic",
+          "path": "auth.Basic",
+          "type": "ElasticsearchAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.auth.ApiKey",
+          "field": "ApiKey",
+          "path": "auth.ApiKey",
+          "type": "ElasticsearchAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "elasticsearch.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "usize",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.request_timeout_ms",
+          "field": "request_timeout_ms",
+          "path": "request_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "elasticsearch.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "gcp_iot",
+      "crate": "broker-connectors-enterprise",
+      "module": "gcp_iot",
+      "source": "crates/broker-connectors-enterprise/src/gcp_iot.rs",
+      "direction": "both",
+      "config": "GcpIotConfig",
+      "items": [
+        {
+          "id": "gcp_iot.project_id",
+          "field": "project_id",
+          "path": "project_id",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.cloud_region",
+          "field": "cloud_region",
+          "path": "cloud_region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.registry_id",
+          "field": "registry_id",
+          "path": "registry_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.device_id",
+          "field": "device_id",
+          "path": "device_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.private_key_pem",
+          "field": "private_key_pem",
+          "path": "private_key_pem",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.algorithm",
+          "field": "algorithm",
+          "path": "algorithm",
+          "type": "GcpIotAlgorithm",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.algorithm.Rs256",
+          "field": "Rs256",
+          "path": "algorithm.Rs256",
+          "type": "GcpIotAlgorithm",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "gcp_iot.algorithm.Es256",
+          "field": "Es256",
+          "path": "algorithm.Es256",
+          "type": "GcpIotAlgorithm",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "gcp_iot.token_lifetime_secs",
+          "field": "token_lifetime_secs",
+          "path": "token_lifetime_secs",
+          "type": "u64",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_iot.ca_bundle_pem",
+          "field": "ca_bundle_pem",
+          "path": "ca_bundle_pem",
+          "type": "Option<String>",
+          "category": "tls",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "gcp_pubsub",
+      "crate": "broker-connectors-enterprise",
+      "module": "gcp_pubsub",
+      "source": "crates/broker-connectors-enterprise/src/gcp_pubsub.rs",
+      "direction": "sink",
+      "config": "GcpPubSubSinkConfig",
+      "items": [
+        {
+          "id": "gcp_pubsub.project_id",
+          "field": "project_id",
+          "path": "project_id",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.topic_id",
+          "field": "topic_id",
+          "path": "topic_id",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.auth.None",
+          "field": "None",
+          "path": "auth.None",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "gcp_pubsub.auth.AccessToken",
+          "field": "AccessToken",
+          "path": "auth.AccessToken",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "gcp_pubsub.auth.ServiceAccountKey",
+          "field": "ServiceAccountKey",
+          "path": "auth.ServiceAccountKey",
+          "type": "GcpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "gcp_pubsub.ordering_key_template",
+          "field": "ordering_key_template",
+          "path": "ordering_key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.attributes",
+          "field": "attributes",
+          "path": "attributes",
+          "type": "HashMap<String, String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "gcp_pubsub.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "greptimedb",
+      "crate": "broker-connectors",
+      "module": "greptimedb",
+      "source": "crates/broker-connectors/src/greptimedb.rs",
+      "direction": "sink",
+      "config": "GreptimeDbConfig",
+      "items": [
+        {
+          "id": "greptimedb.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "Option<GreptimeDbAuth>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.auth.username",
+          "field": "username",
+          "path": "auth.username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.auth.password",
+          "field": "password",
+          "path": "auth.password",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.format",
+          "field": "format",
+          "path": "format",
+          "type": "GreptimeFormat",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.format.SqlInsert",
+          "field": "SqlInsert",
+          "path": "format.SqlInsert",
+          "type": "GreptimeFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "greptimedb.format.InfluxLineProtocol",
+          "field": "InfluxLineProtocol",
+          "path": "format.InfluxLineProtocol",
+          "type": "GreptimeFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "greptimedb.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.timestamp_precision",
+          "field": "timestamp_precision",
+          "path": "timestamp_precision",
+          "type": "GreptimePrecision",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.timestamp_precision.Nanosecond",
+          "field": "Nanosecond",
+          "path": "timestamp_precision.Nanosecond",
+          "type": "GreptimePrecision",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "greptimedb.timestamp_precision.Microsecond",
+          "field": "Microsecond",
+          "path": "timestamp_precision.Microsecond",
+          "type": "GreptimePrecision",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "greptimedb.timestamp_precision.Millisecond",
+          "field": "Millisecond",
+          "path": "timestamp_precision.Millisecond",
+          "type": "GreptimePrecision",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "greptimedb.timestamp_precision.Second",
+          "field": "Second",
+          "path": "timestamp_precision.Second",
+          "type": "GreptimePrecision",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "greptimedb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "influxdb",
+      "crate": "broker-connectors",
+      "module": "influxdb",
+      "source": "crates/broker-connectors/src/influxdb.rs",
+      "direction": "sink",
+      "config": "InfluxDbSinkConfig",
+      "items": [
+        {
+          "id": "influxdb.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.bucket",
+          "field": "bucket",
+          "path": "bucket",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.org",
+          "field": "org",
+          "path": "org",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.token",
+          "field": "token",
+          "path": "token",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.measurement_template",
+          "field": "measurement_template",
+          "path": "measurement_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.precision",
+          "field": "precision",
+          "path": "precision",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.request_timeout_ms",
+          "field": "request_timeout_ms",
+          "path": "request_timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "influxdb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "iotdb",
+      "crate": "broker-connectors-enterprise",
+      "module": "iotdb",
+      "source": "crates/broker-connectors-enterprise/src/iotdb.rs",
+      "direction": "sink",
+      "config": "IotDbSinkConfig",
+      "items": [
+        {
+          "id": "iotdb.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.device_path_template",
+          "field": "device_path_template",
+          "path": "device_path_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "IotDbAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.auth.username",
+          "field": "username",
+          "path": "auth.username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.auth.password",
+          "field": "password",
+          "path": "auth.password",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.is_aligned",
+          "field": "is_aligned",
+          "path": "is_aligned",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.measurements",
+          "field": "measurements",
+          "path": "measurements",
+          "type": "Vec<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.data_types",
+          "field": "data_types",
+          "path": "data_types",
+          "type": "Vec<IotDbDataType>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.data_types.Boolean",
+          "field": "Boolean",
+          "path": "data_types.Boolean",
+          "type": "IotDbDataType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "iotdb.data_types.Int32",
+          "field": "Int32",
+          "path": "data_types.Int32",
+          "type": "IotDbDataType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "iotdb.data_types.Int64",
+          "field": "Int64",
+          "path": "data_types.Int64",
+          "type": "IotDbDataType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "iotdb.data_types.Float",
+          "field": "Float",
+          "path": "data_types.Float",
+          "type": "IotDbDataType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "iotdb.data_types.Double",
+          "field": "Double",
+          "path": "data_types.Double",
+          "type": "IotDbDataType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "iotdb.data_types.Text",
+          "field": "Text",
+          "path": "data_types.Text",
+          "type": "IotDbDataType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "iotdb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "iotdb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "kafka",
+      "crate": "broker-connectors",
+      "module": "kafka",
+      "source": "crates/broker-connectors/src/kafka.rs",
+      "direction": "sink",
+      "config": "KafkaSinkConfig",
+      "items": [
+        {
+          "id": "kafka.bootstrap_servers",
+          "field": "bootstrap_servers",
+          "path": "bootstrap_servers",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.topic_template",
+          "field": "topic_template",
+          "path": "topic_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.partition_key_field",
+          "field": "partition_key_field",
+          "path": "partition_key_field",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.key_template",
+          "field": "key_template",
+          "path": "key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.partitions",
+          "field": "partitions",
+          "path": "partitions",
+          "type": "u32",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.client_id",
+          "field": "client_id",
+          "path": "client_id",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.acks",
+          "field": "acks",
+          "path": "acks",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.batch_max_records",
+          "field": "batch_max_records",
+          "path": "batch_max_records",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.batch_max_bytes",
+          "field": "batch_max_bytes",
+          "path": "batch_max_bytes",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.random_partition",
+          "field": "random_partition",
+          "path": "random_partition",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.headers_template",
+          "field": "headers_template",
+          "path": "headers_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.extra_headers",
+          "field": "extra_headers",
+          "path": "extra_headers",
+          "type": "Vec<(String, String)>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.header_encode_mode",
+          "field": "header_encode_mode",
+          "path": "header_encode_mode",
+          "type": "KafkaHeaderEncodeMode",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kafka.header_encode_mode.None",
+          "field": "None",
+          "path": "header_encode_mode.None",
+          "type": "KafkaHeaderEncodeMode",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "kafka.header_encode_mode.Json",
+          "field": "Json",
+          "path": "header_encode_mode.Json",
+          "type": "KafkaHeaderEncodeMode",
+          "category": "mapping",
+          "origin": "variant"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "kinesis",
+      "crate": "broker-connectors-enterprise",
+      "module": "kinesis",
+      "source": "crates/broker-connectors-enterprise/src/kinesis.rs",
+      "direction": "sink",
+      "config": "KinesisSinkConfig",
+      "items": [
+        {
+          "id": "kinesis.stream_name",
+          "field": "stream_name",
+          "path": "stream_name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.region",
+          "field": "region",
+          "path": "region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.access_key_id",
+          "field": "access_key_id",
+          "path": "access_key_id",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.secret_access_key",
+          "field": "secret_access_key",
+          "path": "secret_access_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.session_token",
+          "field": "session_token",
+          "path": "session_token",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.explicit_hash_key",
+          "field": "explicit_hash_key",
+          "path": "explicit_hash_key",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "kinesis.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "mongodb",
+      "crate": "broker-connectors-enterprise",
+      "module": "mongodb",
+      "source": "crates/broker-connectors-enterprise/src/mongodb.rs",
+      "direction": "sink",
+      "config": "MongoDbSinkConfig",
+      "items": [
+        {
+          "id": "mongodb.connection_string",
+          "field": "connection_string",
+          "path": "connection_string",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.collection_template",
+          "field": "collection_template",
+          "path": "collection_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.payload_template",
+          "field": "payload_template",
+          "path": "payload_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.operation",
+          "field": "operation",
+          "path": "operation",
+          "type": "MongoOperation",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.operation.InsertOne",
+          "field": "InsertOne",
+          "path": "operation.InsertOne",
+          "type": "MongoOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "mongodb.operation.UpdateOne",
+          "field": "UpdateOne",
+          "path": "operation.UpdateOne",
+          "type": "MongoOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "mongodb.operation.ReplaceOne",
+          "field": "ReplaceOne",
+          "path": "operation.ReplaceOne",
+          "type": "MongoOperation",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "mongodb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mongodb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "mqtt_bridge",
+      "crate": "broker-connectors",
+      "module": "mqtt_bridge",
+      "source": "crates/broker-connectors/src/mqtt_bridge.rs",
+      "direction": "sink",
+      "config": "MqttBridgeSinkConfig",
+      "items": [
+        {
+          "id": "mqtt_bridge.broker_address",
+          "field": "broker_address",
+          "path": "broker_address",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.client_id",
+          "field": "client_id",
+          "path": "client_id",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.clean_start",
+          "field": "clean_start",
+          "path": "clean_start",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.username",
+          "field": "username",
+          "path": "username",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.password",
+          "field": "password",
+          "path": "password",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.keep_alive_secs",
+          "field": "keep_alive_secs",
+          "path": "keep_alive_secs",
+          "type": "u16",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.topic_prefix",
+          "field": "topic_prefix",
+          "path": "topic_prefix",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.topic_template",
+          "field": "topic_template",
+          "path": "topic_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.payload_template",
+          "field": "payload_template",
+          "path": "payload_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.qos_override",
+          "field": "qos_override",
+          "path": "qos_override",
+          "type": "Option<u8>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.retain_override",
+          "field": "retain_override",
+          "path": "retain_override",
+          "type": "Option<bool>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.max_inflight",
+          "field": "max_inflight",
+          "path": "max_inflight",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.max_batch_size",
+          "field": "max_batch_size",
+          "path": "max_batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.protocol",
+          "field": "protocol",
+          "path": "protocol",
+          "type": "MqttBridgeProtocol",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mqtt_bridge.protocol.V311",
+          "field": "V311",
+          "path": "protocol.V311",
+          "type": "MqttBridgeProtocol",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "mqtt_bridge.protocol.V50",
+          "field": "V50",
+          "path": "protocol.V50",
+          "type": "MqttBridgeProtocol",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "mqtt_bridge.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "mssql",
+      "crate": "broker-connectors-enterprise",
+      "module": "mssql",
+      "source": "crates/broker-connectors-enterprise/src/mssql.rs",
+      "direction": "sink",
+      "config": "MssqlSinkConfig",
+      "items": [
+        {
+          "id": "mssql.host",
+          "field": "host",
+          "path": "host",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.port",
+          "field": "port",
+          "path": "port",
+          "type": "Option<u16>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "MssqlAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.auth.SqlPassword",
+          "field": "SqlPassword",
+          "path": "auth.SqlPassword",
+          "type": "MssqlAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "mssql.auth.Integrated",
+          "field": "Integrated",
+          "path": "auth.Integrated",
+          "type": "MssqlAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "mssql.auth.ActiveDirectoryPassword",
+          "field": "ActiveDirectoryPassword",
+          "path": "auth.ActiveDirectoryPassword",
+          "type": "MssqlAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "mssql.query_mode",
+          "field": "query_mode",
+          "path": "query_mode",
+          "type": "MssqlQueryMode",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.query_mode.InsertJson",
+          "field": "InsertJson",
+          "path": "query_mode.InsertJson",
+          "type": "MssqlQueryMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "mssql.query_mode.CustomUpsert",
+          "field": "CustomUpsert",
+          "path": "query_mode.CustomUpsert",
+          "type": "MssqlQueryMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "mssql.trust_server_certificate",
+          "field": "trust_server_certificate",
+          "path": "trust_server_certificate",
+          "type": "bool",
+          "category": "tls",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "mssql.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "mysql",
+      "crate": "broker-connectors",
+      "module": "mysql",
+      "source": "crates/broker-connectors/src/mysql.rs",
+      "direction": "sink",
+      "config": "MySqlSinkConfig",
+      "items": [
+        {
+          "id": "mysql.connection_url",
+          "field": "connection_url",
+          "path": "connection_url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "mysql.sql_template",
+          "field": "sql_template",
+          "path": "sql_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "mysql.pool_size",
+          "field": "pool_size",
+          "path": "pool_size",
+          "type": "usize",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "mysql.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "mysql.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "oci_streaming",
+      "crate": "broker-connectors-enterprise",
+      "module": "oci_streaming",
+      "source": "crates/broker-connectors-enterprise/src/oci_streaming.rs",
+      "direction": "sink",
+      "config": "OciStreamingSinkConfig",
+      "items": [
+        {
+          "id": "oci_streaming.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.stream_pool_id",
+          "field": "stream_pool_id",
+          "path": "stream_pool_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.stream_id",
+          "field": "stream_id",
+          "path": "stream_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.tenancy_ocid",
+          "field": "tenancy_ocid",
+          "path": "tenancy_ocid",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.user_ocid",
+          "field": "user_ocid",
+          "path": "user_ocid",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.fingerprint",
+          "field": "fingerprint",
+          "path": "fingerprint",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.private_key_pem",
+          "field": "private_key_pem",
+          "path": "private_key_pem",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "oci_streaming.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "out-of-mvp"
+    },
+    {
+      "kind": "opc_ua",
+      "crate": "broker-connectors-enterprise",
+      "module": "opc_ua",
+      "source": "crates/broker-connectors-enterprise/src/opc_ua.rs",
+      "direction": "both",
+      "config": "OpcUaSinkConfig",
+      "items": [
+        {
+          "id": "opc_ua.endpoint_url",
+          "field": "endpoint_url",
+          "path": "endpoint_url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.security_policy",
+          "field": "security_policy",
+          "path": "security_policy",
+          "type": "OpcUaSecurityPolicy",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.security_policy.None",
+          "field": "None",
+          "path": "security_policy.None",
+          "type": "OpcUaSecurityPolicy",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.security_policy.Basic256Sha256",
+          "field": "Basic256Sha256",
+          "path": "security_policy.Basic256Sha256",
+          "type": "OpcUaSecurityPolicy",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.security_policy.Aes128Sha256RsaOaep",
+          "field": "Aes128Sha256RsaOaep",
+          "path": "security_policy.Aes128Sha256RsaOaep",
+          "type": "OpcUaSecurityPolicy",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.security_mode",
+          "field": "security_mode",
+          "path": "security_mode",
+          "type": "OpcUaSecurityMode",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.security_mode.None",
+          "field": "None",
+          "path": "security_mode.None",
+          "type": "OpcUaSecurityMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.security_mode.Sign",
+          "field": "Sign",
+          "path": "security_mode.Sign",
+          "type": "OpcUaSecurityMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.security_mode.SignAndEncrypt",
+          "field": "SignAndEncrypt",
+          "path": "security_mode.SignAndEncrypt",
+          "type": "OpcUaSecurityMode",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "OpcUaAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.auth.Anonymous",
+          "field": "Anonymous",
+          "path": "auth.Anonymous",
+          "type": "OpcUaAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.auth.UsernamePassword",
+          "field": "UsernamePassword",
+          "path": "auth.UsernamePassword",
+          "type": "OpcUaAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.auth.Certificate",
+          "field": "Certificate",
+          "path": "auth.Certificate",
+          "type": "OpcUaAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "opc_ua.node_subscriptions",
+          "field": "node_subscriptions",
+          "path": "node_subscriptions",
+          "type": "Vec<NodeSubscriptionConfig>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.node_subscriptions.node_id",
+          "field": "node_id",
+          "path": "node_subscriptions.node_id",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.node_subscriptions.sampling_interval_ms",
+          "field": "sampling_interval_ms",
+          "path": "node_subscriptions.sampling_interval_ms",
+          "type": "u64",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.node_subscriptions.publish_topic_template",
+          "field": "publish_topic_template",
+          "path": "node_subscriptions.publish_topic_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.node_subscriptions.write_topic_pattern",
+          "field": "write_topic_pattern",
+          "path": "node_subscriptions.write_topic_pattern",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "opc_ua.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "opentsdb",
+      "crate": "broker-connectors",
+      "module": "opentsdb",
+      "source": "crates/broker-connectors/src/opentsdb.rs",
+      "direction": "sink",
+      "config": "OpenTsdbConfig",
+      "items": [
+        {
+          "id": "opentsdb.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.protocol",
+          "field": "protocol",
+          "path": "protocol",
+          "type": "OpenTsdbProtocol",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.protocol.Http",
+          "field": "Http",
+          "path": "protocol.Http",
+          "type": "OpenTsdbProtocol",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "opentsdb.protocol.Telnet",
+          "field": "Telnet",
+          "path": "protocol.Telnet",
+          "type": "OpenTsdbProtocol",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "opentsdb.metric_template",
+          "field": "metric_template",
+          "path": "metric_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.tag_mappings",
+          "field": "tag_mappings",
+          "path": "tag_mappings",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.value_field",
+          "field": "value_field",
+          "path": "value_field",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.summary",
+          "field": "summary",
+          "path": "summary",
+          "type": "bool",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.compression",
+          "field": "compression",
+          "path": "compression",
+          "type": "OpenTsdbCompression",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.compression.None",
+          "field": "None",
+          "path": "compression.None",
+          "type": "OpenTsdbCompression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opentsdb.compression.Gzip",
+          "field": "Gzip",
+          "path": "compression.Gzip",
+          "type": "OpenTsdbCompression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "opentsdb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "opentsdb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "oracle",
+      "crate": "broker-connectors-enterprise",
+      "module": "oracle",
+      "source": "crates/broker-connectors-enterprise/src/oracle.rs",
+      "direction": "sink",
+      "config": "OracleSinkConfig",
+      "items": [
+        {
+          "id": "oracle.url",
+          "field": "url",
+          "path": "url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.schema",
+          "field": "schema",
+          "path": "schema",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.table",
+          "field": "table",
+          "path": "table",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.username",
+          "field": "username",
+          "path": "username",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.password",
+          "field": "password",
+          "path": "password",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.custom_upsert",
+          "field": "custom_upsert",
+          "path": "custom_upsert",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.key_columns",
+          "field": "key_columns",
+          "path": "key_columns",
+          "type": "Vec<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "oracle.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "postgres",
+      "crate": "broker-connectors",
+      "module": "postgres",
+      "source": "crates/broker-connectors/src/postgres.rs",
+      "direction": "sink",
+      "config": "PostgreSqlSinkConfig",
+      "items": [
+        {
+          "id": "postgres.connection_url",
+          "field": "connection_url",
+          "path": "connection_url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "postgres.sql_template",
+          "field": "sql_template",
+          "path": "sql_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "postgres.pool_size",
+          "field": "pool_size",
+          "path": "pool_size",
+          "type": "usize",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "postgres.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "postgres.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "postgres.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "pulsar",
+      "crate": "broker-connectors-enterprise",
+      "module": "pulsar",
+      "source": "crates/broker-connectors-enterprise/src/pulsar.rs",
+      "direction": "sink",
+      "config": "PulsarSinkConfig",
+      "items": [
+        {
+          "id": "pulsar.service_url",
+          "field": "service_url",
+          "path": "service_url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.tenant",
+          "field": "tenant",
+          "path": "tenant",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.namespace",
+          "field": "namespace",
+          "path": "namespace",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.topic",
+          "field": "topic",
+          "path": "topic",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "PulsarAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.auth.None",
+          "field": "None",
+          "path": "auth.None",
+          "type": "PulsarAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "pulsar.auth.Token",
+          "field": "Token",
+          "path": "auth.Token",
+          "type": "PulsarAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "pulsar.partition_key_template",
+          "field": "partition_key_template",
+          "path": "partition_key_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.strategy",
+          "field": "strategy",
+          "path": "strategy",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.properties",
+          "field": "properties",
+          "path": "properties",
+          "type": "HashMap<String, String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "pulsar.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "rabbitmq",
+      "crate": "broker-connectors",
+      "module": "rabbitmq",
+      "source": "crates/broker-connectors/src/rabbitmq.rs",
+      "direction": "sink",
+      "config": "RabbitMqSinkConfig",
+      "items": [
+        {
+          "id": "rabbitmq.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "rabbitmq.exchange",
+          "field": "exchange",
+          "path": "exchange",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "rabbitmq.routing_key_template",
+          "field": "routing_key_template",
+          "path": "routing_key_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "rabbitmq.delivery_mode",
+          "field": "delivery_mode",
+          "path": "delivery_mode",
+          "type": "u8",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "rabbitmq.extra_headers",
+          "field": "extra_headers",
+          "path": "extra_headers",
+          "type": "Vec<(String, String)>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "rabbitmq.payload_template",
+          "field": "payload_template",
+          "path": "payload_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "redis",
+      "crate": "broker-connectors",
+      "module": "redis",
+      "source": "crates/broker-connectors/src/redis.rs",
+      "direction": "sink",
+      "config": "RedisSinkConfig",
+      "items": [
+        {
+          "id": "redis.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "redis.command",
+          "field": "command",
+          "path": "command",
+          "type": "RedisCommandKind",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "redis.command.Set",
+          "field": "Set",
+          "path": "command.Set",
+          "type": "RedisCommandKind",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "redis.command.HSet",
+          "field": "HSet",
+          "path": "command.HSet",
+          "type": "RedisCommandKind",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "redis.command.Publish",
+          "field": "Publish",
+          "path": "command.Publish",
+          "type": "RedisCommandKind",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "redis.command.XAdd",
+          "field": "XAdd",
+          "path": "command.XAdd",
+          "type": "RedisCommandKind",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "redis.command.Raw",
+          "field": "Raw",
+          "path": "command.Raw",
+          "type": "RedisCommandKind",
+          "category": "other",
+          "origin": "variant"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "redshift",
+      "crate": "broker-connectors-enterprise",
+      "module": "redshift",
+      "source": "crates/broker-connectors-enterprise/src/redshift.rs",
+      "direction": "sink",
+      "config": "RedshiftSinkConfig",
+      "items": [
+        {
+          "id": "redshift.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.cluster_identifier",
+          "field": "cluster_identifier",
+          "path": "cluster_identifier",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.workgroup_name",
+          "field": "workgroup_name",
+          "path": "workgroup_name",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.region",
+          "field": "region",
+          "path": "region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.access_key_id",
+          "field": "access_key_id",
+          "path": "access_key_id",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.secret_access_key",
+          "field": "secret_access_key",
+          "path": "secret_access_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.session_token",
+          "field": "session_token",
+          "path": "session_token",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.db_user",
+          "field": "db_user",
+          "path": "db_user",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.sql_template",
+          "field": "sql_template",
+          "path": "sql_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "redshift.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "rocketmq",
+      "crate": "broker-connectors-enterprise",
+      "module": "rocketmq",
+      "source": "crates/broker-connectors-enterprise/src/rocketmq.rs",
+      "direction": "sink",
+      "config": "RocketMqSinkConfig",
+      "items": [
+        {
+          "id": "rocketmq.endpoints",
+          "field": "endpoints",
+          "path": "endpoints",
+          "type": "Vec<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.topic",
+          "field": "topic",
+          "path": "topic",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.tag_template",
+          "field": "tag_template",
+          "path": "tag_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.keys_template",
+          "field": "keys_template",
+          "path": "keys_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.strategy",
+          "field": "strategy",
+          "path": "strategy",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.message_group_template",
+          "field": "message_group_template",
+          "path": "message_group_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.access_key",
+          "field": "access_key",
+          "path": "access_key",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.secret_key",
+          "field": "secret_key",
+          "path": "secret_key",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.security_token",
+          "field": "security_token",
+          "path": "security_token",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "rocketmq.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "s3",
+      "crate": "broker-connectors",
+      "module": "s3",
+      "source": "crates/broker-connectors/src/s3.rs",
+      "direction": "sink",
+      "config": "S3SinkConfig",
+      "items": [
+        {
+          "id": "s3.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "s3.bucket",
+          "field": "bucket",
+          "path": "bucket",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "s3.region",
+          "field": "region",
+          "path": "region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "s3.access_key_id",
+          "field": "access_key_id",
+          "path": "access_key_id",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "s3.secret_access_key",
+          "field": "secret_access_key",
+          "path": "secret_access_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "s3.key_template",
+          "field": "key_template",
+          "path": "key_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "s3.compression",
+          "field": "compression",
+          "path": "compression",
+          "type": "S3Compression",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "s3.compression.None",
+          "field": "None",
+          "path": "compression.None",
+          "type": "S3Compression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "s3.compression.Gzip",
+          "field": "Gzip",
+          "path": "compression.Gzip",
+          "type": "S3Compression",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "s3.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "s3.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "s3.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "s3.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "s3.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "snowflake",
+      "crate": "broker-connectors-enterprise",
+      "module": "snowflake",
+      "source": "crates/broker-connectors-enterprise/src/snowflake.rs",
+      "direction": "sink",
+      "config": "SnowflakeSinkConfig",
+      "items": [
+        {
+          "id": "snowflake.account",
+          "field": "account",
+          "path": "account",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.user",
+          "field": "user",
+          "path": "user",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.schema",
+          "field": "schema",
+          "path": "schema",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.table_template",
+          "field": "table_template",
+          "path": "table_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.private_key_pem",
+          "field": "private_key_pem",
+          "path": "private_key_pem",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.role",
+          "field": "role",
+          "path": "role",
+          "type": "Option<String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.channel",
+          "field": "channel",
+          "path": "channel",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.column_mappings",
+          "field": "column_mappings",
+          "path": "column_mappings",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "snowflake.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "sparkplug_b",
+      "crate": "broker-connectors-enterprise",
+      "module": "sparkplug_b",
+      "source": "crates/broker-connectors-enterprise/src/sparkplug_b.rs",
+      "direction": "both",
+      "config": "SparkplugSinkConfig",
+      "items": [
+        {
+          "id": "sparkplug_b.topic_prefix",
+          "field": "topic_prefix",
+          "path": "topic_prefix",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.tier",
+          "field": "tier",
+          "path": "tier",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.mqtt_url",
+          "field": "mqtt_url",
+          "path": "mqtt_url",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.client_id",
+          "field": "client_id",
+          "path": "client_id",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.max_aliases",
+          "field": "max_aliases",
+          "path": "max_aliases",
+          "type": "Option<usize>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "sparkplug_b.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "tablestore",
+      "crate": "broker-connectors-enterprise",
+      "module": "tablestore",
+      "source": "crates/broker-connectors-enterprise/src/tablestore.rs",
+      "direction": "sink",
+      "config": "TablestoreSinkConfig",
+      "items": [
+        {
+          "id": "tablestore.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.instance_name",
+          "field": "instance_name",
+          "path": "instance_name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.table_name",
+          "field": "table_name",
+          "path": "table_name",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.access_key_id",
+          "field": "access_key_id",
+          "path": "access_key_id",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.access_key_secret",
+          "field": "access_key_secret",
+          "path": "access_key_secret",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.primary_keys",
+          "field": "primary_keys",
+          "path": "primary_keys",
+          "type": "Vec<PrimaryKeyMapping>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.primary_keys.name",
+          "field": "name",
+          "path": "primary_keys.name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.primary_keys.source",
+          "field": "source",
+          "path": "primary_keys.source",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.primary_keys.data_type",
+          "field": "data_type",
+          "path": "primary_keys.data_type",
+          "type": "PrimaryKeyType",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.primary_keys.data_type.String",
+          "field": "String",
+          "path": "primary_keys.data_type.String",
+          "type": "PrimaryKeyType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.primary_keys.data_type.Integer",
+          "field": "Integer",
+          "path": "primary_keys.data_type.Integer",
+          "type": "PrimaryKeyType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.primary_keys.data_type.Binary",
+          "field": "Binary",
+          "path": "primary_keys.data_type.Binary",
+          "type": "PrimaryKeyType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.attribute_columns",
+          "field": "attribute_columns",
+          "path": "attribute_columns",
+          "type": "Vec<AttributeColumnMapping>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.attribute_columns.name",
+          "field": "name",
+          "path": "attribute_columns.name",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.attribute_columns.source",
+          "field": "source",
+          "path": "attribute_columns.source",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.attribute_columns.data_type",
+          "field": "data_type",
+          "path": "attribute_columns.data_type",
+          "type": "AttributeColumnType",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.attribute_columns.data_type.String",
+          "field": "String",
+          "path": "attribute_columns.data_type.String",
+          "type": "AttributeColumnType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.attribute_columns.data_type.Integer",
+          "field": "Integer",
+          "path": "attribute_columns.data_type.Integer",
+          "type": "AttributeColumnType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.attribute_columns.data_type.Double",
+          "field": "Double",
+          "path": "attribute_columns.data_type.Double",
+          "type": "AttributeColumnType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.attribute_columns.data_type.Boolean",
+          "field": "Boolean",
+          "path": "attribute_columns.data_type.Boolean",
+          "type": "AttributeColumnType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.attribute_columns.data_type.Binary",
+          "field": "Binary",
+          "path": "attribute_columns.data_type.Binary",
+          "type": "AttributeColumnType",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "tablestore.measurement",
+          "field": "measurement",
+          "path": "measurement",
+          "type": "String",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "tablestore.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "tdengine",
+      "crate": "broker-connectors-enterprise",
+      "module": "tdengine",
+      "source": "crates/broker-connectors-enterprise/src/tdengine.rs",
+      "direction": "sink",
+      "config": "TdengineSinkConfig",
+      "items": [
+        {
+          "id": "tdengine.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.database",
+          "field": "database",
+          "path": "database",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.stable_name",
+          "field": "stable_name",
+          "path": "stable_name",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.subtable_template",
+          "field": "subtable_template",
+          "path": "subtable_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "TdengineAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.auth.Basic",
+          "field": "Basic",
+          "path": "auth.Basic",
+          "type": "TdengineAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "tdengine.auth.Token",
+          "field": "Token",
+          "path": "auth.Token",
+          "type": "TdengineAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "tdengine.tags_template",
+          "field": "tags_template",
+          "path": "tags_template",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.metrics_template",
+          "field": "metrics_template",
+          "path": "metrics_template",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "tdengine.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "timescaledb",
+      "crate": "broker-connectors",
+      "module": "timescaledb",
+      "source": "crates/broker-connectors/src/timescaledb.rs",
+      "direction": "sink",
+      "config": "TimescaleDbSinkConfig",
+      "items": [
+        {
+          "id": "timescaledb.connection_url",
+          "field": "connection_url",
+          "path": "connection_url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.hypertable",
+          "field": "hypertable",
+          "path": "hypertable",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.time_column",
+          "field": "time_column",
+          "path": "time_column",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.sql_template",
+          "field": "sql_template",
+          "path": "sql_template",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.pool_size",
+          "field": "pool_size",
+          "path": "pool_size",
+          "type": "usize",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "usize",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.batch_timeout_ms",
+          "field": "batch_timeout_ms",
+          "path": "batch_timeout_ms",
+          "type": "u64",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "timescaledb.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "timestream",
+      "crate": "broker-connectors-enterprise",
+      "module": "timestream",
+      "source": "crates/broker-connectors-enterprise/src/timestream.rs",
+      "direction": "sink",
+      "config": "TimestreamSinkConfig",
+      "items": [
+        {
+          "id": "timestream.database_name",
+          "field": "database_name",
+          "path": "database_name",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.table_name",
+          "field": "table_name",
+          "path": "table_name",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.region",
+          "field": "region",
+          "path": "region",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.endpoint",
+          "field": "endpoint",
+          "path": "endpoint",
+          "type": "Option<String>",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.access_key_id",
+          "field": "access_key_id",
+          "path": "access_key_id",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.secret_access_key",
+          "field": "secret_access_key",
+          "path": "secret_access_key",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.session_token",
+          "field": "session_token",
+          "path": "session_token",
+          "type": "Option<String>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.dimensions",
+          "field": "dimensions",
+          "path": "dimensions",
+          "type": "HashMap<String, String>",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.time_unit",
+          "field": "time_unit",
+          "path": "time_unit",
+          "type": "TimestreamTimeUnit",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.time_unit.Milliseconds",
+          "field": "Milliseconds",
+          "path": "time_unit.Milliseconds",
+          "type": "TimestreamTimeUnit",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "timestream.time_unit.Microseconds",
+          "field": "Microseconds",
+          "path": "time_unit.Microseconds",
+          "type": "TimestreamTimeUnit",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "timestream.time_unit.Nanoseconds",
+          "field": "Nanoseconds",
+          "path": "time_unit.Nanoseconds",
+          "type": "TimestreamTimeUnit",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "timestream.measure_name_template",
+          "field": "measure_name_template",
+          "path": "measure_name_template",
+          "type": "Option<String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.multi_measure_mappings",
+          "field": "multi_measure_mappings",
+          "path": "multi_measure_mappings",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "timestream.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    },
+    {
+      "kind": "webhook",
+      "crate": "broker-connectors",
+      "module": "http",
+      "source": "crates/broker-connectors/src/http.rs",
+      "direction": "sink",
+      "config": "HttpSinkConfig",
+      "items": [
+        {
+          "id": "webhook.url",
+          "field": "url",
+          "path": "url",
+          "type": "String",
+          "category": "endpoint",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.method",
+          "field": "method",
+          "path": "method",
+          "type": "HttpMethod",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.method.Post",
+          "field": "Post",
+          "path": "method.Post",
+          "type": "HttpMethod",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.method.Put",
+          "field": "Put",
+          "path": "method.Put",
+          "type": "HttpMethod",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.method.Patch",
+          "field": "Patch",
+          "path": "method.Patch",
+          "type": "HttpMethod",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.headers",
+          "field": "headers",
+          "path": "headers",
+          "type": "HashMap<String, String>",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.auth",
+          "field": "auth",
+          "path": "auth",
+          "type": "HttpAuth",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.auth.None",
+          "field": "None",
+          "path": "auth.None",
+          "type": "HttpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.auth.Basic",
+          "field": "Basic",
+          "path": "auth.Basic",
+          "type": "HttpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.auth.Bearer",
+          "field": "Bearer",
+          "path": "auth.Bearer",
+          "type": "HttpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.auth.ApiKey",
+          "field": "ApiKey",
+          "path": "auth.ApiKey",
+          "type": "HttpAuth",
+          "category": "auth",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.body_format",
+          "field": "body_format",
+          "path": "body_format",
+          "type": "HttpBodyFormat",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.body_format.RawJson",
+          "field": "RawJson",
+          "path": "body_format.RawJson",
+          "type": "HttpBodyFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.body_format.JsonBatchArray",
+          "field": "JsonBatchArray",
+          "path": "body_format.JsonBatchArray",
+          "type": "HttpBodyFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.body_format.FormUrlEncoded",
+          "field": "FormUrlEncoded",
+          "path": "body_format.FormUrlEncoded",
+          "type": "HttpBodyFormat",
+          "category": "mapping",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.signature",
+          "field": "signature",
+          "path": "signature",
+          "type": "Option<HttpHmacSignature>",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.signature.header_name",
+          "field": "header_name",
+          "path": "signature.header_name",
+          "type": "String",
+          "category": "mapping",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.signature.algorithm",
+          "field": "algorithm",
+          "path": "signature.algorithm",
+          "type": "HmacAlgorithm",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.signature.algorithm.Sha256",
+          "field": "Sha256",
+          "path": "signature.algorithm.Sha256",
+          "type": "HmacAlgorithm",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.signature.algorithm.Sha1",
+          "field": "Sha1",
+          "path": "signature.algorithm.Sha1",
+          "type": "HmacAlgorithm",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.signature.secret",
+          "field": "secret",
+          "path": "signature.secret",
+          "type": "String",
+          "category": "auth",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.signature.encoding",
+          "field": "encoding",
+          "path": "signature.encoding",
+          "type": "HmacEncoding",
+          "category": "other",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.signature.encoding.Hex",
+          "field": "Hex",
+          "path": "signature.encoding.Hex",
+          "type": "HmacEncoding",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.signature.encoding.Base64",
+          "field": "Base64",
+          "path": "signature.encoding.Base64",
+          "type": "HmacEncoding",
+          "category": "other",
+          "origin": "variant"
+        },
+        {
+          "id": "webhook.batch_size",
+          "field": "batch_size",
+          "path": "batch_size",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.batch_bytes",
+          "field": "batch_bytes",
+          "path": "batch_bytes",
+          "type": "Option<usize>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.linger_ms",
+          "field": "linger_ms",
+          "path": "linger_ms",
+          "type": "Option<u64>",
+          "category": "batching",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.timeout_ms",
+          "field": "timeout_ms",
+          "path": "timeout_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.max_retries",
+          "field": "max_retries",
+          "path": "max_retries",
+          "type": "Option<usize>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.initial_backoff_ms",
+          "field": "initial_backoff_ms",
+          "path": "initial_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.max_backoff_ms",
+          "field": "max_backoff_ms",
+          "path": "max_backoff_ms",
+          "type": "Option<u64>",
+          "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.buffer_capacity",
+          "field": "buffer_capacity",
+          "path": "buffer_capacity",
+          "type": "Option<usize>",
+          "category": "buffering",
+          "origin": "config"
+        },
+        {
+          "id": "webhook.tls",
+          "field": "tls",
+          "path": "tls",
+          "type": "feature",
+          "category": "tls",
+          "origin": "source"
+        }
+      ],
+      "status": "mvp"
+    }
+  ]
+}
