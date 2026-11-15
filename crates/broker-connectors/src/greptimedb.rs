@@ -11,7 +11,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,12 @@ fn default_batch_size_1000() -> Option<usize> {
 fn default_buffer_capacity_10k() -> Option<usize> {
     Some(10_000)
 }
+
+/// Linger window for a partial batch.
+/// Reason: 50 ms flushes a sparse row soon while a burst still reaches
+/// the configured batch size.
+/// Source: connector batching default.
+const GREPTIME_BATCH_LINGER: Duration = Duration::from_millis(50);
 
 /// Ingestion format for GreptimeDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,22 +696,27 @@ pub struct GreptimeDbSink {
     queue: Mutex<BatchQueue<GreptimeRecord>>,
     backoff: Mutex<BackoffState>,
     sent: AtomicU64,
+    /// Last emitted stamp in the configured precision.
+    /// The server keeps the last row per stamp on one series.
+    /// Rapid writes in one unit would collapse into one row.
+    /// The sink hands out strictly increasing stamps.
+    last_timestamp: AtomicI64,
 }
 
 impl GreptimeDbSink {
     pub fn new(config: GreptimeDbConfig, transport: Arc<dyn GreptimeDbTransport>) -> Result<Self> {
         config.validate()?;
         let batch_size = config.batch_size.unwrap_or(1000).max(1);
-        // Linger 50 ms: small batches flush promptly without waiting
-        // for a full batch, while steady streams still batch up; 50 ms
-        // keeps added latency negligible against the 5 s request
-        // timeout.
+        // A full batch flushes at once. A stale partial batch waits for
+        // the linger window, and the background sweep below flushes it
+        // even when no later publish arrives.
         Ok(Self {
             config,
             transport,
-            queue: Mutex::new(BatchQueue::new(batch_size, Duration::from_millis(50))),
+            queue: Mutex::new(BatchQueue::new(batch_size, GREPTIME_BATCH_LINGER)),
             backoff: Mutex::new(BackoffState::default()),
             sent: AtomicU64::new(0),
+            last_timestamp: AtomicI64::new(0),
         })
     }
 
@@ -719,6 +730,32 @@ impl GreptimeDbSink {
 
     pub fn buffered_rows(&self) -> usize {
         self.queue.lock().len()
+    }
+
+    /// Next stamp in the configured precision.
+    /// Uses the wall clock when it moves forward.
+    /// Bumps the last stamp by one unit on collision.
+    /// Reason: colliding stamps merge on the server.
+    /// Source: server last-row merge on one series.
+    fn next_timestamp(&self, candidate: i64) -> i64 {
+        let mut last = self.last_timestamp.load(Ordering::Relaxed);
+        loop {
+            let now_scaled = self
+                .config
+                .timestamp_precision
+                .scale_timestamp(now_millis());
+            let fresh = candidate.max(now_scaled);
+            let next = if fresh > last { fresh } else { last + 1 };
+            match self.last_timestamp.compare_exchange_weak(
+                last,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => last = actual,
+            }
+        }
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -801,12 +838,43 @@ impl GreptimeDbSink {
             }
         }
     }
+
+    /// Flush a stale partial batch when no later publish arrives.
+    /// The sweep holds the sink weakly, so a dropped sink stops it.
+    /// It skips a queue at its buffer capacity: that queue already
+    /// reports backpressure, and the orderly stop drains it.
+    pub fn start_linger_flush(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(GREPTIME_BATCH_LINGER).await;
+                let Some(sink) = weak.upgrade() else {
+                    break;
+                };
+                let should_flush = {
+                    let queue = sink.queue.lock();
+                    !queue.is_empty()
+                        && queue.is_stale()
+                        && queue.len() < sink.config.effective_buffer_capacity()
+                };
+                if should_flush {
+                    let _ = sink.flush().await;
+                }
+            }
+        });
+    }
 }
 
 #[async_trait]
 impl Sink for GreptimeDbSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> Result<()> {
-        let rec = extract_greptime_record(payload, topic.as_str(), &self.config)?;
+        let mut rec = extract_greptime_record(payload, topic.as_str(), &self.config)?;
+        // Keep stamps strictly increasing on one sink.
+        // Rapid sends in one unit would share a stamp and merge.
+        rec.timestamp = self.next_timestamp(rec.timestamp);
         let should_flush = {
             let mut q = self.queue.lock();
             // Bounded backlog: past the effective capacity the sink
@@ -830,6 +898,10 @@ impl Sink for GreptimeDbSink {
             self.flush().await?;
         }
         Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        GreptimeDbSink::flush(self).await
     }
 
     fn kind(&self) -> &'static str {

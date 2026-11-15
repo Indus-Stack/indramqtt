@@ -7376,6 +7376,19 @@ pub async fn register_live_sink(
     Ok(())
 }
 
+/// Render a duplicate connector create: HTTP 409 with the documented
+/// `ALREADY_EXISTS` code.
+fn connector_already_exists(message: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "code": "ALREADY_EXISTS",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /api/v5/connectors` (C07-02): validate the body against the
 /// named kind (unknown kind or malformed config rejected with the
 /// documented error shape); a duplicate id is rejected cleanly, never
@@ -7497,8 +7510,7 @@ pub async fn create_connector(
     // registration below; the write-locked re-check before the push
     // closes the check-then-insert race for the in-memory store.
     if state.connectors.contains(&name) {
-        return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
-            .into_response();
+        return connector_already_exists(format!("connector {name:?} already exists"));
     }
     // Store-cap bound (management-plane, fail closed): an obviously full
     // store fails without a needless registration attempt.
@@ -7683,8 +7695,7 @@ pub async fn create_connector(
         Ok(()) => {}
         Err(ConnectorInsertError::Duplicate) => {
             state.engine.connectors().abort_stage();
-            return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
-                .into_response();
+            return connector_already_exists(format!("connector {name:?} already exists"));
         }
         Err(ConnectorInsertError::Full) => {
             state.engine.connectors().abort_stage();

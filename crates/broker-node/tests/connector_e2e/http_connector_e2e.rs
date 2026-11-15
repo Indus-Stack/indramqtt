@@ -677,16 +677,25 @@ async fn http_buffer_capacity_fails_closed_through_broker() {
         .await;
     // Reason: the open batch fills the bound without a send or a backoff.
     // Source: CE-01 Q2 capacity error, not backoff error.
+    // Publish all six rows on one socket.
+    // One stream keeps the order of the rows.
+    // Reason: 2 ms keeps the rows apart on loopback.
+    // Source: task buffer case.
+    const ROW_SPACING: Duration = Duration::from_millis(2);
+    let mut publisher = broker.connect("ce01-http-buffer-pub").await;
     for value in 1..=6 {
-        broker
+        if value > 1 {
+            tokio::time::sleep(ROW_SPACING).await;
+        }
+        publisher
             .publish(
-                "ce01-http-buffer-pub",
                 "ce01/http/buffer",
                 format!(r#"{{"v":{value}}}"#).as_bytes(),
                 0,
             )
             .await;
     }
+    drop(publisher);
     let (_, _, failed) = broker
         .wait_for_action_failures(&rule, 4, Duration::from_secs(10))
         .await;

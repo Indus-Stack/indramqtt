@@ -8,6 +8,8 @@
 
 #[path = "connector_e2e/e2e_support/mod.rs"]
 mod e2e_support;
+#[path = "connector_e2e/greptimedb_e2e.rs"]
+mod greptimedb_e2e;
 #[path = "connector_e2e/http_connector_e2e.rs"]
 mod http_connector_e2e;
 #[path = "connector_e2e/mqtt_bridge_e2e.rs"]

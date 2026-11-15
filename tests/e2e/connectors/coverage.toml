@@ -161,3 +161,55 @@ test = "mqtt_bridge_topic_mapping_through_broker"
 
 [items."mqtt_bridge.username"]
 test = "mqtt_bridge_auth_through_broker"
+
+# greptimedb
+[items."greptimedb.endpoint"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.database"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.auth"]
+test = "greptimedb_auth_header_through_broker"
+
+[items."greptimedb.auth.username"]
+test = "greptimedb_auth_header_through_broker"
+
+[items."greptimedb.auth.password"]
+test = "greptimedb_auth_header_through_broker"
+
+[items."greptimedb.format"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.format.SqlInsert"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.format.InfluxLineProtocol"]
+test = "greptimedb_influx_line_protocol_through_broker"
+
+[items."greptimedb.table_template"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.timestamp_precision"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Nanosecond"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Microsecond"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Millisecond"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Second"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.batch_size"]
+test = "greptimedb_batch_size_through_broker"
+
+[items."greptimedb.buffer_capacity"]
+test = "greptimedb_buffer_capacity_fails_closed_through_broker"
+
+[items."greptimedb.timeout_ms"]
+test = "greptimedb_timeout_applied_through_broker"

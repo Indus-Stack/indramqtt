@@ -2590,9 +2590,12 @@ pub async fn build_connector(
                 let transport = std::sync::Arc::new(
                     broker_connectors::HttpGreptimeDbTransport::new(&config),
                 );
-                let sink = broker_connectors::GreptimeDbSink::new(config, transport)
-                    .map_err(|e| format!("invalid greptimedb sink: {e}"))?;
-                Ok(("greptimedb".to_string(), std::sync::Arc::new(sink)
+                let sink = std::sync::Arc::new(
+                    broker_connectors::GreptimeDbSink::new(config, transport)
+                        .map_err(|e| format!("invalid greptimedb sink: {e}"))?,
+                );
+                sink.start_linger_flush();
+                Ok(("greptimedb".to_string(), sink
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "datalayers" | "data_layers" | "datalayers_db" => {
@@ -22723,7 +22726,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(
-            status, 400,
+            status, 409,
             "duplicate create must be rejected, got: {body}"
         );
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
@@ -22737,7 +22740,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(
-            status, 400,
+            status, 409,
             "duplicate create by id must be rejected, got: {body}"
         );
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
@@ -22878,7 +22881,7 @@ connector_id = "pending-good"
                 &token,
             )
             .await;
-        assert_eq!(status, 400, "duplicate must be rejected, got: {body}");
+        assert_eq!(status, 409, "duplicate must be rejected, got: {body}");
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
         let (status, body) = server
             .post_auth(
@@ -22887,7 +22890,7 @@ connector_id = "pending-good"
                 &token,
             )
             .await;
-        assert_eq!(status, 400, "duplicate by id must be rejected, got: {body}");
+        assert_eq!(status, 409, "duplicate by id must be rejected, got: {body}");
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
 
         // Unknown kind and malformed bodies are rejected with the
