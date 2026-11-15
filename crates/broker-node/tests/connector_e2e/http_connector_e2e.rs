@@ -305,16 +305,19 @@ async fn http_batch_array_through_broker() {
     broker
         .create_forward_rule("ce01-http-batch-rule", "ce01/http/batch", "ce01-http-batch")
         .await;
+    // Send all rows on one connection with QoS 1.
+    // One connection keeps the order of the rows.
+    let mut publisher = broker.connect("ce01-http-batch-pub").await;
     for value in 1..=3 {
-        broker
+        publisher
             .publish(
-                "ce01-http-batch-pub",
                 "ce01/http/batch",
                 format!(r#"{{"n":{value}}}"#).as_bytes(),
-                0,
+                1,
             )
             .await;
     }
+    publisher.disconnect().await;
 
     target.expect_batch(3, Duration::from_secs(10)).await;
     let records = target.records();
@@ -619,18 +622,18 @@ async fn http_retry_after_server_down_through_broker() {
     let rule = broker
         .create_forward_rule("ce01-http-down-rule", "ce01/http/down", "ce01-http-down")
         .await;
-    broker
-        .publish("ce01-http-down-pub", "ce01/http/down", br#"{"v":1}"#, 0)
-        .await;
+    // Send both rows on one connection with QoS 1.
+    // One connection keeps the order of the rows.
+    let mut publisher = broker.connect("ce01-http-down-pub").await;
+    publisher.publish("ce01/http/down", br#"{"v":1}"#, 1).await;
     broker
         .wait_for_action_failures(&rule, 1, Duration::from_secs(10))
         .await;
 
     target.stop_and_restart_server().await;
     tokio::time::sleep(Duration::from_millis(2100)).await;
-    broker
-        .publish("ce01-http-down-pub2", "ce01/http/down", br#"{"v":2}"#, 0)
-        .await;
+    publisher.publish("ce01/http/down", br#"{"v":2}"#, 1).await;
+    publisher.disconnect().await;
     target.wait_for_count(2, Duration::from_secs(10)).await;
     let bodies: Vec<serde_json::Value> = target
         .records()
@@ -677,8 +680,8 @@ async fn http_buffer_capacity_fails_closed_through_broker() {
         .await;
     // Reason: the open batch fills the bound without a send or a backoff.
     // Source: CE-01 Q2 capacity error, not backoff error.
-    // Publish all six rows on one socket.
-    // One stream keeps the order of the rows.
+    // Publish all six rows on one connection with QoS 1.
+    // One connection keeps the order of the rows.
     // Reason: 2 ms keeps the rows apart on loopback.
     // Source: task buffer case.
     const ROW_SPACING: Duration = Duration::from_millis(2);
@@ -691,11 +694,11 @@ async fn http_buffer_capacity_fails_closed_through_broker() {
             .publish(
                 "ce01/http/buffer",
                 format!(r#"{{"v":{value}}}"#).as_bytes(),
-                0,
+                1,
             )
             .await;
     }
-    drop(publisher);
+    publisher.disconnect().await;
     let (_, _, failed) = broker
         .wait_for_action_failures(&rule, 4, Duration::from_secs(10))
         .await;
@@ -734,16 +737,19 @@ async fn http_orderly_stop_with_partial_batch_through_broker() {
     let rule = broker
         .create_forward_rule("ce01-http-stop-rule", "ce01/http/stop", "ce01-http-stop")
         .await;
+    // Send both rows on one connection with QoS 1.
+    // One connection keeps the order of the rows.
+    let mut publisher = broker.connect("ce01-http-stop-pub").await;
     for value in 1..=2 {
-        broker
+        publisher
             .publish(
-                "ce01-http-stop-pub",
                 "ce01/http/stop",
                 format!(r#"{{"n":{value}}}"#).as_bytes(),
-                0,
+                1,
             )
             .await;
     }
+    publisher.disconnect().await;
     broker
         .wait_for_action_success(&rule, 2, Duration::from_secs(10))
         .await;
