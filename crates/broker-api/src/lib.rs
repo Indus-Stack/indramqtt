@@ -5561,6 +5561,7 @@ connector_id = "pending-good"
     struct Mv03aKafkaFake {
         port: u16,
         produced: std::sync::Arc<std::sync::Mutex<Vec<Mv03aKafkaProduced>>>,
+        #[cfg(feature = "confluent")]
         auth_bytes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         error_acks: std::sync::Arc<std::sync::Mutex<bool>>,
         _task: tokio::task::JoinHandle<()>,
@@ -5603,11 +5604,13 @@ connector_id = "pending-good"
 
         async fn serve(listener: tokio::net::TcpListener, port: u16, sasl: bool) -> Self {
             let produced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            #[cfg(feature = "confluent")]
             let auth_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let error_acks = std::sync::Arc::new(std::sync::Mutex::new(false));
             let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let task_produced = std::sync::Arc::clone(&produced);
+            #[cfg(feature = "confluent")]
             let task_auth = std::sync::Arc::clone(&auth_bytes);
             let task_error = std::sync::Arc::clone(&error_acks);
             let task_connections = std::sync::Arc::clone(&connections);
@@ -5617,6 +5620,7 @@ connector_id = "pending-good"
                         break;
                     };
                     let produced = std::sync::Arc::clone(&task_produced);
+                    #[cfg(feature = "confluent")]
                     let auth_bytes = std::sync::Arc::clone(&task_auth);
                     let error_acks = std::sync::Arc::clone(&task_error);
                     let connection = tokio::spawn(async move {
@@ -5726,6 +5730,7 @@ connector_id = "pending-good"
                                     if frame.len() < 8 {
                                         break;
                                     }
+                                    #[cfg(feature = "confluent")]
                                     auth_bytes
                                         .lock()
                                         .expect("fake records")
@@ -5923,6 +5928,7 @@ connector_id = "pending-good"
             Self {
                 port,
                 produced,
+                #[cfg(feature = "confluent")]
                 auth_bytes,
                 error_acks,
                 _task: task,
@@ -22700,7 +22706,7 @@ connector_id = "pending-good"
     async fn connector_duplicate_create_rejected_without_poisoning() {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         // TK-03: a duplicate create must be rejected with the documented
-        // conflict code before the store is mutated, so later
+        // code before the store is mutated, so later
         // POST/PUT/DELETE keep working (no poisoned persistence).
         let dir = unique_data_dir("tk03-conn-dup");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
@@ -22717,7 +22723,7 @@ connector_id = "pending-good"
             .await;
         assert_eq!(status, 201);
 
-        // Duplicate by `name`: the documented conflict, not a 500.
+        // Duplicate by `name`: the documented 400, not a 500.
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
@@ -22726,7 +22732,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(
-            status, 409,
+            status, 400,
             "duplicate create must be rejected, got: {body}"
         );
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
@@ -22740,7 +22746,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(
-            status, 409,
+            status, 400,
             "duplicate create by id must be rejected, got: {body}"
         );
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
@@ -22881,7 +22887,7 @@ connector_id = "pending-good"
                 &token,
             )
             .await;
-        assert_eq!(status, 409, "duplicate must be rejected, got: {body}");
+        assert_eq!(status, 400, "duplicate must be rejected, got: {body}");
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
         let (status, body) = server
             .post_auth(
@@ -22890,7 +22896,7 @@ connector_id = "pending-good"
                 &token,
             )
             .await;
-        assert_eq!(status, 409, "duplicate by id must be rejected, got: {body}");
+        assert_eq!(status, 400, "duplicate by id must be rejected, got: {body}");
         assert_eq!(body["code"], json!("ALREADY_EXISTS"));
 
         // Unknown kind and malformed bodies are rejected with the

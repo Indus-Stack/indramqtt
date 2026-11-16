@@ -213,3 +213,49 @@ test = "greptimedb_buffer_capacity_fails_closed_through_broker"
 
 [items."greptimedb.timeout_ms"]
 test = "greptimedb_timeout_applied_through_broker"
+
+# kafka
+[items."kafka.bootstrap_servers"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.topic_template"]
+test = "kafka_topic_template_through_broker"
+
+[items."kafka.partition_key_field"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.key_template"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.partitions"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.client_id"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.acks"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.batch_max_records"]
+test = "kafka_batch_through_broker"
+
+[items."kafka.batch_max_bytes"]
+test = "kafka_batch_through_broker"
+
+[items."kafka.random_partition"]
+test = "kafka_random_partition_through_broker"
+
+[items."kafka.headers_template"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.extra_headers"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.header_encode_mode"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.header_encode_mode.None"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.header_encode_mode.Json"]
+test = "kafka_headers_json_through_broker"

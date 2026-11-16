@@ -1199,9 +1199,9 @@ async fn greptimedb_timeout_applied_through_broker() {
     broker.finish().await;
 }
 
-/// A duplicate v5 connector id must fail with the documented conflict.
+/// A duplicate v5 connector id must fail with the documented response.
 ///
-/// The spec asks for 409 with `ALREADY_EXISTS`.
+/// The spec asks for 400 with `ALREADY_EXISTS`.
 #[tokio::test]
 #[ignore = "needs no server; the v5 duplicate path runs in qualification"]
 async fn greptimedb_duplicate_through_broker() {
@@ -1222,7 +1222,7 @@ async fn greptimedb_duplicate_through_broker() {
     let (status, answer) = broker
         .api(reqwest::Method::POST, "/api/v5/connectors", body)
         .await;
-    assert_eq!(status, 409, "v5 duplicate fails: {answer}");
+    assert_eq!(status, 400, "v5 duplicate fails: {answer}");
     assert_eq!(
         answer.get("code").and_then(|code| code.as_str()),
         Some("ALREADY_EXISTS"),

@@ -7376,11 +7376,11 @@ pub async fn register_live_sink(
     Ok(())
 }
 
-/// Render a duplicate connector create: HTTP 409 with the documented
+/// Render a duplicate connector create: HTTP 400 with the documented
 /// `ALREADY_EXISTS` code.
 fn connector_already_exists(message: String) -> Response {
     (
-        StatusCode::CONFLICT,
+        StatusCode::BAD_REQUEST,
         Json(serde_json::json!({
             "code": "ALREADY_EXISTS",
             "message": message,
@@ -7505,7 +7505,8 @@ pub async fn create_connector(
     // Reject a duplicate id before mutating anything: pushing it into
     // the store would poison every later connector POST/PUT/DELETE, whose
     // persistence export re-validates the whole store and fails on the
-    // duplicated id. The documented conflict code is `ALREADY_EXISTS`.
+    // duplicated id. The documented code is `ALREADY_EXISTS` and the
+    // status is `BAD_REQUEST`, as the error catalogue documents.
     // This early read-check also skips the wasted live-sink
     // registration below; the write-locked re-check before the push
     // closes the check-then-insert race for the in-memory store.
