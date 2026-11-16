@@ -195,7 +195,7 @@ check "explain shows the value from indra.toml" $?
 # --- 2a. The MCP endpoint answers on the management listener ---
 # A key opens tools/list. No key gives 401. The list holds the status
 # tools (get_api_v5_status, get_status, broker_status, list_toolsets).
-# A disabled endpoint gives 404. Boot reads both from [mcp] in indra.toml.
+# Boot reads the enabled path from [mcp] in indra.toml.
 python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
 import json, sys, urllib.request, urllib.error
 api, key = sys.argv[1:3]
