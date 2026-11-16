@@ -2244,7 +2244,7 @@ fn missing_connector_field(
 /// True when a `disk_log` file path stays inside the data directory:
 /// relative, with no `..`, root or Windows prefix component, and with
 /// no symlink that leaves the directory.
-fn disk_log_path_contained(filepath: &str, data_dir: &std::path::Path) -> bool {
+pub(crate) fn disk_log_path_contained(filepath: &str, data_dir: &std::path::Path) -> bool {
     use std::path::{Component, Path};
     let path = Path::new(filepath);
     if filepath.trim().is_empty()

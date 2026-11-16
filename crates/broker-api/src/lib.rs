@@ -44,6 +44,7 @@ pub mod mfa_totp;
 pub mod node_scope;
 pub mod pagination;
 pub mod swagger;
+mod v1_disk_log;
 pub mod v5;
 pub mod ws;
 
@@ -1667,7 +1668,7 @@ pub struct CreateConnectorRequest {
 
 async fn create_connector(
     State(state): State<ApiState>,
-    Json(req): Json<CreateConnectorRequest>,
+    Json(mut req): Json<CreateConnectorRequest>,
 ) -> Response {
     if req.id.trim().is_empty() {
         return bad_request("connector id must not be empty");
@@ -1684,6 +1685,13 @@ async fn create_connector(
             "connector id {:?} is reserved: ids starting with `action:` name action sinks (field `id`)",
             req.id
         ));
+    }
+    if matches!(kind.as_str(), "disk_log" | "disklog" | "disk") {
+        if let Err(message) =
+            v1_disk_log::prepare_v1_disk_log(&mut req, &state.connectors.data_dir())
+        {
+            return bad_request(message);
+        }
     }
     let built = build_connector(&req).await;
     match built {
@@ -2634,6 +2642,9 @@ mod tests {
     use broker_auth::Authenticator;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[path = "mn08_tests.rs"]
+    mod mn08;
 
     /// Serialises the connector tests that share the process-global v5
     /// connector store. Parallel creates/persists export the whole global
@@ -26173,14 +26184,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("mqtt_bridge"));
 
-        // Disk log sink: validated against an isolated temp directory.
-        let disk_dir = std::env::temp_dir().join(format!("indra-test-disk-{}", std::process::id()));
+        // Disk log sink: validated against a relative path inside the data directory.
+        let disk_dir = format!("indra-test-disk-{}", std::process::id());
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "disk-1",
                        "kind": "disk_log",
-                       "config": {"directory": disk_dir.to_string_lossy(),
+                       "config": {"directory": disk_dir,
                                   "filename_prefix": "audit",
                                   "filename_extension": "log",
                                   "format": "ndjson",
@@ -26191,7 +26202,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("disk_log"));
-        std::fs::remove_dir_all(&disk_dir).ok();
 
         // Sparkplug B sink: the driver connects at the first write, thus
         // the create step does not need a server.

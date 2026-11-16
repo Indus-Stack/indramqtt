@@ -44,7 +44,7 @@ Set `kind` to `disk_log` on the v1 API. The v1 route also accepts `disklog` and 
 | `sync_mode` | no | `{"mode":"everybatch"}`, `{"mode":"interval","ms":N}`, or `{"mode":"osdefault"}`. Default every batch. The interval must be at least 1 ms. |
 | `timeout_ms` | no | Write and flush deadline in ms. Default 5000. A value below 1 becomes 1. |
 
-The v5 route reads `directory`, `dir`, or `path` (default `disk_logs` in the node data directory). The path is relative to the node data directory. A path outside it is refused with 400: an absolute path, a `..` part, or a symlink. It reads `filename_prefix` or `prefix` (default `indra`) and `filename_extension` or `extension` (default `log`). It reads `timeout_ms`, `timeout`, or `request_timeout_ms`. It applies `format`, `max_file_size_bytes`, `max_file_age_secs`, `compression`, `max_backup_files`, `max_retention_days`, and `sync_mode` with the string values `every_batch` or `os_default`. It registers the name and the aliases `disk_log:name` and `disk:name`.
+The v5 route reads `directory`, `dir`, or `path` (default `logs` in the node data directory). The directory is relative to data_dir and must stay inside it. The path is relative to the node data directory. A path outside it is refused with 400: an absolute path, a `..` part, or a symlink. It reads `filename_prefix` or `prefix` (default `indra`) and `filename_extension` or `extension` (default `log`). It reads `timeout_ms`, `timeout`, or `request_timeout_ms`. It applies `format`, `max_file_size_bytes`, `max_file_age_secs`, `compression`, `max_backup_files`, `max_retention_days`, and `sync_mode` with the string values `every_batch` or `os_default`. It registers the name and the aliases `disk_log:name` and `disk:name`.
 
 Example:
 
@@ -121,7 +121,7 @@ def call(method, path, body=None):
         except ValueError:
             return err.code, raw
 
-config = {"directory": work, "filename_prefix": "audit",
+config = {"directory": "logs", "filename_prefix": "audit",
           "filename_extension": "log", "format": "ndjson",
           "max_file_size_bytes": 67108864, "max_backup_files": 10,
           "compression": "none", "sync_mode": {"mode": "everybatch"},
@@ -167,7 +167,7 @@ while time.time() < deadline:
 else:
     raise AssertionError("the disk_log action did not run")
 
-with open(os.path.join(work, "audit.log"), encoding="utf-8") as handle:
+with open(os.path.join(data_dir, "logs", "audit.log"), encoding="utf-8") as handle:
     row = json.loads(handle.readline())
 assert row["topic"] == "docs/disk_log/in", row
 assert row["qos"] == 0, row
