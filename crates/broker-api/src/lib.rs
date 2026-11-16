@@ -20003,6 +20003,7 @@ connector_id = "pending-good"
                 "bigquery" => {
                     json!({"authentication": {"private_key": SECRET, "client_email": "a@b.c"}})
                 }
+                "gcp_pubsub" => json!({"service_account_json": null}),
                 "datalayers" => {
                     json!({"username": "u", "database": "d", "table": "t", "token": null})
                 }
@@ -31667,15 +31668,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 201, "action create: {body}");
         let above_max = (tokio::sync::Semaphore::MAX_PERMITS as u64) + 1;
+        // `health_check_timeout` is applied (default 60s), so a
+        // non-default value parses and is not in the refused list.
         let bad_fields = [
             ("dispatch_strategy", json!({"dispatch_strategy": "random"})),
             (
                 "health_check_interval_jitter",
                 json!({"health_check_interval_jitter": "1s"}),
-            ),
-            (
-                "health_check_timeout",
-                json!({"health_check_timeout": "30s"}),
             ),
             ("no_such_option", json!({"no_such_option": 1})),
             ("batch_time", json!({"batch_time": "infinity"})),

@@ -6164,6 +6164,744 @@ async fn mv01_webhook_action_sinks_route_independently_and_stop_on_delete() {
     kernel.finish().await;
 }
 
+/// Each documented action alias routes to its canonical kind and the
+/// action create answers 201.
+#[tokio::test]
+async fn alias_action_create_routes_to_canonical_kind() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let _receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 0);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "alias-webhook",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+
+    // `rest` is a documented alias of `http`/`webhook`.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "alias-rest",
+            "type": "rest",
+            "connector": "alias-webhook",
+            "parameters": {"path": "/r"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rest alias action create: {body}");
+
+    // `logger` is a documented alias of `console`; no connector required.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "alias-logger",
+            "type": "logger",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "logger alias action create: {body}");
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/alias-rest",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/alias-logger",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/alias-webhook",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// Every section-3 action alias is accepted through the HTTP API. Each
+/// alias posts an action document with that `type` and succeeds; the
+/// canonical kind owns the validation. Aliases of pending or refused
+/// kinds are refused naming the canonical kind.
+#[tokio::test]
+async fn mn05_every_section3_alias_routes_through_http() {
+    let kernel = spawn_kernel("").await;
+    // (alias, canonical kind). The canonical kind owns the params.
+    let aliases: &[(&str, &str)] = &[
+        ("aws_timestream", "timestream"),
+        ("opents", "opentsdb"),
+        ("scylla", "cassandra"),
+        ("scylladb", "cassandra"),
+        ("cql", "cassandra"),
+        ("greptime", "greptimedb"),
+        ("ch", "clickhouse"),
+        ("mongo", "mongodb"),
+        ("documentdb", "mongodb"),
+        ("couch", "couchbase"),
+        ("cb", "couchbase"),
+        ("elastic", "elasticsearch"),
+        ("es", "elasticsearch"),
+        ("opensearch", "elasticsearch"),
+        ("sqlserver", "mssql"),
+        ("mariadb", "mysql"),
+        ("cockroach", "cockroachdb"),
+        ("postgres", "pgsql"),
+        ("postgresql", "pgsql"),
+        ("google_alloydb", "alloydb"),
+        ("alloy_db", "alloydb"),
+        ("minio", "s3"),
+        ("azure_blob_storage", "azure_blob"),
+        ("dynamo", "dynamodb"),
+        ("ddb", "dynamodb"),
+        ("rabbit", "rabbitmq"),
+        ("amqp", "rabbitmq"),
+        ("bq", "bigquery"),
+        ("gbq", "bigquery"),
+        ("snowflake_streaming", "snowflake"),
+        ("snowflake_aggregated", "snowflake"),
+        ("ots", "tablestore"),
+        ("delta_lake", "databricks"),
+        ("opcua", "opc_ua"),
+        ("sparkplug", "sparkplug_b"),
+        ("spb", "sparkplug_b"),
+        ("rest", "http"),
+        ("logger", "console"),
+        ("aws_kinesis", "kinesis"),
+        ("gcp", "gcp_pubsub"),
+        ("pubsub", "gcp_pubsub"),
+        ("gcp_pubsub_producer", "gcp_pubsub"),
+        ("gcp_pubsub_consumer", "gcp_pubsub"),
+        ("azure_event_hubs", "azure_eventhubs"),
+        ("azure", "azure_eventhubs"),
+        ("eventhubs", "azure_eventhubs"),
+        ("azure_event_hub_producer", "azure_eventhubs"),
+        ("oci", "oci_streaming"),
+        ("aws_iot_core", "aws_iot"),
+        ("azure_iot_hub", "azure_iot"),
+        ("azure_iothub", "azure_iot"),
+        ("iothub", "azure_iot"),
+        ("gcp_iot_core", "gcp_iot"),
+        ("cloud_iot", "gcp_iot"),
+        ("mqtt", "mqtt_bridge"),
+        ("kafka_producer", "kafka"),
+        ("kafka_consumer", "kafka"),
+        ("confluent_producer", "confluent"),
+        ("confluent_kafka", "confluent"),
+        ("confluent_cloud", "confluent"),
+    ];
+    // Aliases whose canonical kind is pending or refused: the HTTP
+    // refusal names the canonical kind.
+    let pending_400: &[&str] = &[
+        "scylla",
+        "scylladb",
+        "cql",
+        "delta_lake",
+        "gcp_iot_core",
+        "cloud_iot",
+        "aws_iot_core",
+        "azure_iot_hub",
+        "azure_iothub",
+        "iothub",
+        "oci",
+    ];
+    // Parameters that satisfy every canonical kind at once. The
+    // connector dangles, so only the param gate runs; the sink never
+    // builds and no server is needed.
+    let full_params = || {
+        serde_json::json!({
+            "path": "/r",
+            "sql": "SELECT 1",
+            "bucket": "b", "key": "k",
+            "container": "c", "blob": "bl",
+            "table": "events", "hash_key": "id",
+            "dataset": "d",
+            "database": "db", "schema": "s", "pipe": "p",
+            "table_name": "t", "measurement": "m",
+            "fields": [{"column": "c", "value": "${payload.c}"}],
+            "stream_name": "sn", "partition_key": "${client_id}",
+            "pubsub_topic": "events", "topic": "events",
+            "event_hub": "hub",
+            "routing_key": "rk",
+            "node_id": "ns=2;i=1",
+            "topic_prefix": "spBv1.0/plant1",
+            "action": "create", "index": "idx",
+        })
+    };
+    for (alias, canonical) in aliases {
+        let name = format!("mn05-alias-{alias}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": name,
+                "type": alias,
+                "connector": "mn05-no-such-connector",
+                "parameters": full_params(),
+            }),
+        )
+        .await;
+        if pending_400.contains(alias) {
+            assert_eq!(status, 400, "pending alias {alias} refuses: {body}");
+            assert!(
+                body["message"].as_str().unwrap_or("").contains(canonical),
+                "pending alias {alias} refusal names {canonical}: {body}"
+            );
+        } else {
+            assert_eq!(status, 201, "alias {alias} creates: {body}");
+            assert_eq!(
+                body["type"].as_str().unwrap_or(""),
+                *alias,
+                "alias {alias} echoes its type: {body}"
+            );
+            let (status, _) = mv00_api(
+                &kernel,
+                reqwest::Method::DELETE,
+                &format!("/api/v5/actions/{name}"),
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, 204);
+        }
+    }
+    // Each canonical kind validates its own required field for its
+    // aliases: without it the create is refused naming the field.
+    // (alias, missing field).
+    let negative: &[(&str, &str)] = &[
+        ("couch", "sql"),
+        ("elastic", "index"),
+        ("sqlserver", "sql"),
+        ("mariadb", "sql"),
+        ("cockroach", "sql"),
+        ("postgres", "sql"),
+        ("google_alloydb", "sql"),
+        ("minio", "bucket"),
+        ("azure_blob_storage", "container"),
+        ("dynamo", "table"),
+        ("bq", "dataset"),
+        ("snowflake_streaming", "database"),
+        ("ots", "table_name"),
+        ("opcua", "node_id"),
+        ("aws_kinesis", "stream_name"),
+        ("gcp", "pubsub_topic"),
+        ("azure", "event_hub"),
+        ("mqtt", "topic"),
+        ("kafka_producer", "topic"),
+        ("confluent_producer", "topic"),
+        ("rabbit", "routing_key"),
+    ];
+    for (alias, field) in negative {
+        let mut params = full_params();
+        params
+            .as_object_mut()
+            .expect("params object")
+            .remove(*field);
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": format!("mn05-alias-neg-{alias}"),
+                "type": alias,
+                "connector": "mn05-no-such-connector",
+                "parameters": params,
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "alias {alias} without {field} refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains(field),
+            "alias {alias} refusal names {field}: {body}"
+        );
+    }
+    kernel.finish().await;
+}
+
+/// A `file:` or `env:` target on `POST /api/v5/connectors` resolves to its
+/// real URL when the reference is readable, or answers 400 naming the field
+/// when it is not.
+#[tokio::test]
+async fn file_env_connector_target_resolves_or_refusals() {
+    // The spawned kernel inherits its environment at spawn, so set the
+    // referenced variable before boot. The kernel then resolves it.
+    std::env::set_var("MN05_CONNECTOR_URL", "http://127.0.0.1:9");
+    let kernel = spawn_kernel("").await;
+
+    // A readable file: URL resolves.
+    let dir = std::env::temp_dir().join(format!("broker-mn05-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create dir");
+    let path = dir.join("url");
+    std::fs::write(&path, b"http://127.0.0.1:9\n").expect("write url");
+    let file_ref = format!("file:{}", path.display());
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn05-file-url",
+            "type": "webhook",
+            "url": file_ref,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "file: connector create: {body}");
+
+    // An unreadable file: URL is refused naming the field.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn05-file-missing",
+            "type": "webhook",
+            "url": "file:/definitely/not/here-mn05",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "missing file: connector create: {body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("url"),
+        "refusal names url: {body}"
+    );
+
+    // An env: URL that is set resolves.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn05-env-url",
+            "type": "webhook",
+            "url": "env:MN05_CONNECTOR_URL",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "env: connector create: {body}");
+
+    // An env: URL that is unset is refused naming the field.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn05-env-missing",
+            "type": "webhook",
+            "url": "env:MN05_CONNECTOR_DEFINITELY_UNSET",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "missing env: connector create: {body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("url"),
+        "refusal names url: {body}"
+    );
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mn05-file-url",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mn05-env-url",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    std::fs::remove_dir_all(&dir).ok();
+    std::env::remove_var("MN05_CONNECTOR_URL");
+    kernel.finish().await;
+}
+
+/// A `file:` or `env:` target on `POST /api/v5/connectors_probe` resolves to
+/// its real URL and is dialled (no `127.0.0.1:80` fallback). An unresolvable
+/// reference is refused with 400 that names the field.
+#[tokio::test]
+async fn file_env_connector_probe_target_resolves() {
+    // The spawned kernel inherits its environment at spawn, so set the
+    // referenced variable before boot.
+    std::env::set_var("MN05_PROBE_URL", "http://127.0.0.1:1");
+    let kernel = spawn_kernel("").await;
+
+    // A readable file: URL resolves and the probe dials it; nothing listens
+    // on port 1 so the dial fails naming the resolved host and port.
+    let dir = std::env::temp_dir().join(format!("broker-mn05p-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create dir");
+    let path = dir.join("url");
+    std::fs::write(&path, b"http://127.0.0.1:1\n").expect("write url");
+    let file_ref = format!("file:{}", path.display());
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors_probe",
+        serde_json::json!({
+            "type": "webhook",
+            "url": file_ref,
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "file: probe dials and fails: {body}");
+    let message = body["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("127.0.0.1:1"),
+        "file: probe dialled the resolved host and port: {body}"
+    );
+    assert!(
+        !message.contains("127.0.0.1:80"),
+        "file: probe never dialled a synthesised 127.0.0.1:80: {body}"
+    );
+
+    // An env: URL that is set resolves similarly.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors_probe",
+        serde_json::json!({
+            "type": "webhook",
+            "url": "env:MN05_PROBE_URL",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "env: probe dials and fails: {body}");
+    let message = body["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("127.0.0.1:1"),
+        "env: probe dialled the resolved host and port: {body}"
+    );
+    assert!(
+        !message.contains("127.0.0.1:80"),
+        "env: probe never dialled a synthesised 127.0.0.1:80: {body}"
+    );
+
+    // An unset env: reference resolves to nothing: 400 names the field.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors_probe",
+        serde_json::json!({
+            "type": "webhook",
+            "url": "env:MN05_PROBE_DEFINITELY_UNSET",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "unset env: probe refuses: {body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("url"),
+        "unset env: refusal names url: {body}"
+    );
+
+    // An unreadable file: reference resolves to nothing: 400 names it.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors_probe",
+        serde_json::json!({
+            "type": "webhook",
+            "url": "file:/definitely/not/here-mn05",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "missing file: probe refuses: {body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("url"),
+        "missing file: refusal names url: {body}"
+    );
+    std::env::remove_var("MN05_PROBE_URL");
+
+    std::fs::remove_dir_all(&dir).ok();
+    kernel.finish().await;
+}
+
+/// A bad service account key is refused through the management API. A
+/// connector or action that carries `service_account_json` with bad JSON,
+/// without `client_email`, or without `private_key` answers 400 that
+/// names the field. A build without the cloud feature keeps the same
+/// fail-closed refusal naming the feature.
+#[tokio::test]
+async fn mn05_bigquery_bad_key_refused_through_api() {
+    let kernel = spawn_kernel("").await;
+
+    // A valid attached-identity connector probes the build: 201 means
+    // the cloud feature is on and the strict 400 checks run below.
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn05-bq-probe",
+            "type": "gcp_pubsub",
+            "project_id": "demo",
+            "authentication": {"type": "attached_service_account", "gcp_project_id": "p"},
+        }),
+    )
+    .await;
+    let strict = status == 201;
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mn05-bq-probe",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    // Connector leg: each bad key shape is refused naming the field.
+    for (leaf, raw) in [
+        ("bad-json", "{not json".to_string()),
+        (
+            "missing-email",
+            "{\"private_key\":\"pk\",\"project_id\":\"proj\"}".to_string(),
+        ),
+        (
+            "missing-key",
+            "{\"client_email\":\"a@b\",\"project_id\":\"proj\"}".to_string(),
+        ),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            serde_json::json!({
+                "name": format!("mn05-bq-bad-{leaf}"),
+                "type": "gcp_pubsub",
+                "project_id": "demo",
+                "authentication": {"type": "service_account_json", "service_account_json": raw},
+            }),
+        )
+        .await;
+        if strict {
+            assert_eq!(status, 400, "bad {leaf} connector refuses: {body}");
+            let message = body["message"].as_str().unwrap_or("");
+            assert!(
+                message.contains("authentication.service_account_json"),
+                "bad {leaf} refusal names the key: {body}"
+            );
+            let want = match leaf {
+                "missing-email" => "client_email",
+                "missing-key" => "private_key",
+                _ => "authentication.service_account_json",
+            };
+            assert!(
+                message.contains(want),
+                "bad {leaf} refusal names {want}: {body}"
+            );
+        } else {
+            assert_ne!(
+                status, 201,
+                "bad {leaf} never stores without the feature: {body}"
+            );
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("gcp_pubsub"),
+                "feature-off refusal names the kind: {body}"
+            );
+        }
+    }
+
+    // Action leg: a stored connector with a bad key fails the action.
+    // Without the feature the connector itself is already refused.
+    if strict {
+        for (leaf, raw) in [
+            ("bad-json", "{not json".to_string()),
+            (
+                "missing-email",
+                "{\"private_key\":\"pk\",\"project_id\":\"proj\"}".to_string(),
+            ),
+            (
+                "missing-key",
+                "{\"client_email\":\"a@b\",\"project_id\":\"proj\"}".to_string(),
+            ),
+        ] {
+            let connector = format!("mn05-bq-actconn-{leaf}");
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::POST,
+                "/api/v5/connectors",
+                serde_json::json!({
+                    "name": connector,
+                    "type": "bigquery",
+                    "project_id": "demo",
+                    "authentication": {"type": "service_account_json", "service_account_json": raw},
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 201,
+                "bad {leaf} connector without dataset stores: {body}"
+            );
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::POST,
+                "/api/v5/actions",
+                serde_json::json!({
+                    "name": format!("mn05-bq-act-{leaf}"),
+                    "type": "bigquery",
+                    "connector": connector,
+                    "parameters": {"dataset": "d", "table": "events"},
+                }),
+            )
+            .await;
+            assert_eq!(status, 400, "bad {leaf} action refuses: {body}");
+            let message = body["message"].as_str().unwrap_or("");
+            assert!(
+                message.contains("authentication.service_account_json"),
+                "bad {leaf} action refusal names the key: {body}"
+            );
+            let want = match leaf {
+                "missing-email" => "client_email",
+                "missing-key" => "private_key",
+                _ => "authentication.service_account_json",
+            };
+            assert!(
+                message.contains(want),
+                "bad {leaf} action refusal names {want}: {body}"
+            );
+            let (status, _) = mv00_api(
+                &kernel,
+                reqwest::Method::DELETE,
+                &format!("/api/v5/connectors/{connector}"),
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, 204);
+        }
+    }
+    kernel.finish().await;
+}
+
+/// The probe dial uses the configured health timeout. Posting to the
+/// connector and action probes with distinct
+/// `resource_opts.health_check_timeout` values shows each value in the
+/// reachability result; the documented 60 s default applies when the
+/// field is absent (capped by the 5 s outer probe bound).
+#[tokio::test]
+async fn mn05_probe_uses_configured_health_timeout() {
+    let kernel = spawn_kernel("").await;
+
+    // A closed port fails fast and names the dialled target, proving
+    // the probe entry accepts distinct timeout values.
+    for (leg, timeout) in [("one", "1s"), ("two", "2s")] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors_probe",
+            serde_json::json!({
+                "type": "webhook",
+                "url": "http://127.0.0.1:1",
+                "resource_opts": {"health_check_timeout": timeout},
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "closed port with {timeout} refuses ({leg}): {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("127.0.0.1:1"),
+            "closed port with {timeout} dialled the target ({leg}): {body}"
+        );
+    }
+
+    // An unroutable address hangs until the configured timeout, so the
+    // timeout value is visible in the refusal message on both probes.
+    for path in ["/api/v5/connectors_probe", "/api/v5/actions_probe"] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            path,
+            serde_json::json!({
+                "type": "webhook",
+                "url": "http://192.0.2.1:81",
+                "resource_opts": {"health_check_timeout": "1s"},
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{path} with 1s refuses: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out after 1s"),
+            "{path} with 1s uses the 1s dial timeout: {body}"
+        );
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            path,
+            serde_json::json!({
+                "type": "webhook",
+                "url": "http://192.0.2.1:81",
+                "resource_opts": {"health_check_timeout": "2s"},
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{path} with 2s refuses: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out after 2s"),
+            "{path} with 2s uses the 2s dial timeout: {body}"
+        );
+        // No field: the 60 s default applies, capped by the outer bound.
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            path,
+            serde_json::json!({
+                "type": "webhook",
+                "url": "http://192.0.2.1:81",
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{path} with default refuses: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out after 5s"),
+            "{path} default timeout applies (outer 5s cap over 60s): {body}"
+        );
+    }
+    kernel.finish().await;
+}
+
 /// An action whose connector does not resolve stores `disconnected` with
 /// the named reason and starts delivering once the connector arrives —
 /// creating the connector alone wires it.
@@ -7723,10 +8461,6 @@ async fn ro01_action_resource_opts_refusals_through_the_api() {
         (
             "health_check_interval_jitter",
             serde_json::json!({"health_check_interval_jitter": "1s"}),
-        ),
-        (
-            "health_check_timeout",
-            serde_json::json!({"health_check_timeout": "30s"}),
         ),
         ("no_such_option", serde_json::json!({"no_such_option": 1})),
         ("batch_time", serde_json::json!({"batch_time": "infinity"})),
@@ -13753,5 +14487,407 @@ async fn sb17_mqtt_source_refuses_tls_and_v5_with_a_reason() {
         sb17_wait_reason(&kernel, &format!("{name}-src"), needle).await;
     }
 
+    kernel.finish().await;
+}
+
+/// RO-01/B2-4: `inflight_window == 1` keeps publish order through dispatch.
+/// Twenty QoS 1 messages published in order arrive at the HTTP receiver
+/// in the same order; no reordering under a window of one.
+#[tokio::test]
+async fn ro01_inflight_window_one_keeps_publish_order() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-order-conn",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-order-action",
+            "type": "webhook",
+            "connector": "ro01-order-conn",
+            "parameters": {"path": "/order"},
+            "resource_opts": {
+                "inflight_window": 1,
+                "worker_pool_size": 1,
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-order-rule",
+            "sql": "SELECT * FROM \"ro01/in/order\"",
+            "actions": ["ro01-order-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 20);
+    let mut publisher = mv00_connect(&kernel, "ro01-order-pub").await;
+    for i in 1..=20 {
+        let payload = format!("{{\"n\":{i}}}");
+        let publish = sy02_publish311("ro01/in/order", i, 1, false, payload.as_bytes());
+        send_mqtt(&mut publisher, &publish).await;
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
+            .await
+            .expect("PUBACK in time")
+            .expect("PUBACK");
+        assert_eq!(head, 0x40, "publisher sees PUBACK for message {i}");
+        assert_eq!(
+            body,
+            vec![(i >> 8) as u8, (i & 0xff) as u8],
+            "PUBACK mirrors packet id {i}"
+        );
+    }
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("ordered delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 20, "all 20 messages delivered");
+    for (i, (path, body)) in received.iter().enumerate() {
+        assert_eq!(path, "/order", "path for message {}", i + 1);
+        let expected = format!("{{\"n\":{}}}", i + 1);
+        assert_eq!(
+            body,
+            expected.as_bytes(),
+            "message {} arrives in publish order",
+            i + 1
+        );
+    }
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-order-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-order-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/ro01-order-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// RO-01/B2-6: GreptimeDB defaults `server` to 127.0.0.1:4001 when absent.
+/// The default is observed on the wire: a listener on 127.0.0.1:4001
+/// receives the published row.
+#[tokio::test]
+async fn ro01_greptimedb_defaults_server() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:4001")
+            .await
+            .expect("GreptimeDB default port binds"),
+    );
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-greptime-conn",
+            "type": "greptimedb",
+            "database": "demo",
+            "table": "metrics",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/ro01-greptime-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "connector readable: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-greptime-action",
+            "type": "greptimedb",
+            "connector": "ro01-greptime-conn",
+            "parameters": {"table": "metrics"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-greptime-rule",
+            "sql": "SELECT * FROM \"ro01/greptime\"",
+            "actions": ["ro01-greptime-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "ro01-greptime-pub").await;
+    let publish = sy02_publish311("ro01/greptime", 1, 1, false, b"{\"n\":1}");
+    send_mqtt(&mut publisher, &publish).await;
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK");
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    assert_eq!(body, vec![0, 1], "PUBACK mirrors packet id 1");
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("default-endpoint delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "one row reaches 127.0.0.1:4001");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-greptime-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-greptime-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/ro01-greptime-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// GreptimeDB appends port 8086 to a bare host: a connector with
+/// `server` 127.0.0.1 delivers to 127.0.0.1:8086.
+#[tokio::test]
+async fn mn05_greptimedb_bare_host_gains_8086() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:8086")
+            .await
+            .expect("GreptimeDB bare-host port binds"),
+    );
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn05-greptime-bare-conn",
+            "type": "greptimedb",
+            "server": "127.0.0.1",
+            "database": "demo",
+            "table": "metrics",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mn05-greptime-bare-action",
+            "type": "greptimedb",
+            "connector": "mn05-greptime-bare-conn",
+            "parameters": {"table": "metrics"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mn05-greptime-bare-rule",
+            "sql": "SELECT * FROM \"mn05/greptime-bare\"",
+            "actions": ["mn05-greptime-bare-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mn05-greptime-bare-pub").await;
+    let publish = sy02_publish311("mn05/greptime-bare", 1, 1, false, b"{\"n\":1}");
+    send_mqtt(&mut publisher, &publish).await;
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK");
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    assert_eq!(body, vec![0, 1], "PUBACK mirrors packet id 1");
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("bare-host delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "one row reaches 127.0.0.1:8086");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/mn05-greptime-bare-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mn05-greptime-bare-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mn05-greptime-bare-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    kernel.finish().await;
+}
+
+/// RO-01/B2-6: Datalayers defaults `server` to 127.0.0.1:8361 when absent.
+/// The default is observed on the wire: a listener on 127.0.0.1:8361
+/// receives the published row.
+#[tokio::test]
+async fn ro01_datalayers_defaults_server() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:8361")
+            .await
+            .expect("Datalayers default port binds"),
+    );
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "ro01-datalayers-conn",
+            "type": "datalayers",
+            "database": "demo",
+            "table": "metrics",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/ro01-datalayers-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "connector readable: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "ro01-datalayers-action",
+            "type": "datalayers",
+            "connector": "ro01-datalayers-conn",
+            "parameters": {"table": "metrics"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "ro01-datalayers-rule",
+            "sql": "SELECT * FROM \"ro01/datalayers\"",
+            "actions": ["ro01-datalayers-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "ro01-datalayers-pub").await;
+    let publish = sy02_publish311("ro01/datalayers", 1, 1, false, b"{\"n\":1}");
+    send_mqtt(&mut publisher, &publish).await;
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut publisher))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK");
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    assert_eq!(body, vec![0, 1], "PUBACK mirrors packet id 1");
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("default-endpoint delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "one row reaches 127.0.0.1:8361");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/ro01-datalayers-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/ro01-datalayers-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/ro01-datalayers-conn",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
     kernel.finish().await;
 }

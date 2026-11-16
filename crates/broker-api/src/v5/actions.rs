@@ -779,6 +779,18 @@ pub async fn create_action(
     // reason and the run reads `disconnected` until the connector
     // arrives. A connector that resolves but stays incomplete (its own
     // credential is missing) stores the same way.
+    // For a bigquery action, refuse up front (400) when the referenced
+    // connector's service_account_json is malformed: the build feature
+    // is off so the sink builder never reaches its own credential check.
+    if crate::v5::action_sinks::canonical_action_kind(&entry.action_type) == "bigquery"
+        && !entry.connector.is_empty()
+    {
+        if let Some(doc) = state.connectors.get(&entry.connector) {
+            if let Err(msg) = super::rules::validate_service_account_json(&doc, &entry.id) {
+                return ApiError::BadRequest(msg).into_response();
+            }
+        }
+    }
     let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
         Ok(staged) => staged,
         Err(message) => return ApiError::AlreadyExists(message).into_response(),

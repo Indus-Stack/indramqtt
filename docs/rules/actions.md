@@ -147,7 +147,7 @@ Example: `{"batch_size": 10, "batch_time": "100ms"}` sends a partial batch after
 
 ### `inflight_window`
 
-Type: integer. Default: `100`. Minimum: `1`. Maximum driver calls in flight. A value above the semaphore maximum is refused.
+Type: integer. Default: `100`. Minimum: `1`. Maximum driver calls in flight. A value above the semaphore maximum is refused. `1` keeps the order of messages. A larger value sends in parallel and does not keep the order.
 
 Example: `{"inflight_window": 4, "worker_pool_size": 2}` sends two chunks of two rows.
 
@@ -197,9 +197,9 @@ Example: `{"health_check_interval_jitter": "1s"}` is refused with 400. The answe
 
 ### `health_check_timeout`
 
-Type: duration string. Default: `60s`. Only the default is accepted. Another value answers 400. The accepted value bounds one probe dial.
+Type: duration string. Default: `60s`. The broker accepts a valid value. The value bounds one probe dial.
 
-Example: `{"health_check_timeout": "30s"}` is refused with 400. The answer names the field.
+Example: `{"health_check_timeout": "30s"}` is accepted. The probe dial uses 30s.
 
 ## Read the action counters
 

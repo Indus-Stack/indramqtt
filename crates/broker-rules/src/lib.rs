@@ -9536,6 +9536,87 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .unwrap()
     }
 
+    /// Cassandra keyspace e2e (MN-05 item 7): one ingress event
+    /// routes through a streaming SQL `INTO connector(...)` rule into
+    /// a real `CassandraSink`. The sink qualifies the bare table
+    /// with the configured keyspace, so the statement that reaches
+    /// the transport carries `keyspace.table`. The transport is
+    /// in-memory.
+    // Needs the `cassandra` heavy SDK (X1-10).
+    #[cfg(feature = "cassandra")]
+    #[tokio::test]
+    async fn test_into_cassandra_carries_keyspace_table() {
+        use broker_connectors_enterprise::{
+            CassandraSink, CassandraSinkConfig, CqlConsistency, MockCassandraTransport,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Cassandra statements (auto-flush every row). The template
+        // names the bare table; the sink qualifies it on the path.
+        let transport = Arc::new(MockCassandraTransport::new());
+        let sink = Arc::new(
+            CassandraSink::new(
+                CassandraSinkConfig {
+                    contact_points: vec!["10.0.0.1:9042".to_string()],
+                    keyspace: "telemetry".to_string(),
+                    table_template: "events".to_string(),
+                    auth: broker_connectors_enterprise::CassandraAuth::None,
+                    consistency: CqlConsistency::LocalQuorum,
+                    partition_key_template: "${client_id}".to_string(),
+                    cql_statement_template: "INSERT INTO events (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)".to_string(),
+                    ttl_secs: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                    timeout_ms: None,
+                },
+                transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("cassandra-sink", sink.clone());
+
+        engine
+            .create_rule(
+                "cassandra-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, device_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("cassandra-sink")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "client_id": "device-42", "device_id": "device-42", "temp": 22.5 }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // The row lands with the qualified table on the deliver path.
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1, "one batch reaches the transport");
+        assert_eq!(captured[0].keyspace, "telemetry");
+        assert_eq!(captured[0].batch.len(), 1);
+        assert_eq!(
+            captured[0].batch[0].cql,
+            "INSERT INTO telemetry.events (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)",
+            "the CQL carries keyspace.table"
+        );
+        assert_eq!(captured[0].batch[0].values[0], b"device-42");
+    }
+
     /// Multi-store e2e (INDRA-220): one ingress event routes through
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the MongoDB, MSSQL, Cassandra and Couchbase

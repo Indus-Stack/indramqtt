@@ -386,15 +386,12 @@ impl ActionResourceOpts {
                 }
             }
         }
-        if opts.health_check_interval_jitter != Duration::ZERO
-            || opts.health_check_timeout != Some(DEFAULT_HEALTH_CHECK_TIMEOUT)
-        {
+        if opts.health_check_interval_jitter != Duration::ZERO {
             // TODO(parity): the probe uses the documented timeout and no
-            // jitter. The rulebook does not decide a per-connector jitter
-            // or a timeout outside the documented default. Refuse those
-            // non-default values instead of ignoring them.
+            // jitter. The rulebook does not decide a per-connector jitter.
+            // Refuse non-default jitter instead of ignoring it.
             return Err(format!(
-                "action {id:?} field `resource_opts.health_check_interval_jitter` / `health_check_timeout` is not supported: this action runtime uses the documented default for those fields"
+                "action {id:?} field `resource_opts.health_check_interval_jitter` is not supported: this action runtime uses the documented default for that field"
             ));
         }
         if let Some(ttl) = opts.request_ttl {
@@ -434,8 +431,6 @@ impl ActionResourceOpts {
             Some("health_check_interval")
         } else if self.health_check_interval_jitter != Duration::ZERO {
             Some("health_check_interval_jitter")
-        } else if self.health_check_timeout != Some(DEFAULT_HEALTH_CHECK_TIMEOUT) {
-            Some("health_check_timeout")
         } else {
             None
         }
@@ -1087,9 +1082,9 @@ impl ActionRuntimeState {
         self: &Arc<Self>,
         mut batch: Vec<QueuedMessage>,
     ) -> broker_connectors::Result<()> {
-        // No gate spans the driver call. Up to `inflight_window` calls run
-        // at the same time. Each call holds one semaphore permit, so a
-        // window of one still sends one call at a time.
+        // One permit per driver call spans `send_batch`. Up to
+        // `inflight_window` calls run at the same time. A window
+        // of one keeps enqueue order. A larger window sends in parallel.
         //
         // One chunk is one driver call. `worker_pool_size` bounds the rows
         // in one call; `inflight_window` bounds the calls in flight.
@@ -1905,23 +1900,15 @@ pub(crate) fn required_action_parameters(record: &ActionRecord) -> Result<(), St
         "gcp_pubsub" => {
             let field = "pubsub_topic";
             if param_string(record, field).is_none() {
-                // Accept the documented `topic` alias too.
-                if param_string(record, "topic").is_none()
-                    && param_string(record, "topic_id").is_none()
-                {
-                    return Err(format!(
-                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
-                        record.id
-                    ));
-                }
+                return Err(format!(
+                    "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                    record.id
+                ));
             }
         }
         "azure_eventhubs" => {
             let field = "event_hub";
-            if param_string(record, field).is_none()
-                && param_string(record, "hub").is_none()
-                && param_string(record, "topic").is_none()
-            {
+            if param_string(record, field).is_none() && param_string(record, "hub").is_none() {
                 return Err(format!(
                     "action {:?} is missing required field: {field} (field `parameters.{field}`)",
                     record.id
@@ -3567,6 +3554,32 @@ fn http_endpoint(raw: &str) -> String {
     }
 }
 
+/// Endpoint for one GreptimeDB target. Reason: the reference default
+/// is `127.0.0.1:4001`; a bare host keeps the documented 8086 port.
+pub(crate) fn greptimedb_endpoint(raw_server: Option<&str>) -> String {
+    let raw = raw_server
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:4001");
+    if raw.contains("://") {
+        raw.to_string()
+    } else if raw.contains(':') {
+        format!("http://{raw}")
+    } else {
+        format!("http://{raw}:8086")
+    }
+}
+
+/// Endpoint for one Datalayers target. Reason: the reference default
+/// is `127.0.0.1:8361`; any other value already carries its port.
+pub(crate) fn datalayers_endpoint(raw_server: Option<&str>) -> String {
+    let raw = raw_server
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:8361");
+    http_endpoint(raw)
+}
+
 /// IoTDB REST endpoint: the driver posts `{endpoint}/insertTablet`
 /// and its contract names `http://host:port/rest/v2`. A bare
 /// `host:port` gains the `/rest/v2` base path; an endpoint that
@@ -3978,15 +3991,8 @@ pub(crate) fn build_greptimedb_sink(
     };
     let connector = record.connector.trim().to_string();
     let raw_server = first_string(connector_doc, &["server", "url", "endpoint", "host"])
-        .map(|value| value.into_owned())
-        .unwrap_or_else(|| "127.0.0.1:4001".to_string());
-    let endpoint = if raw_server.contains("://") {
-        raw_server.clone()
-    } else if raw_server.contains(':') {
-        format!("http://{raw_server}")
-    } else {
-        format!("http://{raw_server}:8086")
-    };
+        .map(|value| value.into_owned());
+    let endpoint = greptimedb_endpoint(raw_server.as_deref());
     let database = connector_field(
         connector_doc,
         &connector,
@@ -4667,9 +4673,9 @@ pub(crate) fn build_datalayers_sink(
         DatalayersConfig, DatalayersSink, HttpDatalayersTransport,
     };
     let connector = record.connector.trim().to_string();
-    let raw_server = first_string(connector_doc, &["server", "url", "endpoint"])
-        .map(|value| value.into_owned())
-        .unwrap_or_else(|| "127.0.0.1:8361".to_string());
+    let raw_server =
+        first_string(connector_doc, &["server", "url", "endpoint"]).map(|value| value.into_owned());
+    let raw_server = raw_server.as_deref();
     let database = connector_field(
         connector_doc,
         &connector,
@@ -4706,7 +4712,7 @@ pub(crate) fn build_datalayers_sink(
     let (timestamp_field, tag_columns, field_columns) =
         datalayers_column_settings(connector_doc, &connector)?;
     let config = DatalayersConfig {
-        endpoint: http_endpoint(&raw_server),
+        endpoint: datalayers_endpoint(raw_server),
         database,
         table,
         auth_token,
@@ -6060,6 +6066,71 @@ pub(crate) fn build_bigquery_sink(
 }
 
 #[cfg(feature = "bigquery")]
+fn parse_service_account_key(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+    raw: &str,
+    authentication: Option<&serde_json::Value>,
+) -> Result<(String, broker_connectors_enterprise::gcp_pubsub::GcpAuth), String> {
+    use broker_connectors_enterprise::gcp_pubsub::GcpAuth;
+    let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        format!(
+            "connector {connector:?} field `authentication.service_account_json` is not JSON: {error}"
+        )
+    })?;
+    let client_email = key
+        .get("client_email")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} field `authentication.service_account_json` is missing client_email"
+            )
+        })?
+        .to_string();
+    let private_key_pem = key
+        .get("private_key")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} field `authentication.service_account_json` is missing private_key"
+            )
+        })?
+        .to_string();
+    let project_id = key
+        .get("project_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            authentication
+                .and_then(|auth| auth.get("gcp_project_id"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            connector_doc
+                .get("gcp_project_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} field `authentication` is missing project_id (action {action_id:?})"
+            )
+        })?
+        .to_string();
+    Ok((
+        project_id,
+        GcpAuth::ServiceAccountKey {
+            client_email,
+            private_key_pem,
+        },
+    ))
+}
+
+#[cfg(feature = "bigquery")]
 pub(crate) fn bigquery_auth(
     connector_doc: &serde_json::Value,
     connector: &str,
@@ -6068,14 +6139,26 @@ pub(crate) fn bigquery_auth(
     use broker_connectors_enterprise::gcp_pubsub::GcpAuth;
     // The native form names `authentication`; the reference form names
     // the same object `auth`. Both carry the operator credential.
+    // A bare top-level `service_account_json` also carries it.
+    if connector_doc
+        .get("authentication")
+        .or_else(|| connector_doc.get("auth"))
+        .is_none()
+    {
+        if let Some(raw) = connector_doc
+            .get("service_account_json")
+            .and_then(|value| value.as_str())
+        {
+            return parse_service_account_key(connector_doc, connector, action_id, raw, None);
+        }
+        return Err(format!(
+            "connector {connector:?} is missing required field: authentication (action {action_id:?})"
+        ));
+    }
     let authentication = connector_doc
         .get("authentication")
         .or_else(|| connector_doc.get("auth"))
-        .ok_or_else(|| {
-            format!(
-                "connector {connector:?} is missing required field: authentication (action {action_id:?})"
-            )
-        })?;
+        .expect("authentication present");
     let kind = authentication
         .get("type")
         .and_then(|value| value.as_str())
@@ -6091,49 +6174,7 @@ pub(crate) fn bigquery_auth(
                         "connector {connector:?} is missing required field: authentication.service_account_json (action {action_id:?})"
                     )
                 })?;
-            let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
-                format!(
-                    "connector {connector:?} field `authentication.service_account_json` is not JSON: {error}"
-                )
-            })?;
-            let project_id = key
-                .get("project_id")
-                .or_else(|| authentication.get("gcp_project_id"))
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "connector {connector:?} field `authentication` is missing project_id (action {action_id:?})"
-                    )
-                })?
-                .to_string();
-            let client_email = key
-                .get("client_email")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "connector {connector:?} field `authentication.service_account_json` is missing client_email"
-                    )
-                })?
-                .to_string();
-            let private_key_pem = key
-                .get("private_key")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "connector {connector:?} field `authentication.service_account_json` is missing private_key"
-                    )
-                })?
-                .to_string();
-            Ok((
-                project_id,
-                GcpAuth::ServiceAccountKey {
-                    client_email,
-                    private_key_pem,
-                },
-            ))
+            parse_service_account_key(connector_doc, connector, action_id, raw, Some(authentication))
         }
         "attached_service_account" => {
             // The reference needs only `type` for this form.
@@ -7940,49 +7981,41 @@ pub(crate) fn build_gcp_pubsub_sink(
     connector_doc: &serde_json::Value,
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     use broker_connectors_enterprise::gcp_pubsub::{
-        GcpAuth, GcpPubSubSink, GcpPubSubSinkConfig, SdkGcpPubSubTransport,
+        GcpPubSubSink, GcpPubSubSinkConfig, SdkGcpPubSubTransport,
     };
     let connector = record.connector.trim().to_string();
-    let project_id = connector_field(
-        connector_doc,
-        &connector,
-        &record.id,
-        &["project_id", "gcp_project_id", "project"],
-        "project_id",
-    )?;
+    // Use the top-level project when the operator gives it.
+    // Else use the project inside the service account key.
+    let top_project = first_string(connector_doc, &["project_id", "gcp_project_id", "project"])
+        .map(|value| value.into_owned())
+        .filter(|value| !value.trim().is_empty());
     let endpoint =
         first_string(connector_doc, &["endpoint", "url", "server"]).map(|value| value.into_owned());
-    let auth = if let Some(sa_json) = first_string(connector_doc, &["service_account_json"]) {
-        match serde_json::from_str::<serde_json::Value>(&sa_json) {
-            Ok(sa) => {
-                let client_email = sa
-                    .get("client_email")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let private_key_pem = sa
-                    .get("private_key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !client_email.is_empty() && !private_key_pem.is_empty() {
-                    GcpAuth::ServiceAccountKey {
-                        client_email,
-                        private_key_pem,
-                    }
-                } else {
-                    GcpAuth::None
-                }
-            }
-            Err(_) => GcpAuth::None,
-        }
+    // A present but bad key is refused. An absent key keeps the
+    // anonymous identity; only a present key must prove itself.
+    let has_key = connector_doc
+        .get("authentication")
+        .or_else(|| connector_doc.get("auth"))
+        .is_some()
+        || connector_doc
+            .get("service_account_json")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty());
+    let (auth_project_id, auth) = if has_key {
+        bigquery_auth(connector_doc, &connector, &record.id)?
     } else {
-        first_string(connector_doc, &["access_token", "token"])
-            .map(|value| GcpAuth::AccessToken {
-                token: value.into_owned(),
-            })
-            .unwrap_or(GcpAuth::None)
+        (
+            String::new(),
+            broker_connectors_enterprise::gcp_pubsub::GcpAuth::None,
+        )
     };
+    let project_id = top_project.unwrap_or(auth_project_id);
+    if project_id.trim().is_empty() {
+        return Err(format!(
+            "connector {connector:?} is missing required field: project_id (action {:?})",
+            record.id
+        ));
+    }
     let topic_id = param_string(record, "pubsub_topic")
         .or_else(|| param_string(record, "topic"))
         .or_else(|| param_string(record, "topic_id"))
@@ -9249,6 +9282,71 @@ mod tests {
             .expect("every precision and format builds");
             assert_eq!(sink.kind(), "greptimedb");
         }
+
+        // Default server: no server field → 127.0.0.1:4001.
+        let rec = mv02b_record(
+            "act",
+            "greptimedb",
+            "greptimedb:up",
+            serde_json::json!({"table": "events"}),
+        );
+        let sink = build_greptimedb_sink(&rec, &serde_json::json!({"database": "db"}))
+            .expect("default server builds");
+        assert_eq!(sink.kind(), "greptimedb");
+    }
+
+    #[test]
+    fn greptimedb_endpoint_applies_the_reference_default() {
+        // No server field: the reference default applies.
+        assert_eq!(
+            greptimedb_endpoint(None),
+            "http://127.0.0.1:4001",
+            "absent server uses 127.0.0.1:4001"
+        );
+        assert_eq!(
+            greptimedb_endpoint(Some("")),
+            "http://127.0.0.1:4001",
+            "blank server uses 127.0.0.1:4001"
+        );
+        // A bare host gains the documented 8086 port.
+        assert_eq!(
+            greptimedb_endpoint(Some("example.com")),
+            "http://example.com:8086",
+            "bare host gains port 8086"
+        );
+        // A host with a port keeps it.
+        assert_eq!(
+            greptimedb_endpoint(Some("example.com:4001")),
+            "http://example.com:4001",
+            "host with port keeps its port"
+        );
+        // A full URL stays unchanged.
+        assert_eq!(
+            greptimedb_endpoint(Some("https://example.com:7443/db")),
+            "https://example.com:7443/db",
+            "full URL stays unchanged"
+        );
+    }
+
+    #[test]
+    fn datalayers_endpoint_applies_the_reference_default() {
+        // No server field: the reference default applies.
+        assert_eq!(
+            datalayers_endpoint(None),
+            "http://127.0.0.1:8361",
+            "absent server uses 127.0.0.1:8361"
+        );
+        assert_eq!(
+            datalayers_endpoint(Some("")),
+            "http://127.0.0.1:8361",
+            "blank server uses 127.0.0.1:8361"
+        );
+        // A host with a port keeps it.
+        assert_eq!(
+            datalayers_endpoint(Some("example.com:8361")),
+            "http://example.com:8361",
+            "host with port keeps its port"
+        );
     }
 
     #[tokio::test]
@@ -9505,6 +9603,20 @@ mod tests {
             &serde_json::json!({"server": "127.0.0.1:8360", "database": "db"}),
         )
         .expect("a full datalayers pair builds");
+        assert_eq!(sink.kind(), "datalayers");
+    }
+
+    #[tokio::test]
+    async fn datalayers_sink_defaults_server() {
+        let rec = mv02b_record(
+            "act",
+            "datalayers",
+            "datalayers:up",
+            serde_json::json!({"table": "events"}),
+        );
+        // No server field: the default 127.0.0.1:8361 is used.
+        let sink = build_datalayers_sink(&rec, &serde_json::json!({"database": "db"}))
+            .expect("default server builds");
         assert_eq!(sink.kind(), "datalayers");
     }
 
@@ -10098,10 +10210,6 @@ mod tests {
                 serde_json::json!({"health_check_interval_jitter": "1s"}),
                 "health_check_interval_jitter",
             ),
-            (
-                serde_json::json!({"health_check_timeout": "30s"}),
-                "health_check_timeout",
-            ),
             (serde_json::json!({"no_such_option": 1}), "no_such_option"),
             (serde_json::json!({"batch_time": "infinity"}), "batch_time"),
             (
@@ -10133,6 +10241,17 @@ mod tests {
         assert_eq!(opts.health_check_interval, Duration::from_secs(30));
         assert_eq!(opts.batch_time, Duration::from_millis(25));
         assert_eq!(opts.batch_size, 10);
+    }
+
+    #[test]
+    fn resource_opts_accept_a_non_default_health_check_timeout() {
+        let opts =
+            ActionResourceOpts::parse("act", &serde_json::json!({"health_check_timeout": "30s"}))
+                .expect("a non-default health check timeout is now accepted");
+        assert_eq!(
+            opts.health_check_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
     }
 
     #[tokio::test]
@@ -11499,6 +11618,22 @@ mod tests {
     }
 
     #[test]
+    fn canonical_action_kind_maps_every_remaining_alias() {
+        assert_eq!(canonical_action_kind("sqlserver"), "mssql");
+        assert_eq!(canonical_action_kind("mariadb"), "mysql");
+        assert_eq!(canonical_action_kind("cockroach"), "cockroachdb");
+        assert_eq!(canonical_action_kind("postgres"), "pgsql");
+        assert_eq!(canonical_action_kind("postgresql"), "pgsql");
+        assert_eq!(canonical_action_kind("google_alloydb"), "alloydb");
+        assert_eq!(canonical_action_kind("alloy_db"), "alloydb");
+        assert_eq!(canonical_action_kind("opcua"), "opc_ua");
+        assert_eq!(canonical_action_kind("sparkplug"), "sparkplug_b");
+        assert_eq!(canonical_action_kind("spb"), "sparkplug_b");
+        assert_eq!(canonical_action_kind("rest"), "http");
+        assert_eq!(canonical_action_kind("logger"), "console");
+    }
+
+    #[test]
     fn action_owned_kind_covers_the_mv03a_kinds() {
         for kind in [
             "kafka",
@@ -11896,5 +12031,61 @@ mod tests {
         bad_prefix.parameters = serde_json::json!({"topic_prefix": "spBv1.0/a/#/x"});
         let error = required_action_parameters(&bad_prefix).expect_err("a wildcard prefix refuses");
         assert!(error.contains("topic_prefix"), "{error}");
+    }
+
+    #[cfg(feature = "bigquery")]
+    #[test]
+    fn bigquery_auth_refuses_bad_service_account_json() {
+        let rec = record("act", "bigquery", "bq:up");
+        let doc = serde_json::json!({
+            "authentication": {"type": "service_account_json", "service_account_json": "{not json"}
+        });
+        let error = bigquery_auth(&doc, &rec.connector, &rec.id).expect_err("bad JSON refuses");
+        assert!(
+            error.contains("authentication.service_account_json"),
+            "names the field: {error}"
+        );
+    }
+
+    #[cfg(feature = "bigquery")]
+    #[test]
+    fn bigquery_auth_refuses_missing_client_email() {
+        let rec = record("act", "bigquery", "bq:up");
+        let doc = serde_json::json!({
+            "authentication": {"type": "service_account_json", "service_account_json": "{\"private_key\":\"pk\"}"}
+        });
+        let error =
+            bigquery_auth(&doc, &rec.connector, &rec.id).expect_err("missing client_email refuses");
+        assert!(
+            error.contains("authentication.service_account_json"),
+            "names the field: {error}"
+        );
+    }
+
+    #[cfg(feature = "bigquery")]
+    #[test]
+    fn bigquery_auth_refuses_missing_private_key() {
+        let rec = record("act", "bigquery", "bq:up");
+        let doc = serde_json::json!({
+            "authentication": {"type": "service_account_json", "service_account_json": "{\"client_email\":\"a@b\"}"}
+        });
+        let error =
+            bigquery_auth(&doc, &rec.connector, &rec.id).expect_err("missing private_key refuses");
+        assert!(
+            error.contains("authentication.service_account_json"),
+            "names the field: {error}"
+        );
+    }
+
+    #[cfg(feature = "bigquery")]
+    #[test]
+    fn bigquery_auth_accepts_valid_service_account() {
+        let rec = record("act", "bigquery", "bq:up");
+        let doc = serde_json::json!({
+            "authentication": {"type": "service_account_json", "service_account_json": "{\"client_email\":\"a@b\",\"private_key\":\"pk\",\"project_id\":\"proj\"}"}
+        });
+        let (project_id, _auth) =
+            bigquery_auth(&doc, &rec.connector, &rec.id).expect("valid account builds");
+        assert_eq!(project_id, "proj");
     }
 }

@@ -97,6 +97,35 @@ fn is_cql_identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Qualify bare table names in CQL text with the keyspace. Handles
+/// `INSERT INTO`, `UPDATE`, `DELETE FROM`, and `TABLE` patterns. If the
+/// keyspace already appears in the CQL text, the text is returned as-is.
+fn qualify_cql_with_keyspace(cql: &str, keyspace: &str) -> String {
+    // Match keywords without regard to case. The driver accepts
+    // lower-case and upper-case CQL verbs.
+    let upper = cql.to_uppercase();
+    let mut result = cql.to_string();
+    for keyword in ["INTO ", "FROM ", "UPDATE ", "TABLE "] {
+        let Some(pos) = upper.find(keyword) else {
+            continue;
+        };
+        let after = pos + keyword.len();
+        let start = result[after..]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(after, |i| after + i);
+        let end = result[start..]
+            .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+            .map_or(result.len(), |i| start + i);
+        let table = &result[start..end];
+        if table.is_empty() || table.contains('.') {
+            return result;
+        }
+        result.replace_range(start..end, &format!("{keyspace}.{table}"));
+        return result;
+    }
+    result
+}
+
 /// Cassandra sink configuration. All depths are optional (`None` =
 /// unbounded) with zero clamped ceilings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -943,11 +972,13 @@ impl CassandraTransport for NativeCassandraTransport {
         if batch.is_empty() {
             return Ok(());
         }
-        let _ = keyspace;
         self.connect().await?;
         let statements: Vec<(String, Vec<Vec<u8>>)> = batch
             .iter()
-            .map(|statement| (statement.cql.clone(), statement.values.clone()))
+            .map(|statement| {
+                let cql = qualify_cql_with_keyspace(&statement.cql, keyspace);
+                (cql, statement.values.clone())
+            })
             .collect();
         // Batches are homogeneous by construction; the head carries
         // the batch consistency.
@@ -1198,17 +1229,14 @@ impl CassandraTransport for ScyllaCassandraTransport {
         if batch.is_empty() {
             return Ok(());
         }
-        let _ = keyspace;
         let session = self.session().await?;
         // Group by CQL text: one prepared statement per shape, one
         // driver BATCH per group.
         let mut groups: std::collections::HashMap<String, Vec<&CqlBoundStatement>> =
             std::collections::HashMap::new();
         for statement in &batch {
-            groups
-                .entry(statement.cql.clone())
-                .or_default()
-                .push(statement);
+            let cql = qualify_cql_with_keyspace(&statement.cql, keyspace);
+            groups.entry(cql).or_default().push(statement);
         }
         // Batches are homogeneous by construction; the head carries
         // the batch consistency.
@@ -1491,9 +1519,11 @@ impl CassandraSink {
         }
         let millis = now_millis();
         let table = self.config.resolve_table(topic.as_str(), qos, millis)?;
-        // NOTE: the CQL text carries the bare table; the keyspace
-        // binds at the transport (USE) and per batch call.
-        let (statement, encoded_bytes) = self.build_statement(topic, payload, millis)?;
+        // The CQL text carries the qualified table. Transports keep
+        // their own qualify step as a backstop; it leaves a
+        // qualified table unchanged.
+        let (mut statement, encoded_bytes) = self.build_statement(topic, payload, millis)?;
+        statement.cql = qualify_cql_with_keyspace(&statement.cql, &self.config.keyspace);
         let mut buffer = self.buffer.lock();
         let full = buffer.queue.push(CassandraRow { table, statement });
         buffer.bytes = buffer.bytes.saturating_add(encoded_bytes);
@@ -1968,6 +1998,37 @@ mod tests {
             86_400
         );
         assert!(decode_i32_field(b"xx", "ttl").is_err());
+    }
+
+    #[test]
+    fn test_qualify_cql_with_keyspace() {
+        // Bare table names get qualified with the keyspace.
+        assert_eq!(
+            qualify_cql_with_keyspace("INSERT INTO events VALUES (?, ?)", "telemetry"),
+            "INSERT INTO telemetry.events VALUES (?, ?)"
+        );
+        assert_eq!(
+            qualify_cql_with_keyspace("UPDATE events SET x = 1", "telemetry"),
+            "UPDATE telemetry.events SET x = 1"
+        );
+        assert_eq!(
+            qualify_cql_with_keyspace("DELETE FROM events WHERE id = 1", "telemetry"),
+            "DELETE FROM telemetry.events WHERE id = 1"
+        );
+        assert_eq!(
+            qualify_cql_with_keyspace("SELECT * FROM events", "telemetry"),
+            "SELECT * FROM telemetry.events"
+        );
+        // Already-qualified text is returned as-is.
+        assert_eq!(
+            qualify_cql_with_keyspace("INSERT INTO telemetry.events VALUES (?, ?)", "telemetry"),
+            "INSERT INTO telemetry.events VALUES (?, ?)"
+        );
+        // Table names containing a dot are not re-qualified.
+        assert_eq!(
+            qualify_cql_with_keyspace("INSERT INTO schema.events VALUES (?, ?)", "telemetry"),
+            "INSERT INTO schema.events VALUES (?, ?)"
+        );
     }
 
     fn qual_env(name: &str) -> Option<String> {
