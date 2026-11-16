@@ -3236,7 +3236,7 @@ mod tests {
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"id": "pending-keep-source", "type": "console"}),
+                json!({"id": "pending-keep-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/pending-keep-source"}}),
                 &token,
             )
             .await;
@@ -3291,7 +3291,7 @@ mod tests {
             .get_auth("/api/v5/sources/pending-keep-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
 
         // Create of a pending action and source also stores nothing.
         for (path, id) in [
@@ -3485,12 +3485,19 @@ mod tests {
                 "source_types lists non-ready kind {kind}"
             );
         }
-        // MV-03a sets the message-broker source kinds ready, so the
-        // listing holds the ready names and no pending kind.
-        for ready in ["mqtt", "kafka_consumer", "rabbitmq"] {
+        // MV-08 lists only the source kinds with a working ingress
+        // runtime. The MQTT subscriber runs here. The other reference
+        // kinds stay out until their driver consumer lands; a create of
+        // one answers 400 instead of claiming a source that receives
+        // nothing.
+        assert!(
+            source_kinds.contains(&"mqtt"),
+            "source_types lists the ready ingress kind mqtt: {source_kinds:?}"
+        );
+        for unsupported in ["kafka_consumer", "gcp_pubsub_consumer", "rabbitmq"] {
             assert!(
-                source_kinds.contains(&ready),
-                "source_types lists the ready kind {ready}: {source_kinds:?}"
+                !source_kinds.contains(&unsupported),
+                "source_types lists no kind without ingress {unsupported}: {source_kinds:?}"
             );
         }
         for pending in ["timescaledb", "oci_streaming"] {
@@ -32304,7 +32311,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-29-source", "type": "console"}),
+                json!({"name": "w3-29-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-29-source"}}),
                 &token,
             )
             .await;
@@ -32723,7 +32730,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // reports zeroes (W3-31 restores the source directory, so the
         // absence check reads the live summary, not a 404).
         let (status, _) = server
-            .post_auth("/api/v5/sources_probe", json!({"type": "console"}), &token)
+            .post_auth("/api/v5/sources_probe", json!({"type": "mqtt"}), &token)
             .await;
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
@@ -32779,7 +32786,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "sum-src-a", "type": "console"}),
+                json!({"name": "sum-src-a", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/sum-src-a"}}),
                 &token,
             )
             .await;
@@ -32787,7 +32794,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "sum-src-b", "type": "console", "enable": false}),
+                json!({"name": "sum-src-b", "type": "mqtt", "enable": false, "connector": "mqtt:up", "parameters": {"topic": "in/sum-src-b"}}),
                 &token,
             )
             .await;
@@ -32866,13 +32873,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-26-source", "type": "console"}),
+                json!({"name": "w3-26-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-26-source"}}),
                 &token,
             )
             .await;
         assert_eq!(status, 201);
         assert_eq!(body["id"], json!("w3-26-source"));
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
@@ -32888,7 +32895,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-26-source", "type": "console"}),
+                json!({"name": "w3-26-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-26-source"}}),
                 &token,
             )
             .await;
@@ -32933,7 +32940,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-27-source", "type": "console"}),
+                json!({"name": "w3-27-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-27-source"}}),
                 &token,
             )
             .await;
@@ -32944,7 +32951,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-27-source"));
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         assert_eq!(body["enable"], json!(true));
         // Unknown query parameters are ignored on the single read.
         let (status, _) = server
@@ -32955,26 +32962,26 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/w3-27-source",
-                json!({"type": "console", "enable": false}),
+                json!({"type": "mqtt", "enable": false, "connector": "mqtt:up", "parameters": {"topic": "in/w3-27-source"}}),
                 &token,
             )
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-27-source"));
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         assert_eq!(body["enable"], json!(false));
         // Read again sees the new values.
         let (status, body) = server
             .get_auth("/api/v5/sources/w3-27-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         assert_eq!(body["enable"], json!(false));
         // Update of an unknown id is 404 and creates nothing.
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/no-such-source",
-                json!({"type": "console"}),
+                json!({"type": "mqtt"}),
                 &token,
             )
             .await;
@@ -33008,12 +33015,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/sources/w3-27-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         // Mismatched body id is rejected instead of renaming.
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/w3-27-source",
-                json!({"id": "other-source", "type": "console"}),
+                json!({"id": "other-source", "type": "mqtt"}),
                 &token,
             )
             .await;
@@ -33039,7 +33046,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "restart-src", "type": "console"}),
+                json!({"name": "restart-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/restart-src"}}),
                 &token,
             )
             .await;
@@ -33113,7 +33120,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-23-src", "type": "console"}),
+                json!({"name": "w3-23-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-23-src"}}),
                 &token,
             )
             .await;
@@ -33247,7 +33254,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-28-src", "type": "console"}),
+                json!({"name": "w3-28-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-28-src"}}),
                 &token,
             )
             .await;
@@ -33415,7 +33422,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-24-src", "type": "console"}),
+                json!({"name": "w3-24-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-24-src"}}),
                 &token,
             )
             .await;
@@ -36434,10 +36441,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "listed kind {name} is documented"
             );
         }
-        for ready in ["mqtt", "kafka_consumer", "rabbitmq"] {
+        assert!(
+            kinds.contains(&"mqtt"),
+            "type list holds the documented ingress kind mqtt"
+        );
+        for unsupported in ["kafka_consumer", "gcp_pubsub_consumer", "rabbitmq"] {
             assert!(
-                kinds.contains(ready),
-                "type list holds the documented ready kind {ready}"
+                !kinds.contains(unsupported),
+                "type list has no ingress-less kind {unsupported}"
             );
         }
         for pending in ["timescaledb", "oci_streaming"] {
@@ -36464,7 +36475,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w325-probe-src", "type": "console"}),
+                json!({"name": "w325-probe-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w325-probe-src"}}),
                 &token,
             )
             .await;
@@ -36724,22 +36735,22 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn ap05_sources_typed_round_trip() {
-        // AP-05/KC-00: ready kinds (webhook and pgsql) round trip. Pending
+        // AP-05/KC-00: the ready MQTT ingress kind round trips. Pending
         // timescaledb and oci_streaming are refused and store nothing.
-        // MV-03a sets mqtt and kafka_consumer ready, so they no longer
-        // prove the pending refusal here.
+        // MV-08 keeps only the MQTT subscriber as a source with a runtime.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let cases = [
             (
-                "ap05-src-webhook",
-                json!({"type": "webhook", "name": "ap05-src-webhook",
-                       "connector": "webhook:ap05-up",
+                "ap05-src-mqtt-a",
+                json!({"type": "mqtt", "name": "ap05-src-mqtt-a",
+                       "connector": "mqtt:ap05-up",
                        "parameters": {"topic": "in/ap05"}}),
             ),
             (
-                "ap05-src-pgsql",
-                json!({"type": "postgres", "name": "ap05-src-pgsql",
+                "ap05-src-mqtt-b",
+                json!({"type": "mqtt", "name": "ap05-src-mqtt-b",
+                       "connector": "mqtt:ap05-up",
                        "parameters": {"topic": "in/ap05"}}),
             ),
         ];
@@ -36748,7 +36759,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(status, 201, "create for {bare}");
             assert_eq!(created["name"], json!(bare));
             assert!(created["parameters"].is_object());
-            assert_eq!(created["status"], json!("connected"));
+            assert_eq!(created["status"], json!("disconnected"));
+            assert_eq!(created["status_reason"], json!("source is starting"));
             let (status, _) = server
                 .get_auth(&format!("/api/v5/sources/{bare}"), &token)
                 .await;

@@ -31,9 +31,11 @@
 //!   memory per entry; longer ids are rejected with `BAD_REQUEST`);
 //! - the list is not paged, as the reference API documents; the default
 //!   store is empty;
-//! - every entry is three small fields (`id`, `type`, `enable`), so
+//! - every entry holds small scalar fields plus three JSON objects, so
 //!   per-entry memory is constant and a list/summary snapshot clones at
-//!   most the capped list once per request under a short lock.
+//!   most the capped list once per request under a short lock;
+//! - the live status map holds at most one small record per stored
+//!   source (bounded by [`MAX_SOURCES`]) and a restart starts it empty.
 // TODO(parity): which operation names does the documented spec serve
 // beyond `start`/`stop` (for example `restart`)? The rulebook does not
 // decide the exact verb set; the current choice serves exactly
@@ -53,6 +55,16 @@
 // current choice returns the updated source with 200 (mirroring the
 // connector operation) so the resulting state is visible without a
 // second read.
+//
+// Source ingress: only `mqtt` has an ingress runtime in this broker. The
+// runtime connects to the source connector, subscribes to the configured
+// remote topic, and publishes each remote message into the local broker.
+// A reference source kind without a runtime is refused at create and
+// update with `400`. A stored record of an older version stays readable
+// and reports `disconnected` with the reason.
+// TODO(parity): `kafka_consumer`, `gcp_pubsub_consumer` and `rabbitmq`
+// have no ingress runtime yet. The reference defines them, so they stay
+// open until a later task adds the driver consumer and its loopback test.
 
 use axum::{
     extract::{Path, Query, State},
@@ -62,6 +74,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
@@ -79,6 +92,49 @@ pub const MAX_SOURCES: usize = broker_config::MAX_SOURCES;
 /// Longest accepted source `id`. Reason: bounds map-key memory per
 /// entry so one create cannot balloon the store.
 const MAX_SOURCE_ID_LEN: usize = broker_config::MAX_SOURCE_ID_LEN;
+
+/// Source kinds with a working ingress runtime. Reason: a source that
+/// cannot receive from the external system is a facade; the create and
+/// update paths refuse it instead of reporting it as connected. The
+/// reference defines four usable kinds; only the MQTT subscriber runs
+/// here. The other three wait for their driver consumer.
+pub const SUPPORTED_SOURCE_TYPES: &[&str] = &["mqtt"];
+
+/// True when `kind` has a working ingress runtime in this build.
+#[must_use]
+pub fn is_supported_source_type(kind: &str) -> bool {
+    SUPPORTED_SOURCE_TYPES.contains(&kind)
+}
+
+/// Live ingress state of one source, written by the source runtime.
+/// `Connected` means the consumer holds its subscription. `Disconnected`
+/// carries the reason. No value is invented: a source with no runtime
+/// status falls back to the stored enable flag on reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRuntimeStatus {
+    Connected,
+    Disconnected(String),
+}
+
+impl SourceRuntimeStatus {
+    /// Documented status string.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Disconnected(_) => "disconnected",
+        }
+    }
+
+    /// Reason for a disconnected source.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Connected => None,
+            Self::Disconnected(reason) => Some(reason),
+        }
+    }
+}
 
 /// One stored source: operator-chosen bare id, the ingress kind it was
 /// validated against, whether it is enabled (disabled sources stop
@@ -98,8 +154,11 @@ pub struct SourceEntry {
 }
 
 impl SourceEntry {
-    fn to_json(&self) -> serde_json::Value {
-        let status = super::typed::typed_status(self.enable);
+    /// Render the entry with the live runtime status when one exists.
+    fn to_json_with_status(&self, runtime: Option<&SourceRuntimeStatus>) -> serde_json::Value {
+        let status = runtime
+            .map(SourceRuntimeStatus::label)
+            .unwrap_or_else(|| super::typed::typed_status(self.enable));
         let mut obj = serde_json::Map::new();
         obj.insert("id".to_string(), serde_json::Value::String(self.id.clone()));
         obj.insert(
@@ -125,6 +184,12 @@ impl SourceEntry {
             "node_status".to_string(),
             super::typed::typed_node_status(status),
         );
+        if let Some(reason) = runtime.and_then(SourceRuntimeStatus::reason) {
+            obj.insert(
+                "status_reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
         if let Some(extra) = self.params.as_object() {
             for (key, value) in extra {
                 if !obj.contains_key(key) {
@@ -150,6 +215,83 @@ const SOURCE_ENVELOPE_KEYS: &[&str] = &[
     "node_status",
     "status_reason",
 ];
+
+/// Validate one source `resource_opts` object before the store.
+///
+/// The runtime applies these three health fields. It cannot apply an
+/// unknown key. Reason: an accepted value that does nothing breaks the
+/// apply-or-refuse contract. Each value must be a finite duration
+/// string, and the interval must be at least 1 ns. An unknown key and a
+/// malformed duration are refused before storage.
+fn validate_source_resource_opts(id: &str, raw: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = raw.as_object() else {
+        return Err(format!(
+            "source {id:?} field `resource_opts` must be an object"
+        ));
+    };
+    for (key, value) in obj {
+        match key.as_str() {
+            "health_check_interval" => {
+                let interval = source_resource_duration(id, key, value)?;
+                if interval.is_zero() {
+                    return Err(format!(
+                        "source {id:?} field `resource_opts.health_check_interval` must be at least 1ns"
+                    ));
+                }
+            }
+            "health_check_interval_jitter" | "health_check_timeout" => {
+                source_resource_duration(id, key, value)?;
+            }
+            _ => {
+                return Err(format!(
+                    "source {id:?} field `resource_opts.{key}` is not supported"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse one source resource duration such as `250ms`, `15s` or `1h`.
+fn source_resource_duration(
+    id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<Duration, String> {
+    let Some(text) = value.as_str() else {
+        return Err(format!(
+            "source {id:?} field `resource_opts.{key}` must be a duration string"
+        ));
+    };
+    let text = text.trim().to_ascii_lowercase();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .ok_or_else(|| source_resource_duration_error(id, key, value))?;
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number
+        .parse()
+        .map_err(|_| source_resource_duration_error(id, key, value))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(source_resource_duration_error(id, key, value));
+    }
+    let nanos = match unit.trim() {
+        "ns" => number,
+        "us" | "µs" => number * 1_000.0,
+        "ms" => number * 1_000_000.0,
+        "s" => number * 1_000_000_000.0,
+        "m" => number * 60.0 * 1_000_000_000.0,
+        "h" => number * 3600.0 * 1_000_000_000.0,
+        _ => return Err(source_resource_duration_error(id, key, value)),
+    };
+    if nanos > u64::MAX as f64 {
+        return Err(source_resource_duration_error(id, key, value));
+    }
+    Ok(Duration::from_nanos(nanos as u64))
+}
+
+fn source_resource_duration_error(id: &str, key: &str, value: &serde_json::Value) -> String {
+    format!("source {id:?} field `resource_opts.{key}` value {value} is not a valid duration")
+}
 
 /// Split a create or replace body into envelope fields plus extras.
 /// Returns the error text for a 400 answer.
@@ -187,6 +329,18 @@ fn split_source_body(
     if let Some(message) = super::rules::kind_refusal(&kind) {
         return Err(message);
     }
+    // MV-08: a source kind without a working ingress is refused before
+    // anything is stored. A stored record of an older version stays
+    // readable and reports `disconnected` with the reason.
+    if !is_supported_source_type(&kind) {
+        return Err(format!(
+            "source type {kind} has no ingress runtime in this broker"
+        ));
+    }
+    // The reference marks `connector` and `parameters.topic` required.
+    // Create and update refuse a missing value before the store. A
+    // stored record from an older version stays readable, and the
+    // runtime reports the reason.
     // The path id is authoritative. The caller resolves it to the
     // stored bare id first. A body id that names another source is
     // rejected. A type change through replace stays allowed.
@@ -228,6 +382,17 @@ fn split_source_body(
         Some(value) if value.is_object() => value.clone(),
         Some(_) => return Err("field `resource_opts` must be an object".to_string()),
     };
+    validate_source_resource_opts(&id, &resource_opts)?;
+    if connector.trim().is_empty() {
+        return Err("missing required field: connector".to_string());
+    }
+    let has_topic = parameters
+        .get("topic")
+        .and_then(|value| value.as_str())
+        .is_some_and(|topic| !topic.trim().is_empty());
+    if !has_topic {
+        return Err("missing required field: parameters.topic".to_string());
+    }
     let mut extras = serde_json::Map::new();
     for (key, value) in obj {
         if !SOURCE_ENVELOPE_KEYS.contains(&key.as_str()) {
@@ -263,6 +428,10 @@ pub enum SourceInsertError {
 /// messaging (and publish/deliver never touch this store at all).
 pub struct SourceStore {
     inner: RwLock<HashMap<String, SourceEntry>>,
+    /// Live ingress state per source, written by the source runtime.
+    /// Memory-only: a restart starts at `Disconnected` and the runtime
+    /// reports the real state again. Bounded by [`MAX_SOURCES`].
+    runtime: RwLock<HashMap<String, SourceRuntimeStatus>>,
     /// Kernel config registry receiving every mutation (`None` in unit
     /// tests and standalone state, which stay memory-only).
     registry: RwLock<Option<Arc<broker_config::ConfigRegistry>>>,
@@ -276,6 +445,7 @@ impl SourceStore {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            runtime: RwLock::new(HashMap::new()),
             registry: RwLock::new(None),
             save_lock: Mutex::new(()),
         }
@@ -314,6 +484,11 @@ impl SourceStore {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.clear();
+        let mut runtime = self
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.clear();
         for entry in &conf.sources {
             // Old files store an empty document. New files store the
             // envelope (`connector`, `parameters`, `resource_opts`)
@@ -353,6 +528,12 @@ impl SourceStore {
                 }
             }
             let bare = super::typed::bare_name(&entry.id, &entry.source_type);
+            let status = if entry.enable {
+                SourceRuntimeStatus::Disconnected("source is starting".to_string())
+            } else {
+                SourceRuntimeStatus::Disconnected("source is disabled".to_string())
+            };
+            runtime.insert(bare.clone(), status);
             map.insert(
                 bare.clone(),
                 SourceEntry {
@@ -393,6 +574,33 @@ impl SourceStore {
         (total, enabled, total - enabled)
     }
 
+    /// Read the live ingress state of one source. `None` means no runtime
+    /// has reported a state yet (unit tests and standalone state).
+    pub fn runtime_status(&self, id: &str) -> Option<SourceRuntimeStatus> {
+        self.runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    /// Record the live ingress state of one source.
+    pub fn set_runtime_status(&self, id: &str, status: SourceRuntimeStatus) {
+        self.runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.to_string(), status);
+    }
+
+    /// Drop the live ingress state of one source. A later read falls back
+    /// to the stored enable flag.
+    pub fn clear_runtime_status(&self, id: &str) {
+        self.runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+    }
+
     /// Insert one entry. Fails cleanly when the id already exists
     /// (caller maps to `ALREADY_EXISTS`) or the store is at
     /// [`MAX_SOURCES`] (caller maps to `BAD_REQUEST`).
@@ -407,18 +615,31 @@ impl SourceStore {
         if map.len() >= MAX_SOURCES {
             return Err(SourceInsertError::Full);
         }
-        map.insert(entry.id.clone(), entry.clone());
+        let id = entry.id.clone();
+        let status = if entry.enable {
+            SourceRuntimeStatus::Disconnected("source is starting".to_string())
+        } else {
+            SourceRuntimeStatus::Disconnected("source is disabled".to_string())
+        };
+        map.insert(id.clone(), entry.clone());
+        drop(map);
+        self.set_runtime_status(&id, status);
         Ok(entry)
     }
 
     /// Remove one entry by id. Returns false when the id is unknown
     /// (caller maps to `NOT_FOUND`).
     pub fn remove(&self, id: &str) -> bool {
-        self.inner
+        let removed = self
+            .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(id)
-            .is_some()
+            .is_some();
+        if removed {
+            self.clear_runtime_status(id);
+        }
+        removed
     }
 
     /// Read one entry by id. Clones at most one small record under a
@@ -490,8 +711,27 @@ impl SourceStore {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = map.get_mut(id)?;
+        // A flip to the same value keeps the live status.
+        if entry.enable == enable {
+            let updated = entry.clone();
+            drop(map);
+            return Some(updated);
+        }
         entry.enable = enable;
-        Some(entry.clone())
+        let updated = entry.clone();
+        drop(map);
+        if enable {
+            self.set_runtime_status(
+                id,
+                SourceRuntimeStatus::Disconnected("source is starting".to_string()),
+            );
+        } else {
+            self.set_runtime_status(
+                id,
+                SourceRuntimeStatus::Disconnected("source is disabled".to_string()),
+            );
+        }
+        Some(updated)
     }
 
     /// Replace the entry stored under `id` with a validated snapshot.
@@ -505,10 +745,21 @@ impl SourceStore {
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !map.contains_key(id) {
+        let Some(stored) = map.get(id) else {
             return false;
+        };
+        // An identical entry keeps the live status.
+        if *stored == entry {
+            return true;
         }
+        let status = if entry.enable {
+            SourceRuntimeStatus::Disconnected("source is starting".to_string())
+        } else {
+            SourceRuntimeStatus::Disconnected("source is disabled".to_string())
+        };
         map.insert(id.to_string(), entry);
+        drop(map);
+        self.set_runtime_status(id, status);
         true
     }
 
@@ -623,7 +874,11 @@ fn is_known_source_type(kind: &str) -> bool {
 /// rule match in `dispatch_ingress`) with no new lock, allocation or
 /// queue from this route.
 pub async fn list_source_types(Query(_ignored): Query<HashMap<String, String>>) -> Response {
-    let names = super::rules::ready_kind_names(super::typed::SPEC_SOURCE_TYPES, |row| row.source);
+    let names: Vec<&str> =
+        super::rules::ready_kind_names(super::typed::SPEC_SOURCE_TYPES, |row| row.source)
+            .into_iter()
+            .filter(|kind| is_supported_source_type(kind))
+            .collect();
     (StatusCode::OK, Json(serde_json::json!(names))).into_response()
 }
 
@@ -663,7 +918,13 @@ fn source_persist_error(error: broker_config::ConfigError) -> Response {
 /// no allocation on either path).
 pub async fn list_sources(State(state): State<ApiState>) -> Response {
     let entries = state.sources.snapshot();
-    let rows: Vec<serde_json::Value> = entries.iter().map(SourceEntry::to_json).collect();
+    let rows: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            let status = state.sources.runtime_status(&entry.id);
+            entry.to_json_with_status(status.as_ref())
+        })
+        .collect();
     (StatusCode::OK, Json(rows)).into_response()
 }
 
@@ -707,7 +968,12 @@ pub async fn create_source(
             if let Err(error) = state.sources.persist() {
                 return source_persist_error(error);
             }
-            (axum::http::StatusCode::CREATED, Json(entry.to_json())).into_response()
+            let status = state.sources.runtime_status(&id);
+            (
+                axum::http::StatusCode::CREATED,
+                Json(entry.to_json_with_status(status.as_ref())),
+            )
+                .into_response()
         }
         Err(SourceInsertError::Duplicate) => {
             ApiError::AlreadyExists(format!("source {id:?} already exists")).into_response()
@@ -774,7 +1040,14 @@ pub async fn get_source(
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
     match state.sources.get_any(&id) {
-        Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
+        Some(entry) => {
+            let status = state.sources.runtime_status(&entry.id);
+            (
+                StatusCode::OK,
+                Json(entry.to_json_with_status(status.as_ref())),
+            )
+                .into_response()
+        }
         None => ApiError::NotFound(format!("source {id:?} not found")).into_response(),
     }
 }
@@ -844,7 +1117,12 @@ pub async fn update_source(
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    let status = state.sources.runtime_status(&bare);
+    (
+        StatusCode::OK,
+        Json(entry.to_json_with_status(status.as_ref())),
+    )
+        .into_response()
 }
 
 /// `POST /api/v5/sources/:id/:operation`: run one named lifecycle
@@ -1135,9 +1413,9 @@ pub async fn reset_source_metrics(
 /// `GET /api/v5/sources_summary` (C07-22): a bare JSON array with one
 /// summary row per source, as the reference API documents.
 ///
-/// Each row carries `name`, `type` and `enable`, read from the live store.
-/// The broker keeps no health state, no creation time and no rule links
-/// for a source, so the rows leave out `status`, `created_at`,
+/// Each row carries `name`, `type`, `enable` and `status`, read from the
+/// live store and the source runtime. The broker keeps no creation time
+/// and no rule links. The rows therefore omit `created_at`,
 /// `last_modified_at` and `rules` instead of inventing values. An empty
 /// store reads as `[]`. The query parameters `ns` and `only_global` are
 /// ignored. Management-plane only: one bounded snapshot clone per
@@ -1148,10 +1426,16 @@ pub async fn get_sources_summary(State(state): State<ApiState>) -> Response {
         .snapshot()
         .iter()
         .map(|entry| {
+            let status = state
+                .sources
+                .runtime_status(&entry.id)
+                .map(|runtime| runtime.label().to_string())
+                .unwrap_or_else(|| super::typed::typed_status(entry.enable).to_string());
             serde_json::json!({
                 "name": entry.id,
                 "type": entry.source_type,
                 "enable": entry.enable,
+                "status": status,
             })
         })
         .collect();
@@ -1225,7 +1509,7 @@ mod tests {
         assert_eq!(found.id, "a");
         assert!(store.contains_any("webhook:a"));
         assert!(store.get_any("other:a").is_none());
-        let rendered = found.to_json();
+        let rendered = found.to_json_with_status(None);
         assert_eq!(rendered["type"], serde_json::json!("webhook"));
         assert_eq!(rendered["connector"], serde_json::json!(""));
         assert!(rendered["parameters"].is_object());
@@ -1236,9 +1520,9 @@ mod tests {
     fn split_body_accepts_the_documented_envelope() {
         let entry = split_source_body(
             &serde_json::json!({
-                "type": "webhook",
+                "type": "mqtt",
                 "name": "in",
-                "connector": "webhook:up",
+                "connector": "mqtt:up",
                 "parameters": {"topic": "events"},
             }),
             None,
@@ -1250,6 +1534,158 @@ mod tests {
         assert!(
             split_source_body(&serde_json::json!({"name": "x", "type": "nope"}), None).is_err()
         );
+    }
+
+    #[test]
+    fn split_body_refuses_a_missing_connector_or_topic() {
+        let missing_connector = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "parameters": {"topic": "events"},
+            }),
+            None,
+        )
+        .expect_err("a source without a connector is refused");
+        assert!(
+            missing_connector.contains("connector"),
+            "{missing_connector}"
+        );
+        let missing_topic = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {},
+            }),
+            None,
+        )
+        .expect_err("a source without a topic is refused");
+        assert!(
+            missing_topic.contains("parameters.topic"),
+            "{missing_topic}"
+        );
+        let blank_topic = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "  "},
+            }),
+            None,
+        )
+        .expect_err("a blank topic is refused");
+        assert!(blank_topic.contains("parameters.topic"), "{blank_topic}");
+    }
+
+    #[test]
+    fn split_body_validates_resource_opts_before_the_store() {
+        let valid = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "events"},
+                "resource_opts": {
+                    "health_check_interval": "1ms",
+                    "health_check_interval_jitter": "0ms",
+                    "health_check_timeout": "2s",
+                },
+            }),
+            None,
+        )
+        .expect("supported resource options parse");
+        assert_eq!(
+            valid.resource_opts["health_check_interval"],
+            serde_json::json!("1ms")
+        );
+
+        let unknown = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "events"},
+                "resource_opts": {"inventory_unknown": "requested"},
+            }),
+            None,
+        )
+        .expect_err("an unknown resource option is refused");
+        assert!(
+            unknown.contains("resource_opts.inventory_unknown"),
+            "{unknown}"
+        );
+
+        let malformed = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "events"},
+                "resource_opts": {"health_check_interval": "soon"},
+            }),
+            None,
+        )
+        .expect_err("a malformed duration is refused");
+        assert!(malformed.contains("not a valid duration"), "{malformed}");
+
+        let zero = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "events"},
+                "resource_opts": {"health_check_interval": "0ms"},
+            }),
+            None,
+        )
+        .expect_err("a zero interval is refused");
+        assert!(zero.contains("at least 1ns"), "{zero}");
+    }
+
+    #[test]
+    fn seed_marks_persisted_sources_disconnected_until_a_consumer_reports() {
+        let conf = broker_config::SourcesConf {
+            sources: vec![
+                broker_config::SourceEntry {
+                    id: "enabled".to_string(),
+                    source_type: "mqtt".to_string(),
+                    enable: true,
+                    config: serde_json::json!({
+                        "connector": "up",
+                        "parameters": {"topic": "in"},
+                    })
+                    .to_string(),
+                },
+                broker_config::SourceEntry {
+                    id: "disabled".to_string(),
+                    source_type: "mqtt".to_string(),
+                    enable: false,
+                    config: serde_json::json!({
+                        "connector": "up",
+                        "parameters": {"topic": "in"},
+                    })
+                    .to_string(),
+                },
+            ],
+        };
+        let store = SourceStore::new();
+        store.seed_from_snapshot(&conf);
+        assert_eq!(
+            store.runtime_status("enabled"),
+            Some(SourceRuntimeStatus::Disconnected(
+                "source is starting".to_string()
+            ))
+        );
+        assert_eq!(
+            store.runtime_status("disabled"),
+            Some(SourceRuntimeStatus::Disconnected(
+                "source is disabled".to_string()
+            ))
+        );
+        let enabled = store.get("enabled").expect("seeded source reads back");
+        let rendered = enabled.to_json_with_status(store.runtime_status("enabled").as_ref());
+        assert_eq!(rendered["status"], serde_json::json!("disconnected"));
     }
 
     #[test]

@@ -1373,25 +1373,47 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(messages["meta"]["count"], 0)
 
     # // AZ-01 inventory: current behaviour; owner MV-08
-    def test_source_accepts_missing_connector_and_keeps_unused_parameters(self):
+    def test_source_requires_connector_and_topic_and_keeps_unused_parameters(self):
         b = self.boot()
-        config = {"type": "console", "name": "inventorysource", "enable": True,
-                  "connector": "missing", "parameters": {"topic": "inventory/#"},
-                  "resource_opts": {"health_check_interval": "1ms", "health_check_interval_jitter": "1ms",
-                                    "health_check_timeout": "1ms", "inventory_unknown": "requested"},
-                  "inventory_unknown": {"policy": "requested"},
-                  "description": "inventory", "tags": ["audit"]}
+        base = {"type": "mqtt", "name": "inventorysource", "enable": True,
+                "parameters": {"topic": "inventory/#"},
+                "resource_opts": {"health_check_interval": "1ms", "health_check_interval_jitter": "1ms",
+                                  "health_check_timeout": "1ms"},
+                "inventory_unknown": {"policy": "requested"},
+                "description": "inventory", "tags": ["audit"]}
+        missing_connector = {key: value for key, value in base.items() if key != "connector"}
+        status, error = b.http("POST", "/api/v5/sources", missing_connector)
+        self.assertEqual(status, 400)
+        self.assertIn("connector", error["message"])
+        missing_topic = {**base, "connector": "missing", "parameters": {}}
+        status, error = b.http("POST", "/api/v5/sources", missing_topic)
+        self.assertEqual(status, 400)
+        self.assertIn("parameters.topic", error["message"])
+        config = {**base, "connector": "missing"}
         status, created = b.http("POST", "/api/v5/sources", config)
         self.assertEqual(status, 201)
-        self.assertEqual(created["status"], "connected")
         self.assertEqual(created["connector"], "missing")
-        pub, _ = b.connect("source-publisher")
-        publish(b, pub, "inventory/source", b"input")
+        self.assertNotEqual(created["status"], "connected")
         status, source = b.http("GET", "/api/v5/sources/inventorysource")
         self.assertEqual(status, 200)
         self.assertEqual(source["parameters"], config["parameters"])
         self.assertEqual(source["resource_opts"], config["resource_opts"])
         self.assertEqual(source["inventory_unknown"], config["inventory_unknown"])
+        unknown_opt = {**config, "name": "inventorysourceopt",
+                       "resource_opts": {**config["resource_opts"],
+                                         "inventory_unknown": "requested"}}
+        status, error = b.http("POST", "/api/v5/sources", unknown_opt)
+        self.assertEqual(status, 400)
+        self.assertIn("resource_opts.inventory_unknown", error["message"])
+        status, _ = b.http("GET", "/api/v5/sources/inventorysourceopt")
+        self.assertEqual(status, 404)
+        status, error = b.http("PUT", "/api/v5/sources/inventorysource",
+                               {**config, "resource_opts": {"health_check_interval": "soon"}})
+        self.assertEqual(status, 400)
+        self.assertIn("not a valid duration", error["message"])
+        status, source = b.http("GET", "/api/v5/sources/inventorysource")
+        self.assertEqual(status, 200)
+        self.assertEqual(source["resource_opts"], config["resource_opts"])
         status, _ = b.http("PUT", "/api/v5/sources/inventorysource",
                            {**config, "parameters": "invalid"})
         self.assertEqual(status, 400)

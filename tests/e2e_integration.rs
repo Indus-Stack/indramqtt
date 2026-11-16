@@ -51,6 +51,58 @@ impl Kernel {
         let _ = std::fs::remove_dir_all(&self.scratch);
         let _ = std::fs::remove_dir_all(&self.config_dir);
     }
+
+    /// Stop the kernel and start it again on the same config and data
+    /// dirs. The caller observes persisted state and the runtime rebuild.
+    async fn restart(&mut self) {
+        let _ = self.child.kill().await;
+        let mut child = tokio::process::Command::new(shard_kernel_binary())
+            .arg("--config-dir")
+            .arg(&self.config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("respawn real kernel");
+        let http = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", self.api_port);
+        let deadline = std::time::Instant::now() + BOOT;
+        loop {
+            let up = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                http.get(format!("{base}/healthz")).send(),
+            )
+            .await;
+            if let Ok(Ok(res)) = up {
+                if let Ok(text) = res.text().await {
+                    if text == "OK"
+                        && tokio::net::TcpStream::connect(("127.0.0.1", self.mqtt_port))
+                            .await
+                            .is_ok()
+                        && tokio::net::TcpStream::connect(("127.0.0.1", self.ws_port))
+                            .await
+                            .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill().await;
+                panic!(
+                    "kernel did not restart on API {} and MQTT {}",
+                    self.api_port, self.mqtt_port
+                );
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("kernel exited during restart: {status}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        self.child = child;
+    }
 }
 
 /// Takes one free loopback port.
@@ -368,14 +420,22 @@ fn mqtt_connect_packet(client_id: &str) -> Vec<u8> {
 /// Read one MQTT control packet: returns the fixed-header first byte
 /// and the remaining body. Only used with an explicit caller timeout.
 async fn read_mqtt_packet(sock: &mut tokio::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    read_mqtt_packet_from(sock).await
+}
+
+/// Read one MQTT control packet from any async reader.
+async fn read_mqtt_packet_from<R>(reader: &mut R) -> std::io::Result<(u8, Vec<u8>)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
     let mut head = [0u8; 1];
-    sock.read_exact(&mut head).await?;
+    reader.read_exact(&mut head).await?;
     let mut multiplier = 1usize;
     let mut remaining = 0usize;
     loop {
         let mut byte = [0u8; 1];
-        sock.read_exact(&mut byte).await?;
+        reader.read_exact(&mut byte).await?;
         remaining += ((byte[0] & 0x7F) as usize) * multiplier;
         if byte[0] & 0x80 == 0 {
             break;
@@ -389,7 +449,7 @@ async fn read_mqtt_packet(sock: &mut tokio::net::TcpStream) -> std::io::Result<(
         }
     }
     let mut body = vec![0u8; remaining];
-    sock.read_exact(&mut body).await?;
+    reader.read_exact(&mut body).await?;
     Ok((head[0], body))
 }
 
@@ -12860,6 +12920,838 @@ async fn mv00_group_update_and_restart_keep_state() {
     let message = sy02_parse_publish_classic(head, &body);
     assert_eq!(message.topic, format!("mv00/out/{id}"));
     assert_eq!(message.payload, r#"{"key":"x","total":3}"#.as_bytes());
+
+    kernel.finish().await;
+}
+
+/// Loopback MQTT broker for the source ingress tests. It accepts a
+/// CONNECT, answers a SUBSCRIBE, and forwards a test message to each
+/// connection that holds the matching subscription. Drop stops the
+/// accept task and every connection task.
+struct FakeMqttSource {
+    port: u16,
+    active: Arc<AtomicUsize>,
+    subscriptions: Arc<Mutex<Vec<String>>>,
+    written: Arc<AtomicUsize>,
+    broadcasts: tokio::sync::broadcast::Sender<(String, Vec<Vec<u8>>)>,
+    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeMqttSource {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake source broker");
+        let port = listener.local_addr().expect("fake address").port();
+        let active = Arc::new(AtomicUsize::new(0));
+        let subscriptions = Arc::new(Mutex::new(Vec::new()));
+        let written = Arc::new(AtomicUsize::new(0));
+        let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (broadcasts, _) = tokio::sync::broadcast::channel::<(String, Vec<Vec<u8>>)>(64);
+        let task = {
+            let active = Arc::clone(&active);
+            let subscriptions = Arc::clone(&subscriptions);
+            let written = Arc::clone(&written);
+            let connections = Arc::clone(&connections);
+            let broadcasts = broadcasts.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let active = Arc::clone(&active);
+                    let subscriptions = Arc::clone(&subscriptions);
+                    let written = Arc::clone(&written);
+                    let mut receiver = broadcasts.subscribe();
+                    let handle = tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt;
+                        let (mut reader, mut writer) = stream.into_split();
+                        let mut subscription: Option<(String, u8)> = None;
+                        let mut next_packet_id: u16 = 1;
+                        loop {
+                            tokio::select! {
+                                packet = read_mqtt_packet_from(&mut reader) => {
+                                    let Ok((head, body)) = packet else {
+                                        break;
+                                    };
+                                    match head >> 4 {
+                                        1 => {
+                                            if writer.write_all(&[0x20, 0x02, 0x00, 0x00]).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        8 => {
+                                            if body.len() < 4 {
+                                                break;
+                                            }
+                                            let len = u16::from_be_bytes([body[2], body[3]]) as usize;
+                                            if body.len() < 5 + len {
+                                                break;
+                                            }
+                                            let topic = String::from_utf8_lossy(&body[4..4 + len]).to_string();
+                                            let qos = body[4 + len] & 0x03;
+                                            subscription = Some((topic.clone(), qos));
+                                            subscriptions.lock().unwrap().push(topic);
+                                            let ack = [0x90, 0x03, body[0], body[1], qos];
+                                            if writer.write_all(&ack).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        12 if writer.write_all(&[0xD0, 0x00]).await.is_err() => break,
+                                        _ => {}
+                                    }
+                                }
+                                received = receiver.recv() => {
+                                    if let Ok((topic, payloads)) = received {
+                                        if let Some((subscribed, sub_qos)) = subscription.as_ref() {
+                                            if subscribed == &topic {
+                                                let mut batch = Vec::new();
+                                                for payload in &payloads {
+                                                    let qos = (*sub_qos).min(1);
+                                                    let packet = sy02_publish311(
+                                                        &topic,
+                                                        next_packet_id,
+                                                        qos,
+                                                        false,
+                                                        payload,
+                                                    );
+                                                    next_packet_id = next_packet_id.wrapping_add(1).max(1);
+                                                    batch.extend_from_slice(&packet);
+                                                }
+                                                if writer.write_all(&batch).await.is_err() {
+                                                    break;
+                                                }
+                                                written.fetch_add(payloads.len(), Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                    connections.lock().unwrap().push(handle);
+                }
+            })
+        };
+        Self {
+            port,
+            active,
+            subscriptions,
+            broadcasts,
+            written,
+            connections,
+            task,
+        }
+    }
+
+    fn publish(&self, topic: &str, payload: &[u8]) {
+        let _ = self
+            .broadcasts
+            .send((topic.to_string(), vec![payload.to_vec()]));
+    }
+
+    fn publish_burst(&self, topic: &str, payloads: &[Vec<u8>]) {
+        let _ = self.broadcasts.send((topic.to_string(), payloads.to_vec()));
+    }
+
+    fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    fn written(&self) -> usize {
+        self.written.load(Ordering::SeqCst)
+    }
+
+    fn subscription_count(&self) -> usize {
+        self.subscriptions.lock().unwrap().len()
+    }
+}
+
+impl Drop for FakeMqttSource {
+    fn drop(&mut self) {
+        self.task.abort();
+        for handle in self.connections.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+/// Loopback endpoint that closes each accepted connection. The source
+/// driver then fails and retries after the configured interval, so the
+/// accept count shows which interval the runtime applied.
+struct ClosingMqttSource {
+    port: u16,
+    accepts: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ClosingMqttSource {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closing source broker");
+        let port = listener.local_addr().expect("closing address").port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let accepts = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            })
+        };
+        Self {
+            port,
+            accepts,
+            task,
+        }
+    }
+
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ClosingMqttSource {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn sb17_source_status(kernel: &Kernel, id: &str) -> serde_json::Value {
+    let (status, body) = mv00_api(
+        kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/sources/{id}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "source read: {body}");
+    body
+}
+
+async fn sb17_wait_status(kernel: &Kernel, id: &str, want: &str) {
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let body = sb17_source_status(kernel, id).await;
+        if body["status"] == serde_json::json!(want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source {id} did not reach {want}: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn sb17_wait_reason(kernel: &Kernel, id: &str, needle: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let body = sb17_source_status(kernel, id).await;
+        if body["status"] == serde_json::json!("disconnected") {
+            if let Some(reason) = body["status_reason"].as_str() {
+                if reason.contains(needle) {
+                    return body;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source {id} did not report {needle:?}: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn sb17_wait_fake(fake: &FakeMqttSource, want_active: usize, want_subscriptions: usize) {
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        if fake.active() == want_active && fake.subscription_count() >= want_subscriptions {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake broker active={} subscriptions={} (want {want_active}/{want_subscriptions})",
+            fake.active(),
+            fake.subscription_count()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn sb17_mqtt_source_ingress_lifecycle_through_broker() {
+    let fake = FakeMqttSource::start().await;
+    let kernel = spawn_kernel("").await;
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "sb17-conn",
+            "type": "mqtt",
+            "server": format!("127.0.0.1:{}", fake.port),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "source connector create: {body}");
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources",
+        serde_json::json!({
+            "name": "sb17-src",
+            "type": "mqtt",
+            "connector": "sb17-conn",
+            "parameters": {"topic": "sb17/remote", "qos": 0},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "source create: {body}");
+    sb17_wait_status(&kernel, "sb17-src", "connected").await;
+    sb17_wait_fake(&fake, 1, 1).await;
+
+    let mut subscriber = mv00_connect(&kernel, "sb17-sub").await;
+    send_mqtt(&mut subscriber, &sy02_subscribe(1, &[("sb17/remote", 0)])).await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+
+    fake.publish("sb17/remote", br#"{"v":1}"#);
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30, "source ingress is a PUBLISH");
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, "sb17/remote");
+    assert_eq!(message.payload, br#"{"v":1}"#.to_vec());
+
+    // Update with the same remote topic. The old consumer must stop
+    // before the new one starts, so one remote message yields one local
+    // delivery.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/sources/sb17-src",
+        serde_json::json!({
+            "name": "sb17-src",
+            "type": "mqtt",
+            "connector": "sb17-conn",
+            "parameters": {"topic": "sb17/remote", "qos": 1},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "source update: {body}");
+    sb17_wait_status(&kernel, "sb17-src", "connected").await;
+    sb17_wait_fake(&fake, 1, 2).await;
+
+    // An identical update keeps the live connected status.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/sources/sb17-src",
+        serde_json::json!({
+            "name": "sb17-src",
+            "type": "mqtt",
+            "connector": "sb17-conn",
+            "parameters": {"topic": "sb17/remote", "qos": 1},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "identical source update: {body}");
+    assert_eq!(body["status"], serde_json::json!("connected"));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let current = sb17_source_status(&kernel, "sb17-src").await;
+    assert_eq!(current["status"], serde_json::json!("connected"));
+
+    // Start on a running source keeps the live connected status.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources/sb17-src/start",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "start on running source: {body}");
+    let current = sb17_source_status(&kernel, "sb17-src").await;
+    assert_eq!(current["status"], serde_json::json!("connected"));
+
+    // Publish a burst, then update the source while the burst is still
+    // pending. The stopped consumer must drain every packet that the
+    // driver already read, so the whole burst arrives once.
+    let burst: Vec<Vec<u8>> = (0..40)
+        .map(|index| format!("cutover-{index}").into_bytes())
+        .collect();
+    let before = fake.written();
+    fake.publish_burst("sb17/remote", &burst);
+    let deadline = std::time::Instant::now() + STEP;
+    while fake.written() < before + burst.len() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake wrote {} of {} burst messages",
+            fake.written() - before,
+            burst.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/sources/sb17-src",
+        serde_json::json!({
+            "name": "sb17-src",
+            "type": "mqtt",
+            "connector": "sb17-conn",
+            "parameters": {"topic": "sb17/remote", "qos": 0},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "cutover source update: {body}");
+    sb17_wait_status(&kernel, "sb17-src", "connected").await;
+    let mut received = Vec::new();
+    for _ in 0..burst.len() {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30, "cutover burst delivers");
+        received.push(sy02_parse_publish_classic(head, &body).payload);
+    }
+    for expected in &burst {
+        assert!(
+            received.contains(expected),
+            "cutover lost {:?}",
+            String::from_utf8_lossy(expected)
+        );
+    }
+    let extra = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        read_mqtt_packet(&mut subscriber),
+    )
+    .await;
+    assert!(extra.is_err(), "the cutover delivered no duplicate");
+
+    fake.publish("sb17/remote", b"one");
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30, "updated source delivers");
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.payload, b"one".to_vec());
+    let duplicate = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        read_mqtt_packet(&mut subscriber),
+    )
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the stopped consumer must not deliver a second copy"
+    );
+
+    // A reference source kind without an ingress runtime is refused and
+    // leaves the working source in place.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/sources/sb17-src",
+        serde_json::json!({"name": "sb17-src", "type": "kafka_consumer"}),
+    )
+    .await;
+    assert_eq!(status, 400, "unsupported update: {body}");
+    let current = sb17_source_status(&kernel, "sb17-src").await;
+    assert_eq!(current["type"], serde_json::json!("mqtt"));
+    assert_eq!(current["status"], serde_json::json!("connected"));
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources_probe",
+        serde_json::json!({
+            "type": "mqtt",
+            "server": format!("127.0.0.1:{}", fake.port),
+            "parameters": {"topic": "sb17/remote"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 204, "source probe dials a supplied target: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources_probe",
+        serde_json::json!({"type": "mqtt", "server": "127.0.0.1:9"}),
+    )
+    .await;
+    assert_eq!(status, 400, "source probe refuses a closed target: {body}");
+
+    // A source with no connector is refused before the store. The read
+    // answers 404 because nothing was stored.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources",
+        serde_json::json!({
+            "name": "sb17-bad",
+            "type": "mqtt",
+            "parameters": {"topic": "sb17/bad"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "source without connector: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("connector")),
+        "the refusal names the connector: {body}"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/sources/sb17-bad",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "a refused source is not stored");
+
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/sources/sb17-src",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "source delete");
+    let deadline = std::time::Instant::now() + STEP;
+    while fake.active() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delete stops the consumer"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/sources/sb17-src",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "deleted source is unknown");
+
+    kernel.finish().await;
+}
+
+#[tokio::test]
+async fn sb17_source_resource_opts_apply_and_refuse_through_the_api() {
+    let slow_fake = ClosingMqttSource::start().await;
+    let fast_fake = ClosingMqttSource::start().await;
+    let kernel = spawn_kernel("").await;
+
+    for (name, fake) in [
+        ("sb17-opts-slow", &slow_fake),
+        ("sb17-opts-fast", &fast_fake),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            serde_json::json!({
+                "name": format!("{name}-conn"),
+                "type": "mqtt",
+                "server": format!("127.0.0.1:{}", fake.port),
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{name} connector create: {body}");
+    }
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources",
+        serde_json::json!({
+            "name": "sb17-opts-slow",
+            "type": "mqtt",
+            "connector": "sb17-opts-slow-conn",
+            "parameters": {"topic": "sb17/opts"},
+            "resource_opts": {"health_check_interval": "10s"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "slow source create: {body}");
+
+    let fast_body = serde_json::json!({
+        "name": "sb17-opts-fast",
+        "type": "mqtt",
+        "connector": "sb17-opts-fast-conn",
+        "parameters": {"topic": "sb17/opts"},
+        "resource_opts": {"health_check_interval": "10ms"},
+    });
+    let (status, body) =
+        mv00_api(&kernel, reqwest::Method::POST, "/api/v5/sources", fast_body).await;
+    assert_eq!(status, 201, "fast source create: {body}");
+
+    // An unknown key and a malformed duration are refused before the
+    // store on create and update.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources",
+        serde_json::json!({
+            "name": "sb17-opts-bad",
+            "type": "mqtt",
+            "connector": "sb17-opts-fast-conn",
+            "parameters": {"topic": "sb17/opts"},
+            "resource_opts": {"inventory_unknown": "requested"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown resource option create: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("resource_opts.inventory_unknown")),
+        "the refusal names the unknown key: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/sources/sb17-opts-fast",
+        serde_json::json!({
+            "name": "sb17-opts-fast",
+            "type": "mqtt",
+            "connector": "sb17-opts-fast-conn",
+            "parameters": {"topic": "sb17/opts"},
+            "resource_opts": {"health_check_interval": "soon"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "malformed resource option update: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not a valid duration")),
+        "the refusal names the malformed value: {body}"
+    );
+    let current = sb17_source_status(&kernel, "sb17-opts-fast").await;
+    assert_eq!(
+        current["resource_opts"]["health_check_interval"],
+        serde_json::json!("10ms"),
+        "a refused update keeps the stored options: {current}"
+    );
+
+    // The fast interval retries many times inside one slow interval.
+    let deadline = std::time::Instant::now() + STEP;
+    while (fast_fake.accepts() < 3 || slow_fake.accepts() < 1)
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let fast = fast_fake.accepts();
+    let slow = slow_fake.accepts();
+    assert!(
+        fast >= 3,
+        "the fast interval reconnects: fast={fast} slow={slow}"
+    );
+    assert!(
+        (1..=2).contains(&slow),
+        "the slow interval holds the retry: fast={fast} slow={slow}"
+    );
+
+    kernel.finish().await;
+}
+
+#[tokio::test]
+async fn sb17_mqtt_source_survives_restart_and_keeps_delivering() {
+    let fake = FakeMqttSource::start().await;
+    let mut kernel = spawn_kernel("").await;
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "sb17-restart-conn",
+            "type": "mqtt",
+            "server": format!("127.0.0.1:{}", fake.port),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "restart connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources",
+        serde_json::json!({
+            "name": "sb17-restart-src",
+            "type": "mqtt",
+            "connector": "sb17-restart-conn",
+            "parameters": {"topic": "sb17/restart", "qos": 0},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "restart source create: {body}");
+    sb17_wait_status(&kernel, "sb17-restart-src", "connected").await;
+
+    let mut subscriber = mv00_connect(&kernel, "sb17-restart-sub").await;
+    send_mqtt(&mut subscriber, &sy02_subscribe(1, &[("sb17/restart", 0)])).await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    fake.publish("sb17/restart", b"before");
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    assert_eq!(
+        sy02_parse_publish_classic(head, &body).payload,
+        b"before".to_vec()
+    );
+
+    kernel.restart().await;
+    sb17_wait_status(&kernel, "sb17-restart-src", "connected").await;
+
+    let mut subscriber = mv00_connect(&kernel, "sb17-restart-sub2").await;
+    send_mqtt(&mut subscriber, &sy02_subscribe(1, &[("sb17/restart", 0)])).await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    fake.publish("sb17/restart", b"after");
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30, "restarted source delivers");
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, "sb17/restart");
+    assert_eq!(message.payload, b"after".to_vec());
+
+    kernel.finish().await;
+}
+
+#[tokio::test]
+async fn sb17_mqtt_source_stays_in_the_default_tenant() {
+    let fake = FakeMqttSource::start().await;
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "sb17-tenant-conn",
+            "type": "mqtt",
+            "server": format!("127.0.0.1:{}", fake.port),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "tenant connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/sources",
+        serde_json::json!({
+            "name": "sb17-tenant-src",
+            "type": "mqtt",
+            "connector": "sb17-tenant-conn",
+            "parameters": {"topic": "sb17/tenant", "qos": 0},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "tenant source create: {body}");
+    sb17_wait_status(&kernel, "sb17-tenant-src", "connected").await;
+
+    let mut default_sub = mv00_connect(&kernel, "sb17-tenant-default").await;
+    send_mqtt(&mut default_sub, &sy02_subscribe(1, &[("sb17/tenant", 0)])).await;
+    let (head, body) = recv_mqtt(&mut default_sub).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+
+    let mut tenant_sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut tenant_sub,
+        &sy02_connect5("sb17-tenant-a", true, 60, Some(("user-a", b"pw")), None, 0),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut tenant_sub).await;
+    assert_eq!(head, 0x20, "tenant A CONNECT");
+    assert_eq!(sy02_parse_connack5(&body), (false, 0, 10));
+    send_mqtt(
+        &mut tenant_sub,
+        &sy02_subscribe_v5(1, &[("sb17/tenant", 0)], 0),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut tenant_sub).await;
+    assert_eq!(head & 0xf0, 0x90);
+    assert_eq!(sy02_parse_suback5(&body), (1, vec![0]));
+
+    fake.publish("sb17/tenant", b"default-only");
+    let (head, body) = recv_mqtt(&mut default_sub).await;
+    assert_eq!(
+        head & 0xf0,
+        0x30,
+        "the default tenant receives source ingress"
+    );
+    assert_eq!(
+        sy02_parse_publish_classic(head, &body).payload,
+        b"default-only".to_vec()
+    );
+    let leaked = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut tenant_sub),
+    )
+    .await;
+    assert!(leaked.is_err(), "the source output does not reach tenant A");
+
+    kernel.finish().await;
+}
+
+#[tokio::test]
+async fn sb17_mqtt_source_refuses_tls_and_v5_with_a_reason() {
+    let kernel = spawn_kernel("").await;
+
+    for (name, connector_body, needle) in [
+        (
+            "sb17-tls",
+            serde_json::json!({
+                "name": "sb17-tls-conn",
+                "type": "mqtt",
+                "server": "mqtts://127.0.0.1:1",
+            }),
+            "TLS",
+        ),
+        (
+            "sb17-v5",
+            serde_json::json!({
+                "name": "sb17-v5-conn",
+                "type": "mqtt",
+                "server": "127.0.0.1:1",
+                "proto_ver": "v5",
+            }),
+            "v5",
+        ),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/connectors",
+            connector_body,
+        )
+        .await;
+        assert_eq!(status, 201, "{name} connector create: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/sources",
+            serde_json::json!({
+                "name": format!("{name}-src"),
+                "type": "mqtt",
+                "connector": format!("{name}-conn"),
+                "parameters": {"topic": "sb17/refused"},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{name} source create: {body}");
+        sb17_wait_reason(&kernel, &format!("{name}-src"), needle).await;
+    }
 
     kernel.finish().await;
 }

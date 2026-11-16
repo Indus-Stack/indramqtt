@@ -9575,6 +9575,13 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
     if let Some(message) = kind_refusal(&kind) {
         return probe_failed(message);
     }
+    // MV-08: a source kind without a working ingress has no runtime to
+    // probe. Refuse it with the same 400 shape before any dial.
+    if !super::sources::is_supported_source_type(&kind) {
+        return probe_failed(format!(
+            "source type {kind} has no ingress runtime in this broker"
+        ));
+    }
     // Runtime probe hook (the W3-23 dial path): kinds that expose a network
     // target get one bounded dial; kinds without one count as reachable once
     // the kind itself validated, matching the connector/action probes.

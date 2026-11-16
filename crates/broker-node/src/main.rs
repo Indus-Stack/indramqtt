@@ -43,6 +43,7 @@ mod jwks_test_support;
 #[cfg(test)]
 mod link_harness;
 mod native;
+mod source_runtime;
 /// Test directory server (LDAP). Single-sourced in
 /// `crates/broker-auth/src/test_directory_server.rs` (test-only in both
 /// crates), included here with `#[path]` so there is one copy of the
@@ -11104,6 +11105,10 @@ fn start_background_tasks(shared: &Shared) {
     if shared.cluster.is_some() {
         tokio::spawn(run_cluster_inbox(shared.clone()));
     }
+    // Source ingress (MV-08): reconcile the stored sources with the
+    // running consumers. The task reads one bounded snapshot off the
+    // publish path and stops an old consumer before it starts a new one.
+    source_runtime::spawn(shared.clone());
 }
 
 /// Serve the management REST API on an already-bound listener.

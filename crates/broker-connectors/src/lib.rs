@@ -45,6 +45,7 @@ pub mod influxdb;
 pub mod kafka;
 pub mod kinesis;
 pub mod mqtt_bridge;
+pub mod mqtt_source;
 pub mod mssql;
 pub mod mysql;
 pub mod opentsdb;

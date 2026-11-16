@@ -230,9 +230,10 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/cli.md` | 2348 | `OK` |
 | `reference/configuration.md` | 3404 | `OK` |
 | `reference/configuration.md` | 3420 | `OK` |
-| `reference/index.md` | 41 | `OK` |
+| `reference/index.md` | 42 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |
+| `reference/sources.md` | 62 | `status=connected` |
 | `rules/actions.md` | 64 | `delivered` |
 | `rules/actions.md` | 258 | `matched=2 success=2 reset=0` |
 | `rules/functions.md` | 506 | `ok` |
@@ -261,4 +262,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 245 blocks. Each output matches its page.
+The run captured 246 blocks. Each output matches its page.
