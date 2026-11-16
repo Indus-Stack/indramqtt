@@ -21513,6 +21513,54 @@ connector_id = "pending-good"
     }
 
     #[tokio::test]
+    async fn poisoned_admin_user_store_lock_keeps_http_api_answering() {
+        let (server, state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        // Poison the user-map lock: the thread panics while it holds the
+        // write guard, so every later acquisition sees a poisoned lock.
+        let store = Arc::clone(&state.admin_users);
+        let poisoned = tokio::task::spawn_blocking(move || {
+            store.poison_user_store_for_test();
+        })
+        .await;
+        assert!(poisoned.is_err(), "the poison thread must panic");
+
+        // A read through the poisoned lock still answers over HTTP.
+        let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("users data array")
+            .iter()
+            .map(|user| user["username"].as_str().expect("username"))
+            .collect();
+        assert!(names.contains(&"admin"));
+
+        // A write through the poisoned lock also recovers.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "after-poison", "password": "P0ison-pass", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(created["username"], json!("after-poison"));
+
+        // The broker stays up: the next read sees the new user.
+        let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("users data array")
+            .iter()
+            .map(|user| user["username"].as_str().expect("username"))
+            .collect();
+        assert!(names.contains(&"after-poison"));
+    }
+
+    #[tokio::test]
     async fn demoted_admin_token_loses_admin_rights() {
         let (server, _state) = TestServer::start().await;
         let admin_token = server.login_as_admin().await;

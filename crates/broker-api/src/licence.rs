@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::admin_users::RecoverGuard;
 use crate::ApiState;
 
 /// Days before expiry that the status route starts reporting
@@ -40,10 +41,15 @@ pub const EXPIRY_WARN_DAYS_DEFAULT: u64 = 30;
 /// set; every method finishes quickly behind short locks and nothing here
 /// touches the delivery path.
 pub struct LicenceStore {
+    /// Recover: the data directory is a plain optional path.
     data_dir: RwLock<Option<PathBuf>>,
+    /// Recover: the identity is one plain record, set in one assignment.
     identity: RwLock<Option<ClusterIdentity>>,
+    /// Recover: the token is a plain optional string, set in one assignment.
     token: RwLock<Option<String>>,
+    /// Recover: the trusted set is an immutable snapshot behind an `Arc`.
     trusted: RwLock<Arc<TrustedKeys>>,
+    /// Recover: the warning window is a plain integer.
     expiry_warn_days: RwLock<u64>,
 }
 
@@ -71,9 +77,9 @@ impl LicenceStore {
     ) -> Result<InstallationState, String> {
         let identity = ClusterIdentity::load_or_create(data_dir, now_secs)?;
         let token = load_stored_licence(data_dir)?;
-        *self.data_dir.write().expect("licence store lock") = Some(data_dir.to_path_buf());
-        *self.identity.write().expect("licence store lock") = Some(identity.clone());
-        *self.token.write().expect("licence store lock") = token.clone();
+        *self.data_dir.write().recover("licence data dir") = Some(data_dir.to_path_buf());
+        *self.identity.write().recover("licence identity") = Some(identity.clone());
+        *self.token.write().recover("licence token") = token.clone();
         Ok(self.evaluate_with(&identity, token.as_deref(), now_secs))
     }
 
@@ -81,40 +87,43 @@ impl LicenceStore {
     /// keys loaded at boot). Adding a key enrols a new device; removing
     /// one retires it once its last licence expires.
     pub fn set_trusted_keys(&self, trusted: TrustedKeys) {
-        *self.trusted.write().expect("licence store lock") = Arc::new(trusted);
+        *self.trusted.write().recover("licence trusted keys") = Arc::new(trusted);
     }
 
     /// Window in days before expiry that counts as approaching.
     pub fn set_expiry_warn_days(&self, days: u64) {
-        *self.expiry_warn_days.write().expect("licence store lock") = days;
+        *self
+            .expiry_warn_days
+            .write()
+            .recover("licence expiry warning") = days;
     }
 
     /// Stable cluster identity, once loaded.
     pub fn cluster_identity(&self) -> Option<String> {
         self.identity
             .read()
-            .expect("licence store lock")
+            .recover("licence identity")
             .clone()
             .map(|i| i.identity)
     }
 
     /// Stored licence token, once loaded.
     pub fn stored_token(&self) -> Option<String> {
-        self.token.read().expect("licence store lock").clone()
+        self.token.read().recover("licence token").clone()
     }
 
     /// Trial start carried with the cluster identity, once loaded.
     pub fn cluster_trial_started_at(&self) -> Option<u64> {
         self.identity
             .read()
-            .expect("licence store lock")
+            .recover("licence identity")
             .clone()
             .map(|i| i.trial_started_at)
     }
 
     /// Seed an identity directly (tests and tools).
     pub fn set_identity_for_tests(&self, identity: ClusterIdentity) {
-        *self.identity.write().expect("licence store lock") = Some(identity);
+        *self.identity.write().recover("licence identity") = Some(identity);
     }
 
     fn evaluate_with(
@@ -123,7 +132,7 @@ impl LicenceStore {
         token: Option<&str>,
         now_secs: u64,
     ) -> InstallationState {
-        let trusted = self.trusted.read().expect("licence store lock").clone();
+        let trusted = self.trusted.read().recover("licence trusted keys").clone();
         evaluate_installation(identity, token, &trusted, now_secs)
     }
 
@@ -131,9 +140,12 @@ impl LicenceStore {
     /// fresh trial only when nothing was ever loaded; once loaded the
     /// recorded trial start governs restarts.
     pub fn status_at(&self, now_secs: u64) -> serde_json::Value {
-        let identity = self.identity.read().expect("licence store lock").clone();
-        let token = self.token.read().expect("licence store lock").clone();
-        let warn_days = *self.expiry_warn_days.read().expect("licence store lock");
+        let identity = self.identity.read().recover("licence identity").clone();
+        let token = self.token.read().recover("licence token").clone();
+        let warn_days = *self
+            .expiry_warn_days
+            .read()
+            .recover("licence expiry warning");
         match identity {
             None => serde_json::json!({
                 "state": "trial",
@@ -163,7 +175,7 @@ impl LicenceStore {
         let identity = self
             .identity
             .read()
-            .expect("licence store lock")
+            .recover("licence identity")
             .clone()
             .ok_or_else(|| "no cluster identity loaded".to_string())?;
         Ok(LicenceRequest::generate(
@@ -183,16 +195,16 @@ impl LicenceStore {
         let identity = self
             .identity
             .read()
-            .expect("licence store lock")
+            .recover("licence identity")
             .clone()
             .ok_or_else(|| InstallError::Malformed("no cluster identity loaded".to_string()))?;
-        let trusted = self.trusted.read().expect("licence store lock").clone();
+        let trusted = self.trusted.read().recover("licence trusted keys").clone();
         let payload =
             broker_cluster::verify_for_install(token, &identity.identity, &trusted, now_secs)?;
-        if let Some(dir) = self.data_dir.read().expect("licence store lock").clone() {
+        if let Some(dir) = self.data_dir.read().recover("licence data dir").clone() {
             cluster_install(&dir, token, &identity.identity, &trusted, now_secs)?;
         }
-        *self.token.write().expect("licence store lock") = Some(token.trim().to_string());
+        *self.token.write().recover("licence token") = Some(token.trim().to_string());
         Ok(payload)
     }
 
@@ -205,9 +217,12 @@ impl LicenceStore {
         alarms: &crate::v5::alarms::AlarmStore,
         now_secs: u64,
     ) -> InstallationState {
-        let identity = self.identity.read().expect("licence store lock").clone();
-        let token = self.token.read().expect("licence store lock").clone();
-        let warn_days = *self.expiry_warn_days.read().expect("licence store lock");
+        let identity = self.identity.read().recover("licence identity").clone();
+        let token = self.token.read().recover("licence token").clone();
+        let warn_days = *self
+            .expiry_warn_days
+            .read()
+            .recover("licence expiry warning");
         let Some(identity) = identity else {
             return InstallationState::Trial {
                 days_remaining: broker_cluster::TRIAL_DAYS,
