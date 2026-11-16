@@ -950,9 +950,8 @@ impl AwsIotSink {
     }
 
     /// Flush buffered rows (no-op when empty). Throttles and
-    /// disconnects retry in-loop with backoff. Exhaustion drops the
-    /// batch and engages backoff. Rejections restore the buffer
-    /// and propagate.
+    /// disconnects retry in-loop with backoff. Exhaustion restores
+    /// the buffer, engages backoff and returns the error.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();

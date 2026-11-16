@@ -1005,8 +1005,7 @@ impl AzureIotSink {
 
     /// Flush buffered rows (no-op when empty). 401 forces one SAS
     /// renewal and one retry. Throttles retry in-loop. Exhaustion
-    /// drops the batch and engages backoff. Rejections restore
-    /// the buffer and propagate.
+    /// restores the buffer, engages backoff and returns the error.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
@@ -1886,7 +1885,7 @@ mod tests {
         // The write path uses the broker-facing `Sink`.
         // `send` buffers one row. `flush` publishes through TLS.
         // No hub listens on the loopback port.
-        // `flush` fails with a retryable error and drops the batch.
+        // `flush` fails with a retryable error and restores the batch.
         let mut config = sas_test_config("127.0.0.1:1");
         config.max_retries = Some(0);
         config.connect_timeout_ms = Some(200);
