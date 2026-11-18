@@ -259,3 +259,34 @@ test = "kafka_headers_none_through_broker"
 
 [items."kafka.header_encode_mode.Json"]
 test = "kafka_headers_json_through_broker"
+
+# influxdb
+[items."influxdb.endpoint"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.bucket"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.org"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.token"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.measurement_template"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.precision"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.batch_size"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.batch_timeout_ms"]
+test = "influxdb_batch_timeout_through_broker"
+
+[items."influxdb.request_timeout_ms"]
+test = "influxdb_request_timeout_through_broker"
+
+[items."influxdb.tls"]
+not_built = { file = "crates/broker-connectors/src/influxdb.rs", line = 44, reason = "InfluxDbSinkConfig has no tls field; the sink speaks plaintext HTTP via reqwest with no TLS option" }
