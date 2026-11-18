@@ -290,3 +290,19 @@ test = "influxdb_request_timeout_through_broker"
 
 [items."influxdb.tls"]
 not_built = { file = "crates/broker-connectors/src/influxdb.rs", line = 44, reason = "InfluxDbSinkConfig has no tls field; the sink speaks plaintext HTTP via reqwest with no TLS option" }
+
+# mysql
+[items."mysql.connection_url"]
+test = "mysql_auth_through_broker"
+
+[items."mysql.sql_template"]
+test = "mysql_forward_through_broker"
+
+[items."mysql.pool_size"]
+test = "mysql_pool_size_through_broker"
+
+[items."mysql.batch_size"]
+test = "mysql_batch_size_through_broker"
+
+[items."mysql.batch_timeout_ms"]
+test = "mysql_batch_timeout_through_broker"

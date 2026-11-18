@@ -162,3 +162,6 @@ time = "0.3"
 
 # The e2e helper uses this driver to read records back.
 rdkafka = { version = "0.39", features = ["ssl"] }
+# The MySQL e2e helper reads rows back through this driver. The version
+# and features match crates/broker-connectors so the same protocol runs.
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }

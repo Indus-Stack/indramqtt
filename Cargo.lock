@@ -1639,6 +1639,7 @@ dependencies = [
  "futures",
  "http",
  "jsonwebtoken",
+ "mysql_async",
  "openssl",
  "parking_lot",
  "picky-asn1",
