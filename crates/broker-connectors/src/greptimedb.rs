@@ -11,7 +11,8 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -696,11 +697,11 @@ pub struct GreptimeDbSink {
     queue: Mutex<BatchQueue<GreptimeRecord>>,
     backoff: Mutex<BackoffState>,
     sent: AtomicU64,
-    /// Last emitted stamp in the configured precision.
-    /// The server keeps the last row per stamp on one series.
-    /// Rapid writes in one unit would collapse into one row.
-    /// The sink hands out strictly increasing stamps.
-    last_timestamp: AtomicI64,
+    /// Last emitted stamp per series (`table|topic`) in the configured
+    /// precision. Bounded to `MAX_SERIES_TIMESTAMPS` entries so memory is
+    /// capped and collisions are resolved per series without advancing
+    /// unrelated tables or series into the future.
+    last_by_series: Mutex<HashMap<String, i64>>,
 }
 
 impl GreptimeDbSink {
@@ -716,7 +717,7 @@ impl GreptimeDbSink {
             queue: Mutex::new(BatchQueue::new(batch_size, GREPTIME_BATCH_LINGER)),
             backoff: Mutex::new(BackoffState::default()),
             sent: AtomicU64::new(0),
-            last_timestamp: AtomicI64::new(0),
+            last_by_series: Mutex::new(HashMap::new()),
         })
     }
 
@@ -732,30 +733,26 @@ impl GreptimeDbSink {
         self.queue.lock().len()
     }
 
-    /// Next stamp in the configured precision.
-    /// Uses the wall clock when it moves forward.
-    /// Bumps the last stamp by one unit on collision.
-    /// Reason: colliding stamps merge on the server.
-    /// Source: server last-row merge on one series.
-    fn next_timestamp(&self, candidate: i64) -> i64 {
-        let mut last = self.last_timestamp.load(Ordering::Relaxed);
-        loop {
-            let now_scaled = self
-                .config
-                .timestamp_precision
-                .scale_timestamp(now_millis());
-            let fresh = candidate.max(now_scaled);
-            let next = if fresh > last { fresh } else { last + 1 };
-            match self.last_timestamp.compare_exchange_weak(
-                last,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return next,
-                Err(actual) => last = actual,
-            }
+    /// Next stamp in the configured precision for one series (`table|topic`).
+    /// Preserves wall-clock timestamps and only bumps within that series
+    /// when consecutive writes collide in the same precision unit.
+    fn next_timestamp(&self, series_key: &str, candidate: i64) -> i64 {
+        const MAX_SERIES_TIMESTAMPS: usize = 10_000;
+        let now_scaled = self
+            .config
+            .timestamp_precision
+            .scale_timestamp(now_millis());
+        let fresh = candidate.max(now_scaled);
+        let mut map = self.last_by_series.lock();
+        if map.len() >= MAX_SERIES_TIMESTAMPS && !map.contains_key(series_key) {
+            map.clear();
         }
+        let next = match map.get(series_key).copied() {
+            Some(prev) if fresh <= prev => prev + 1,
+            _ => fresh,
+        };
+        map.insert(series_key.to_string(), next);
+        next
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -874,7 +871,8 @@ impl Sink for GreptimeDbSink {
         let mut rec = extract_greptime_record(payload, topic.as_str(), &self.config)?;
         // Keep stamps strictly increasing on one sink.
         // Rapid sends in one unit would share a stamp and merge.
-        rec.timestamp = self.next_timestamp(rec.timestamp);
+        let series_key = format!("{}|{}", rec.table, topic.as_str());
+        rec.timestamp = self.next_timestamp(&series_key, rec.timestamp);
         let should_flush = {
             let mut q = self.queue.lock();
             // Bounded backlog: past the effective capacity the sink
@@ -940,6 +938,35 @@ impl Connector for GreptimeDbConnector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn greptimedb_timestamps_do_not_drift_across_tables_or_series() {
+        let cfg = super::GreptimeDbConfig {
+            endpoint: "http://127.0.0.1:4000".into(),
+            database: "public".into(),
+            table_template: "${topic_segment_0}".into(),
+            format: super::GreptimeFormat::SqlInsert,
+            timestamp_precision: super::GreptimePrecision::Second,
+            batch_size: Some(10),
+            buffer_capacity: None,
+            auth: None,
+            timeout_ms: None,
+        };
+        let sink = super::GreptimeDbSink::new(
+            cfg,
+            std::sync::Arc::new(super::MockGreptimeDbTransport::new()),
+        )
+        .unwrap();
+        let now_s = super::GreptimePrecision::Second.scale_timestamp(super::now_millis());
+        for _ in 0..20 {
+            let _ = sink.next_timestamp("table_a|table_a/s1", now_s);
+        }
+        let table_b_ts = sink.next_timestamp("table_b|table_b/s1", now_s);
+        assert!(
+            table_b_ts <= now_s + 1,
+            "unrelated table timestamp drifted into future: {table_b_ts} vs now {now_s}"
+        );
+    }
+
     use super::*;
 
     fn sample_sql_config() -> GreptimeDbConfig {

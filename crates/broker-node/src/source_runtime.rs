@@ -171,14 +171,19 @@ pub fn spawn(shared: Shared) {
     };
     handle.spawn(async move {
         let mut running: HashMap<String, RunningSource> = HashMap::new();
+        let mut last_topics: HashMap<String, String> = HashMap::new();
         loop {
-            reconcile(&shared, &mut running).await;
+            reconcile(&shared, &mut running, &mut last_topics).await;
             tokio::time::sleep(SOURCE_RECONCILE_INTERVAL).await;
         }
     });
 }
 
-async fn reconcile(shared: &Shared, running: &mut HashMap<String, RunningSource>) {
+async fn reconcile(
+    shared: &Shared,
+    running: &mut HashMap<String, RunningSource>,
+    last_topics: &mut HashMap<String, String>,
+) {
     let entries = shared.sources.snapshot();
     let mut seen = HashSet::with_capacity(entries.len());
     for entry in entries {
@@ -195,14 +200,22 @@ async fn reconcile(shared: &Shared, running: &mut HashMap<String, RunningSource>
             .await;
             continue;
         }
-        match build_config(&entry, &shared.connectors) {
-            Ok(config) => {
+        match build_config(&entry, shared) {
+            Ok(mut config) => {
                 let unchanged = running
                     .get(&entry.id)
-                    .is_some_and(|current| current.config == config);
+                    .is_some_and(|current| current.config.same_config(&config));
                 if unchanged {
                     continue;
                 }
+                if !config.clean_session {
+                    if let Some(prev) = last_topics.get(&entry.id) {
+                        if prev != &config.topic {
+                            config.previous_topic = Some(prev.clone());
+                        }
+                    }
+                }
+                last_topics.insert(entry.id.clone(), config.topic.clone());
                 stop(
                     shared,
                     running,
@@ -248,6 +261,7 @@ async fn reconcile(shared: &Shared, running: &mut HashMap<String, RunningSource>
         .cloned()
         .collect();
     for id in missing {
+        last_topics.remove(&id);
         stop(shared, running, &id, None).await;
     }
 }
@@ -331,10 +345,8 @@ impl DeliveryHandler {
     }
 }
 
-fn build_config(
-    entry: &SourceEntry,
-    connectors: &broker_api::v5::rules::ConnectorStore,
-) -> Result<MqttSourceConfig, String> {
+fn build_config(entry: &SourceEntry, shared: &Shared) -> Result<MqttSourceConfig, String> {
+    let connectors = &shared.connectors;
     if !is_supported_source_type(&entry.source_type) {
         return Err(format!(
             "source type {} has no ingress runtime in this broker",
@@ -401,6 +413,12 @@ fn build_config(
     if endpoint.tls {
         return Err("MQTT source TLS is not enabled in this build".to_string());
     }
+    if is_self_listener_target(&endpoint.host, endpoint.port, shared) {
+        return Err(format!(
+            "MQTT source connector {:?} targets this broker's own listener ({}:{}) and would create a publish loop",
+            entry.connector, endpoint.host, endpoint.port
+        ));
+    }
     let proto = connector
         .get("proto_ver")
         .and_then(|value| value.as_str())
@@ -438,6 +456,7 @@ fn build_config(
         keep_alive_secs,
         clean_session,
         topic,
+        previous_topic: None,
         qos,
         retry_delay: health.retry_delay(&entry.id),
         connection_timeout: health.timeout,
@@ -494,4 +513,50 @@ fn parse_seconds(text: &str) -> Result<u16, String> {
         .filter(|seconds| *seconds <= u64::from(u16::MAX))
         .ok_or_else(|| format!("field `keepalive` is too large: {text:?}"))?;
     Ok(seconds as u16)
+}
+
+fn is_self_listener_target(host: &str, port: u16, shared: &Shared) -> bool {
+    let Ok(guard) = shared.api_listeners.read() else {
+        return false;
+    };
+    let Some(listeners) = guard.as_ref() else {
+        return false;
+    };
+    let binds = [
+        (listeners.tcp.enabled, listeners.tcp.bind.as_str()),
+        (listeners.tls.enabled, listeners.tls.bind.as_str()),
+    ];
+    for (enabled, bind) in binds {
+        if !enabled {
+            continue;
+        }
+        let Ok(addr) = bind.parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        if addr.port() != port {
+            continue;
+        }
+        if host_targets_listener(host, addr.ip()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn host_targets_listener(host: &str, bind_ip: std::net::IpAddr) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return bind_ip.is_loopback() || bind_ip.is_unspecified();
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        if ip == bind_ip {
+            return true;
+        }
+        if (ip.is_loopback() || ip.is_unspecified())
+            && (bind_ip.is_loopback() || bind_ip.is_unspecified())
+        {
+            return true;
+        }
+    }
+    false
 }
