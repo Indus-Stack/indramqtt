@@ -765,8 +765,50 @@ async fn sr01_auto_subscribe_uses_verified_identity() {
         Some(("pubsuper", b"Pub-super-1a")),
     )
     .await;
+    let mut subscriber = sr01_connect5(
+        kernel.mqtt_port,
+        "sr01-super-subscriber",
+        Some(("pubsuper", b"Pub-super-1a")),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let listed = tokio::time::timeout(
+            STEP,
+            http.get(format!(
+                "{base}/api/v5/clients/sr01-super-subscriber/subscriptions"
+            ))
+            .bearer_auth(API_KEY)
+            .send(),
+        )
+        .await
+        .expect("subscription list in time")
+        .expect("subscription list sends");
+        assert_eq!(listed.status(), 200, "subscription list reads");
+        let text = listed.text().await.expect("subscription list reads");
+        if text.contains("sr01/auto/#") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "auto-subscription sr01/auto/# registers in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let reason = sr01_publish_reason(&mut publisher, 1, "sr01/auto/data").await;
     assert_eq!(reason, 0, "the verified superuser publishes");
+    let (head, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_mqtt(&mut subscriber),
+    )
+    .await
+    .expect("permitted super-subscriber receives in time");
+    assert_eq!(head & 0xF0, 0x30, "permitted client gets a PUBLISH");
+    let got = sy02_parse_publish_v5(head, &body);
+    assert_eq!(
+        got.topic, "sr01/auto/data",
+        "permitted super-subscriber receives the auto-subscribed publish"
+    );
     let delivery = tokio::time::timeout(
         std::time::Duration::from_millis(500),
         recv_mqtt(&mut victim),
@@ -779,6 +821,49 @@ async fn sr01_auto_subscribe_uses_verified_identity() {
 
     let _ = std::fs::remove_file(&cert_path);
     kernel.finish().await;
+}
+
+/// MN-12: the subscription-table quota answers per protocol version.
+///
+/// A version-4 SUBACK allows only 0x00-0x02 and 0x80, so a version-4
+/// client refused for quota gets 0x80. A version-5 client gets 0x97.
+/// One kernel serves a version-4 fill plus a version-5 probe.
+#[tokio::test]
+async fn mn12_subscription_quota_codes_by_protocol_version() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let kernel = spawn_kernel("").await;
+        let mut v4 = dial_mqtt(kernel.mqtt_port).await;
+        send_mqtt(&mut v4, &mqtt_connect_packet("mn12-v4-fill")).await;
+        let (head, body) = recv_mqtt(&mut v4).await;
+        assert_eq!(head, 0x20, "kernel answers v4 with CONNACK");
+        assert_eq!(body, vec![0x00, 0x00], "v4 CONNECT is accepted");
+        for batch in 0..100u32 {
+            let owned: Vec<String> = (0..1000u32).map(|n| format!("mn12/{batch}/{n}")).collect();
+            let refs: Vec<(&str, u8)> = owned.iter().map(|f| (f.as_str(), 0u8)).collect();
+            let packet_id = batch as u16 + 1;
+            send_mqtt(&mut v4, &sy02_subscribe(packet_id, &refs)).await;
+            let (head, body) = recv_mqtt(&mut v4).await;
+            assert_eq!(head & 0xF0, 0x90, "kernel answers v4 with SUBACK");
+            let (got_id, codes) = sy02_parse_suback(&body);
+            assert_eq!(got_id, packet_id, "v4 SUBACK mirrors packet id");
+            assert_eq!(codes.len(), 1000, "each SUBACK holds 1000 codes");
+            assert!(
+                codes.iter().all(|c| *c == 0),
+                "fill batch {batch} grants every filter"
+            );
+        }
+        send_mqtt(&mut v4, &sy02_subscribe(101, &[("mn12/over", 0)])).await;
+        let (head, body) = recv_mqtt(&mut v4).await;
+        assert_eq!(head & 0xF0, 0x90, "kernel answers v4 with SUBACK");
+        let (_, codes) = sy02_parse_suback(&body);
+        assert_eq!(codes, vec![0x80u8], "version-4 quota refusal answers 0x80");
+        let mut v5 = sr01_connect5(kernel.mqtt_port, "mn12-v5-probe", None).await;
+        let code = sr01_subscribe_code(&mut v5, 1, "mn12/over5").await;
+        assert_eq!(code, 0x97, "version-5 quota refusal answers 0x97");
+        kernel.finish().await;
+    })
+    .await
+    .expect("mn12 quota flow completes in time");
 }
 
 /// Backup file download through the broker HTTP API (C18-05).

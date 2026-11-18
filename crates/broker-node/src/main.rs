@@ -6573,12 +6573,10 @@ async fn apply_subscribe(
         // connection's own session, so two tenants sharing a client id
         // subscribe independently.
         // B4-08 bound: a new entry past MAX_SUBSCRIPTIONS is denied fail
-        // closed (existing delivery proceeds); report MQTT 5 0x97 Quota
-        // Exceeded — the same code the broker uses for publish rate quota
-        // — and register nothing (no session mirror, no grant, no announce,
-        // no retained replay), never success for a subscription with no store.
-        // TODO(parity): is 0x97 the observable reference behaviour for a
-        // subscription-table bound, or does it answer 0x80 Unspecified error?
+        // closed. Existing delivery proceeds. A version-5 client gets 0x97
+        // Quota Exceeded; a version-4 client gets 0x80. The denial
+        // registers nothing (no session mirror, no grant, no announce,
+        // no retained replay).
         let mut sub = Subscription::with_options(
             client_id.clone(),
             frame.header.conn_id,
@@ -6592,7 +6590,11 @@ async fn apply_subscribe(
         sub.tenant = tenant.clone().into();
         let stored = shared.router.subscribe(&filter, sub);
         if !stored {
-            codes.push(V5_SUBACK_QUOTA_EXCEEDED);
+            codes.push(if entry.has_options {
+                V5_SUBACK_QUOTA_EXCEEDED
+            } else {
+                V5_SUBACK_UNSPECIFIED
+            });
             continue;
         }
         // Per-client decision cache (W2-01): record the grant on the
