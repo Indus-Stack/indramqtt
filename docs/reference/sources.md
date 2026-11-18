@@ -1,3 +1,10 @@
+---
+title: "Sources"
+description: "Receive messages from external systems and put them into the broker."
+sidebar:
+  order: 89
+---
+
 # Sources
 
 A source receives messages from an external system and puts them into the
