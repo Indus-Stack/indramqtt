@@ -10702,7 +10702,7 @@ connector_id = "pending-good"
             .rsplit_once(' ')
             .unwrap_or_else(|| panic!("line: {text}"));
         assert_eq!(
-            head, "m,topic=mv02b/nl\\nrow qos=0i,payload=\"{\\\"msg\\\":\\\"line1\\nline2\\\"}\"",
+            head, "m,topic=mv02b/nl\\nrow qos=0i,payload=\"{\\\"msg\\\":\\\"line1\\\\nline2\\\"}\"",
             "line: {text}"
         );
         assert!(

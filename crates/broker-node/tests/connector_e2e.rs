@@ -16,6 +16,8 @@ mod http_connector_e2e;
 mod influxdb_e2e;
 #[path = "connector_e2e/kafka_e2e.rs"]
 mod kafka_e2e;
+#[path = "connector_e2e/mn10_e2e.rs"]
+mod mn10_e2e;
 #[path = "connector_e2e/mqtt_bridge_e2e.rs"]
 mod mqtt_bridge_e2e;
 #[path = "connector_e2e/mysql_e2e.rs"]
