@@ -2175,22 +2175,13 @@ The code holds one exclusion table with a reason for each entry:
 
 ## Limits
 
-- One `/mcp` request body holds 8 MiB or less. The cap counts the
-  whole JSON-RPC envelope as text, base64 and all, so a binary payload
-  carried in `body_base64` is limited to roughly 6 MiB before encoding
-  (8 MiB divided by the ~4/3 base64 expansion). The outer cap is
-  checked first; a larger envelope gets `413`.
-- The decoded `body_base64` payload itself is capped at 8 MiB, as is
-  any `body` JSON payload. The outer 8 MiB request cap applies first,
-  so an envelope that already exceeds 8 MiB is rejected before decoding.
-- One tool answer holds 8 MiB or less, counting the answer bytes before
-  any base64 envelope. Larger files stay available over the HTTP route
-  directly.
+- An envelope above 8 MiB gets HTTP 413.
+- A `body_base64` value that is not base64 gives a tool error.
 - At most 8 collects run at once. The ninth fails closed. Each
   collect holds at most 128 queued messages of at most 64 KiB each.
 - No multipart operation exists in the router. File uploads take JSON
   or raw bytes through `body` or `body_base64`; file downloads return
-  through the base64 envelope. The same 8 MiB limit applies both ways.
+  through the base64 envelope.
 - The management API defines no request rate limit, so `/mcp` defines
   none either. TODO(parity): decide a shared management rate limit.
 - Each inner handler still applies its own body cap to the re-entered

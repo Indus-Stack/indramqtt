@@ -243,6 +243,7 @@ async fn mcp_client_proof() {
         "cluster",
         "license",
         "audit",
+        "gateways",
     ] {
         assert!(group_names.contains(&wanted.to_string()), "{group_names:?}");
     }
