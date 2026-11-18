@@ -4663,6 +4663,10 @@ async fn mv00_restart(kernel: &mut Kernel) {
         .kill()
         .await
         .expect("stop broker before restart");
+    // Wait for the old broker to exit so its listeners release
+    // before the new broker binds the same ports. Reason: an
+    // immediate rebind can fail with EADDRINUSE under parallel load.
+    let _ = kernel.child.wait().await;
     kernel.child = tokio::process::Command::new(shard_kernel_binary())
         .arg("--config-dir")
         .arg(&kernel.config_dir)

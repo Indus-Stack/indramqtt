@@ -13,11 +13,15 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 
 ```mermaid
 flowchart LR
-    G0["node + operate"] -- "set" --> Kernel["kernel"]
-    G1["listeners"] -- "set" --> Kernel["kernel"]
-    G2["session + quotas"] -- "set" --> Kernel["kernel"]
-    G3["rules + delayed"] -- "set" --> Kernel["kernel"]
-    G4["auth + user stores"] -- "set" --> Kernel["kernel"]
+    G0["node + operate"] -- "set node.id" --> Kernel["kernel"]
+    G1["listeners"] -- "set listeners.tcp.bind" --> ListenerStore["ListenerStore"]
+    ListenerStore -- "serve" --> Kernel["kernel"]
+    G2["session + quotas"] -- "set session.max_packet_size" --> SessionManager["SessionManager"]
+    SessionManager -- "hold" --> Kernel["kernel"]
+    G3["rules + delayed"] -- "set rules_engine.window_channel_depth" --> RuleEngine["RuleEngine"]
+    RuleEngine -- "apply" --> Kernel["kernel"]
+    G4["auth + user stores"] -- "set auth.enabled" --> ApiState["ApiState"]
+    ApiState -- "guard" --> Kernel["kernel"]
 ```
 
 ## node

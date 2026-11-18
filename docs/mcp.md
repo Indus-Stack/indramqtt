@@ -163,7 +163,8 @@ One entry per tool, in route-table order within each toolset. The
 fields, `query` carries query keys, `body` carries the JSON body and
 `body_base64` carries raw bytes in base64 (use either `body` or
 `body_base64`, never both). Verified examples were captured against a
-running broker with an Administrator API key.
+running broker with an Administrator API key. The full catalogue with
+one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 
 ### `broker_status`
 
