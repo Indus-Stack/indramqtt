@@ -624,7 +624,7 @@ mod tests {
     async fn qos1_burst_beyond_channel_cap_does_not_stall_and_acks_all() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let total = (MQTT_SOURCE_CHANNEL_CAP * 2 + 22) as usize;
+        let total = MQTT_SOURCE_CHANNEL_CAP * 2 + 22;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _connect = read_mqtt_packet(&mut stream).await;
