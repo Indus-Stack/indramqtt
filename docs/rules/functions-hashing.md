@@ -1,6 +1,6 @@
 ---
-title: Rule functions: hashing
-description: Verified entries for the hashing functions.
+title: "Rule functions: hashing"
+description: "Verified entries for the hashing functions."
 sidebar:
   order: 51
 ---

@@ -1,6 +1,6 @@
 ---
-title: Rule functions: arrays
-description: Verified entries for the array functions.
+title: "Rule functions: arrays"
+description: "Verified entries for the array functions."
 sidebar:
   order: 50
 ---

@@ -51,7 +51,11 @@ def render(ledger):
             "Every row has entry evidence or a stated no-runtime-effect reason. "
             "A complete inventory does not mean that a stored setting works.\n\n"
         )
-    text = "# Stored setting audit\n\n" + intro
+    text = (
+        "---\ntitle: \"Stored setting audit\"\n"
+        "description: \"Stored settings, the code that reads them, and their current behaviour.\"\n"
+        "---\n\n# Stored setting audit\n\n" + intro
+    )
     text += """```mermaid
 flowchart LR
     F["Startup file<br/>file.*"] --> S["Config registry<br/>data_dir/state.toml"]

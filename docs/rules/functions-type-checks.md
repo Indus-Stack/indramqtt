@@ -1,6 +1,6 @@
 ---
-title: Rule functions: type checks
-description: Verified entries for the type check functions.
+title: "Rule functions: type checks"
+description: "Verified entries for the type check functions."
 sidebar:
   order: 49
 ---

@@ -1,12 +1,28 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { fileURLToPath } from 'node:url';
+import remarkMdLinks from './remark-md-links.mjs';
+import { remarkMermaid } from './src/plugins/mermaid.mjs';
+
+function mermaidIntegration() {
+  return {
+    name: 'indramqtt-mermaid',
+    hooks: {
+      'astro:config:setup': ({ injectScript }) => {
+        injectScript('page', 'import "/src/scripts/mermaid-client.js";');
+      },
+    },
+  };
+}
 
 // Static site for the user documentation. It reads `docs/` at build
 // time (see the `sync-docs` script in `package.json`).
 export default defineConfig({
-  // The docs mark expected command output with `output` fences.
-  // This name joins the highlighter so the build prints no warning.
   markdown: {
+    remarkPlugins: [
+      remarkMermaid,
+      [remarkMdLinks, { docsRoot: fileURLToPath(new URL('./src/content/docs', import.meta.url)) }],
+    ],
     shikiConfig: {
       langs: [
         {
@@ -18,9 +34,13 @@ export default defineConfig({
     },
   },
   integrations: [
+    mermaidIntegration(),
     starlight({
       title: 'IndraMQTT',
       description: 'The complete MQTT platform in one small binary.',
+      components: {
+        Head: './src/components/overrides/Head.astro',
+      },
       sidebar: [
         {
           label: 'Start here',

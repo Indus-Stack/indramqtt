@@ -1,6 +1,6 @@
 ---
-title: Rule events
-description: Verified entries for each rule event source.
+title: "Rule events"
+description: "Verified entries for each rule event source."
 sidebar:
   order: 57
 ---
