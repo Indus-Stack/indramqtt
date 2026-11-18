@@ -4752,33 +4752,48 @@ async fn mv00_restart(kernel: &mut Kernel) {
     // before the new broker binds the same ports. Reason: an
     // immediate rebind can fail with EADDRINUSE under parallel load.
     let _ = kernel.child.wait().await;
-    kernel.child = tokio::process::Command::new(shard_kernel_binary())
-        .arg("--config-dir")
-        .arg(&kernel.config_dir)
-        .arg("--allow-anonymous")
-        .env("INDRA_API_KEYS", API_KEY)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("restart broker");
-    let deadline = std::time::Instant::now() + BOOT;
+    let mut attempt = 0;
     loop {
-        if let Ok(Ok(response)) = tokio::time::timeout(
-            STEP,
-            reqwest::Client::new()
-                .get(format!("http://127.0.0.1:{}/healthz", kernel.api_port))
-                .send(),
-        )
-        .await
-        {
-            if response.text().await.expect("health body") == "OK"
-                && tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port))
-                    .await
-                    .is_ok()
+        attempt += 1;
+        kernel.child = tokio::process::Command::new(shard_kernel_binary())
+            .arg("--config-dir")
+            .arg(&kernel.config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("restart broker");
+        let deadline = std::time::Instant::now() + BOOT;
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Ok(response)) = tokio::time::timeout(
+                STEP,
+                reqwest::Client::new()
+                    .get(format!("http://127.0.0.1:{}/healthz", kernel.api_port))
+                    .send(),
+            )
+            .await
             {
-                return;
+                if response.text().await.expect("health body") == "OK"
+                    && tokio::net::TcpStream::connect(("127.0.0.1", kernel.mqtt_port))
+                        .await
+                        .is_ok()
+                {
+                    return;
+                }
             }
+            if let Ok(Some(_)) = kernel.child.try_wait() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if exited && attempt < 3 {
+            let _ = kernel.child.wait().await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -4788,7 +4803,7 @@ async fn mv00_restart(kernel: &mut Kernel) {
             kernel.child.try_wait().expect("restart status").is_none(),
             "restarted broker stays running"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        break;
     }
 }
 

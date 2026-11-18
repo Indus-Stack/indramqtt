@@ -515,6 +515,7 @@ impl IotDbTransport for MockIotDbTransport {
 pub struct HttpIotDbTransport {
     url: String,
     client: reqwest::Client,
+    timeout: Duration,
 }
 
 impl HttpIotDbTransport {
@@ -523,6 +524,7 @@ impl HttpIotDbTransport {
         Ok(Self {
             url: config.tablet_url(),
             client,
+            timeout: config.timeout(),
         })
     }
 }
@@ -536,6 +538,7 @@ impl IotDbTransport for HttpIotDbTransport {
             .header(reqwest::header::AUTHORIZATION, auth.header_value()?)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(render_tablet_body(&req))
+            .timeout(self.timeout)
             .send()
             .await
             .map_err(|e| ConnectorError::Connection(format!("iotdb insert failed: {e}")))?;
@@ -591,6 +594,7 @@ struct IotDbRow {
 struct IotDbBuffer {
     queue: BatchQueue<IotDbRow>,
     bytes: usize,
+    last_millis: i64,
 }
 
 /// IoTDB sink: buffers rows, writes tablets grouped by device.
@@ -611,6 +615,7 @@ impl IotDbSink {
             buffer: parking_lot::Mutex::new(IotDbBuffer {
                 queue: BatchQueue::new(config.effective_batch_size(), linger),
                 bytes: 0,
+                last_millis: 0,
             }),
             config,
             transport,
@@ -783,9 +788,12 @@ impl IotDbSink {
                 "iotdb row requires a non-empty topic".to_string(),
             ));
         }
-        let millis = now_millis();
-        let (row, bytes) = self.build_row(topic, payload, qos, millis)?;
         let mut buffer = self.buffer.lock();
+        // Rows of one device need distinct times, or the server
+        // overwrites the earlier row.
+        let millis = now_millis().max(buffer.last_millis.saturating_add(1));
+        buffer.last_millis = millis;
+        let (row, bytes) = self.build_row(topic, payload, qos, millis)?;
         let full = buffer.queue.push(row);
         buffer.bytes = buffer.bytes.saturating_add(bytes);
         Ok(full || buffer.bytes >= self.config.effective_batch_bytes())
@@ -820,6 +828,7 @@ impl Sink for IotDbSink {
         }
         {
             let mut buffer = self.buffer.lock();
+            buffer.last_millis = buffer.last_millis.max(previous);
             for (row, bytes) in built {
                 buffer.queue.push(row);
                 buffer.bytes = buffer.bytes.saturating_add(bytes);

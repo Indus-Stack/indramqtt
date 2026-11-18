@@ -306,3 +306,70 @@ test = "mysql_batch_size_through_broker"
 
 [items."mysql.batch_timeout_ms"]
 test = "mysql_batch_timeout_through_broker"
+
+# iotdb
+[items."iotdb.endpoint"]
+test = "iotdb_end_to_end_through_broker"
+
+[items."iotdb.device_path_template"]
+test = "iotdb_end_to_end_through_broker"
+
+[items."iotdb.auth"]
+test = "iotdb_auth_through_broker"
+
+[items."iotdb.auth.username"]
+test = "iotdb_auth_through_broker"
+
+[items."iotdb.auth.password"]
+test = "iotdb_auth_through_broker"
+
+[items."iotdb.is_aligned"]
+test = "iotdb_aligned_through_broker"
+
+[items."iotdb.measurements"]
+test = "iotdb_end_to_end_through_broker"
+
+[items."iotdb.data_types"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.data_types.Boolean"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.data_types.Int32"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.data_types.Int64"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.data_types.Float"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.data_types.Double"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.data_types.Text"]
+test = "iotdb_data_types_through_broker"
+
+[items."iotdb.batch_size"]
+test = "iotdb_batch_size_through_broker"
+
+[items."iotdb.batch_bytes"]
+test = "iotdb_batch_bytes_through_broker"
+
+[items."iotdb.linger_ms"]
+not_built = { file = "crates/broker-connectors-enterprise/src/iotdb.rs", line = 797, reason = "the sink has no background timer to flush on linger_ms alone" }
+
+[items."iotdb.max_retries"]
+test = "iotdb_retry_through_broker"
+
+[items."iotdb.initial_backoff_ms"]
+test = "iotdb_retry_through_broker"
+
+[items."iotdb.max_backoff_ms"]
+test = "iotdb_retry_through_broker"
+
+[items."iotdb.timeout_ms"]
+not_built = { file = "crates/broker-api/src/lib.rs", line = 2395, reason = "live timeout requires docker pause or a delay server not available in qualification; setting is proved through HTTP API per ruling (b).7" }
+
+[items."iotdb.tls"]
+not_built = { file = "crates/broker-connectors-enterprise/src/iotdb.rs", line = 137, reason = "the sink config has no TLS field" }
