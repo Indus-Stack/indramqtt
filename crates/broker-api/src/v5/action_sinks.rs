@@ -10621,7 +10621,11 @@ mod tests {
                 .expect("send joins the buffer");
         }
         let deadline = Instant::now() + Duration::from_secs(3);
-        while metrics.snapshot().dropped == 0 && Instant::now() < deadline {
+        while (metrics.snapshot().dropped == 0
+            || metrics.snapshot().success == 0
+            || metrics.snapshot().inflight > 0)
+            && Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let snapshot = metrics.snapshot();

@@ -184,6 +184,11 @@ async fn apply_candidate(
         return Err(Box::new(bad_request(err)));
     }
     let previous = state.config.snapshot();
+    // A new pending IoT record is refused at the file-load entry. A record
+    // already stored by an older version stays readable and is kept.
+    if let Some(message) = refuse_new_pending_iot(&previous, candidate) {
+        return Err(Box::new(bad_request(message)));
+    }
     // An empty administrator list restores the default account and its
     // default password. Refuse a candidate that removes all the
     // administrators of an installation. Thus a reload or a restore
@@ -471,6 +476,40 @@ fn validate_connector_io_settings(snapshot: &FullSnapshot) -> Result<(), String>
         crate::v5::action_sinks::validate_connector_io_bounds(&params, &entry.id, "config file")?;
     }
     Ok(())
+}
+
+/// Refuse a candidate that adds a pending IoT connector or action.
+///
+/// A stored record with the same id and kind is kept, so an older state
+/// file still reads and deletes. Only a new file-load entry is refused.
+fn refuse_new_pending_iot(previous: &FullSnapshot, candidate: &FullSnapshot) -> Option<String> {
+    for entry in &candidate.connectors.connectors {
+        if !crate::v5::rules::is_mvp_pending_iot_kind(&entry.connector_type) {
+            continue;
+        }
+        let stored = previous
+            .connectors
+            .connectors
+            .iter()
+            .any(|old| old.id == entry.id && old.connector_type == entry.connector_type);
+        if !stored {
+            return crate::v5::rules::kind_refusal(&entry.connector_type);
+        }
+    }
+    for entry in &candidate.actions.actions {
+        if !crate::v5::rules::is_mvp_pending_iot_kind(&entry.action_type) {
+            continue;
+        }
+        let stored = previous
+            .actions
+            .actions
+            .iter()
+            .any(|old| old.id == entry.id && old.action_type == entry.action_type);
+        if !stored {
+            return crate::v5::rules::kind_refusal(&entry.action_type);
+        }
+    }
+    None
 }
 
 fn resolve_params_secrets_in_place(

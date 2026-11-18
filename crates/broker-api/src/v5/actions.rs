@@ -981,6 +981,16 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     // reaches the old target.
     let previous = state.engine.connectors().get(&key);
     state.engine.connectors().unregister(&key);
+    // A console record shares its runtime under the bare connector
+    // name, as create does. Remove it with the delete; an unknown
+    // name is a no-op. The shared generation drains through the key
+    // flush above.
+    if crate::v5::action_sinks::canonical_action_kind(stored.action_type.as_str()) == "console" {
+        let bare_name = stored.connector.trim();
+        if !bare_name.is_empty() {
+            state.engine.connectors().unregister(bare_name);
+        }
+    }
     if let Some(old) = previous {
         let _ = old.flush().await;
     }
@@ -1062,6 +1072,13 @@ pub async fn update_action(
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // Old console bare name for the shared capture below. Create
+    // registers the console runtime under the dispatch key and the
+    // bare connector name; update and delete mirror that rule.
+    let old_bare = stored.connector.trim().to_string();
+    let old_console_bare =
+        crate::v5::action_sinks::canonical_action_kind(stored.action_type.as_str()) == "console"
+            && !old_bare.is_empty();
     // MV-01/R2: the connector's flag rides along with every dispatch
     // mirror and with the rollback below. Probed from the OLD record:
     // the update can move the action to another connector, so the
@@ -1130,6 +1147,13 @@ pub async fn update_action(
     let previous = state.engine.connectors().get(&key);
     let wiring = staged.wiring;
     let probe_on_create = staged.probe_on_create;
+    // New console bare name for the shared capture. Only a console
+    // record with a non-empty trimmed connector shares the runtime
+    // under the bare name, as create does.
+    let new_bare = entry.connector.trim().to_string();
+    let new_console_bare =
+        crate::v5::action_sinks::canonical_action_kind(entry.action_type.as_str()) == "console"
+            && !new_bare.is_empty();
     match &staged.sink {
         Some(sink) => {
             let sink = crate::v5::action_sinks::wrap_action_runtime(
@@ -1150,6 +1174,19 @@ pub async fn update_action(
                 .engine
                 .connectors()
                 .register(key.clone(), Arc::clone(&sink));
+            // A stale bare name leaves with the old generation: the
+            // bare name changed or the record is no longer a console
+            // record with a bare name. The same bare name still
+            // console keeps one registration through the write below.
+            if old_console_bare && (!new_console_bare || old_bare != new_bare) {
+                state.engine.connectors().unregister(&old_bare);
+            }
+            if new_console_bare {
+                state
+                    .engine
+                    .connectors()
+                    .register(new_bare, Arc::clone(&sink));
+            }
             state
                 .alarms
                 .deactivate(&format!("action_build_failed:{bare}"));
@@ -1160,6 +1197,11 @@ pub async fn update_action(
             // drains below through `previous`.
             if previous.is_some() {
                 state.engine.connectors().unregister(&key);
+            }
+            // No new runtime exists, so no bare name can share it. A
+            // stale bare name from the old record is removed.
+            if old_console_bare {
+                state.engine.connectors().unregister(&old_bare);
             }
             if let crate::v5::actions::ActionWiring::Failed(message) = &wiring {
                 state.alarms.activate(

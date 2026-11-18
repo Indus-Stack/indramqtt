@@ -2655,11 +2655,17 @@ mod tests {
     /// depends on it; it only orders tests.
     static CONNECTOR_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Settle delay before a dead-target leg. Reason: a closed socket
+    /// becomes visible at the next poll.
+    const DEAD_SOCKET_SETTLE_MS: u64 = 300;
+
     /// In-process HTTP round-trip over loopback TCP: no extra crates, no
     /// daemons. The server is spawned per test and aborted at the end.
     struct TestServer {
         port: u16,
         task: tokio::task::JoinHandle<()>,
+        mqtt_task: tokio::task::JoinHandle<()>,
+        mqtt_port: u16,
     }
 
     struct TestState {
@@ -2730,7 +2736,16 @@ mod tests {
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.expect("serve test app");
             });
-            (Self { port, task }, state)
+            let (mqtt_port, mqtt_task) = mv03c_start_mqtt_ingress(engine.clone()).await;
+            (
+                Self {
+                    port,
+                    task,
+                    mqtt_task,
+                    mqtt_port,
+                },
+                state,
+            )
         }
 
         async fn request(&self, raw: &str) -> (u16, Value) {
@@ -5236,6 +5251,167 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 202, "publish drives the rule path");
+    }
+
+    /// Next MQTT client number for through-broker publishes.
+    static MV03C_MQTT_CLIENT_SEQ: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    /// Publish one JSON event through a real MQTT client socket. The
+    /// socket connects to the broker listener and sends QoS 0 on the
+    /// topic. The call returns after the send; the caller polls the
+    /// target fake or the action metrics for the delivery.
+    async fn mv03c_publish_mqtt(port: u16, topic: &str, payload: &str) {
+        let id = MV03C_MQTT_CLIENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let client_id = format!("mv03c-pub-{id}");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect mqtt listener");
+        stream
+            .write_all(&mqtt_connect(&client_id, None, None))
+            .await
+            .expect("write CONNECT");
+        let mut connack = [0u8; 4];
+        stream
+            .read_exact(&mut connack)
+            .await
+            .expect("connack answers");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0, "anonymous connect succeeds");
+        stream
+            .write_all(&mqtt_publish(topic, 0, 0, payload.as_bytes()))
+            .await
+            .expect("write PUBLISH");
+        let _ = stream.flush().await;
+        let _ = stream.write_all(&[0xE0, 0x00]).await;
+        let _ = stream.shutdown().await;
+    }
+
+    /// Read one MQTT variable-byte integer from the ingress socket.
+    async fn mv03c_mqtt_read_varint(stream: &mut tokio::net::TcpStream) -> Option<usize> {
+        let mut value = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.ok()?;
+            value |= ((byte[0] & 0x7F) as usize) << shift;
+            if byte[0] & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+            if shift > 21 {
+                return None;
+            }
+        }
+    }
+
+    /// Serve one raw MQTT ingress connection. Each QoS 0 PUBLISH
+    /// drives the stored rule path through `dispatch_ingress`.
+    async fn mv03c_handle_mqtt_conn(mut stream: tokio::net::TcpStream, engine: Arc<RuleEngine>) {
+        let mut fixed = [0u8; 1];
+        if stream.read_exact(&mut fixed).await.is_err() {
+            return;
+        }
+        if fixed[0] >> 4 != 1 {
+            return;
+        }
+        let Some(len) = mv03c_mqtt_read_varint(&mut stream).await else {
+            return;
+        };
+        let mut body = vec![0u8; len];
+        if stream.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        if stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.is_err() {
+            return;
+        }
+        loop {
+            let mut head = [0u8; 1];
+            if stream.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            match head[0] >> 4 {
+                3 => {
+                    let Some(len) = mv03c_mqtt_read_varint(&mut stream).await else {
+                        return;
+                    };
+                    let mut rest = vec![0u8; len];
+                    if stream.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    if rest.len() < 2 {
+                        continue;
+                    }
+                    let topic_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                    if rest.len() < 2 + topic_len {
+                        continue;
+                    }
+                    let topic = String::from_utf8_lossy(&rest[2..2 + topic_len]).to_string();
+                    let qos = (head[0] & 0x06) >> 1;
+                    let (packet_id, payload) = if qos == 0 {
+                        (0u16, rest[2 + topic_len..].to_vec())
+                    } else {
+                        if rest.len() < 2 + topic_len + 2 {
+                            continue;
+                        }
+                        let pid = u16::from_be_bytes([rest[2 + topic_len], rest[3 + topic_len]]);
+                        (pid, rest[4 + topic_len..].to_vec())
+                    };
+                    if let Ok(parsed) = Topic::new(topic) {
+                        let sink: Arc<dyn broker_rules::BrokerSink> = Arc::new(NoopBrokerSink);
+                        let _ = engine
+                            .dispatch_ingress(
+                                &parsed,
+                                &bytes::Bytes::from(payload),
+                                QoS::AtMostOnce,
+                                &sink,
+                            )
+                            .await;
+                    }
+                    if qos == 1
+                        && stream
+                            .write_all(&[
+                                0x40,
+                                0x02,
+                                (packet_id >> 8) as u8,
+                                (packet_id & 0xFF) as u8,
+                            ])
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                12 => {
+                    if stream.write_all(&[0xD0, 0x00]).await.is_err() {
+                        return;
+                    }
+                }
+                14 => return,
+                _ => return,
+            }
+        }
+    }
+
+    /// Start a raw MQTT listener for through-broker tests. Each
+    /// PUBLISH on it runs the rule engine. Returns the port and task handle.
+    async fn mv03c_start_mqtt_ingress(
+        engine: Arc<RuleEngine>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mqtt ingress");
+        let port = listener.local_addr().expect("mqtt addr").port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let engine = Arc::clone(&engine);
+                tokio::spawn(mv03c_handle_mqtt_conn(stream, engine));
+            }
+        });
+        (port, handle)
     }
 
     /// Poll one action's metrics until `failed` reaches `want`.
@@ -14183,30 +14359,29 @@ connector_id = "pending-good"
             );
         }
         // A stored record of a pending kind stays readable but never starts.
-        let mut candidate = state.config.snapshot().as_ref().clone();
-        candidate
-            .connectors
-            .connectors
-            .push(broker_config::ConnectorEntry {
-                id: "mv03b-pending-stored".to_string(),
-                connector_type: "aws_iot".to_string(),
-                enable: true,
-                config: "{}".to_string(),
-            });
-        candidate.actions.actions.push(broker_config::ActionEntry {
-            id: "mv03b-pending-stored-act".to_string(),
-            action_type: "aws_iot".to_string(),
-            enable: true,
-            config: json!({"connector": "mv03b-pending-stored", "parameters": {}}).to_string(),
-        });
-        let (status, out) = server
-            .post_auth(
-                "/api/v1/config/reload",
-                json!({"snapshot": candidate, "actor": "mv03b", "summary": "pending iot"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 200, "a stored pending record reloads: {out}");
+        // Write it to the boot file, as an older state file would hold it.
+        drop(server);
+        drop(state);
+        let dir = unique_data_dir("mv03b-pending-stored");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let pending_state = r#"
+[[connectors.connectors]]
+id = "mv03b-pending-stored"
+connector_type = "aws_iot"
+enable = true
+config = '{}'
+
+[[actions.actions]]
+id = "mv03b-pending-stored-act"
+action_type = "aws_iot"
+enable = true
+config = '{"connector":"mv03b-pending-stored","parameters":{}}'
+"#;
+        std::fs::write(dir.join("state.toml"), pending_state).expect("write pending state");
+        let registry =
+            Arc::new(ConfigRegistry::load_for_boot(&dir).expect("pending state loads for boot"));
+        let (server, state) = TestServer::start_with_registry(registry).await;
+        let token = server.login_as_admin().await;
         assert!(
             state
                 .engine
@@ -14227,6 +14402,120 @@ connector_id = "pending-good"
                 .contains("not available"),
             "the stored connector names the refusal: {stored}"
         );
+        // A stored pending action never starts either.
+        assert!(
+            state
+                .engine
+                .connectors()
+                .get(&broker_config::v5_action_sink_key(
+                    "mv03b-pending-stored-act"
+                ))
+                .is_none(),
+            "a stored pending action does not start"
+        );
+        let (status, stored) = server
+            .get_auth("/api/v5/actions/mv03b-pending-stored-act", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(stored["status"], json!("disconnected"));
+        assert!(
+            stored["status_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not available"),
+            "the stored action names the refusal: {stored}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03b_pending_iot_kinds_refuse_at_probe_and_replay_stored_state() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Same driver bodies as the create-refusal test.
+        let bodies = [
+            (
+                "aws_iot",
+                json!({"endpoint": "127.0.0.1:8883", "region": "us-east-1",
+                       "client_id": "pending-1",
+                       "client_cert_pem": "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----",
+                       "client_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----"}),
+            ),
+            (
+                "azure_iot",
+                json!({"iot_hub_name": "127.0.0.1:8883", "device_id": "edge-1",
+                       "shared_access_key": "secret"}),
+            ),
+            (
+                "oci_streaming",
+                json!({"endpoint": "https://cell-1.streaming.us-east-1.oraclecloud.com",
+                       "stream_pool_id": "ocid1.streampool.oc1.phx.aaa",
+                       "stream_id": "ocid1.stream.oc1.phx.aaa",
+                       "tenancy_ocid": "ocid1.tenancy.oc1..aaa",
+                       "user_ocid": "ocid1.user.oc1..aaa",
+                       "fingerprint": "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
+                       "private_key_pem": "key"}),
+            ),
+        ];
+        for (kind, fields) in &bodies {
+            let mut body = fields.as_object().expect("object").clone();
+            body.insert("type".to_string(), json!(kind));
+            body.insert(
+                "name".to_string(),
+                json!(format!("mv03b-pending-probe-{kind}")),
+            );
+            // Each probe entry refuses before any dial.
+            for path in ["/api/v5/connectors_probe", "/api/v5/actions_probe"] {
+                let (status, out) = server
+                    .post_auth(path, Value::Object(body.clone()), &token)
+                    .await;
+                assert_eq!(status, 400, "{kind} probe {path} refuses: {out}");
+                assert_eq!(
+                    out["code"], "TEST_FAILED",
+                    "{kind} probe {path} code: {out}"
+                );
+                let message = out["message"].as_str().unwrap_or("");
+                assert!(
+                    message.contains("not available"),
+                    "{kind} probe {path} names the refusal: {out}"
+                );
+                assert!(
+                    message.contains(kind),
+                    "{kind} probe {path} names the kind: {out}"
+                );
+            }
+        }
+        // A file load that carries a pending kind refuses.
+        for (kind, _) in &bodies {
+            let mut candidate = state.config.snapshot().as_ref().clone();
+            candidate
+                .connectors
+                .connectors
+                .push(broker_config::ConnectorEntry {
+                    id: format!("mv03b-pending-file-{kind}"),
+                    connector_type: kind.to_string(),
+                    enable: true,
+                    config: "{}".to_string(),
+                });
+            let (status, out) = server
+                .post_auth(
+                    "/api/v1/config/reload",
+                    json!({"snapshot": candidate, "actor": "mv03b", "summary": "refuse pending iot"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "a file load refuses {kind}: {out}");
+            let text = out.to_string();
+            assert!(
+                text.contains("not available"),
+                "{kind} file load names the refusal: {out}"
+            );
+            assert!(
+                text.contains(kind),
+                "{kind} file load names the kind: {out}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14267,7 +14556,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 201);
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":21}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":21}").await;
         let got = fake.wait_for(1).await;
         assert_eq!(got[0].method, "POST");
         assert!(
@@ -14291,7 +14580,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 200);
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":22}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":22}").await;
         let got = fake.wait_for(2).await;
         assert!(
             got[1].path.contains("/updated/mv03c/http"),
@@ -14309,7 +14598,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 400, "a non-string header refuses: {body}");
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":23}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":23}").await;
         let got = fake.wait_for(3).await;
         assert!(
             got[2].path.contains("/updated/mv03c/http"),
@@ -14317,7 +14606,7 @@ connector_id = "pending-good"
             got[2].path
         );
         drop(fake);
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":24}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":24}").await;
         let mut failed = 0;
         for _ in 0..100 {
             let (status, metrics) = server
@@ -14348,7 +14637,7 @@ connector_id = "pending-good"
             .await;
         assert_eq!(status, 200, "stored entry survives the restart");
         let fake = Mv02bFake::start_on(port, 200, "{}").await;
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":25}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":25}").await;
         // Metrics are memory-only, so the restarted broker starts at
         // zero and this first delivery reads one success.
         mv02b_wait_success(&server, &token, "mv03c-http-act", 1).await;
@@ -15007,7 +15296,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 201);
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":21}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":21}").await;
         for _ in 0..100 {
             if !received.lock().expect("fake lock").is_empty() {
                 break;
@@ -15033,7 +15322,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 200);
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":22}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":22}").await;
         for _ in 0..100 {
             if received.lock().expect("fake lock").len() >= 2 {
                 break;
@@ -15064,9 +15353,8 @@ connector_id = "pending-good"
         }
         // Let the driver observe the closed sockets before the next send.
         // Reason: a closed socket becomes visible at the next poll.
-        const DEAD_SOCKET_SETTLE_MS: u64 = 300;
         tokio::time::sleep(std::time::Duration::from_millis(DEAD_SOCKET_SETTLE_MS)).await;
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":23}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":23}").await;
         let mut failed = 0;
         for _ in 0..100 {
             let (status, metrics) = server
@@ -15094,7 +15382,7 @@ connector_id = "pending-good"
             endpoint_for_fake,
             std::sync::Arc::clone(&connections),
         ));
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":24}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":24}").await;
         for _ in 0..100 {
             if received.lock().expect("fake lock").len() >= 3 {
                 break;
@@ -15275,7 +15563,7 @@ connector_id = "pending-good"
             "spBv1.0/plant1/NBIRTH/edge1",
             "spBv1.0/plant1/NDEATH/edge1",
         ] {
-            mv02b_publish(&server, &token, topic, "{\"metrics\":{\"temp\":21}}").await;
+            mv03c_publish_mqtt(server.mqtt_port, topic, "{\"metrics\":{\"temp\":21}}").await;
         }
         for _ in 0..100 {
             if received.lock().expect("fake lock").len() >= 3 {
@@ -15316,9 +15604,8 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 200);
-        mv02b_publish(
-            &server,
-            &token,
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":22}}",
         )
@@ -15353,9 +15640,8 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 400, "a wildcard prefix refuses: {body}");
-        mv02b_publish(
-            &server,
-            &token,
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":23}}",
         )
@@ -15378,10 +15664,10 @@ connector_id = "pending-good"
         }
         // Let the driver's event loop observe the closed socket before
         // the next send, so the dead-target failure is deterministic.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        mv02b_publish(
-            &server,
-            &token,
+        // Reason: a closed socket becomes visible at the next poll.
+        tokio::time::sleep(std::time::Duration::from_millis(DEAD_SOCKET_SETTLE_MS)).await;
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":24}}",
         )
@@ -15464,9 +15750,8 @@ connector_id = "pending-good"
                 }
             }
         });
-        mv02b_publish(
-            &server,
-            &token,
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":25}}",
         )
@@ -15530,7 +15815,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 201);
-        mv02b_publish(&server, &token, "mv03c/local", "{\"v\":21}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/local", "{\"v\":21}").await;
         mv02b_wait_success(&server, &token, "mv03c-console-act", 1).await;
         let sink = state
             .engine
@@ -15557,6 +15842,213 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 400, "the test kind refuses in a release build");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03c_console_action_update_follows_the_new_connector_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03c-consupd");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        for name in ["mv03c-cons-upd-a", "mv03c-cons-upd-b"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"type": "console", "name": name}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201);
+        }
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": "mv03c-cons-upd-a"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03c-cons-upd-rule", "name": "mv03c-cons-upd-rule",
+                       "sql": "SELECT * FROM \"mv03c/consupd\"",
+                       "actions": ["mv03c-cons-upd-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":21}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-upd-act", 1).await;
+        let sink = state
+            .engine
+            .connectors()
+            .get("mv03c-cons-upd-a")
+            .expect("console stays registered under the old bare name");
+        assert_eq!(sink.local_deliveries(), Some(1));
+        assert!(
+            sink.local_last_preview()
+                .expect("console keeps captured output")
+                .contains("21"),
+            "console captures the delivery value"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03c-cons-upd-a", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Move the action to the second connector.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03c-cons-upd-act",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": "mv03c-cons-upd-b"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":22}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-upd-act", 2).await;
+        let sink = state
+            .engine
+            .connectors()
+            .get("mv03c-cons-upd-b")
+            .expect("console follows the new bare name");
+        assert_eq!(sink.local_deliveries(), Some(1));
+        assert!(
+            sink.local_last_preview()
+                .expect("console keeps captured output")
+                .contains("22"),
+            "the connector read shows the new capture"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03c-cons-upd-b", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert!(
+            state.engine.connectors().get("mv03c-cons-upd-a").is_none(),
+            "no stale capture stays under the old name"
+        );
+        // The same bare name still console keeps one registration.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03c-cons-upd-act",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": "mv03c-cons-upd-b"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":23}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-upd-act", 3).await;
+        let sink = state
+            .engine
+            .connectors()
+            .get("mv03c-cons-upd-b")
+            .expect("console keeps the same bare name");
+        assert_eq!(sink.local_deliveries(), Some(1));
+        assert!(sink
+            .local_last_preview()
+            .expect("console keeps captured output")
+            .contains("23"));
+        // An empty bare name registers nothing and removes the old one.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03c-cons-upd-act",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": ""}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":24}").await;
+        assert!(
+            state.engine.connectors().get("mv03c-cons-upd-b").is_none(),
+            "the empty bare name removes the old registration"
+        );
+        let mut failed = 0;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv03c-cons-upd-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            failed = metrics["metrics"]["failed"].as_u64().unwrap_or(0);
+            if failed >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            failed >= 1,
+            "a console action without a connector counts one failure"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03c_console_action_delete_removes_the_bare_capture_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03c-consdel");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "console", "name": "mv03c-cons-del"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "console", "name": "mv03c-cons-del-act",
+                       "connector": "mv03c-cons-del"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03c-cons-del-rule", "name": "mv03c-cons-del-rule",
+                       "sql": "SELECT * FROM \"mv03c/consdel\"",
+                       "actions": ["mv03c-cons-del-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consdel", "{\"v\":21}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-del-act", 1).await;
+        assert!(
+            state.engine.connectors().get("mv03c-cons-del").is_some(),
+            "console stays registered under the bare name"
+        );
+        // The delete refuses while a rule still references the action.
+        let (status, _) = server
+            .delete_auth("/api/v5/rules/mv03c-cons-del-rule", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/mv03c-cons-del-act", &token)
+            .await;
+        assert_eq!(status, 204);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consdel", "{\"v\":22}").await;
+        assert!(
+            state.engine.connectors().get("mv03c-cons-del").is_none(),
+            "no capture stays after the delete"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03c-cons-del", &token)
+            .await;
+        assert_eq!(status, 200, "the connector record stays readable");
+        let (status, _) = server
+            .get_auth("/api/v5/actions/mv03c-cons-del-act", &token)
+            .await;
+        assert_eq!(status, 404, "the action is gone");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -16314,6 +16806,7 @@ connector_id = "pending-good"
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.task.abort();
+            self.mqtt_task.abort();
         }
     }
 
