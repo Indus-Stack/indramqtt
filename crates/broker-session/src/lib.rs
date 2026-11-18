@@ -813,6 +813,11 @@ impl Session {
             .store(is_superuser, Ordering::Relaxed);
     }
 
+    /// Verified MQTT principal bound to this session, if authenticated.
+    pub fn verified_username(&self) -> Option<String> {
+        self.verified_username.read().clone()
+    }
+
     /// Negotiated protocol level for this session (X1-02): 4 or 5.
     /// One relaxed atomic load; bind/disconnect/delivery paths only.
     pub fn protocol_version(&self) -> u8 {

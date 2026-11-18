@@ -2254,6 +2254,19 @@ async fn apply_bind_request_inner(
                     alias_max,
                     server_max_pkt,
                 ));
+            } else if !shared.allow_anonymous {
+                // `auth.allow_anonymous = false` must still fail closed when
+                // no authentication backend is configured, even if CONNECT
+                // carries a username.
+                shared.metrics.inc_auth_failures();
+                shared.authn_chain.record_built_in_failed();
+                return Some(refusal_for_req(
+                    frame,
+                    &req,
+                    0x87,
+                    alias_max,
+                    server_max_pkt,
+                ));
             } else {
                 // Open broker: no users, no directory, no database, no webhook, no enabled Kerberos
                 // or JWKS. Fall through to the session resolution below
@@ -2453,8 +2466,15 @@ async fn apply_bind_request_inner(
     // session: snapshot them before `get_or_create` drops the old
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
+    let principal_mismatch = match parsed.as_ref() {
+        Ok(req) if !req.clean_start => shared
+            .sessions
+            .get_in_tenant(&tenant_for_bind, &req.client_id)
+            .is_some_and(|existing| existing.verified_username() != verified_connect_username),
+        _ => false,
+    };
     let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) = match parsed.clone() {
-        Ok(req) if req.clean_start => (
+        Ok(req) if req.clean_start || principal_mismatch => (
             SessionKey::new(&tenant_for_bind, &req.client_id),
             shared
                 .sessions
@@ -2564,7 +2584,7 @@ async fn apply_bind_request_inner(
             let (session, present, expired_swept) = shared.sessions.get_or_create_v5_in_tenant(
                 &tenant_for_bind,
                 &req.client_id,
-                req.clean_start,
+                req.clean_start || principal_mismatch,
                 req.protocol_version,
                 req.session_expiry,
                 req.receive_maximum,
@@ -19472,6 +19492,77 @@ config = '{"connector":"pending-timescaledb"}'
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_auth_rejects_username_without_backend_when_allow_anonymous_is_false() {
+        let mut shared = test_shared();
+        shared.allow_anonymous = false;
+
+        let frame = bind_frame(
+            840,
+            1,
+            encode_bind_meta_creds("dev-user-no-backend", true, 60, "alice", b"secret"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(
+            rc, 0x87,
+            "CONNECT with username and no backend must fail closed when allow_anonymous=false"
+        );
+        assert!(!present);
+        assert!(shared.sessions.get("dev-user-no-backend").is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_resume_with_different_principal_drops_cached_authz_and_subscriptions() {
+        let shared = test_shared();
+        shared.auth.add_user("super", b"p1").unwrap();
+        shared.auth.add_user("bob", b"p2").unwrap();
+
+        let frame1 = bind_frame(
+            841,
+            1,
+            encode_bind_meta_creds("shared-cid", false, 60, "super", b"p1"),
+        );
+        let reply1 = apply_bind(&frame1, &shared).await.expect("bind1 replies");
+        let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
+        assert_eq!(rc1, 0);
+
+        let sess1 = shared.sessions.get("shared-cid").unwrap();
+        sess1.record_authz_decision("publish", "secret/topic", 1, false, true);
+        let filter = broker_protocol::TopicFilter::new("secret/#").unwrap();
+        shared
+            .sessions
+            .add_subscription("shared-cid", filter, QoS::AtLeastOnce);
+        shared.sessions.unbind_connection("shared-cid", 841);
+
+        let frame2 = bind_frame(
+            842,
+            1,
+            encode_bind_meta_creds("shared-cid", false, 60, "bob", b"p2"),
+        );
+        let reply2 = apply_bind(&frame2, &shared).await.expect("bind2 replies");
+        let (_, present2, rc2) = decode_session_binding_meta(&reply2.metadata);
+        assert_eq!(rc2, 0);
+        assert!(
+            !present2,
+            "resuming another principal's session must not report session_present"
+        );
+
+        let sess2 = shared.sessions.get("shared-cid").unwrap();
+        assert_eq!(sess2.verified_username().as_deref(), Some("bob"));
+        assert!(
+            sess2.authz_cache_snapshot().is_empty(),
+            "new principal must not inherit prior principal's authz_cache"
+        );
+        assert!(
+            shared
+                .sessions
+                .subscription_filters("shared-cid")
+                .is_empty(),
+            "new principal must not inherit prior principal's subscriptions"
+        );
     }
 
     #[tokio::test]

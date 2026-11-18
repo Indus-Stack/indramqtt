@@ -1455,7 +1455,7 @@ impl ConnectorStore {
 
     /// Directory holding kernel state. Disk sinks join it.
     /// Defaults to `./data` in unit tests with no registry.
-    pub(crate) fn data_dir(&self) -> std::path::PathBuf {
+    pub fn data_dir(&self) -> std::path::PathBuf {
         self.registry
             .read()
             .unwrap_or_else(|poison| poison.into_inner())

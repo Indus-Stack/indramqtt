@@ -20,8 +20,10 @@ use async_trait::async_trait;
 use broker_protocol::{Topic, TopicFilter};
 use bytes::Bytes;
 use rumqttc::{
-    AsyncClient, Event, EventLoop, MqttOptions, NetworkOptions, Packet, QoS, SubscribeReasonCode,
+    AsyncClient, ClientError, Event, EventLoop, MqttOptions, NetworkOptions, Packet, Publish, QoS,
+    SubscribeReasonCode,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -56,9 +58,9 @@ pub struct MqttSourceConfig {
     pub keep_alive_secs: u16,
     pub clean_session: bool,
     pub topic: String,
-    /// Previous subscription filter to unsubscribe when a persistent
+    /// Previous subscription filters to unsubscribe when a persistent
     /// session (`clean_session = false`) replaces its topic filter.
-    pub previous_topic: Option<String>,
+    pub previous_topics: Vec<String>,
     pub qos: u8,
     /// Delay before a failed connection retries.
     pub retry_delay: Duration,
@@ -69,7 +71,7 @@ pub struct MqttSourceConfig {
 
 impl MqttSourceConfig {
     /// Returns true if the persistent configuration fields match,
-    /// ignoring one-shot `previous_topic` migration state.
+    /// ignoring one-shot `previous_topics` migration state.
     pub fn same_config(&self, other: &Self) -> bool {
         self.host == other.host
             && self.port == other.port
@@ -101,6 +103,8 @@ pub enum MqttSourceEvent {
     Connected,
     /// One remote publish.
     Message(MqttSourceMessage),
+    /// Upstream broker acknowledged unsubscribing these superseded filters.
+    Unsubscribed(Vec<String>),
     /// The connection failed. The message is the reason.
     Disconnected(String),
 }
@@ -180,17 +184,22 @@ async fn run_once(
         network_options.set_connection_timeout(timeout.as_secs().max(1));
         eventloop.set_network_options(network_options);
     }
-    if let Some(old_topic) = &config.previous_topic {
-        if old_topic != &config.topic {
-            client
-                .unsubscribe(old_topic.clone())
-                .await
-                .map_err(|error| {
-                    ConnectorError::Connection(format!(
-                        "mqtt source unsubscribe request failed: {error}"
-                    ))
-                })?;
-        }
+    let mut pending_unsub_topics: Vec<String> = config
+        .previous_topics
+        .iter()
+        .filter(|old| *old != &config.topic)
+        .cloned()
+        .collect();
+    let mut unsub_acks_remaining = pending_unsub_topics.len();
+    for old_topic in &pending_unsub_topics {
+        client
+            .unsubscribe(old_topic.clone())
+            .await
+            .map_err(|error| {
+                ConnectorError::Connection(format!(
+                    "mqtt source unsubscribe request failed: {error}"
+                ))
+            })?;
     }
     client
         .subscribe(config.topic.clone(), source_qos(config.qos))
@@ -198,44 +207,96 @@ async fn run_once(
         .map_err(|error| {
             ConnectorError::Connection(format!("mqtt source subscribe request failed: {error}"))
         })?;
+    let mut pending_acks: VecDeque<Publish> = VecDeque::new();
     loop {
+        flush_pending_acks(&client, &mut pending_acks);
         let polled = tokio::select! {
             _ = wait_for_stop(&mut stop) => {
-                drain(&mut eventloop, &client, &filter, &config.topic, handler).await;
+                drain(
+                    &mut eventloop,
+                    &client,
+                    &filter,
+                    &config.topic,
+                    handler,
+                    &mut pending_acks,
+                    &mut pending_unsub_topics,
+                    &mut unsub_acks_remaining,
+                )
+                .await;
                 return Ok(());
             }
             event = eventloop.poll() => event,
         };
         match polled {
-            Ok(event) => handle_event(event, &client, &filter, &config.topic, handler).await?,
+            Ok(event) => {
+                handle_event(
+                    event,
+                    &client,
+                    &filter,
+                    &config.topic,
+                    handler,
+                    &mut pending_acks,
+                    &mut pending_unsub_topics,
+                    &mut unsub_acks_remaining,
+                )
+                .await?;
+            }
             Err(error) => {
                 return Err(ConnectorError::Connection(format!(
                     "mqtt source connection failed: {error}"
                 )));
             }
         }
+        flush_pending_acks(&client, &mut pending_acks);
+    }
+}
+
+/// Non-blocking drain of queued manual acknowledgements so the poll loop
+/// never deadlocks waiting on a full bounded request channel.
+fn flush_pending_acks(client: &AsyncClient, pending_acks: &mut VecDeque<Publish>) {
+    while let Some(front) = pending_acks.front() {
+        match client.try_ack(front) {
+            Ok(()) => {
+                pending_acks.pop_front();
+            }
+            Err(ClientError::TryRequest(_)) | Err(ClientError::Request(_)) => break,
+        }
     }
 }
 
 /// Deliver every packet that the driver already read. The bound keeps
 /// one update from waiting on a busy remote broker.
+#[allow(clippy::too_many_arguments)]
 async fn drain(
     eventloop: &mut EventLoop,
     client: &AsyncClient,
     filter: &TopicFilter,
     topic_pattern: &str,
     handler: &dyn MqttSourceHandler,
+    pending_acks: &mut VecDeque<Publish>,
+    pending_unsub_topics: &mut Vec<String>,
+    unsub_acks_remaining: &mut usize,
 ) {
     let deadline = tokio::time::Instant::now() + MQTT_SOURCE_DRAIN;
     loop {
         while let Some(event) = eventloop.state.events.pop_front() {
-            if handle_event(event, client, filter, topic_pattern, handler)
-                .await
-                .is_err()
+            if handle_event(
+                event,
+                client,
+                filter,
+                topic_pattern,
+                handler,
+                pending_acks,
+                pending_unsub_topics,
+                unsub_acks_remaining,
+            )
+            .await
+            .is_err()
             {
                 return;
             }
         }
+        flush_pending_acks(client, pending_acks);
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
@@ -243,9 +304,18 @@ async fn drain(
         let wait = MQTT_SOURCE_DRAIN_READ.min(deadline - now);
         match tokio::time::timeout(wait, eventloop.poll()).await {
             Ok(Ok(event)) => {
-                if handle_event(event, client, filter, topic_pattern, handler)
-                    .await
-                    .is_err()
+                if handle_event(
+                    event,
+                    client,
+                    filter,
+                    topic_pattern,
+                    handler,
+                    pending_acks,
+                    pending_unsub_topics,
+                    unsub_acks_remaining,
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
@@ -253,23 +323,38 @@ async fn drain(
             Ok(Err(_)) => break,
             Err(_) => {}
         }
+        flush_pending_acks(client, pending_acks);
     }
     while let Some(event) = eventloop.state.events.pop_front() {
-        if handle_event(event, client, filter, topic_pattern, handler)
-            .await
-            .is_err()
+        if handle_event(
+            event,
+            client,
+            filter,
+            topic_pattern,
+            handler,
+            pending_acks,
+            pending_unsub_topics,
+            unsub_acks_remaining,
+        )
+        .await
+        .is_err()
         {
             return;
         }
     }
+    flush_pending_acks(client, pending_acks);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: Event,
     client: &AsyncClient,
     filter: &TopicFilter,
     topic_pattern: &str,
     handler: &dyn MqttSourceHandler,
+    pending_acks: &mut VecDeque<Publish>,
+    pending_unsub_topics: &mut Vec<String>,
+    unsub_acks_remaining: &mut usize,
 ) -> Result<()> {
     match event {
         Event::Incoming(Packet::SubAck(suback)) => {
@@ -284,6 +369,17 @@ async fn handle_event(
                 )));
             }
             handler.on_event(MqttSourceEvent::Connected).await;
+        }
+        Event::Incoming(Packet::UnsubAck(_)) => {
+            if *unsub_acks_remaining > 0 {
+                *unsub_acks_remaining -= 1;
+                if *unsub_acks_remaining == 0 && !pending_unsub_topics.is_empty() {
+                    let completed = std::mem::take(pending_unsub_topics);
+                    handler
+                        .on_event(MqttSourceEvent::Unsubscribed(completed))
+                        .await;
+                }
+            }
         }
         Event::Incoming(Packet::Publish(publish)) => {
             let matched = Topic::new(publish.topic.as_str())
@@ -305,9 +401,8 @@ async fn handle_event(
                     .await;
             }
             if publish.qos != QoS::AtMostOnce {
-                client.ack(&publish).await.map_err(|error| {
-                    ConnectorError::Connection(format!("mqtt source ack failed: {error}"))
-                })?;
+                pending_acks.push_back(publish);
+                flush_pending_acks(client, pending_acks);
             }
         }
         _ => {}
@@ -352,7 +447,7 @@ mod tests {
             keep_alive_secs: 60,
             clean_session: true,
             topic: topic.to_string(),
-            previous_topic: None,
+            previous_topics: Vec::new(),
             qos: 1,
             retry_delay: Duration::from_millis(50),
             connection_timeout: Some(Duration::from_secs(2)),
@@ -493,7 +588,7 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut cfg = base_config(port, "new/topic");
         cfg.clean_session = false;
-        cfg.previous_topic = Some("old/topic".to_string());
+        cfg.previous_topics = vec!["old/topic".to_string()];
         let h = Arc::clone(&handler);
         let task = tokio::spawn(async move {
             run_mqtt_source(cfg, h, stop_rx).await;
@@ -523,5 +618,71 @@ mod tests {
             })
             .collect();
         assert_eq!(delivered_topics, vec!["new/topic"]);
+    }
+
+    #[tokio::test]
+    async fn qos1_burst_beyond_channel_cap_does_not_stall_and_acks_all() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let total = (MQTT_SOURCE_CHANNEL_CAP * 2 + 22) as usize;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _connect = read_mqtt_packet(&mut stream).await;
+            // CONNACK
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.unwrap();
+            let (_sub_hdr, sub_body) = read_mqtt_packet(&mut stream).await;
+            let pid = u16::from_be_bytes([sub_body[0], sub_body[1]]);
+            // SUBACK QoS 1
+            stream
+                .write_all(&[0x90, 0x03, (pid >> 8) as u8, pid as u8, 0x01])
+                .await
+                .unwrap();
+
+            // Send > MQTT_SOURCE_CHANNEL_CAP QoS 1 PUBLISH packets in one burst.
+            let topic = b"burst/t";
+            for i in 1..=total {
+                let mut pkt = Vec::new();
+                let mut body = Vec::new();
+                body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+                body.extend_from_slice(topic);
+                body.extend_from_slice(&(i as u16).to_be_bytes());
+                body.extend_from_slice(b"x");
+                pkt.push(0x32); // PUBLISH QoS 1
+                pkt.push(body.len() as u8);
+                pkt.extend_from_slice(&body);
+                stream.write_all(&pkt).await.unwrap();
+            }
+
+            let mut acked = 0usize;
+            while acked < total {
+                let (hdr, _body) =
+                    tokio::time::timeout(Duration::from_secs(5), read_mqtt_packet(&mut stream))
+                        .await
+                        .expect("timed out waiting for PUBACK during QoS 1 burst");
+                if hdr == 4 {
+                    acked += 1;
+                }
+            }
+            acked
+        });
+
+        let handler = Arc::new(RecordingHandler::default());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let cfg = base_config(port, "burst/#");
+        let task = tokio::spawn(run_mqtt_source(cfg, handler.clone(), stop_rx));
+
+        let acked = server.await.unwrap();
+        assert_eq!(acked, total);
+
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+        let delivered = handler
+            .events
+            .lock()
+            .await
+            .iter()
+            .filter(|e| matches!(e, MqttSourceEvent::Message(_)))
+            .count();
+        assert_eq!(delivered, total);
     }
 }

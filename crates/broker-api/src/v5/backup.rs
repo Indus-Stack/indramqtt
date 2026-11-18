@@ -689,7 +689,10 @@ fn merge_admin_users(value: &Value, previous: &AdminUsersConf) -> Result<AdminUs
 /// or the membership of the dashboard users. Description, password-change
 /// flag and MFA state do not raise rights, so they do not need a full
 /// administrator.
-fn admin_user_rights_change(candidate: &AdminUsersConf, previous: &AdminUsersConf) -> bool {
+pub(crate) fn admin_user_rights_change(
+    candidate: &AdminUsersConf,
+    previous: &AdminUsersConf,
+) -> bool {
     if candidate.users.len() != previous.users.len() {
         return true;
     }

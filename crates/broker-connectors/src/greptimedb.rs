@@ -690,17 +690,60 @@ impl GreptimeDbTransport for MockGreptimeDbTransport {
     }
 }
 
+#[derive(Debug, Clone)]
+struct QueuedRecord {
+    record: GreptimeRecord,
+    /// Monotonic uniqueness sequence attached only when multiple rows in
+    /// the same series collide on the same wall-clock precision unit.
+    uniqueness_seq: Option<u64>,
+}
+
+fn format_queued_sql_insert(table: &str, items: &[QueuedRecord]) -> Result<String> {
+    if items.iter().all(|item| item.uniqueness_seq.is_none()) {
+        let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
+        return build_greptime_sql_insert(table, &records);
+    }
+    let records: Vec<GreptimeRecord> = items
+        .iter()
+        .map(|item| {
+            let mut rec = item.record.clone();
+            if let Some(seq) = item.uniqueness_seq {
+                rec.fields
+                    .push(("_seq".to_string(), GreptimeValue::Integer(seq as i64)));
+            }
+            rec
+        })
+        .collect();
+    build_greptime_sql_insert(table, &records)
+}
+
+fn format_queued_influx_line_protocol(items: &[QueuedRecord]) -> String {
+    let mut out = String::new();
+    for item in items {
+        let line = build_influx_line_protocol(std::slice::from_ref(&item.record));
+        if let Some(seq) = item.uniqueness_seq {
+            if let Some(space_idx) = line.find(' ') {
+                out.push_str(&line[..space_idx]);
+                out.push_str(&format!(",_seq={seq}"));
+                out.push_str(&line[space_idx..]);
+                continue;
+            }
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
 /// GreptimeDB time-series ingestion sink.
 pub struct GreptimeDbSink {
     config: GreptimeDbConfig,
     transport: Arc<dyn GreptimeDbTransport>,
-    queue: Mutex<BatchQueue<GreptimeRecord>>,
+    queue: Mutex<BatchQueue<QueuedRecord>>,
     backoff: Mutex<BackoffState>,
     sent: AtomicU64,
-    /// Last emitted stamp per series (`table|topic`) in the configured
-    /// precision. Bounded to `MAX_SERIES_TIMESTAMPS` entries so memory is
-    /// capped and collisions are resolved per series without advancing
-    /// unrelated tables or series into the future.
+    seq: AtomicU64,
+    /// Last emitted wall-clock stamp per series (`table|topic`) in the
+    /// configured precision. Bounded to `MAX_SERIES_TIMESTAMPS` entries.
     last_by_series: Mutex<HashMap<String, i64>>,
 }
 
@@ -717,6 +760,7 @@ impl GreptimeDbSink {
             queue: Mutex::new(BatchQueue::new(batch_size, GREPTIME_BATCH_LINGER)),
             backoff: Mutex::new(BackoffState::default()),
             sent: AtomicU64::new(0),
+            seq: AtomicU64::new(0),
             last_by_series: Mutex::new(HashMap::new()),
         })
     }
@@ -733,26 +777,30 @@ impl GreptimeDbSink {
         self.queue.lock().len()
     }
 
-    /// Next stamp in the configured precision for one series (`table|topic`).
-    /// Preserves wall-clock timestamps and only bumps within that series
-    /// when consecutive writes collide in the same precision unit.
-    fn next_timestamp(&self, series_key: &str, candidate: i64) -> i64 {
+    /// Preserve wall-clock timestamp in the configured precision for one series
+    /// (`table|topic`), returning an optional uniqueness sequence when a write
+    /// collides with the previous stamp in the same precision unit.
+    fn next_timestamp_and_seq(&self, series_key: &str, candidate: i64) -> (i64, Option<u64>) {
         const MAX_SERIES_TIMESTAMPS: usize = 10_000;
         let now_scaled = self
             .config
             .timestamp_precision
             .scale_timestamp(now_millis());
-        let fresh = candidate.max(now_scaled);
+        let wall_ts = candidate.max(now_scaled);
         let mut map = self.last_by_series.lock();
         if map.len() >= MAX_SERIES_TIMESTAMPS && !map.contains_key(series_key) {
             map.clear();
         }
-        let next = match map.get(series_key).copied() {
-            Some(prev) if fresh <= prev => prev + 1,
-            _ => fresh,
-        };
-        map.insert(series_key.to_string(), next);
-        next
+        match map.get(series_key).copied() {
+            Some(prev) if wall_ts <= prev => {
+                let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                (prev, Some(seq))
+            }
+            _ => {
+                map.insert(series_key.to_string(), wall_ts);
+                (wall_ts, None)
+            }
+        }
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -773,20 +821,20 @@ impl GreptimeDbSink {
         match self.config.format {
             GreptimeFormat::SqlInsert => {
                 let mut tables: Vec<String> = Vec::new();
-                let mut groups: Vec<Vec<GreptimeRecord>> = Vec::new();
+                let mut groups: Vec<Vec<QueuedRecord>> = Vec::new();
                 let mut index: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
-                for rec in records {
-                    if let Some(&pos) = index.get(&rec.table) {
-                        groups[pos].push(rec);
+                for item in records {
+                    if let Some(&pos) = index.get(&item.record.table) {
+                        groups[pos].push(item);
                     } else {
-                        index.insert(rec.table.clone(), groups.len());
-                        tables.push(rec.table.clone());
-                        groups.push(vec![rec]);
+                        index.insert(item.record.table.clone(), groups.len());
+                        tables.push(item.record.table.clone());
+                        groups.push(vec![item]);
                     }
                 }
                 for idx in 0..tables.len() {
-                    let sql = match build_greptime_sql_insert(&tables[idx], &groups[idx]) {
+                    let sql = match format_queued_sql_insert(&tables[idx], &groups[idx]) {
                         Ok(sql) => sql,
                         Err(e) => {
                             self.backoff.lock().failure();
@@ -818,7 +866,7 @@ impl GreptimeDbSink {
                 Ok(())
             }
             GreptimeFormat::InfluxLineProtocol => {
-                let lines = build_influx_line_protocol(&records);
+                let lines = format_queued_influx_line_protocol(&records);
                 let prec = self.config.timestamp_precision.as_influx_param();
                 match self.transport.post_influx(&lines, prec).await {
                     Ok(_) => {
@@ -869,10 +917,13 @@ impl GreptimeDbSink {
 impl Sink for GreptimeDbSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> Result<()> {
         let mut rec = extract_greptime_record(payload, topic.as_str(), &self.config)?;
-        // Keep stamps strictly increasing on one sink.
-        // Rapid sends in one unit would share a stamp and merge.
         let series_key = format!("{}|{}", rec.table, topic.as_str());
-        rec.timestamp = self.next_timestamp(&series_key, rec.timestamp);
+        let (ts, uniqueness_seq) = self.next_timestamp_and_seq(&series_key, rec.timestamp);
+        rec.timestamp = ts;
+        let queued = QueuedRecord {
+            record: rec,
+            uniqueness_seq,
+        };
         let should_flush = {
             let mut q = self.queue.lock();
             // Bounded backlog: past the effective capacity the sink
@@ -884,7 +935,7 @@ impl Sink for GreptimeDbSink {
                     self.config.effective_buffer_capacity()
                 )));
             }
-            q.push(rec)
+            q.push(queued)
         };
 
         if should_flush {
@@ -938,32 +989,49 @@ impl Connector for GreptimeDbConnector {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn greptimedb_timestamps_do_not_drift_across_tables_or_series() {
-        let cfg = super::GreptimeDbConfig {
-            endpoint: "http://127.0.0.1:4000".into(),
-            database: "public".into(),
-            table_template: "${topic_segment_0}".into(),
-            format: super::GreptimeFormat::SqlInsert,
-            timestamp_precision: super::GreptimePrecision::Second,
-            batch_size: Some(10),
-            buffer_capacity: None,
-            auth: None,
-            timeout_ms: None,
-        };
-        let sink = super::GreptimeDbSink::new(
-            cfg,
-            std::sync::Arc::new(super::MockGreptimeDbTransport::new()),
-        )
-        .unwrap();
-        let now_s = super::GreptimePrecision::Second.scale_timestamp(super::now_millis());
-        for _ in 0..20 {
-            let _ = sink.next_timestamp("table_a|table_a/s1", now_s);
+    #[tokio::test]
+    async fn greptimedb_timestamps_do_not_drift_across_tables_or_series() {
+        let mut cfg = sample_influx_config();
+        cfg.timestamp_precision = GreptimePrecision::Second;
+        cfg.batch_size = Some(1);
+        let transport = Arc::new(MockGreptimeDbTransport::new());
+        let sink = GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let before_sec = now_millis() / 1000;
+        let topic_a = Topic::new("sensors/a").unwrap();
+        let topic_b = Topic::new("sensors/b").unwrap();
+        let payload = Bytes::from_static(br#"{"v":1}"#);
+
+        // Burst 30 messages on topic_a in the same wall-clock window.
+        for _ in 0..30 {
+            sink.send(&topic_a, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap();
         }
-        let table_b_ts = sink.next_timestamp("table_b|table_b/s1", now_s);
+        sink.send(&topic_b, &payload, QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        let after_sec = now_millis() / 1000;
+
+        let items = transport.captured_influx.lock();
+        assert_eq!(items.len(), 31);
+        for (idx, (line, _)) in items.iter().enumerate() {
+            let ts: i64 = line.split_whitespace().last().unwrap().parse().unwrap();
+            assert!(
+                ts >= before_sec && ts <= after_sec + 1,
+                "row {idx} timestamp {ts} drifted outside wall clock [{before_sec}, {}]",
+                after_sec + 1
+            );
+        }
+        let seq_lines: Vec<&str> = items
+            .iter()
+            .take(30)
+            .filter(|(l, _)| l.contains("_seq="))
+            .map(|(l, _)| l.as_str())
+            .collect();
         assert!(
-            table_b_ts <= now_s + 1,
-            "unrelated table timestamp drifted into future: {table_b_ts} vs now {now_s}"
+            seq_lines.len() >= 29,
+            "expected colliding rows to carry _seq uniqueness tags"
         );
     }
 
