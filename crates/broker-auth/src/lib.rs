@@ -146,7 +146,7 @@ impl AclAction {
 }
 
 /// One ordered ACL entry: first match wins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclRule {
     pub client_pattern: String,
     pub action: AclAction,
@@ -2398,6 +2398,94 @@ impl MemoryAuth {
             }
             table.retain(|stored| stored.client_pattern != clientid);
             table.extend(rules);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Replace the connection ACL set that a successful re-authentication
+    /// returned in the given tenant. An empty set clears the previous client rules.
+    /// This is the same table that the publish and subscribe checks consult.
+    pub fn apply_reauth_acl(
+        &self,
+        tenant: &str,
+        clientid: &str,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), ClientRuleError> {
+        if clientid.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must not be empty".to_string(),
+            ));
+        }
+        if clientid.len() > MAX_AUTHZ_CLIENTID_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `clientid` {clientid:?} exceeds {MAX_AUTHZ_CLIENTID_LEN} bytes",
+            )));
+        }
+        if clientid == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must name a concrete client, not the catch-all (field `clientid`)".to_string(),
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern != clientid {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].clientid {:?} does not match {clientid:?} (field `clientid`)",
+                    rule.client_pattern
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        {
+            let mut seen: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::with_capacity(rules.len());
+            for rule in &rules {
+                let scope = (
+                    rule.topic_pattern.as_str(),
+                    match rule.action {
+                        AclAction::Publish => "publish",
+                        AclAction::Subscribe => "subscribe",
+                        AclAction::All => "all",
+                    },
+                );
+                if !seen.insert(scope) {
+                    return Err(ClientRuleError::Duplicate);
+                }
+            }
+        }
+        let key = tenant_key(tenant);
+        {
+            let mut tenants = self.tenants_mut();
+            if !tenants.contains_key(key) {
+                if tenants.len() >= MAX_AUTH_TENANTS {
+                    return Err(ClientRuleError::Full);
+                }
+                tenants.insert(key.to_string(), TenantState::default());
+            }
+            // INVARIANT: tenant map contains the target tenant key after insertion check.
+            let state = tenants.get_mut(key).expect("tenant just inserted");
+            let others = state
+                .rules
+                .iter()
+                .filter(|stored| stored.client_pattern != clientid)
+                .count();
+            if others + rules.len() > MAX_ACL_RULES_PER_TENANT {
+                return Err(ClientRuleError::Full);
+            }
+            state
+                .rules
+                .retain(|stored| stored.client_pattern != clientid);
+            state.rules.extend(rules);
         }
         self.persist()
             .map_err(|e| ClientRuleError::Persist(e.to_string()))

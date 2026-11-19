@@ -182,6 +182,11 @@ fn encode_connect(connect: &wire::Connect) -> Vec<u8> {
             section.extend_from_slice(&(method.len() as u16).to_be_bytes());
             section.extend_from_slice(method.as_bytes());
         }
+        if let Some(data) = &props.auth_data {
+            section.push(wire::prop::AUTH_DATA as u8);
+            section.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            section.extend_from_slice(data);
+        }
         for (key, value) in &props.user_properties {
             section.push(wire::prop::USER_PROPERTY as u8);
             section.extend_from_slice(&(key.len() as u16).to_be_bytes());

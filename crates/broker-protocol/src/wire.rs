@@ -47,6 +47,7 @@ pub mod prop {
     pub const SESSION_EXPIRY: u32 = 17;
     pub const ASSIGNED_CLIENT_ID: u32 = 18;
     pub const AUTH_METHOD: u32 = 21;
+    pub const AUTH_DATA: u32 = 22;
     pub const REQUEST_PROBLEM_INFO: u32 = 23;
     pub const REQUEST_RESPONSE_INFO: u32 = 25;
     pub const REASON_STRING: u32 = 28;
@@ -245,8 +246,8 @@ enum PropValue<'a> {
     U32(u32),
     Varint(u32),
     Text(&'a str),
-    /// Binary data. No caller reads the bytes.
-    Binary,
+    /// Binary data. Authentication data is the only caller that reads it.
+    Binary(&'a [u8]),
     Pair(&'a str, &'a str),
 }
 
@@ -267,10 +268,7 @@ fn walk_properties<'a>(
             2 | 17 | 24 | 39 => PropValue::U32(reader.u32()?),
             11 => PropValue::Varint(reader.varint()?),
             3 | 8 | 18 | 21 | 26 | 28 | 31 => PropValue::Text(reader.utf8()?),
-            9 | 22 => {
-                reader.binary()?;
-                PropValue::Binary
-            }
+            9 | 22 => PropValue::Binary(reader.binary()?),
             38 => {
                 let key = reader.utf8()?;
                 let value = reader.utf8()?;
@@ -320,6 +318,7 @@ pub struct ConnectProperties {
     pub request_response_info: Option<u8>,
     pub request_problem_info: Option<u8>,
     pub auth_method: Option<String>,
+    pub auth_data: Option<Vec<u8>>,
     pub user_properties: Vec<(String, String)>,
 }
 
@@ -370,7 +369,6 @@ pub fn decode_connect(body: &[u8]) -> Result<Connect> {
     let properties = if level == 5 {
         let section = reader.properties()?;
         let mut props = ConnectProperties::default();
-        let mut auth_data = false;
         walk_properties(section, |id, value| match (id, value) {
             (prop::SESSION_EXPIRY, PropValue::U32(v)) => set_once(&mut props.session_expiry, v),
             (prop::RECEIVE_MAXIMUM, PropValue::U16(v)) => {
@@ -397,13 +395,7 @@ pub fn decode_connect(body: &[u8]) -> Result<Connect> {
             (prop::AUTH_METHOD, PropValue::Text(v)) => {
                 set_once(&mut props.auth_method, v.to_string())
             }
-            (22, PropValue::Binary) => {
-                if auth_data {
-                    return Err(WireError::Malformed("property is in the section two times"));
-                }
-                auth_data = true;
-                Ok(())
-            }
+            (prop::AUTH_DATA, PropValue::Binary(v)) => set_once(&mut props.auth_data, v.to_vec()),
             (prop::USER_PROPERTY, PropValue::Pair(k, v)) => {
                 props.user_properties.push((k.to_string(), v.to_string()));
                 Ok(())
@@ -522,7 +514,7 @@ pub fn decode_publish(flags: u8, body: &[u8], level: u8) -> Result<Publish<'_>> 
             )),
             // Content type, response topic and correlation data are
             // correct in a PUBLISH. This broker does not forward them.
-            (3, PropValue::Text(_)) | (8, PropValue::Text(_)) | (9, PropValue::Binary) => Ok(()),
+            (3, PropValue::Text(_)) | (8, PropValue::Text(_)) | (9, PropValue::Binary(_)) => Ok(()),
             _ => Err(WireError::Malformed("property is not permitted in PUBLISH")),
         })?;
     }
@@ -699,6 +691,61 @@ pub fn decode_disconnect(body: &[u8], level: u8) -> Result<u8> {
         }
     }
     Ok(reason)
+}
+
+/// The properties of an MQTT 5 AUTH packet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthProperties {
+    pub auth_method: Option<String>,
+    pub auth_data: Option<Vec<u8>>,
+    pub reason_string: Option<String>,
+    pub user_properties: Vec<(String, String)>,
+}
+
+/// A decoded MQTT 5 AUTH packet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Auth {
+    pub reason: u8,
+    pub properties: AuthProperties,
+}
+
+/// Decodes the body of an AUTH packet. A body with no reason code is
+/// reason code 0. Only protocol level 5 carries AUTH.
+pub fn decode_auth(body: &[u8], level: u8) -> Result<Auth> {
+    if level != 5 {
+        return Err(WireError::Unsupported("AUTH is an MQTT 5 packet"));
+    }
+    if body.is_empty() {
+        return Ok(Auth::default());
+    }
+    let mut reader = Reader::new(body);
+    let reason = reader.u8()?;
+    let mut properties = AuthProperties::default();
+    if !reader.is_empty() {
+        let section = reader.properties()?;
+        walk_properties(section, |id, value| match (id, value) {
+            (prop::AUTH_METHOD, PropValue::Text(v)) => {
+                set_once(&mut properties.auth_method, v.to_string())
+            }
+            (prop::AUTH_DATA, PropValue::Binary(v)) => {
+                set_once(&mut properties.auth_data, v.to_vec())
+            }
+            (prop::REASON_STRING, PropValue::Text(v)) => {
+                set_once(&mut properties.reason_string, v.to_string())
+            }
+            (prop::USER_PROPERTY, PropValue::Pair(k, v)) => {
+                properties
+                    .user_properties
+                    .push((k.to_string(), v.to_string()));
+                Ok(())
+            }
+            _ => Err(WireError::Malformed("property is not permitted in AUTH")),
+        })?;
+        if !reader.is_empty() {
+            return Err(WireError::Malformed("bytes after the properties"));
+        }
+    }
+    Ok(Auth { reason, properties })
 }
 
 fn put_fixed_header(first: u8, remaining: usize, out: &mut Vec<u8>) {
@@ -928,6 +975,29 @@ pub fn encode_disconnect_v5(reason: u8, out: &mut Vec<u8>) {
     } else {
         out.extend_from_slice(&[0xE0, 0x01, reason]);
     }
+}
+
+/// Appends an MQTT 5 AUTH packet. The method and the data are optional
+/// properties. A success with no properties uses the empty body form.
+pub fn encode_auth(reason: u8, method: Option<&str>, data: Option<&[u8]>, out: &mut Vec<u8>) {
+    let mut section = Vec::new();
+    if let Some(method) = method {
+        section.push(prop::AUTH_METHOD as u8);
+        put_binary(method.as_bytes(), &mut section);
+    }
+    if let Some(data) = data {
+        section.push(prop::AUTH_DATA as u8);
+        put_binary(data, &mut section);
+    }
+    if reason == 0 && section.is_empty() {
+        out.extend_from_slice(&[0xF0, 0x00]);
+        return;
+    }
+    let remaining = 1 + varint_len(section.len()) + section.len();
+    put_fixed_header(0xF0, remaining, out);
+    out.push(reason);
+    encode_varint(section.len() as u32, out);
+    out.extend_from_slice(&section);
 }
 
 #[cfg(test)]
@@ -1517,5 +1587,24 @@ mod tests {
         assert!(body
             .windows(9)
             .any(|w| w == [18, 0, 6, b'a', b'u', b't', b'o', b'-', b'9']));
+    }
+
+    #[test]
+    fn auth_round_trip_carries_reason_method_and_data() {
+        let mut out = Vec::new();
+        encode_auth(0x19, Some("JWT"), Some(b"token"), &mut out);
+        assert_eq!(out[0] & 0xF0, 0xF0);
+        let header = fixed_header(&out).unwrap().expect("complete packet");
+        let auth = decode_auth(&out[header.header_len..], 5).expect("AUTH decodes");
+        assert_eq!(auth.reason, 0x19);
+        assert_eq!(auth.properties.auth_method.as_deref(), Some("JWT"));
+        assert_eq!(auth.properties.auth_data.as_deref(), Some(&b"token"[..]));
+        // A success without properties uses the empty body form.
+        let mut out = Vec::new();
+        encode_auth(0, None, None, &mut out);
+        assert_eq!(out, [0xF0, 0x00]);
+        assert_eq!(decode_auth(&[], 5).expect("empty body").reason, 0);
+        // AUTH is not an MQTT 3.1.1 packet.
+        assert!(decode_auth(&[], 4).is_err());
     }
 }

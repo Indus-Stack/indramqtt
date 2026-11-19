@@ -10,6 +10,9 @@
 //! The connection uses the same session, routing and delivery code as a
 //! connection of the edge. Only the transport is different.
 
+#[path = "reauth.rs"]
+mod reauth;
+
 use super::{
     decode_session_binding_full, detach, handle_inbound_frame_with, merge_egress_batch,
     BindRequest, BindWill, Shared,
@@ -1719,6 +1722,17 @@ enum FrameEffect {
     Close,
 }
 
+/// Converts a Unix expiry time in seconds to a local deadline. A zero or
+/// missing value means that the credential carries no expiry.
+fn auth_expiry_instant(expires_at: Option<u64>) -> Option<Instant> {
+    let seconds = expires_at.filter(|value| *value > 0)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    Some(Instant::now() + Duration::from_secs(seconds.saturating_sub(now)))
+}
+
 /// The return code of a CONNACK for protocol level 3 or 4.
 fn connack_return_code(reason: u8) -> u8 {
     match reason {
@@ -1947,6 +1961,16 @@ struct Conn {
     /// denial with `deny_action = disconnect`). Packets that are already
     /// in the read buffer are not handled after that.
     closing: Option<Arc<AtomicBool>>,
+    /// Authentication Method that CONNECT negotiated, if any.
+    auth_method: Option<String>,
+    /// A SCRAM re-authentication that waits for its client-final message.
+    reauth: Option<reauth::Session>,
+    /// Deadline of an open re-authentication exchange.
+    reauth_deadline: Option<Instant>,
+    /// Deadline of the authentication that the client last presented.
+    auth_expiry: Option<Instant>,
+    /// Pending CONNECT during initial enhanced authentication.
+    pending_connect: Option<(wire::Connect, BindRequest)>,
 }
 
 impl Conn {
@@ -1998,6 +2022,24 @@ fn bind_request(
     peer_as_clientid: &str,
 ) -> BindRequest {
     let props = connect.properties;
+    let is_jwt = props
+        .as_ref()
+        .and_then(|p| p.auth_method.as_deref())
+        .is_some_and(|m| m.eq_ignore_ascii_case("JWT"));
+    let is_scram = props
+        .as_ref()
+        .and_then(|p| p.auth_method.as_deref())
+        .is_some_and(|m| m.eq_ignore_ascii_case("SCRAM-SHA-256"));
+    let auth_data = props.as_ref().and_then(|p| p.auth_data.clone());
+    let scram_user = if is_scram {
+        auth_data
+            .as_deref()
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .and_then(|s| reauth::parameter(s, "n"))
+    } else {
+        None
+    };
+    let password = connect.password.or(if is_jwt { auth_data } else { None });
     // A verified PSK identity replaces the CONNECT username: the
     // bind carries the value authentication checks.
     // A PSK bind keeps accepted behavior.
@@ -2006,13 +2048,21 @@ fn bind_request(
         .psk_identity
         .clone()
         .or_else(|| cert_identity_value(peer_as_username, peer_cert))
-        .or(connect.username);
+        .or(connect.username)
+        .or(scram_user)
+        .or_else(|| {
+            if is_jwt && password.is_some() {
+                Some(connect.client_id.clone())
+            } else {
+                None
+            }
+        });
     BindRequest {
         client_id: cert_identity_value(peer_as_clientid, peer_cert).unwrap_or(connect.client_id),
         clean_start: connect.clean_start,
         keepalive_secs: connect.keepalive,
         username,
-        password: connect.password,
+        password,
         peerhost: Some(peer.to_string()),
         client_alias_max: props
             .as_ref()
@@ -2141,6 +2191,190 @@ async fn release_connection(
     shared.conns.unregister(conn_id);
 }
 
+/// Returns the assigned tenant identifier for one connect request.
+fn request_tenant(shared: &Shared, request: &BindRequest) -> String {
+    let ctx = broker_session::tenant::ConnectContext {
+        client_id: request.client_id.clone(),
+        username: request.username.clone(),
+        peer_host: request.peerhost.clone(),
+        listener: request.listener.clone(),
+        cert_cn: request.cert_cn.clone(),
+        cert_subject: request.cert_subject.clone(),
+        cert_sans: request.cert_sans.clone(),
+        user_properties: request.user_properties.clone(),
+    };
+    shared.tenant_registry.assign(&ctx)
+}
+
+/// Checks admission rules before takeover and bind.
+fn is_admission_allowed(shared: &Shared, tenant: &str, req: &BindRequest) -> bool {
+    if shared.bans.is_banned_in_tenant(
+        tenant,
+        &req.client_id,
+        req.username.as_deref(),
+        req.peerhost.as_deref(),
+    ) {
+        return false;
+    }
+    if super::client_cert_required(shared, &req.listener) && !super::has_client_cert(req) {
+        return false;
+    }
+    true
+}
+
+/// Checks credentials and admission rules for plain CONNECT before takeover.
+async fn is_plain_connect_authenticated(shared: &Shared, tenant: &str, req: &BindRequest) -> bool {
+    if !is_admission_allowed(shared, tenant, req) {
+        return false;
+    }
+    if !shared.authn_chain.built_in_available() {
+        return false;
+    }
+    let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
+    let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
+    let db_configured = shared.db_auth.as_ref().is_some_and(|d| d.is_configured());
+
+    if req.username.is_none() {
+        if shared.auth.user_count() > 0
+            || shared.ldap.is_some()
+            || kerberos_enabled
+            || jwks_enabled
+            || db_configured
+            || shared.webhook.is_some()
+            || !shared.allow_anonymous
+        {
+            return false;
+        }
+        return true;
+    }
+    let password = req.password.as_deref();
+    let chain_entries = shared.authn_chain.snapshot();
+    if !chain_entries.is_empty() {
+        return super::decide_chain_auth(
+            shared,
+            &chain_entries,
+            tenant,
+            &req.client_id,
+            req.username.as_deref(),
+            password,
+        )
+        .await
+        .is_ok();
+    }
+    if shared.auth.user_count() > 0 {
+        let local_ok = shared
+            .auth
+            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
+            .await
+            .is_ok();
+        if local_ok {
+            return true;
+        }
+        if req
+            .username
+            .as_deref()
+            .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u))
+        {
+            return false;
+        }
+    }
+    if jwks_enabled && password.is_some_and(broker_auth::JwksAuthenticator::looks_like_jwt) {
+        return super::verify_jwks_connect(shared, tenant, &req.client_id, password)
+            .await
+            .is_ok();
+    }
+    if kerberos_enabled {
+        let looks_kerberos =
+            password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
+        if looks_kerberos {
+            let Some(token) = password else {
+                return false;
+            };
+            let Some(kerberos) = shared.kerberos.as_ref() else {
+                return false;
+            };
+            return kerberos
+                .verify_token_in_tenant(tenant, &req.client_id, token)
+                .is_ok();
+        }
+        return false;
+    }
+    if let Some(ldap) = shared.ldap.as_ref() {
+        return ldap
+            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
+            .await
+            .is_ok();
+    }
+    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+        return db
+            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
+            .await
+            .is_ok();
+    }
+    if let Some(webhook) = shared.webhook.as_ref() {
+        return webhook
+            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
+            .await
+            .is_ok();
+    }
+    if jwks_enabled {
+        return false;
+    }
+    shared.auth.user_count() == 0
+}
+
+/// Disconnects the previous connection before the new connection binds.
+/// When the previous connection registered a last will, the broker publishes it.
+async fn handle_takeover_pre_bind(
+    shared: &Shared,
+    tx: &tokio::sync::mpsc::UnboundedSender<BrokerFrame>,
+    tenant: &str,
+    client_id: &str,
+    new_conn_id: u64,
+) {
+    let Some(session) = shared.sessions.get_in_tenant(tenant, client_id) else {
+        return;
+    };
+    let old_conn_id = match *session.conn_id.read() {
+        Some(id) if id != new_conn_id => id,
+        _ => return,
+    };
+    let id = client_id.as_bytes();
+    let mut meta = Vec::with_capacity(2 + id.len());
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    if let Ok(close_frame) = BrokerFrame::new(
+        OpCode::ConnClose,
+        old_conn_id,
+        0,
+        Bytes::new(),
+        Bytes::new(),
+    ) {
+        let _ = shared.conns.order_close(old_conn_id, close_frame);
+    }
+    if let Ok(frame) = BrokerFrame::new(
+        OpCode::DisconnectIn,
+        old_conn_id,
+        0,
+        Bytes::from(meta),
+        Bytes::new(),
+    ) {
+        let dummy_sink = NativeSink::new();
+        let dummy_waker = Arc::new(tokio::sync::Notify::new());
+        let mut dummy_bound = Vec::new();
+        let _ = handle_inbound_frame_with(
+            frame,
+            shared,
+            tx,
+            &dummy_sink,
+            &mut dummy_bound,
+            &dummy_waker,
+            None,
+        )
+        .await;
+    }
+}
+
 /// Owns the kernel state of one connection. When the task ends without
 /// the normal release (a panic in the task, or a cancelled task), the
 /// drop of this guard starts the release. One faulty connection then
@@ -2225,14 +2459,30 @@ where
         keepalive: None,
         peer,
         closing: None,
+        auth_method: None,
+        reauth: None,
+        reauth_deadline: None,
+        auth_expiry: None,
+        pending_connect: None,
     };
     let mut last_packet = Instant::now();
 
     let stop = loop {
         ensure_read_room(&mut inbuf);
-        // One deadline: CONNECT in time, then the keepalive of the client.
+        // One deadline: CONNECT in time, then the keepalive of the client,
+        // an open re-authentication or the current authentication expiry.
         let deadline = if conn.connected {
-            conn.keepalive.map(|keepalive| last_packet + keepalive)
+            let mut earliest = conn.keepalive.map(|keepalive| last_packet + keepalive);
+            for extra in [conn.reauth_deadline, conn.auth_expiry]
+                .into_iter()
+                .flatten()
+            {
+                earliest = Some(match earliest {
+                    Some(current) => current.min(extra),
+                    None => extra,
+                });
+            }
+            earliest
         } else {
             Some(accepted_at + CONNECT_TIMEOUT)
         };
@@ -2300,7 +2550,18 @@ where
             () = waker.notified() => {
                 collect_egress(&mut rx, &shared, conn.conn_id, &sink, &waker);
             }
-            () = timer => break Stop::Abnormal,
+            () = timer => {
+                let now = Instant::now();
+                let expired_auth = conn
+                    .reauth_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                    || conn.auth_expiry.is_some_and(|deadline| now >= deadline);
+                if expired_auth && conn.level == 5 {
+                    wire::encode_disconnect_v5(reauth::RC_NOT_AUTHORIZED, &mut sink.out.lock());
+                    let _ = flush(&sink, &mut io).await;
+                }
+                break Stop::Abnormal;
+            }
         }
         if flush(&sink, &mut io).await.is_err() {
             break Stop::Abnormal;
@@ -2441,6 +2702,143 @@ async fn drain_inbound(
         }
         let packet = inbuf.split_to(header.packet_len()).freeze();
         let body = packet.slice(header.header_len..);
+        if !conn.connected && conn.pending_connect.is_some() {
+            if header.kind != kind::AUTH {
+                return Err(WireError::Malformed(
+                    "expected AUTH during initial authentication",
+                ));
+            }
+            let auth = wire::decode_auth(&body, conn.level)?;
+            if auth.reason == reauth::RC_REAUTHENTICATE {
+                // Behaviour 8: If a client sends AUTH Reason Code 0x19 during initial CONNECT authentication,
+                // the broker sends CONNACK with Reason Code 0x82.
+                let props = ConnackProperties::default();
+                wire::encode_connack_v5(
+                    false,
+                    reauth::RC_BAD_AUTH_METHOD,
+                    &props,
+                    &mut sink.out.lock(),
+                );
+                return Ok(Some(Stop::Clean));
+            }
+            if auth.reason == reauth::RC_CONTINUE_AUTHENTICATION {
+                let Some(pending) = conn.reauth.take() else {
+                    let props = ConnackProperties::default();
+                    wire::encode_connack_v5(
+                        false,
+                        reauth::RC_NOT_AUTHORIZED,
+                        &props,
+                        &mut sink.out.lock(),
+                    );
+                    return Ok(Some(Stop::Clean));
+                };
+                let reauth::State::Scram(state) = pending.state;
+                let scram_username = state.username.clone();
+                let outcome = reauth::finish_scram(
+                    shared,
+                    conn.conn_id,
+                    &conn.client_id,
+                    state,
+                    auth.properties.auth_data.as_deref(),
+                    false,
+                );
+                match outcome {
+                    reauth::Outcome::Success {
+                        method,
+                        data,
+                        expires_at,
+                    } => {
+                        wire::encode_auth(
+                            reauth::RC_SUCCESS,
+                            method.as_deref(),
+                            data.as_deref(),
+                            &mut sink.out.lock(),
+                        );
+                        let (_connect, mut request) =
+                            // INVARIANT: pending_connect was populated when the exchange started.
+                            conn.pending_connect.take().expect("pending connect");
+                        if request.username.is_none() {
+                            request.username = Some(scram_username);
+                        }
+                        conn.reauth_deadline = None;
+                        conn.auth_expiry = auth_expiry_instant(expires_at);
+                        let tenant = request_tenant(shared, &request);
+                        let has_existing = shared
+                            .sessions
+                            .get_in_tenant(&tenant, &request.client_id)
+                            .and_then(|session| *session.conn_id.read())
+                            .is_some_and(|id| id != conn.conn_id);
+                        if has_existing && is_admission_allowed(shared, &tenant, &request) {
+                            handle_takeover_pre_bind(
+                                shared,
+                                tx,
+                                &tenant,
+                                &request.client_id,
+                                conn.conn_id,
+                            )
+                            .await;
+                        }
+                        let Some(frame) =
+                            conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
+                        else {
+                            return Err(WireError::Malformed("frame"));
+                        };
+                        let handled = handle_inbound_frame_with(
+                            frame,
+                            shared,
+                            tx,
+                            sink,
+                            bound,
+                            waker,
+                            Some(&request),
+                        )
+                        .await;
+                        if handled.is_err() {
+                            return Ok(Some(Stop::Abnormal));
+                        }
+                        if sink.accepted.load(Ordering::Relaxed) {
+                            conn.connected = true;
+                            conn.closing = shared.conns.closing_flag(conn.conn_id);
+                        } else {
+                            return Ok(Some(Stop::Clean));
+                        }
+                        continue;
+                    }
+                    _ => {
+                        let props = ConnackProperties::default();
+                        wire::encode_connack_v5(
+                            false,
+                            reauth::RC_NOT_AUTHORIZED,
+                            &props,
+                            &mut sink.out.lock(),
+                        );
+                        return Ok(Some(Stop::Clean));
+                    }
+                }
+            } else {
+                let props = ConnackProperties::default();
+                wire::encode_connack_v5(
+                    false,
+                    reauth::RC_BAD_AUTH_METHOD,
+                    &props,
+                    &mut sink.out.lock(),
+                );
+                return Ok(Some(Stop::Clean));
+            }
+        }
+        if !conn.connected && header.kind == kind::AUTH {
+            // Behaviour 8: AUTH during the initial CONNECT authentication
+            // is a protocol error. The client gets a CONNACK with 0x82.
+            wire::decode_auth(&body, 5)?;
+            let props = ConnackProperties::default();
+            wire::encode_connack_v5(
+                false,
+                reauth::RC_BAD_AUTH_METHOD,
+                &props,
+                &mut sink.out.lock(),
+            );
+            return Ok(Some(Stop::Clean));
+        }
         if !conn.connected && header.kind != kind::CONNECT {
             return Err(WireError::Malformed("first packet is not CONNECT"));
         }
@@ -2452,6 +2850,10 @@ async fn drain_inbound(
                 let connect = wire::decode_connect(&body)?;
                 conn.level = if connect.level == 5 { 5 } else { 4 };
                 sink.level.store(conn.level, Ordering::Relaxed);
+                conn.auth_method = connect
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.auth_method.clone());
                 conn.keepalive = (connect.keepalive > 0)
                     .then(|| Duration::from_millis(u64::from(connect.keepalive) * 1500));
                 // The listener policy selects the certificate identity
@@ -2469,7 +2871,7 @@ async fn drain_inbound(
                     _ => ("disabled", "disabled"),
                 };
                 let request = bind_request(
-                    connect,
+                    connect.clone(),
                     &conn.peer,
                     listener,
                     peer_cert,
@@ -2477,6 +2879,214 @@ async fn drain_inbound(
                     peer_as_clientid,
                 );
                 conn.client_id = request.client_id.clone();
+                let bind_tenant = request_tenant(shared, &request);
+                if let Some(method) = conn.auth_method.as_deref() {
+                    if method.eq_ignore_ascii_case("JWT") {
+                        let auth_data = connect
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.auth_data.as_deref());
+                        let Some(data) = auth_data else {
+                            wire::encode_connack_v5(
+                                false,
+                                reauth::RC_NOT_AUTHORIZED,
+                                &ConnackProperties::default(),
+                                &mut sink.out.lock(),
+                            );
+                            return Ok(Some(Stop::Clean));
+                        };
+                        let Ok(token) = std::str::from_utf8(data) else {
+                            wire::encode_connack_v5(
+                                false,
+                                reauth::RC_NOT_AUTHORIZED,
+                                &ConnackProperties::default(),
+                                &mut sink.out.lock(),
+                            );
+                            return Ok(Some(Stop::Clean));
+                        };
+                        let Some(jwks) = shared.jwks.as_ref() else {
+                            wire::encode_connack_v5(
+                                false,
+                                reauth::RC_NOT_AUTHORIZED,
+                                &ConnackProperties::default(),
+                                &mut sink.out.lock(),
+                            );
+                            return Ok(Some(Stop::Clean));
+                        };
+                        let tenant = &bind_tenant;
+                        match jwks
+                            .verify_token_in_tenant(tenant, &conn.client_id, token)
+                            .await
+                        {
+                            Ok(verified) => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|elapsed| elapsed.as_secs())
+                                    .unwrap_or(0);
+                                if verified.expires_at > 0 && verified.expires_at <= now {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                }
+                                let Some(payload_b64) = token.split('.').nth(1) else {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                };
+                                let Some(payload_bytes) = reauth::decode_base64(payload_b64) else {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                };
+                                let Ok(claims) =
+                                    serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+                                else {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                };
+                                if let Some(claim_cid) =
+                                    claims.get("client_id").and_then(|v| v.as_str())
+                                {
+                                    if claim_cid != conn.client_id {
+                                        wire::encode_connack_v5(
+                                            false,
+                                            reauth::RC_NOT_AUTHORIZED,
+                                            &ConnackProperties::default(),
+                                            &mut sink.out.lock(),
+                                        );
+                                        return Ok(Some(Stop::Clean));
+                                    }
+                                }
+                                if reauth::finish_success(
+                                    shared,
+                                    conn.conn_id,
+                                    &conn.client_id,
+                                    tenant,
+                                    verified.acls,
+                                )
+                                .is_err()
+                                {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                }
+                                conn.auth_expiry = auth_expiry_instant(
+                                    (verified.expires_at > 0).then_some(verified.expires_at),
+                                );
+                                let has_existing = shared
+                                    .sessions
+                                    .get_in_tenant(&bind_tenant, &request.client_id)
+                                    .and_then(|session| *session.conn_id.read())
+                                    .is_some_and(|id| id != conn.conn_id);
+                                if has_existing
+                                    && is_admission_allowed(shared, &bind_tenant, &request)
+                                {
+                                    handle_takeover_pre_bind(
+                                        shared,
+                                        tx,
+                                        &bind_tenant,
+                                        &request.client_id,
+                                        conn.conn_id,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(_) => {
+                                wire::encode_connack_v5(
+                                    false,
+                                    reauth::RC_NOT_AUTHORIZED,
+                                    &ConnackProperties::default(),
+                                    &mut sink.out.lock(),
+                                );
+                                return Ok(Some(Stop::Clean));
+                            }
+                        }
+                    } else if method.eq_ignore_ascii_case("SCRAM-SHA-256") {
+                        let auth_data = connect
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.auth_data.as_deref());
+                        let tenant = &bind_tenant;
+                        let outcome =
+                            reauth::begin_scram(shared, tenant, auth_data, &mut conn.reauth);
+                        match outcome {
+                            reauth::Outcome::Continue {
+                                reason,
+                                method,
+                                data,
+                            } => {
+                                wire::encode_auth(
+                                    reason,
+                                    Some(&method),
+                                    Some(&data),
+                                    &mut sink.out.lock(),
+                                );
+                                conn.reauth_deadline = Some(
+                                    Instant::now()
+                                        + Duration::from_secs(reauth::DEFAULT_REAUTH_TIMEOUT_SECS),
+                                );
+                                conn.pending_connect = Some((connect, request));
+                                continue;
+                            }
+                            _ => {
+                                wire::encode_connack_v5(
+                                    false,
+                                    reauth::RC_NOT_AUTHORIZED,
+                                    &ConnackProperties::default(),
+                                    &mut sink.out.lock(),
+                                );
+                                return Ok(Some(Stop::Clean));
+                            }
+                        }
+                    } else {
+                        wire::encode_connack_v5(
+                            false,
+                            reauth::RC_BAD_AUTH_METHOD,
+                            &ConnackProperties::default(),
+                            &mut sink.out.lock(),
+                        );
+                        return Ok(Some(Stop::Clean));
+                    }
+                } else {
+                    let has_existing = shared
+                        .sessions
+                        .get_in_tenant(&bind_tenant, &request.client_id)
+                        .and_then(|session| *session.conn_id.read())
+                        .is_some_and(|id| id != conn.conn_id);
+                    if has_existing
+                        && is_plain_connect_authenticated(shared, &bind_tenant, &request).await
+                    {
+                        handle_takeover_pre_bind(
+                            shared,
+                            tx,
+                            &bind_tenant,
+                            &request.client_id,
+                            conn.conn_id,
+                        )
+                        .await;
+                    }
+                }
                 let Some(frame) = conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
                 else {
                     return Err(WireError::Malformed("frame"));
@@ -2553,6 +3163,58 @@ async fn drain_inbound(
                 // send a second one.
                 conn.connected = false;
                 return Ok(Some(Stop::Clean));
+            }
+            kind::AUTH => {
+                let auth = wire::decode_auth(&body, conn.level)?;
+                let tenant = shared
+                    .sessions
+                    .session_for_conn(conn.conn_id)
+                    .map(|session| session.tenant_id.read().clone())
+                    .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
+                let client_id = conn.client_id.clone();
+                let method = conn.auth_method.clone();
+                let outcome = reauth::handle(
+                    shared,
+                    conn.conn_id,
+                    &client_id,
+                    &tenant,
+                    method.as_deref(),
+                    &mut conn.reauth,
+                    &auth,
+                )
+                .await;
+                match outcome {
+                    reauth::Outcome::Continue {
+                        reason,
+                        method,
+                        data,
+                    } => {
+                        wire::encode_auth(reason, Some(&method), Some(&data), &mut sink.out.lock());
+                        conn.reauth_deadline = Some(
+                            Instant::now()
+                                + Duration::from_secs(reauth::DEFAULT_REAUTH_TIMEOUT_SECS),
+                        );
+                    }
+                    reauth::Outcome::Success {
+                        method,
+                        data,
+                        expires_at,
+                    } => {
+                        wire::encode_auth(
+                            reauth::RC_SUCCESS,
+                            method.as_deref(),
+                            data.as_deref(),
+                            &mut sink.out.lock(),
+                        );
+                        conn.reauth_deadline = None;
+                        conn.auth_expiry = auth_expiry_instant(expires_at);
+                    }
+                    reauth::Outcome::Reject { reason } => {
+                        wire::encode_disconnect_v5(reason, &mut sink.out.lock());
+                        return Ok(Some(Stop::Abnormal));
+                    }
+                }
+                continue;
             }
             _ => return Err(WireError::Unsupported("packet type")),
         };

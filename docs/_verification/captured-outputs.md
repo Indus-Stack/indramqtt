@@ -254,12 +254,13 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/authorization.md` | 66 | `ok` |
 | `security/authorization.md` | 78 | `201` |
 | `security/authorization.md` | 111 | `hello-press` |
-| `security/index.md` | 81 | `201` |
+| `security/index.md` | 82 | `201` |
 | `security/management-access.md` | 81 | `ok` |
 | `security/management-access.md` | 93 | `200` |
 | `security/psk.md` | 75 | `ok` |
 | `security/psk.md` | 85 | `OK` |
+| `security/re-authentication.md` | 104 | `0x82` |
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 246 blocks. Each output matches its page.
+The run captured 247 blocks. Each output matches its page.

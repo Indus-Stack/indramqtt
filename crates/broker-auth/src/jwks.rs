@@ -273,6 +273,7 @@ pub struct VerifiedJwt {
     pub issuer: String,
     pub key_id: String,
     pub expires_at: u64,
+    pub acls: Vec<crate::AclRule>,
 }
 
 /// JWKS-backed JWT authenticator, consulted at CONNECT.
@@ -660,11 +661,51 @@ impl JwksAuthenticator {
             .get("exp")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let mut acls = Vec::new();
+        if let Some(items) = claims
+            .claims
+            .get("acl")
+            .or_else(|| claims.claims.get("acls"))
+            .and_then(|v| v.as_array())
+        {
+            for item in items {
+                let topic = item
+                    .get("topic")
+                    .or_else(|| item.get("topic_pattern"))
+                    .and_then(|v| v.as_str());
+                let Some(action_str) = item.get("action").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let action = match action_str {
+                    "publish" => crate::AclAction::Publish,
+                    "subscribe" => crate::AclAction::Subscribe,
+                    "all" => crate::AclAction::All,
+                    _ => continue,
+                };
+                let Some(allow) = item.get("allow").and_then(|v| v.as_bool()).or_else(|| {
+                    item.get("permission")
+                        .and_then(|v| v.as_str())
+                        .and_then(|p| match p {
+                            "allow" => Some(true),
+                            "deny" => Some(false),
+                            _ => None,
+                        })
+                }) else {
+                    continue;
+                };
+                if let Some(topic) = topic {
+                    if !topic.trim().is_empty() {
+                        acls.push(crate::AclRule::new(client_id, action, topic, allow));
+                    }
+                }
+            }
+        }
         Ok(VerifiedJwt {
             subject,
             issuer,
             key_id: kid.to_string(),
             expires_at,
+            acls,
         })
     }
 
