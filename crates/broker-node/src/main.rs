@@ -7090,11 +7090,17 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     let _replay_guard = session.lock_replay();
     let mut replayed = 0;
     let mut replayed_bytes: u64 = 0;
+    let v5_receive_max = (session.protocol_version() == 5)
+        .then(|| usize::from(session.client_receive_maximum().max(1)));
+    let mut v5_unacked_sent = 0usize;
     // T-31: unacked downlinks predate anything queued while detached,
     // so they replay first. Entries stay held until their PUBACK: a
     // second reconnect without acks replays them again. Same packet id
     // with DUP set, so resume can never collide with ids in use.
     for held in session.inflight_snapshot() {
+        if v5_receive_max.is_some_and(|cap| v5_unacked_sent >= cap) {
+            break;
+        }
         let topic_str = held.topic.as_str();
         let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
         meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
@@ -7114,6 +7120,7 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
             if shared.conns.route(frame.header.conn_id, routed) {
                 replayed_bytes += len;
                 replayed += 1;
+                v5_unacked_sent += 1;
             }
         }
     }
@@ -7139,6 +7146,9 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     // `qos1_inflight_spill_redelivers_everything_with_dup`.
     if session.has_spill() {
         for held in session.inflight_spill_snapshot() {
+            if v5_receive_max.is_some_and(|cap| v5_unacked_sent >= cap) {
+                break;
+            }
             let topic_str = held.topic.as_str();
             let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
             meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
@@ -7158,6 +7168,7 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
                 if shared.conns.route(frame.header.conn_id, routed) {
                     replayed_bytes += len;
                     replayed += 1;
+                    v5_unacked_sent += 1;
                     shared.metrics.inc_inflight_spill_replayed();
                 }
             }
@@ -7177,6 +7188,9 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
                 }
             }
         } else {
+            if v5_receive_max.is_some_and(|cap| v5_unacked_sent >= cap) {
+                continue;
+            }
             let topic_str = held.topic.as_str();
             if let Some(routed) = encode_publish_out_with_dup(
                 frame.header.conn_id,
@@ -7192,20 +7206,46 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
                 if shared.conns.route(frame.header.conn_id, routed) {
                     replayed_bytes += len;
                     replayed += 1;
+                    v5_unacked_sent += 1;
                 }
             }
         }
     }
-    // B4-06 SLOP-1: drain retained, delete/rewrite only after confirmed
-    // route. The file survives a crash mid-replay (at-least-once); entries
-    // that never reach the new mailbox are re-queued by
-    // `confirm_offline_consumed` instead of being dropped. Unroutable
-    // frames are already counted inside `ConnTable::route`
-    // (`unknown_conn_dropped` / `dead_mailbox_dropped`).
+    let (queued_replayed, queued_bytes) =
+        replay_queued_offline_locked(shared, &session, frame.header.conn_id, expected_conn_id);
+    replayed += queued_replayed;
+    replayed_bytes += queued_bytes;
+    shared.metrics.inc_publish_sent_by(replayed as u64);
+    shared.metrics.inc_delivered_by(replayed as u64);
+    shared.metrics.inc_bytes_sent_by(replayed_bytes);
+    replayed
+}
+
+/// Drain and route queued offline messages for `session` while the caller
+/// holds `session.lock_replay()`. Paces QoS 1/2 deliveries by both the
+/// client's negotiated MQTT 5 Receive Maximum and the session's inflight/spill
+/// capacity, leaving any overflow queued until ACKs free space.
+fn replay_queued_offline_locked(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    conn_id: u64,
+    expected_conn_id: Option<u64>,
+) -> (usize, u64) {
+    let mut replayed = 0usize;
+    let mut replayed_bytes = 0u64;
+    let v5_receive_max = (session.protocol_version() == 5)
+        .then(|| usize::from(session.client_receive_maximum().max(1)));
     let mut retained = session.take_offline_retained().into_iter();
     let mut unrouted: Vec<QueuedMessage> = Vec::new();
     while let Some(queued) = retained.next() {
         if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+            unrouted.push(queued);
+            unrouted.extend(retained);
+            break;
+        }
+        if queued.qos != QoS::AtMostOnce
+            && v5_receive_max.is_some_and(|cap| session.inflight_total_len() >= cap)
+        {
             unrouted.push(queued);
             unrouted.extend(retained);
             break;
@@ -7250,7 +7290,7 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
         meta.push(0u8);
         let routed = match BrokerFrame::new(
             OpCode::PublishOut,
-            frame.header.conn_id,
+            conn_id,
             0, // stamped per-destination by ConnTable::route
             Bytes::from(meta),
             queued.payload.clone(),
@@ -7264,11 +7304,8 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
                 continue;
             }
         };
-        // Only replays that reached the live mailbox count; a dead
-        // mailbox is already counted inside `ConnTable::route`, never
-        // a delivery.
         let len = routed.total_frame_len() as u64;
-        if shared.conns.route(frame.header.conn_id, routed) {
+        if shared.conns.route(conn_id, routed) {
             if tracked_qos1_spilled {
                 shared.metrics.inc_inflight_spilled();
             } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
@@ -7294,11 +7331,8 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     }
     shared
         .sessions
-        .confirm_offline_consumed_if_current(&session, expected_conn_id, unrouted);
-    shared.metrics.inc_publish_sent_by(replayed as u64);
-    shared.metrics.inc_delivered_by(replayed as u64);
-    shared.metrics.inc_bytes_sent_by(replayed_bytes);
-    replayed
+        .confirm_offline_consumed_if_current(session, expected_conn_id, unrouted);
+    (replayed, replayed_bytes)
 }
 
 /// Route one `PublishIn` frame: an optional `PubAckOut` for the publisher
@@ -10317,6 +10351,17 @@ fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
     let Some(entry) = session.ack_inflight_timed(packet_id) else {
         return;
     };
+    if session.offline_len() > 0 {
+        let _replay_guard = session.lock_replay();
+        let expected_conn_id = (*session.conn_id.read()).map(|_| frame.header.conn_id);
+        let (resumed, resumed_bytes) =
+            replay_queued_offline_locked(shared, &session, frame.header.conn_id, expected_conn_id);
+        if resumed > 0 {
+            shared.metrics.inc_publish_sent_by(resumed as u64);
+            shared.metrics.inc_delivered_by(resumed as u64);
+            shared.metrics.inc_bytes_sent_by(resumed_bytes);
+        }
+    }
     // Fire the ack event. Rules belong to the default tenant.
     // Check flag before any lock. Ack path only, never publish.
     if shared
@@ -14327,11 +14372,77 @@ mod tests {
         shared.conns.register(101, tx);
         let bind = bind_frame(101, 1, encode_bind_meta("replay-cap", false, 60));
         assert_eq!(replay_offline(&bind, &shared).await, 2);
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_ok());
+        let f1 = rx.try_recv().expect("first replayed publish");
+        let f2 = rx.try_recv().expect("second replayed publish");
         assert!(rx.try_recv().is_err());
         assert_eq!(sess.inflight_snapshot().len(), 1);
         assert_eq!(sess.offline_len(), 1);
+
+        let pid_of = |f: &BrokerFrame| -> u16 {
+            let tlen = u16::from_be_bytes([f.metadata[0], f.metadata[1]]) as usize;
+            u16::from_be_bytes([f.metadata[2 + tlen], f.metadata[2 + tlen + 1]])
+        };
+        apply_puback(&puback_frame(101, 2, pid_of(&f1)), &shared);
+        apply_puback(&puback_frame(101, 3, pid_of(&f2)), &shared);
+
+        let f3 = rx.try_recv().expect("third message resumes after PUBACK");
+        assert_eq!(f3.payload, Bytes::from_static(b"thr"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_respects_v5_receive_maximum_and_resumes_on_puback() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-v5-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 102,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (topic, payload) in [("rm/1", b"one".as_slice()), ("rm/2", b"two".as_slice())] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(102, tx);
+        let bind = bind_frame(102, 1, encode_bind_meta("replay-v5-rm", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx
+            .try_recv()
+            .expect("first message within Receive Maximum=1");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        apply_puback(&puback_frame(102, 2, pid1), &shared);
+
+        let f2 = rx.try_recv().expect("second message resumes after PUBACK");
+        assert_eq!(f2.payload, Bytes::from_static(b"two"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
     }
 
     #[tokio::test]
