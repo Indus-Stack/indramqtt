@@ -7087,6 +7087,7 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
                 }
             }
         };
+    let _replay_guard = session.lock_replay();
     let mut replayed = 0;
     let mut replayed_bytes: u64 = 0;
     // T-31: unacked downlinks predate anything queued while detached,
@@ -7201,14 +7202,44 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     // `confirm_offline_consumed` instead of being dropped. Unroutable
     // frames are already counted inside `ConnTable::route`
     // (`unknown_conn_dropped` / `dead_mailbox_dropped`).
-    let retained = session.take_offline_retained();
+    let mut retained = session.take_offline_retained().into_iter();
     let mut unrouted: Vec<QueuedMessage> = Vec::new();
-    for queued in retained {
+    while let Some(queued) = retained.next() {
+        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+            unrouted.push(queued);
+            unrouted.extend(retained);
+            break;
+        }
         let downlink_id = if queued.qos == QoS::AtMostOnce {
             0u16
         } else {
             session.next_packet_id()
         };
+        // Reserve QoS 1 inflight/spill tracking capacity before sending so a
+        // full buffer leaves the message queued until ACKs free space instead
+        // of sending without a retry copy.
+        let mut tracked_qos1_spilled = false;
+        if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+            match session.track_inflight_or_spill(broker_session::InflightMessage {
+                packet_id: downlink_id,
+                topic: queued.topic.clone(),
+                qos: QoS::AtLeastOnce,
+                retain: queued.retain,
+                payload: queued.payload.clone(),
+                enqueued_at: std::time::Instant::now(),
+                publish_at_ms: None,
+            }) {
+                InflightTrackOutcome::Tracked => {}
+                InflightTrackOutcome::Spilled => {
+                    tracked_qos1_spilled = true;
+                }
+                InflightTrackOutcome::Dropped => {
+                    unrouted.push(queued);
+                    unrouted.extend(retained);
+                    break;
+                }
+            }
+        }
         let topic_str = queued.topic.as_str();
         let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
         meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
@@ -7226,6 +7257,9 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
         ) {
             Ok(routed) => routed,
             Err(_) => {
+                if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                    let _ = session.ack_inflight(downlink_id);
+                }
                 unrouted.push(queued);
                 continue;
             }
@@ -7235,29 +7269,8 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
         // a delivery.
         let len = routed.total_frame_len() as u64;
         if shared.conns.route(frame.header.conn_id, routed) {
-            // Track both QoS 1 and QoS 2 offline replays as inflight only
-            // after the route reaches the mailbox, so a disconnect before
-            // PUBACK/PUBCOMP keeps the message for the next reconnect
-            // without leaking unrouted entries.
-            if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
-                match session.track_inflight_or_spill(broker_session::InflightMessage {
-                    packet_id: downlink_id,
-                    topic: queued.topic.clone(),
-                    qos: QoS::AtLeastOnce,
-                    retain: queued.retain,
-                    payload: queued.payload.clone(),
-                    enqueued_at: std::time::Instant::now(),
-                    publish_at_ms: None,
-                }) {
-                    InflightTrackOutcome::Tracked => {}
-                    InflightTrackOutcome::Spilled => {
-                        shared.metrics.inc_inflight_spilled();
-                    }
-                    InflightTrackOutcome::Dropped => {
-                        shared.metrics.inc_inflight_dropped();
-                        shared.metrics.inc_inflight_spill_evicted();
-                    }
-                }
+            if tracked_qos1_spilled {
+                shared.metrics.inc_inflight_spilled();
             } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
                 let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
                     packet_id: downlink_id,
@@ -7273,6 +7286,9 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
             replayed_bytes += len;
             replayed += 1;
         } else {
+            if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                let _ = session.ack_inflight(downlink_id);
+            }
             unrouted.push(queued);
         }
     }
@@ -14266,6 +14282,55 @@ mod tests {
         let bad_bind = bind_frame(999, 1, encode_bind_meta("durable-replay-guard", false, 60));
         assert_eq!(replay_offline(&bad_bind, &shared).await, 0);
         assert!(rx_bad.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_qos1_full_inflight_leaves_overflow_in_offline_queue() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-cap",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 101,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_max_inflight(1);
+        sess.set_max_spill(1);
+        for (topic, payload) in [
+            ("cap/1", b"one".as_slice()),
+            ("cap/2", b"two".as_slice()),
+            ("cap/3", b"thr".as_slice()),
+        ] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(101, tx);
+        let bind = bind_frame(101, 1, encode_bind_meta("replay-cap", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 2);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.inflight_snapshot().len(), 1);
         assert_eq!(sess.offline_len(), 1);
     }
 

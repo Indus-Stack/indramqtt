@@ -127,6 +127,9 @@ pub struct Session {
     /// an fsync. One mutex per session, detached-buffer path only; live
     /// deliveries to connected sessions never touch it or a file.
     offline_persist: std::sync::Mutex<()>,
+    /// Serializes offline/inflight replay per session so an overlapping
+    /// reconnect on the same session waits for any in-progress drain/restore.
+    replay_lock: parking_lot::Mutex<()>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
     /// resends oldest-first with DUP set. Bounded per session by the
@@ -754,6 +757,7 @@ impl Session {
             offline_queue: RwLock::new(VecDeque::new()),
             offline_store: RwLock::new(None),
             offline_persist: std::sync::Mutex::new(()),
+            replay_lock: parking_lot::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
             spill_count: AtomicUsize::new(0),
@@ -1810,6 +1814,13 @@ impl Session {
     /// the persist mutex for the drain so the drain pairs with the
     /// confirm's rewrite under the same serialization as concurrent
     /// buffers; no file I/O happens here.
+    /// Serialize offline/inflight replay per session so an overlapping
+    /// reconnect on the same session cannot observe an empty queue while an
+    /// older connection is still routing or restoring unrouted entries.
+    pub fn lock_replay(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.replay_lock.lock()
+    }
+
     pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {
         if self.offline_store.read().is_some() {
             let _persist = self
@@ -2439,14 +2450,21 @@ impl SessionManager {
     ) {
         let tenant = session.offline_tenant();
         let map = self.sessions.read();
-        let is_current = map
+        let Some(cur) = map
             .get(&tenant)
             .and_then(|inner| inner.get(&session.client_id))
-            .is_some_and(|cur| {
-                cur.id == session.id
-                    && expected_conn_id.is_none_or(|cid| *cur.conn_id.read() == Some(cid))
-            });
-        if !is_current {
+        else {
+            return;
+        };
+        if cur.id != session.id {
+            return;
+        }
+        // If another connection already took over this same session, never
+        // delete/consume on disk for an empty batch, but do restore any
+        // unrouted/deferred messages back to the still-current session.
+        if expected_conn_id.is_some_and(|cid| *cur.conn_id.read() != Some(cid))
+            && unrouted.is_empty()
+        {
             return;
         }
         session.confirm_offline_consumed(unrouted);
@@ -5693,9 +5711,23 @@ mod tests {
         );
 
         manager.confirm_offline_consumed_if_current(&s1, Some(10), Vec::new());
-        // Same-session reconnect (same SessionId, new conn_id 30) must also block old conn 20.
+        // Same-session reconnect (same SessionId, new conn_id 30) must block
+        // empty confirmation for old conn 20, while restoring any unrouted
+        // batch back to the still-current session.
         *s2.conn_id.write() = Some(30);
         manager.confirm_offline_consumed_if_current(&s2, Some(20), Vec::new());
+        assert_eq!(
+            store
+                .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
+                .0
+                .len(),
+            1
+        );
+
+        let drained = s2.take_offline_retained();
+        assert_eq!(drained.len(), 1);
+        manager.confirm_offline_consumed_if_current(&s2, Some(20), drained);
+        assert_eq!(s2.offline_len(), 1);
         assert_eq!(
             store
                 .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
