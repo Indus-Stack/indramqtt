@@ -699,21 +699,7 @@ struct QueuedRecord {
 }
 
 fn format_queued_sql_insert(table: &str, items: &[QueuedRecord]) -> Result<String> {
-    if items.iter().all(|item| item.uniqueness_seq.is_none()) {
-        let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
-        return build_greptime_sql_insert(table, &records);
-    }
-    let records: Vec<GreptimeRecord> = items
-        .iter()
-        .map(|item| {
-            let mut rec = item.record.clone();
-            // Keep column shape homogeneous across the batch when any row carries `_seq`.
-            let seq_val = item.uniqueness_seq.unwrap_or(0) as i64;
-            rec.fields
-                .push(("_seq".to_string(), GreptimeValue::Integer(seq_val)));
-            rec
-        })
-        .collect();
+    let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
     build_greptime_sql_insert(table, &records)
 }
 
@@ -792,10 +778,19 @@ impl GreptimeDbSink {
             map.clear();
         }
         match map.get(series_key).copied() {
-            Some(prev) if wall_ts <= prev => {
-                let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-                (prev, Some(seq))
-            }
+            Some(prev) if wall_ts <= prev => match self.config.format {
+                GreptimeFormat::InfluxLineProtocol => {
+                    let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    (prev, Some(seq))
+                }
+                GreptimeFormat::SqlInsert => {
+                    // Existing SQL tables may not have a `_seq` column; bump per-series
+                    // timestamp by 1 unit to keep the time index unique without altering schema.
+                    let next = prev.saturating_add(1);
+                    map.insert(series_key.to_string(), next);
+                    (next, None)
+                }
+            },
             _ => {
                 map.insert(series_key.to_string(), wall_ts);
                 (wall_ts, None)
@@ -1016,11 +1011,7 @@ mod tests {
         );
         let sqls = transport.captured_sqls.lock();
         assert!(!sqls.is_empty());
-        assert!(
-            !sqls[0].contains("NULL"),
-            "SQL _seq must be homogeneous: {}",
-            sqls[0]
-        );
+        assert!(!sqls[0].contains("_seq"), "SQL insert must not invent _seq column: {}", sqls[0]);
     }
 
     #[tokio::test]

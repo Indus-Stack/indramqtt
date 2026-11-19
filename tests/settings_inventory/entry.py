@@ -34,14 +34,19 @@ def _k1_05_dir() -> Path:
     if _EPHEMERAL_K1_05 is not None:
         return _EPHEMERAL_K1_05
     d = Path(tempfile.mkdtemp(prefix="indra-k1-05-"))
-    subprocess.run(
-        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-         "-subj", "/CN=indra-k1-05-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", str(d / "ca-key.pem"), "-out", str(d / "ca-cert.pem")],
-        check=True, capture_output=True,
-    )
-    for name, subj, ext in [
-        ("server", "/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n"),
-        ("client-a", "/CN=k1-05-a", "extendedKeyUsage=clientAuth\n"),
+    for ca_prefix, cn in [("ca", "/CN=indra-k1-05-ca"), ("wrong-ca", "/CN=indra-wrong-ca")]:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-subj", cn, "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+             "-keyout", str(d / f"{ca_prefix}-key.pem"), "-out", str(d / f"{ca_prefix}-cert.pem")],
+            check=True, capture_output=True,
+        )
+    for name, subj, ext, ca_prefix in [
+        ("server", "/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n", "ca"),
+        ("client-a", "/CN=k1-05-a", "extendedKeyUsage=clientAuth\n", "ca"),
+        ("client-b", "/CN=k1-05-b", "extendedKeyUsage=clientAuth\n", "ca"),
+        ("wrong-client", "/CN=wrong-client", "extendedKeyUsage=clientAuth\n", "wrong-ca"),
     ]:
         csr = d / f"{name}.csr"
         extf = d / f"{name}.ext"
@@ -52,11 +57,36 @@ def _k1_05_dir() -> Path:
             check=True, capture_output=True,
         )
         subprocess.run(
-            ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(d / "ca-cert.pem"),
-             "-CAkey", str(d / "ca-key.pem"), "-CAcreateserial", "-days", "1",
+            ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(d / f"{ca_prefix}-cert.pem"),
+             "-CAkey", str(d / f"{ca_prefix}-key.pem"), "-CAcreateserial", "-days", "1",
              "-extfile", str(extf), "-out", str(d / f"{name}-cert.pem")],
             check=True, capture_output=True,
         )
+    # Generate expired-client using `openssl ca` with backdated validity.
+    (d / "index.txt").write_text("")
+    (d / "serial").write_text("1000\n")
+    (d / "newcerts").mkdir(exist_ok=True)
+    ca_cnf = d / "ca.cnf"
+    ca_cnf.write_text(
+        f"[ ca ]\ndefault_ca = CA_default\n"
+        f"[ CA_default ]\ndir = {d}\ndatabase = {d}/index.txt\nnew_certs_dir = {d}/newcerts\n"
+        f"certificate = {d}/ca-cert.pem\nprivate_key = {d}/ca-key.pem\nserial = {d}/serial\n"
+        f"default_md = sha256\npolicy = policy_any\nx509_extensions = v3_cli\n"
+        f"[ policy_any ]\ncommonName = supplied\n"
+        f"[ v3_cli ]\nextendedKeyUsage = clientAuth\n"
+    )
+    exp_csr = d / "expired-client.csr"
+    subprocess.run(
+        ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=expired-client",
+         "-keyout", str(d / "expired-client-key.pem"), "-out", str(exp_csr)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["openssl", "ca", "-batch", "-config", str(ca_cnf),
+         "-startdate", "20200101000000Z", "-enddate", "20200102000000Z",
+         "-in", str(exp_csr), "-out", str(d / "expired-client-cert.pem")],
+        check=True, capture_output=True,
+    )
     _EPHEMERAL_K1_05 = d
     return d
 
@@ -4203,7 +4233,7 @@ class InventoryEntry(unittest.TestCase):
         receiver = HttpReceiver()
         self.addCleanup(receiver.close)
         b = self.boot()
-        key = (ROOT / "crates/broker-connectors-enterprise/tests/fixtures/gcp_iot_device_rs256_private.pem").read_text()
+        key = subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"], check=True, capture_output=True, text=True).stdout
         config = {"type": "snowflake", "name": "inventorystreaming",
                   "account": "audit_account", "user": "audit_user", "database": "audit_database",
                   "schema": "audit_schema", "table": "audit_table", "private_key_pem": key,

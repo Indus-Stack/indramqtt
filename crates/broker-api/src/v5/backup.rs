@@ -710,7 +710,15 @@ pub(crate) fn admin_user_rights_change(
             .iter()
             .find(|entry| entry.username == user.username)
         {
-            Some(entry) => entry.role != user.role || entry.scopes != user.scopes,
+            Some(entry) => {
+                entry.role != user.role
+                    || entry.scopes != user.scopes
+                    || entry.password_hash != user.password_hash
+                    || entry.must_change_password != user.must_change_password
+                    || entry.mfa_secret != user.mfa_secret
+                    || entry.mfa_enabled != user.mfa_enabled
+                    || entry.mfa_last_step != user.mfa_last_step
+            }
             None => true,
         }
     })

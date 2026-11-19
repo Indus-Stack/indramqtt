@@ -19566,6 +19566,78 @@ config = '{"connector":"pending-timescaledb"}'
     }
 
     #[tokio::test]
+    async fn durable_authenticated_session_preserves_offline_queue_across_restart() {
+        let dir = std::env::temp_dir().join(format!("indra-owner-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        {
+            let shared = test_shared();
+            shared.sessions.set_offline_store(store.clone());
+            shared.auth.add_user("alice", b"p1").unwrap();
+
+            let frame1 = bind_frame(
+                850,
+                1,
+                encode_bind_meta_creds("durable-cid", false, 60, "alice", b"p1"),
+            );
+            let reply1 = apply_bind(&frame1, &shared).await.expect("bind1 replies");
+            let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
+            assert_eq!(rc1, 0);
+
+            shared.sessions.unbind_connection("durable-cid", 850);
+            let sess = shared.sessions.get("durable-cid").unwrap();
+            let topic = broker_protocol::Topic::new("offline/t").unwrap();
+            sess.push_offline(broker_session::QueuedMessage {
+                topic,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"msg1"),
+                publish_at_ms: None,
+            });
+            assert_eq!(sess.offline_len(), 1);
+        }
+
+        // Simulate broker restart: new SessionManager restores from the same OfflineQueueStore.
+        let shared2 = test_shared();
+        shared2.auth.add_user("alice", b"p1").unwrap();
+        shared2.sessions.set_offline_store(store.clone());
+        let stats = shared2.sessions.restore_offline_queues();
+        assert_eq!(stats.messages, 1);
+        assert_eq!(
+            store.owner_in_tenant("default", "durable-cid").as_deref(),
+            Some("alice"),
+            "owner file missing"
+        );
+        assert_eq!(
+            shared2
+                .sessions
+                .get("durable-cid")
+                .unwrap()
+                .verified_username()
+                .as_deref(),
+            Some("alice"),
+            "restored session missing verified_username"
+        );
+
+        let frame2 = bind_frame(
+            851,
+            1,
+            encode_bind_meta_creds("durable-cid", false, 60, "alice", b"p1"),
+        );
+        let reply2 = apply_bind(&frame2, &shared2).await.expect("bind2 replies");
+        let (_, present2, rc2) = decode_session_binding_meta(&reply2.metadata);
+        assert_eq!(rc2, 0);
+        assert!(
+            present2,
+            "same authenticated owner must resume durable session after restart"
+        );
+        let sess2 = shared2.sessions.get("durable-cid").unwrap();
+        assert_eq!(sess2.offline_len(), 1, "offline queue must survive restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn bind_auth_rejects_anonymous_when_allow_flag_is_false() {
         // Fail closed: the flag refuses an anonymous CONNECT while the
         // user store is empty.

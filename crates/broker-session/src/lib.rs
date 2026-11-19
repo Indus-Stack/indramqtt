@@ -808,6 +808,11 @@ impl Session {
     /// superuser flag together so the publish path reads one atomic.
     /// Off the hot path (bind only).
     pub fn set_verified_identity(&self, verified: Option<String>, is_superuser: bool) {
+        let store = self.offline_store.read().clone();
+        if let Some(store) = store {
+            let tenant = self.tenant_id.read().clone();
+            let _ = store.set_owner_in_tenant(&tenant, &self.client_id, verified.as_deref());
+        }
         *self.verified_username.write() = verified;
         self.verified_is_superuser
             .store(is_superuser, Ordering::Relaxed);
@@ -2196,6 +2201,8 @@ impl SessionManager {
             self.apply_qos1_limits(&session);
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(Some(store.clone()));
+            let owner = store.owner_in_tenant(&tenant, &client_id);
+            session.set_verified_identity(owner, false);
             *session.connected.write() = false;
             let dropped = session.push_restored_with_limit(messages, self.max_offline_queue());
             stats.capped_dropped += dropped;

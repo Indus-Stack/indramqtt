@@ -198,24 +198,18 @@ async fn run_once(
         eventloop.set_network_options(network_options);
     }
     let mut unsub_acks_remaining = remaining_previous_topics.len();
-    for old_topic in &*remaining_previous_topics {
-        client
-            .unsubscribe(old_topic.clone())
-            .await
-            .map_err(|error| {
-                ConnectorError::Connection(format!(
-                    "mqtt source unsubscribe request failed: {error}"
-                ))
-            })?;
-    }
-    client
-        .subscribe(config.topic.clone(), source_qos(config.qos))
-        .await
-        .map_err(|error| {
-            ConnectorError::Connection(format!("mqtt source subscribe request failed: {error}"))
-        })?;
+    let mut pending_unsub_send: VecDeque<String> =
+        remaining_previous_topics.iter().cloned().collect();
+    let mut subscribe_sent = false;
     let mut pending_acks: VecDeque<Publish> = VecDeque::new();
     loop {
+        flush_startup_requests(
+            &client,
+            &mut pending_unsub_send,
+            &mut subscribe_sent,
+            &config.topic,
+            config.qos,
+        )?;
         flush_pending_acks(&client, &mut pending_acks);
         let polled = tokio::select! {
             _ = wait_for_stop(&mut stop) => {
@@ -256,6 +250,45 @@ async fn run_once(
         }
         flush_pending_acks(&client, &mut pending_acks);
     }
+}
+
+/// Non-blocking drain of startup UNSUBSCRIBE and SUBSCRIBE requests so a
+/// backlog at or above [`MQTT_SOURCE_CHANNEL_CAP`] never blocks before the
+/// poll loop runs.
+fn flush_startup_requests(
+    client: &AsyncClient,
+    pending_unsub_send: &mut VecDeque<String>,
+    subscribe_sent: &mut bool,
+    topic: &str,
+    qos: u8,
+) -> Result<()> {
+    while let Some(old_topic) = pending_unsub_send.front() {
+        match client.try_unsubscribe(old_topic.clone()) {
+            Ok(()) => {
+                pending_unsub_send.pop_front();
+            }
+            Err(ClientError::TryRequest(_)) => return Ok(()),
+            Err(error) => {
+                return Err(ConnectorError::Connection(format!(
+                    "mqtt source unsubscribe request failed: {error}"
+                )));
+            }
+        }
+    }
+    if !*subscribe_sent {
+        match client.try_subscribe(topic.to_string(), source_qos(qos)) {
+            Ok(()) => {
+                *subscribe_sent = true;
+            }
+            Err(ClientError::TryRequest(_)) => {}
+            Err(error) => {
+                return Err(ConnectorError::Connection(format!(
+                    "mqtt source subscribe request failed: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Non-blocking drain of queued manual acknowledgements so the poll loop
@@ -666,6 +699,67 @@ mod tests {
             })
             .collect();
         assert_eq!(delivered_topics, vec!["new/topic"]);
+    }
+
+    #[tokio::test]
+    async fn startup_with_unsub_backlog_beyond_channel_cap_does_not_hang() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let total_old = MQTT_SOURCE_CHANNEL_CAP + 10;
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (pkt_type, _) = read_mqtt_packet(&mut sock).await;
+            assert_eq!(pkt_type, 1); // CONNECT
+            sock.write_all(&[0x20, 0x02, 0x00, 0x00]).await.unwrap();
+
+            let mut unsubs = 0usize;
+            let mut got_sub = false;
+            while unsubs < total_old || !got_sub {
+                let (pkt_type, body) =
+                    tokio::time::timeout(Duration::from_secs(5), read_mqtt_packet(&mut sock))
+                        .await
+                        .expect("timed out waiting for startup packets");
+                if pkt_type == 10 {
+                    unsubs += 1;
+                    sock.write_all(&[0xB0, 0x02, body[0], body[1]])
+                        .await
+                        .unwrap();
+                } else if pkt_type == 8 {
+                    got_sub = true;
+                    sock.write_all(&[0x90, 0x03, body[0], body[1], 0x01])
+                        .await
+                        .unwrap();
+                }
+            }
+            sock.write_all(&encode_publish_qos1("fresh/topic", 1, b"ok"))
+                .await
+                .unwrap();
+            let (ack_type, _) = read_mqtt_packet(&mut sock).await;
+            assert_eq!(ack_type, 4);
+        });
+
+        let handler = Arc::new(RecordingHandler::default());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut cfg = base_config(port, "fresh/topic");
+        cfg.clean_session = false;
+        cfg.previous_topics = (0..total_old).map(|i| format!("old/{i}")).collect();
+        let task = tokio::spawn(run_mqtt_source(cfg, handler.clone(), stop_rx));
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server finished without hanging")
+            .unwrap();
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+
+        let events = handler.events.lock().await;
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, MqttSourceEvent::Connected)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, MqttSourceEvent::Message(m) if m.topic == "fresh/topic")));
     }
 
     #[tokio::test]

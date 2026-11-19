@@ -452,11 +452,65 @@ impl OfflineQueueStore {
     /// Delete one `(tenant, client id)` queue file (MT-03): a drain or a
     /// clean start in one tenant deletes only its own file, never
     /// another tenant's namesake backlog.
+    /// Persist or clear the verified owner username for `(tenant, client_id)`.
+    pub fn set_owner_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        let path = self
+            .log_path_for(tenant, client_id)?
+            .with_extension("owner");
+        match owner {
+            Some(name) => {
+                let tmp = path.with_extension("owner.tmp");
+                std::fs::write(&tmp, name.as_bytes()).map_err(|e| {
+                    self.persist_failed.fetch_add(1, Ordering::Relaxed);
+                    StorageError::Engine(format!("offline owner write failed: {e}"))
+                })?;
+                std::fs::rename(&tmp, &path).map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.persist_failed.fetch_add(1, Ordering::Relaxed);
+                    StorageError::Engine(format!("offline owner rename failed: {e}"))
+                })?;
+            }
+            None => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        self.persist_failed.fetch_add(1, Ordering::Relaxed);
+                        return Err(StorageError::Engine(format!(
+                            "offline owner remove failed: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the persisted verified owner username for `(tenant, client_id)`, if any.
+    pub fn owner_in_tenant(&self, tenant: &str, client_id: &str) -> Option<String> {
+        let path = self
+            .log_path_for(tenant, client_id)
+            .ok()?
+            .with_extension("owner");
+        std::fs::read_to_string(&path)
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn remove_in_tenant(&self, tenant: &str, client_id: &str) {
         let Ok(path) = self.log_path_for(tenant, client_id) else {
             return;
         };
         if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                self.persist_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let owner_path = path.with_extension("owner");
+        if let Err(e) = std::fs::remove_file(&owner_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 self.persist_failed.fetch_add(1, Ordering::Relaxed);
             }
