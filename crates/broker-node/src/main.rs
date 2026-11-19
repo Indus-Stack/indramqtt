@@ -6029,14 +6029,19 @@ where
                         .await;
                     }
                 }
-                let replayed = match native_bind {
-                    Some(request) => {
-                        Box::pin(replay_offline_client(&frame, &request.client_id, shared)).await
+                let replayed = if accepted {
+                    match native_bind {
+                        Some(request) => {
+                            Box::pin(replay_offline_client(&frame, &request.client_id, shared))
+                                .await
+                        }
+                        #[cfg(test)]
+                        None => Box::pin(replay_offline(&frame, shared)).await,
+                        #[cfg(not(test))]
+                        None => 0,
                     }
-                    #[cfg(test)]
-                    None => Box::pin(replay_offline(&frame, shared)).await,
-                    #[cfg(not(test))]
-                    None => 0,
+                } else {
+                    0
                 };
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
@@ -6639,9 +6644,10 @@ async fn apply_subscribe(
         // tenant's session for observability (the router stays the
         // routing authority). Another tenant's namesake session is never
         // touched.
-        shared.sessions.add_subscription_with_options_in_tenant(
+        shared.sessions.add_subscription_if_session_in_tenant(
             &tenant,
             &client_id,
+            owner.as_ref().map(|s| s.id),
             filter.clone(),
             qos,
             u8::from(no_local),
@@ -7012,11 +7018,25 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     // prefer the session bound to this connection (tenant-correct when
     // two tenants share the client id), falling back to the
     // default-tenant record for binds that predate the index entry.
-    let session = match session_for_conn_if_client(shared, frame.header.conn_id, client_id)
-        .or_else(|| shared.sessions.get(client_id))
-    {
+    let session = match session_for_conn_if_client(shared, frame.header.conn_id, client_id) {
         Some(session) => session,
-        None => return 0,
+        None => {
+            #[cfg(test)]
+            {
+                match shared.sessions.get(client_id).filter(|s| {
+                    let cur = *s.conn_id.read();
+                    cur == Some(frame.header.conn_id)
+                        || (cur.is_none() && s.ended_at_ms.read().is_none())
+                }) {
+                    Some(s) => s,
+                    None => return 0,
+                }
+            }
+            #[cfg(not(test))]
+            {
+                return 0;
+            }
+        }
     };
     let mut replayed = 0;
     let mut replayed_bytes: u64 = 0;
@@ -14136,6 +14156,48 @@ mod tests {
 
         let matches = shared.router.matches(&Topic::new("sport/x").unwrap());
         assert!(matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unbound_conn_cannot_replay_or_consume_durable_offline_queue() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "durable-replay-guard",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 301,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        shared
+            .sessions
+            .unbind_connection("durable-replay-guard", 301);
+        sess.buffer_offline(
+            Topic::new("t/1").unwrap(),
+            Bytes::from_static(b"secret"),
+            QoS::AtLeastOnce,
+            false,
+        );
+        assert_eq!(sess.offline_len(), 1);
+
+        let (tx_bad, mut rx_bad) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(999, tx_bad);
+        let bad_bind = bind_frame(999, 1, encode_bind_meta("durable-replay-guard", false, 60));
+        assert_eq!(replay_offline(&bad_bind, &shared).await, 0);
+        assert!(rx_bad.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
     }
 
     #[tokio::test]

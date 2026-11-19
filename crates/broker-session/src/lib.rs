@@ -2830,6 +2830,38 @@ impl SessionManager {
     // MT-03: tenant plus full subscription options kept flat so callers
     // take no new allocation; allowed like the existing handlers.
     #[allow(clippy::too_many_arguments)]
+    /// Mirror a granted subscription only if `(tenant, client_id)` still
+    /// resolves to `expected_session_id` (when `Some`), preventing a stale
+    /// `SUBSCRIBE` from mutating a replacement session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_subscription_if_session_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        expected_session_id: Option<SessionId>,
+        filter: TopicFilter,
+        qos: QoS,
+        no_local: u8,
+        rap: u8,
+        rh: u8,
+    ) {
+        let map = self.sessions.read();
+        if let Some(session) = map.get(tenant).and_then(|inner| inner.get(client_id)) {
+            if expected_session_id.is_some_and(|id| session.id != id) {
+                return;
+            }
+            if session.conn_id.read().is_none() && session.ended_at_ms.read().is_some() {
+                return;
+            }
+        } else {
+            return;
+        }
+        drop(map);
+        self.add_subscription_with_options_in_tenant(
+            tenant, client_id, filter, qos, no_local, rap, rh,
+        );
+    }
+
     pub fn add_subscription_with_options_in_tenant(
         &self,
         tenant: &str,
@@ -2910,6 +2942,7 @@ impl SessionManager {
                 store.remove_in_tenant(tenant, client_id);
             }
         }
+        let _route_guard = clean_start.then(|| self.route_guard.lock());
         let mut map = self.sessions.write();
 
         if clean_start {
@@ -3127,6 +3160,7 @@ impl SessionManager {
             }
         };
 
+        let _route_guard = self.route_guard.lock();
         let mut map = self.sessions.write();
         let existing = map
             .get(tenant)
