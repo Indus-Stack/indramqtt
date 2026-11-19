@@ -6557,6 +6557,7 @@ async fn apply_subscribe(
         );
         sub.group = group;
         sub.tenant = tenant.clone().into();
+        let _route_guard = shared.sessions.lock_route_guard();
         let stored = shared.router.subscribe(&filter, sub);
         if !stored {
             codes.push(if entry.has_options {

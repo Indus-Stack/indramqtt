@@ -1982,6 +1982,9 @@ pub struct SessionManager {
     /// the full session key so two tenants sharing a client id never
     /// resolve to each other's session.
     conn_index: RwLock<HashMap<u64, SessionKey>>,
+    /// Serializes control-plane route installs (`SUBSCRIBE`) with stale-route
+    /// sweeps so cleanup never deletes a newly accepted subscription.
+    route_guard: parking_lot::Mutex<()>,
     /// Live connection count per `(tenant, username)` (INDRA-127 quotas,
     /// MT-03), grouped `tenant -> username -> count` so the connect path
     /// resolves via borrowed `&str` with no per-connect allocation (only
@@ -2116,6 +2119,7 @@ impl SessionManager {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             conn_index: RwLock::new(HashMap::new()),
+            route_guard: parking_lot::Mutex::new(()),
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
             connected_count: AtomicU64::new(0),
@@ -2433,7 +2437,7 @@ impl SessionManager {
     /// `conn_id` writes (paths outside the indexed bind hook) still
     /// resolve exactly as before.
     pub fn client_id_for_conn(&self, conn_id: u64) -> Option<String> {
-        if let Some(owner) = self.conn_index.read().get(&conn_id).cloned() {
+        if let Some(owner) = self.key_for_conn(conn_id) {
             return Some(owner.client_id);
         }
         self.sessions.read().iter().find_map(|(_, inner)| {
@@ -2445,22 +2449,23 @@ impl SessionManager {
     }
 
     /// Full session key owning a live edge connection, if bound (MT-03).
-    /// Tenant-correct where [`SessionManager::client_id_for_conn`] plus a
-    /// bare `get` would land in the default tenant: connection ids are
-    /// unique per edge connection, so the index identifies exactly one
-    /// `(tenant, client id)` pair.
+    /// Verifies the resolved session still owns `conn_id` so a stale
+    /// `conn_index` entry can never resolve to a replacement session.
     pub fn key_for_conn(&self, conn_id: u64) -> Option<SessionKey> {
-        self.conn_index.read().get(&conn_id).cloned()
+        let index = self.conn_index.read();
+        let owner = index.get(&conn_id)?;
+        let sessions = self.sessions.read();
+        let owns = sessions
+            .get(owner.tenant.as_str())?
+            .get(owner.client_id.as_str())
+            .is_some_and(|session| *session.conn_id.read() == Some(conn_id));
+        owns.then(|| owner.clone())
     }
 
     /// Session owning a live edge connection, if bound (MT-03). Resolves
-    /// through the `conn_id -> session key` index, so a connection in a
-    /// non-default tenant yields its own session, never the
-    /// default-tenant namesake. `None` when the connection is unbound or
-    /// its session is gone. Borrowed two-level lookup clones only the
-    /// `Arc` (no `String` allocation), so the publish path pays no new
-    /// allocation per publish; the two short reads are never held across
-    /// dispatch, routing, or I/O.
+    /// through the `conn_id -> session key` index and verifies the resolved
+    /// session still owns `conn_id`, preventing stale index entries from
+    /// resolving to a replacement owner's session.
     pub fn session_for_conn(&self, conn_id: u64) -> Option<Arc<Session>> {
         let index = self.conn_index.read();
         let owner = index.get(&conn_id)?;
@@ -2468,6 +2473,7 @@ impl SessionManager {
         sessions
             .get(owner.tenant.as_str())?
             .get(owner.client_id.as_str())
+            .filter(|session| *session.conn_id.read() == Some(conn_id))
             .cloned()
     }
 
@@ -3242,6 +3248,12 @@ impl SessionManager {
 
     /// Unsubscribe only filters not currently owned by any active replacement
     /// session for `(tenant, client_id)`.
+    /// Acquire the control-plane route guard so `SUBSCRIBE` router + session
+    /// mirror updates serialize with stale-route cleanup.
+    pub fn lock_route_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.route_guard.lock()
+    }
+
     pub fn sweep_unsubscribed_filters_in_tenant<F>(
         &self,
         tenant: &str,
@@ -3254,6 +3266,7 @@ impl SessionManager {
         if filters.is_empty() {
             return;
         }
+        let _route_guard = self.route_guard.lock();
         let map = self.sessions.read();
         let current = map.get(tenant).and_then(|inner| inner.get(client_id));
         let subs = current.map(|s| s.subscriptions.read());
@@ -5497,5 +5510,62 @@ mod tests {
         assert!(manager
             .get_in_tenant(tenant::DEFAULT_TENANT_ID, "exp-1")
             .is_some());
+    }
+
+    #[test]
+    fn session_for_conn_rejects_stale_conn_index_entry() {
+        let manager = SessionManager::new();
+        let (s1, _, _, _) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "race-cid",
+            false,
+            Some(Some("alice")),
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 100,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let (s2, _, _, stale_conn) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "race-cid",
+            false,
+            Some(Some("bob")),
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 200,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: true,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert_ne!(s1.id, s2.id);
+        assert_eq!(stale_conn, Some(100));
+
+        // Even if conn_index still contained 100 -> race-cid during a window,
+        // session_for_conn and key_for_conn must reject it because s2 owns 200.
+        manager
+            .conn_index
+            .write()
+            .insert(100, SessionKey::new(tenant::DEFAULT_TENANT_ID, "race-cid"));
+        assert!(manager.session_for_conn(100).is_none());
+        assert!(manager.key_for_conn(100).is_none());
+        assert_eq!(manager.session_for_conn(200).unwrap().id, s2.id);
     }
 }
