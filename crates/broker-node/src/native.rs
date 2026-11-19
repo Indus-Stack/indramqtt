@@ -3005,7 +3005,14 @@ mod tests {
     #[test]
     fn peer_cert_fields_pull_cn_from_real_cert() {
         use rustls::pki_types::pem::PemObject as _;
-        let cert_pem = include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem");
+        let cert_pem = {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "test-device");
+            params.self_signed(&key).unwrap().pem()
+        };
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
             rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
@@ -4436,8 +4443,91 @@ mod tests {
     /// Each client certificate is version 3 with clientAuth use.
     /// The sign step uses an extension file with clientAuth use.
     /// No new crate was added for them: `rcgen` is not in the lock file.
+    fn k1_05_dir() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("indramqtt-k1-05-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create k1_05 temp dir");
+
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "indramqtt-test-ca");
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            std::fs::write(dir.join("ca-cert.pem"), ca_cert.pem()).unwrap();
+
+            let srv_key = rcgen::KeyPair::generate().unwrap();
+            let mut srv_params =
+                rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            srv_params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::LOCALHOST,
+                )));
+            srv_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+            std::fs::write(dir.join("server-cert.pem"), srv_cert.pem()).unwrap();
+            std::fs::write(dir.join("server-key.pem"), srv_key.serialize_pem()).unwrap();
+
+            for (file_prefix, cn) in [("client-a", "k1-05-a"), ("client-b", "k1-05-b")] {
+                let k = rcgen::KeyPair::generate().unwrap();
+                let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                p.distinguished_name.push(rcgen::DnType::CommonName, cn);
+                p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+                let c = p.signed_by(&k, &ca_cert, &ca_key).unwrap();
+                std::fs::write(dir.join(format!("{file_prefix}-cert.pem")), c.pem()).unwrap();
+                std::fs::write(
+                    dir.join(format!("{file_prefix}-key.pem")),
+                    k.serialize_pem(),
+                )
+                .unwrap();
+            }
+
+            let exp_key = rcgen::KeyPair::generate().unwrap();
+            let mut exp_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            exp_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "expired-client");
+            exp_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            exp_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            exp_params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+            let exp_cert = exp_params.signed_by(&exp_key, &ca_cert, &ca_key).unwrap();
+            std::fs::write(dir.join("expired-client-cert.pem"), exp_cert.pem()).unwrap();
+            std::fs::write(dir.join("expired-client-key.pem"), exp_key.serialize_pem()).unwrap();
+
+            let wrong_ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut wrong_ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            wrong_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            wrong_ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "indramqtt-wrong-ca");
+            let wrong_ca_cert = wrong_ca_params.self_signed(&wrong_ca_key).unwrap();
+            std::fs::write(dir.join("wrong-ca-cert.pem"), wrong_ca_cert.pem()).unwrap();
+
+            let wrong_cli_key = rcgen::KeyPair::generate().unwrap();
+            let mut wrong_cli_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            wrong_cli_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "wrong-client");
+            wrong_cli_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let wrong_cli_cert = wrong_cli_params
+                .signed_by(&wrong_cli_key, &wrong_ca_cert, &wrong_ca_key)
+                .unwrap();
+            std::fs::write(dir.join("wrong-client-cert.pem"), wrong_cli_cert.pem()).unwrap();
+            std::fs::write(
+                dir.join("wrong-client-key.pem"),
+                wrong_cli_key.serialize_pem(),
+            )
+            .unwrap();
+
+            dir
+        })
+    }
+
     fn k1_05_file(name: &str) -> String {
-        format!("{}/tests/k1_05/{name}", env!("CARGO_MANIFEST_DIR"))
+        k1_05_dir().join(name).display().to_string()
     }
 
     /// Trust roots of the K1-05 test CA.

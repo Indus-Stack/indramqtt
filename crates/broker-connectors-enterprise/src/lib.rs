@@ -572,3 +572,68 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_pki {
+    use std::sync::OnceLock;
+
+    pub struct EphemeralPki {
+        pub ca_pem: String,
+        pub server_cert_pem: String,
+        pub server_key_pem: String,
+        pub client_cert_pem: String,
+        pub client_key_pem: String,
+    }
+
+    pub fn get() -> &'static EphemeralPki {
+        static PKI: OnceLock<EphemeralPki> = OnceLock::new();
+        PKI.get_or_init(|| {
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "indramqtt-test-ca");
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+            let srv_key = rcgen::KeyPair::generate().unwrap();
+            let mut srv_params =
+                rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            srv_params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::LOCALHOST,
+                )));
+            let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+
+            let cli_key = rcgen::KeyPair::generate().unwrap();
+            let mut cli_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            cli_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "test-device");
+            cli_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let cli_cert = cli_params.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
+
+            EphemeralPki {
+                ca_pem: ca_cert.pem(),
+                server_cert_pem: srv_cert.pem(),
+                server_key_pem: srv_key.serialize_pem(),
+                client_cert_pem: cli_cert.pem(),
+                client_key_pem: cli_key.serialize_pem(),
+            }
+        })
+    }
+
+    pub fn rs256_pair() -> &'static (String, String) {
+        use rsa::pkcs8::{EncodePrivateKey as _, EncodePublicKey as _, LineEnding};
+        static PAIR: OnceLock<(String, String)> = OnceLock::new();
+        PAIR.get_or_init(|| {
+            let mut rng = rsa::rand_core::OsRng;
+            let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+            let pub_key = rsa::RsaPublicKey::from(&priv_key);
+            let priv_pem = priv_key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+            let pub_pem = pub_key.to_public_key_pem(LineEnding::LF).unwrap();
+            (priv_pem, pub_pem)
+        })
+    }
+}

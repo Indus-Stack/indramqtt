@@ -1484,10 +1484,6 @@ mod tests {
         .is_ok());
     }
 
-    const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
-    const TEST_SERVER_CERT_PEM: &str = include_str!("../testdata/server-cert.pem");
-    const TEST_SERVER_KEY_PEM: &str = include_str!("../testdata/server-key.pem");
-
     /// Write `pem` to a unique temp file and return its path. The caller
     /// removes the file when done.
     fn write_temp_ca_file(pem: &str) -> std::path::PathBuf {
@@ -1539,7 +1535,7 @@ mod tests {
     async fn test_alloydb_tls_trusts_private_ca_from_config_file() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let ca_path = write_temp_ca_file(TEST_CA_PEM);
+        let ca_path = write_temp_ca_file(crate::test_pki::get().ca_pem.as_str());
         let mut config = tls_test_base_config();
         config.tls_ca_file = Some(ca_path.to_string_lossy().to_string());
         config.validate().expect("CA file config validates");
@@ -1549,8 +1545,8 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
             None,
         )
         .expect("test server config");
@@ -1613,8 +1609,8 @@ mod tests {
         config.validate().expect("no-CA config validates");
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
             None,
         )
         .expect("test server config");

@@ -22,7 +22,6 @@ use broker_connectors::mqtt_source::{
 use broker_connectors::parse_bridge_address;
 use broker_protocol::{QoS, Topic};
 use std::collections::{HashMap, HashSet};
-use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -114,30 +113,7 @@ fn source_duration(id: &str, key: &str, value: &serde_json::Value) -> Result<Dur
             "source {id:?} field `resource_opts.{key}` must be a duration string"
         ));
     };
-    let text = text.trim().to_ascii_lowercase();
-    let split = text
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .ok_or_else(|| source_duration_error(id, key, value))?;
-    let (number, unit) = text.split_at(split);
-    let number: f64 = number
-        .parse()
-        .map_err(|_| source_duration_error(id, key, value))?;
-    if !number.is_finite() || number < 0.0 {
-        return Err(source_duration_error(id, key, value));
-    }
-    let nanos = match unit.trim() {
-        "ns" => number,
-        "us" | "µs" => number * 1_000.0,
-        "ms" => number * 1_000_000.0,
-        "s" => number * 1_000_000_000.0,
-        "m" => number * 60.0 * 1_000_000_000.0,
-        "h" => number * 3600.0 * 1_000_000_000.0,
-        _ => return Err(source_duration_error(id, key, value)),
-    };
-    if nanos > u64::MAX as f64 {
-        return Err(source_duration_error(id, key, value));
-    }
-    Ok(Duration::from_nanos(nanos as u64))
+    broker_config::parse_duration_str(text).map_err(|_| source_duration_error(id, key, value))
 }
 
 fn source_duration_error(id: &str, key: &str, value: &serde_json::Value) -> String {
@@ -282,8 +258,17 @@ pub fn spawn(shared: Shared) {
     let topic_state = Arc::new(Mutex::new(PersistedSourceTopics::load(&state_path)));
     handle.spawn(async move {
         let mut running: HashMap<String, RunningSource> = HashMap::new();
+        let mut last_inputs: HashMap<String, (SourceEntry, Option<serde_json::Value>)> =
+            HashMap::new();
         loop {
-            reconcile(&shared, &mut running, &topic_state, &state_path).await;
+            reconcile(
+                &shared,
+                &mut running,
+                &mut last_inputs,
+                &topic_state,
+                &state_path,
+            )
+            .await;
             tokio::time::sleep(SOURCE_RECONCILE_INTERVAL).await;
         }
     });
@@ -292,6 +277,7 @@ pub fn spawn(shared: Shared) {
 async fn reconcile(
     shared: &Shared,
     running: &mut HashMap<String, RunningSource>,
+    last_inputs: &mut HashMap<String, (SourceEntry, Option<serde_json::Value>)>,
     topic_state: &Arc<Mutex<PersistedSourceTopics>>,
     state_path: &Path,
 ) {
@@ -300,6 +286,7 @@ async fn reconcile(
     for entry in entries {
         seen.insert(entry.id.clone());
         if !entry.enable {
+            last_inputs.remove(&entry.id);
             stop(
                 shared,
                 running,
@@ -311,7 +298,21 @@ async fn reconcile(
             .await;
             continue;
         }
-        match build_config(&entry, shared) {
+        let connector_doc = if entry.connector.trim().is_empty() {
+            None
+        } else {
+            shared.connectors.get(&entry.connector)
+        };
+        if last_inputs
+            .get(&entry.id)
+            .is_some_and(|(prev_entry, prev_conn)| {
+                prev_entry == &entry && prev_conn == &connector_doc
+            })
+        {
+            continue;
+        }
+        last_inputs.insert(entry.id.clone(), (entry.clone(), connector_doc));
+        match build_config(&entry, shared).await {
             Ok(mut config) => {
                 let unchanged = running
                     .get(&entry.id)
@@ -398,6 +399,7 @@ async fn reconcile(
         }
     }
     for id in missing {
+        last_inputs.remove(&id);
         stop(shared, running, &id, None).await;
     }
 }
@@ -492,7 +494,7 @@ impl DeliveryHandler {
     }
 }
 
-fn build_config(entry: &SourceEntry, shared: &Shared) -> Result<MqttSourceConfig, String> {
+async fn build_config(entry: &SourceEntry, shared: &Shared) -> Result<MqttSourceConfig, String> {
     let connectors = &shared.connectors;
     if !is_supported_source_type(&entry.source_type) {
         return Err(format!(
@@ -560,7 +562,7 @@ fn build_config(entry: &SourceEntry, shared: &Shared) -> Result<MqttSourceConfig
     if endpoint.tls {
         return Err("MQTT source TLS is not enabled in this build".to_string());
     }
-    if is_self_listener_target(&endpoint.host, endpoint.port, shared) {
+    if is_self_listener_target(&endpoint.host, endpoint.port, shared).await {
         return Err(format!(
             "MQTT source connector {:?} targets this broker's own listener ({}:{}) and would create a publish loop",
             entry.connector, endpoint.host, endpoint.port
@@ -662,28 +664,31 @@ fn parse_seconds(text: &str) -> Result<u16, String> {
     Ok(seconds as u16)
 }
 
-fn is_self_listener_target(host: &str, port: u16, shared: &Shared) -> bool {
-    let Ok(guard) = shared.api_listeners.read() else {
-        return false;
-    };
-    let Some(listeners) = guard.as_ref() else {
-        return false;
-    };
-    let binds = [
-        (listeners.tcp.enabled, listeners.tcp.bind.as_str()),
-        (listeners.tls.enabled, listeners.tls.bind.as_str()),
-    ];
-    for (enabled, bind) in binds {
-        if !enabled {
-            continue;
-        }
-        let Ok(addr) = bind.parse::<std::net::SocketAddr>() else {
-            continue;
+async fn is_self_listener_target(host: &str, port: u16, shared: &Shared) -> bool {
+    let bind_ips: Vec<std::net::IpAddr> = {
+        let Ok(guard) = shared.api_listeners.read() else {
+            return false;
         };
-        if addr.port() != port {
-            continue;
-        }
-        if host_targets_listener(host, addr.ip()) {
+        let Some(listeners) = guard.as_ref() else {
+            return false;
+        };
+        let binds = [
+            (listeners.tcp.enabled, listeners.tcp.bind.as_str()),
+            (listeners.tls.enabled, listeners.tls.bind.as_str()),
+        ];
+        binds
+            .into_iter()
+            .filter_map(|(enabled, bind)| {
+                if !enabled {
+                    return None;
+                }
+                let addr = bind.parse::<std::net::SocketAddr>().ok()?;
+                (addr.port() == port).then_some(addr.ip())
+            })
+            .collect()
+    };
+    for bind_ip in bind_ips {
+        if host_targets_listener(host, bind_ip).await {
             return true;
         }
     }
@@ -700,14 +705,16 @@ fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
-fn is_local_interface_ip(ip: std::net::IpAddr) -> bool {
+async fn is_local_interface_ip(ip: std::net::IpAddr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
-    std::net::TcpListener::bind((ip, 0)).is_ok()
+    tokio::task::spawn_blocking(move || std::net::TcpListener::bind((ip, 0)).is_ok())
+        .await
+        .unwrap_or(false)
 }
 
-fn ip_targets_listener(ip: std::net::IpAddr, bind_ip: std::net::IpAddr) -> bool {
+async fn ip_targets_listener(ip: std::net::IpAddr, bind_ip: std::net::IpAddr) -> bool {
     let ip = normalize_ip(ip);
     let bind_ip = normalize_ip(bind_ip);
     if ip == bind_ip {
@@ -718,20 +725,20 @@ fn ip_targets_listener(ip: std::net::IpAddr, bind_ip: std::net::IpAddr) -> bool 
     {
         return true;
     }
-    bind_ip.is_unspecified() && is_local_interface_ip(ip)
+    bind_ip.is_unspecified() && is_local_interface_ip(ip).await
 }
 
-fn host_targets_listener(host: &str, bind_ip: std::net::IpAddr) -> bool {
+async fn host_targets_listener(host: &str, bind_ip: std::net::IpAddr) -> bool {
     let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
     if trimmed.eq_ignore_ascii_case("localhost") {
         return bind_ip.is_loopback() || bind_ip.is_unspecified();
     }
     if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-        return ip_targets_listener(ip, bind_ip);
+        return ip_targets_listener(ip, bind_ip).await;
     }
-    if let Ok(addrs) = (trimmed, 0u16).to_socket_addrs() {
+    if let Ok(addrs) = tokio::net::lookup_host((trimmed, 0u16)).await {
         for addr in addrs {
-            if ip_targets_listener(addr.ip(), bind_ip) {
+            if ip_targets_listener(addr.ip(), bind_ip).await {
                 return true;
             }
         }
@@ -743,16 +750,16 @@ fn host_targets_listener(host: &str, bind_ip: std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn wildcard_listener_catches_local_lan_ip_and_persists_topic_migrations() {
+    #[tokio::test]
+    async fn wildcard_listener_catches_local_lan_ip_and_persists_topic_migrations() {
         let bind_any: std::net::IpAddr = "0.0.0.0".parse().unwrap();
-        assert!(host_targets_listener("127.0.0.1", bind_any));
+        assert!(host_targets_listener("127.0.0.1", bind_any).await);
         // Probe a real local outbound interface IP if available.
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
             if sock.connect("8.8.8.8:80").is_ok() {
                 if let Ok(local) = sock.local_addr() {
                     assert!(
-                        host_targets_listener(&local.ip().to_string(), bind_any),
+                        host_targets_listener(&local.ip().to_string(), bind_any).await,
                         "expected local interface IP {} to match 0.0.0.0 listener",
                         local.ip()
                     );

@@ -1248,23 +1248,12 @@ mod tests {
         assert!(!transport.is_connected().await);
     }
 
-    const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
-    const TEST_SERVER_CERT_PEM: &str = include_str!("../testdata/server-cert.pem");
-    const TEST_SERVER_KEY_PEM: &str = include_str!("../testdata/server-key.pem");
-
-    /// Test-only device key pair for the JWT-verifying loopback fakes
-    /// (committed fixtures; shipped code never loads them).
-    const FIXTURE_PRIVATE_PEM: &str =
-        include_str!("../tests/fixtures/gcp_iot_device_rs256_private.pem");
-    const FIXTURE_PUBLIC_PEM: &str =
-        include_str!("../tests/fixtures/gcp_iot_device_rs256_public.pem");
-
     /// Mint a device JWT from the fixture private key, valid at the
     /// current time.
     fn fixture_token(lifetime_secs: u64) -> String {
         let now_secs = now_millis().max(0) as u64 / 1_000;
         build_jwt(
-            FIXTURE_PRIVATE_PEM,
+            crate::test_pki::rs256_pair().0.as_str(),
             GcpIotAlgorithm::Rs256,
             "my-iot-project",
             now_secs,
@@ -1278,8 +1267,9 @@ mod tests {
     /// that accepted any placeholder would prove nothing about
     /// authentication.
     fn verify_fixture_token(password: &str) -> serde_json::Value {
-        let key = jsonwebtoken::DecodingKey::from_rsa_pem(FIXTURE_PUBLIC_PEM.as_bytes())
-            .expect("fixture public key parses");
+        let key =
+            jsonwebtoken::DecodingKey::from_rsa_pem(crate::test_pki::rs256_pair().1.as_bytes())
+                .expect("fixture public key parses");
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
         validation.set_audience(&["my-iot-project"]);
         jsonwebtoken::decode::<serde_json::Value>(password, &key, &validation)
@@ -1289,9 +1279,9 @@ mod tests {
 
     fn fixture_test_config(endpoint: &str) -> GcpIotConfig {
         GcpIotConfig {
-            private_key_pem: FIXTURE_PRIVATE_PEM.to_string(),
+            private_key_pem: crate::test_pki::rs256_pair().0.as_str().to_string(),
             endpoint: endpoint.to_string(),
-            ca_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            ca_bundle_pem: Some(crate::test_pki::get().ca_pem.as_str().to_string()),
             ..test_config()
         }
     }
@@ -1299,7 +1289,7 @@ mod tests {
     fn tls_test_config(endpoint: &str) -> GcpIotConfig {
         GcpIotConfig {
             endpoint: endpoint.to_string(),
-            ca_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            ca_bundle_pem: Some(crate::test_pki::get().ca_pem.as_str().to_string()),
             ..test_config()
         }
     }
@@ -1309,8 +1299,8 @@ mod tests {
         use tokio::net::TcpListener;
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
             None,
         )
         .expect("test server config");
@@ -1387,8 +1377,8 @@ mod tests {
         use tokio::net::TcpListener;
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
             None,
         )
         .expect("test server config");
@@ -1444,7 +1434,7 @@ mod tests {
         // the fixture key so both verify.
         let now_secs = now_millis().max(0) as u64 / 1_000;
         let token_one = build_jwt(
-            FIXTURE_PRIVATE_PEM,
+            crate::test_pki::rs256_pair().0.as_str(),
             GcpIotAlgorithm::Rs256,
             "my-iot-project",
             now_secs,
@@ -1452,7 +1442,7 @@ mod tests {
         )
         .expect("token one mints");
         let token_two = build_jwt(
-            FIXTURE_PRIVATE_PEM,
+            crate::test_pki::rs256_pair().0.as_str(),
             GcpIotAlgorithm::Rs256,
             "my-iot-project",
             now_secs.saturating_add(1_800),

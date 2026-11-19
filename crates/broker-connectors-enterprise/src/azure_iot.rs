@@ -1563,12 +1563,6 @@ mod tests {
         }
     }
 
-    const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
-    const TEST_SERVER_CERT_PEM: &str = include_str!("../testdata/server-cert.pem");
-    const TEST_SERVER_KEY_PEM: &str = include_str!("../testdata/server-key.pem");
-    const TEST_CLIENT_CERT_PEM: &str = include_str!("../testdata/client-cert.pem");
-    const TEST_CLIENT_KEY_PEM: &str = include_str!("../testdata/client-key.pem");
-
     fn sas_test_config(hub: &str) -> AzureIotConfig {
         AzureIotConfig {
             iot_hub_name: hub.to_string(),
@@ -1588,7 +1582,7 @@ mod tests {
             timeout_ms: Some(2000),
             connect_timeout_ms: Some(2000),
             handshake_timeout_ms: Some(2000),
-            ca_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            ca_bundle_pem: Some(crate::test_pki::get().ca_pem.as_str().to_string()),
             sas_ttl_secs: Some(3600),
         }
     }
@@ -1599,8 +1593,8 @@ mod tests {
             device_id: "edge-1".to_string(),
             module_id: None,
             auth: AzureIotAuth::X509 {
-                cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
-                key_pem: TEST_CLIENT_KEY_PEM.to_string(),
+                cert_pem: crate::test_pki::get().client_cert_pem.as_str().to_string(),
+                key_pem: crate::test_pki::get().client_key_pem.as_str().to_string(),
             },
             api_version: "2021-04-12".to_string(),
             direct_methods_enabled: true,
@@ -1612,7 +1606,7 @@ mod tests {
             timeout_ms: Some(2000),
             connect_timeout_ms: Some(2000),
             handshake_timeout_ms: Some(2000),
-            ca_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            ca_bundle_pem: Some(crate::test_pki::get().ca_pem.as_str().to_string()),
             sas_ttl_secs: None,
         }
     }
@@ -1708,8 +1702,8 @@ mod tests {
         use tokio::net::TcpListener;
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
             None,
         )
         .expect("test server config");
@@ -1784,9 +1778,9 @@ mod tests {
         use tokio::net::TcpListener;
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
-            Some(TEST_CA_PEM),
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
+            Some(crate::test_pki::get().ca_pem.as_str()),
         )
         .expect("test server config");
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);

@@ -61,9 +61,10 @@ EOF
 # serve the TLS listener tests of the kernel.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TREE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-WSS_CERT="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-cert.pem"
-WSS_KEY="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-key.pem"
-WSS_CA="$TREE_DIR/crates/broker-connectors-enterprise/testdata/ca-cert.pem"
+bash "$TREE_DIR/tools/gen_test_pki.sh" "$ROOT/pki"
+WSS_CERT="$ROOT/pki/server-cert.pem"
+WSS_KEY="$ROOT/pki/server-key.pem"
+WSS_CA="$ROOT/pki/ca-cert.pem"
 
 API_KEY_GOOD=boot-smoke-key-0001
 # The kernel serves every enabled listener. `native` is deprecated and

@@ -5,7 +5,6 @@
 //! It publishes on a real socket.
 //! It reads the request at a receiver.
 
-use std::path::Path;
 use std::time::Duration;
 
 use super::e2e_support::{TestBroker, TestTarget};
@@ -767,10 +766,7 @@ async fn http_orderly_stop_with_partial_batch_through_broker() {
 #[tokio::test]
 async fn http_tls_through_broker() {
     let target = TestTarget::start_https().await;
-    let ca = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("k1_05")
-        .join("ca-cert.pem");
+    let ca = super::e2e_support::ephemeral_k1_05_dir().join("ca-cert.pem");
     let broker =
         TestBroker::start_with_env("", &[("SSL_CERT_FILE", ca.display().to_string())]).await;
     broker

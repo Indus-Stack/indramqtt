@@ -42,7 +42,7 @@ The router and rule engine microbenchmarks measure one function in one thread, i
 cargo test --release --bench broker_throughput -- --nocapture
 ```
 
-The source is `crates/broker-node/benches/broker_throughput.rs`. The method is in `BENCHMARKS.md`. End-to-end loopback results live in `benchmark_suite/`.
+The source is `crates/broker-node/benches/broker_throughput.rs`. The method is in `BENCHMARKS.md`. End-to-end loopback results live in `benchmark/`.
 
 ## Suite method
 

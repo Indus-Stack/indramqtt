@@ -124,11 +124,23 @@ pub async fn run_mqtt_source(
     handler: Arc<dyn MqttSourceHandler>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let mut remaining_previous_topics: Vec<String> = config
+        .previous_topics
+        .iter()
+        .filter(|old| *old != &config.topic)
+        .cloned()
+        .collect();
     loop {
         if *stop.borrow_and_update() {
             return;
         }
-        let result = run_once(&config, handler.as_ref(), stop.clone()).await;
+        let result = run_once(
+            &config,
+            &mut remaining_previous_topics,
+            handler.as_ref(),
+            stop.clone(),
+        )
+        .await;
         match result {
             Ok(()) => return,
             Err(error) => {
@@ -158,6 +170,7 @@ async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
 
 async fn run_once(
     config: &MqttSourceConfig,
+    remaining_previous_topics: &mut Vec<String>,
     handler: &dyn MqttSourceHandler,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -184,14 +197,8 @@ async fn run_once(
         network_options.set_connection_timeout(timeout.as_secs().max(1));
         eventloop.set_network_options(network_options);
     }
-    let mut pending_unsub_topics: Vec<String> = config
-        .previous_topics
-        .iter()
-        .filter(|old| *old != &config.topic)
-        .cloned()
-        .collect();
-    let mut unsub_acks_remaining = pending_unsub_topics.len();
-    for old_topic in &pending_unsub_topics {
+    let mut unsub_acks_remaining = remaining_previous_topics.len();
+    for old_topic in &*remaining_previous_topics {
         client
             .unsubscribe(old_topic.clone())
             .await
@@ -219,7 +226,7 @@ async fn run_once(
                     &config.topic,
                     handler,
                     &mut pending_acks,
-                    &mut pending_unsub_topics,
+                    remaining_previous_topics,
                     &mut unsub_acks_remaining,
                 )
                 .await;
@@ -236,7 +243,7 @@ async fn run_once(
                     &config.topic,
                     handler,
                     &mut pending_acks,
-                    &mut pending_unsub_topics,
+                    remaining_previous_topics,
                     &mut unsub_acks_remaining,
                 )
                 .await?;
@@ -253,15 +260,18 @@ async fn run_once(
 
 /// Non-blocking drain of queued manual acknowledgements so the poll loop
 /// never deadlocks waiting on a full bounded request channel.
-fn flush_pending_acks(client: &AsyncClient, pending_acks: &mut VecDeque<Publish>) {
+fn flush_pending_acks(client: &AsyncClient, pending_acks: &mut VecDeque<Publish>) -> usize {
+    let mut sent = 0;
     while let Some(front) = pending_acks.front() {
         match client.try_ack(front) {
             Ok(()) => {
                 pending_acks.pop_front();
+                sent += 1;
             }
             Err(ClientError::TryRequest(_)) | Err(ClientError::Request(_)) => break,
         }
     }
+    sent
 }
 
 /// Deliver every packet that the driver already read. The bound keeps
@@ -325,6 +335,7 @@ async fn drain(
         }
         flush_pending_acks(client, pending_acks);
     }
+    let mut queued_acks = 0usize;
     while let Some(event) = eventloop.state.events.pop_front() {
         if handle_event(
             event,
@@ -342,7 +353,44 @@ async fn drain(
             return;
         }
     }
-    flush_pending_acks(client, pending_acks);
+    queued_acks += flush_pending_acks(client, pending_acks);
+    // Drive the eventloop until queued PUBACKs are written to the socket or the drain deadline expires.
+    while queued_acks > 0 || !pending_acks.is_empty() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = MQTT_SOURCE_DRAIN_READ.min(deadline - now);
+        match tokio::time::timeout(wait, eventloop.poll()).await {
+            Ok(Ok(Event::Outgoing(
+                rumqttc::Outgoing::PubAck(_)
+                | rumqttc::Outgoing::PubRec(_)
+                | rumqttc::Outgoing::PubComp(_),
+            ))) => {
+                queued_acks = queued_acks.saturating_sub(1);
+                queued_acks += flush_pending_acks(client, pending_acks);
+            }
+            Ok(Ok(event)) => {
+                if handle_event(
+                    event,
+                    client,
+                    filter,
+                    topic_pattern,
+                    handler,
+                    pending_acks,
+                    pending_unsub_topics,
+                    unsub_acks_remaining,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                queued_acks += flush_pending_acks(client, pending_acks);
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

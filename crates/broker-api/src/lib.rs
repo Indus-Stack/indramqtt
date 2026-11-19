@@ -27235,6 +27235,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // SigV4/WebSocket is intentionally not built (no licence-compliant
         // WebSocket client); SigV4 configs are rejected at registration.
         // X1-09: gated behind Cargo feature `aws_iot`.
+        let (ca_pem, client_cert_pem, client_key_pem) = {
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_p.distinguished_name
+                .push(rcgen::DnType::CommonName, "indramqtt-test-ca");
+            let ca_cert = ca_p.self_signed(&ca_key).unwrap();
+            let cli_key = rcgen::KeyPair::generate().unwrap();
+            let mut cli_p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            cli_p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let cli_cert = cli_p.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
+            (ca_cert.pem(), cli_cert.pem(), cli_key.serialize_pem())
+        };
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -27244,9 +27257,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                                   "region": "us-east-1",
                                   "client_id": "indra-bridge-1",
                                   "auth": {"type": "mtls",
-                                            "ca_cert_pem": include_str!("../../broker-connectors-enterprise/testdata/ca-cert.pem"),
-                                            "client_cert_pem": include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem"),
-                                            "client_key_pem": include_str!("../../broker-connectors-enterprise/testdata/client-key.pem")},
+                                            "ca_cert_pem": ca_pem,
+                                            "client_cert_pem": client_cert_pem,
+                                            "client_key_pem": client_key_pem},
                                   "topic_mappings": [{"local_topic": "sensors/+",
                                                       "remote_topic": "indra/up",
                                                       "direction": "localtoremote"}],

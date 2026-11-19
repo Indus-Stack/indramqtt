@@ -419,12 +419,40 @@ fn read_fault(shared: &TargetShared) -> Fault {
     Fault::Up
 }
 
+pub fn ephemeral_k1_05_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("indramqtt-e2e-k1-05-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create e2e k1_05 dir");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "indramqtt-test-ca");
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        std::fs::write(dir.join("ca-cert.pem"), ca_cert.pem()).unwrap();
+
+        let srv_key = rcgen::KeyPair::generate().unwrap();
+        let mut srv_params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .unwrap();
+        srv_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+        std::fs::write(dir.join("server-cert.pem"), srv_cert.pem()).unwrap();
+        std::fs::write(dir.join("server-key.pem"), srv_key.serialize_pem()).unwrap();
+        dir
+    })
+}
+
 fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
     use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("k1_05");
+    let base = ephemeral_k1_05_dir();
     let certs: Vec<CertificateDer<'static>> =
         CertificateDer::pem_file_iter(base.join("server-cert.pem"))
             .expect("cert file reads")

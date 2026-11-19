@@ -555,9 +555,20 @@ async fn handle_packet(
             let verified_is_superuser = verified_username
                 .as_deref()
                 .is_some_and(|name| state.auth.is_superuser(name));
+            let principal_mismatch = !conn.clean_start
+                && state
+                    .sessions
+                    .get(&conn.client_id)
+                    .is_some_and(|existing| existing.verified_username() != verified_username);
+            if conn.clean_start || principal_mismatch {
+                let stale = state.sessions.subscription_filters(&conn.client_id);
+                for filter in &stale {
+                    state.router.unsubscribe(filter, &conn.client_id);
+                }
+            }
             let (stored, present) = state
                 .sessions
-                .get_or_create(&conn.client_id, conn.clean_start);
+                .get_or_create(&conn.client_id, conn.clean_start || principal_mismatch);
             *stored.conn_id.write() = Some(conn_id);
             *stored.keepalive_secs.write() = conn.keepalive_secs;
             *stored.username.write() = conn.username.clone();

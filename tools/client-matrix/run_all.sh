@@ -20,9 +20,13 @@ TREE=$(cd "$HERE/../.." && pwd)
 OUT=${1:-$HERE/out}
 KERNEL=${MATRIX_KERNEL:-/work/target/debug/indramqtt}
 API_KEY=${MATRIX_API_KEY:-matrix-run-key-00000001}
-CA_FILE=${MATRIX_CA:-$TREE/crates/broker-connectors-enterprise/testdata/ca-cert.pem}
-TLS_CERT=${MATRIX_TLS_CERT:-$TREE/crates/broker-connectors-enterprise/testdata/server-cert.pem}
-TLS_KEY=${MATRIX_TLS_KEY:-$TREE/crates/broker-connectors-enterprise/testdata/server-key.pem}
+if [ -z "${MATRIX_CA:-}" ] || [ -z "${MATRIX_TLS_CERT:-}" ] || [ -z "${MATRIX_TLS_KEY:-}" ]; then
+    MATRIX_PKI_DIR=$(mktemp -d)
+    bash "$TREE/tools/gen_test_pki.sh" "$MATRIX_PKI_DIR"
+fi
+CA_FILE=${MATRIX_CA:-$MATRIX_PKI_DIR/ca-cert.pem}
+TLS_CERT=${MATRIX_TLS_CERT:-$MATRIX_PKI_DIR/server-cert.pem}
+TLS_KEY=${MATRIX_TLS_KEY:-$MATRIX_PKI_DIR/server-key.pem}
 # Resolve to absolute paths; the kernel rejects a cert path with `..`.
 CA_FILE=$(readlink -f "$CA_FILE")
 TLS_CERT=$(readlink -f "$TLS_CERT")

@@ -707,10 +707,10 @@ fn format_queued_sql_insert(table: &str, items: &[QueuedRecord]) -> Result<Strin
         .iter()
         .map(|item| {
             let mut rec = item.record.clone();
-            if let Some(seq) = item.uniqueness_seq {
-                rec.fields
-                    .push(("_seq".to_string(), GreptimeValue::Integer(seq as i64)));
-            }
+            // Keep column shape homogeneous across the batch when any row carries `_seq`.
+            let seq_val = item.uniqueness_seq.unwrap_or(0) as i64;
+            rec.fields
+                .push(("_seq".to_string(), GreptimeValue::Integer(seq_val)));
             rec
         })
         .collect();
@@ -901,9 +901,7 @@ impl GreptimeDbSink {
                 };
                 let should_flush = {
                     let queue = sink.queue.lock();
-                    !queue.is_empty()
-                        && queue.is_stale()
-                        && queue.len() < sink.config.effective_buffer_capacity()
+                    !queue.is_empty() && queue.is_stale()
                 };
                 if should_flush {
                     let _ = sink.flush().await;
@@ -989,6 +987,42 @@ impl Connector for GreptimeDbConnector {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn greptimedb_linger_flushes_at_full_capacity_and_sql_seq_is_homogeneous() {
+        let mut cfg = sample_sql_config();
+        cfg.batch_size = Some(2);
+        cfg.buffer_capacity = Some(2);
+        let transport = Arc::new(MockGreptimeDbTransport::with_transient_failures(1));
+        let sink = Arc::new(GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink"));
+        sink.start_linger_flush();
+
+        let topic = Topic::new("sensors/a").unwrap();
+        let payload = Bytes::from_static(br#"{"v":1}"#);
+        // First send hits transient failure and restores into queue; second fills capacity (2).
+        let _ = sink.send(&topic, &payload, QoS::AtLeastOnce).await;
+        let _ = sink.send(&topic, &payload, QoS::AtLeastOnce).await;
+        assert_eq!(sink.buffered_rows(), 2);
+
+        // Wait for linger flush after backoff/linger window.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while sink.buffered_rows() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(
+            sink.buffered_rows(),
+            0,
+            "full buffer must still drain via linger"
+        );
+        let sqls = transport.captured_sqls.lock();
+        assert!(!sqls.is_empty());
+        assert!(
+            !sqls[0].contains("NULL"),
+            "SQL _seq must be homogeneous: {}",
+            sqls[0]
+        );
+    }
+
     #[tokio::test]
     async fn greptimedb_timestamps_do_not_drift_across_tables_or_series() {
         let mut cfg = sample_influx_config();

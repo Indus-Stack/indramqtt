@@ -26,6 +26,40 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+
+_EPHEMERAL_K1_05 = None
+
+def _k1_05_dir() -> Path:
+    global _EPHEMERAL_K1_05
+    if _EPHEMERAL_K1_05 is not None:
+        return _EPHEMERAL_K1_05
+    d = Path(tempfile.mkdtemp(prefix="indra-k1-05-"))
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+         "-subj", "/CN=indra-k1-05-ca", "-keyout", str(d / "ca-key.pem"), "-out", str(d / "ca-cert.pem")],
+        check=True, capture_output=True,
+    )
+    for name, subj, ext in [
+        ("server", "/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n"),
+        ("client-a", "/CN=k1-05-a", "extendedKeyUsage=clientAuth\n"),
+    ]:
+        csr = d / f"{name}.csr"
+        extf = d / f"{name}.ext"
+        extf.write_text(ext)
+        subprocess.run(
+            ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", subj,
+             "-keyout", str(d / f"{name}-key.pem"), "-out", str(csr)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(d / "ca-cert.pem"),
+             "-CAkey", str(d / "ca-key.pem"), "-CAcreateserial", "-days", "1",
+             "-extfile", str(extf), "-out", str(d / f"{name}-cert.pem")],
+            check=True, capture_output=True,
+        )
+    _EPHEMERAL_K1_05 = d
+    return d
+
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(sys.argv.pop(1)).resolve()
 
@@ -1479,7 +1513,7 @@ class InventoryEntry(unittest.TestCase):
     # // AZ-01 inventory: current behaviour; owner new: listener lifecycle
     def test_created_listener_is_only_a_transient_record(self):
         b = self.boot()
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         ports = set()
         while len(ports) < 4:
             ports.add(port())
@@ -2573,7 +2607,7 @@ class InventoryEntry(unittest.TestCase):
 
     def test_certificate_upload_is_an_artifact_and_refused_update_keeps_bytes(self):
         b = self.boot()
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         files = {"key": (fixture / "server-key.pem").read_text(),
                  "chain": (fixture / "server-cert.pem").read_text(),
                  "ca": (fixture / "ca-cert.pem").read_text(),
@@ -2818,10 +2852,10 @@ class InventoryEntry(unittest.TestCase):
                   "application_name": "inventory-app", "pool_size": 3,
                   "disable_prepared_statements": True, "auto_reconnect": False,
                   "ssl": {"enable": True, "verify": "verify_peer",
-                          "cacertfile": str(ROOT / "crates/broker-node/tests/k1_05/ca-cert.pem"),
+                          "cacertfile": str(_k1_05_dir() / "ca-cert.pem"),
                           "cacerts": False,
-                          "certfile": str(ROOT / "crates/broker-node/tests/k1_05/client-a-cert.pem"),
-                          "keyfile": str(ROOT / "crates/broker-node/tests/k1_05/client-a-key.pem"),
+                          "certfile": str(_k1_05_dir() / "client-a-cert.pem"),
+                          "keyfile": str(_k1_05_dir() / "client-a-key.pem"),
                           "ciphers": ["TLS_AES_256_GCM_SHA384"], "versions": ["tlsv1.3"],
                           "depth": 1, "hibernate_after": "7s", "log_level": "warning",
                           "middlebox_comp_mode": False, "partial_chain": False,
@@ -3880,7 +3914,7 @@ class InventoryEntry(unittest.TestCase):
 
     # // AZ-01 inventory: current behaviour; owner MV-02a
     def test_sql_connector_keeps_encoded_password_and_refuses_application_name(self):
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(fixture / "server-cert.pem", fixture / "server-key.pem")
         peer = PgAuthenticationPeer(context)
@@ -4298,7 +4332,7 @@ class InventoryEntry(unittest.TestCase):
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
     def test_alloydb_inline_credentials_reach_tls_and_file_password_is_resolved(self):
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(fixture / "server-cert.pem", fixture / "server-key.pem")
         peer = PgAuthenticationPeer(context)
@@ -4560,7 +4594,7 @@ class InventoryEntry(unittest.TestCase):
             ("static_clientids", [{"node": "az-01-entry", "ids": ["requested-static-0"]}]),
             ("tcp_opts", {"nodelay": False}),
             ("ssl", {"enable": True, "verify": "verify_peer",
-                     "cacertfile": str(ROOT / "crates/broker-node/tests/k1_05/ca-cert.pem")}),
+                     "cacertfile": str(_k1_05_dir() / "ca-cert.pem")}),
         ]:
             status, error = b.http("POST", "/api/v5/connectors", {
                 **config, "name": "inventorymqtt-" + field, field: value})
@@ -4717,7 +4751,7 @@ class InventoryEntry(unittest.TestCase):
     def test_file_tls_policy_reaches_handshake_and_certificate_identity(self):
         b = self.broker
         b.configure()
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         tls_port = port()
         config_path = b.cfg / "indra.toml"
         base = config_path.read_text()
