@@ -20,7 +20,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use broker_auth::Authenticator;
 use broker_protocol::{QoS, Topic, TopicFilter};
@@ -35,6 +35,10 @@ use super::ApiState;
 // Minimal MQTT 3.1.1 codec (fixed header + the five console packets).
 // ---------------------------------------------------------------------------
 
+// Reason: caps pre-authentication incoming buffer to 64 KiB to prevent memory exhaustion.
+const PRE_AUTH_MAX_BYTES: usize = 65_536;
+
+// Reason: maximum MQTT packet size per protocol specification (4 continuation bytes).
 const MAX_PACKET_BYTES: usize = 268_435_460;
 
 fn encode_remaining_length(mut n: usize, out: &mut Vec<u8>) {
@@ -51,17 +55,46 @@ fn encode_remaining_length(mut n: usize, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_remaining_length(buf: &[u8]) -> Option<(usize, usize)> {
+/// Result of decoding an MQTT variable-length Remaining Length header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeRemainingLength {
+    /// Complete remaining length and header byte count.
+    Complete(usize, usize),
+    /// Incomplete header: more bytes needed.
+    Incomplete,
+    /// Malformed header: exceeds four continuation bytes.
+    Malformed,
+}
+
+impl DecodeRemainingLength {
+    /// Return the decoded length and header bytes if complete.
+    #[cfg(test)]
+    pub fn ok(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Complete(len, used) => Some((len, used)),
+            _ => None,
+        }
+    }
+}
+
+/// Decode the variable-length Remaining Length field of an MQTT packet.
+///
+/// Returns `Complete(length, header_bytes)` when valid, `Incomplete` when
+/// more bytes are needed, or `Malformed` when continuation bytes exceed 4.
+pub fn decode_remaining_length(buf: &[u8]) -> DecodeRemainingLength {
     let mut multiplier = 1usize;
     let mut length = 0usize;
-    for (i, &byte) in buf.iter().enumerate().take(4) {
+    for (i, &byte) in buf.iter().enumerate() {
+        if i >= 4 {
+            return DecodeRemainingLength::Malformed;
+        }
         length += ((byte & 0x7F) as usize) * multiplier;
         if byte & 0x80 == 0 {
-            return Some((length, i + 1));
+            return DecodeRemainingLength::Complete(length, i + 1);
         }
         multiplier *= 128;
     }
-    None
+    DecodeRemainingLength::Incomplete
 }
 
 fn read_u16(buf: &[u8]) -> Option<(u16, &[u8])> {
@@ -272,8 +305,115 @@ fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, QoS, bool)> {
 // WebSocket handler.
 // ---------------------------------------------------------------------------
 
+fn normalize_host_port_from_origin(origin: &str) -> Option<(String, u16)> {
+    let s = origin.trim();
+    let (scheme, rest) = if let Some(stripped) = s.strip_prefix("http://") {
+        ("http", stripped)
+    } else {
+        ("https", s.strip_prefix("https://")?)
+    };
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    parse_host_port(host_port, scheme)
+}
+
+fn parse_host_port(host_port: &str, scheme: &str) -> Option<(String, u16)> {
+    let host_port = host_port.trim();
+    if host_port.is_empty() {
+        return None;
+    }
+    if host_port.starts_with('[') {
+        if let Some(end_bracket) = host_port.find(']') {
+            let host = &host_port[..=end_bracket];
+            let rest = &host_port[end_bracket + 1..];
+            let port = if let Some(colon) = rest.strip_prefix(':') {
+                colon.parse::<u16>().ok()?
+            } else if scheme == "https" {
+                443
+            } else {
+                80
+            };
+            return Some((host.to_ascii_lowercase(), port));
+        }
+        return None;
+    }
+    if let Some((h, p)) = host_port.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            return Some((h.to_ascii_lowercase(), port));
+        }
+    }
+    let port = if scheme == "https" { 443 } else { 80 };
+    Some((host_port.to_ascii_lowercase(), port))
+}
+
+fn normalize_host_port_from_host(host_hdr: &str) -> Option<(String, Option<u16>)> {
+    let s = host_hdr.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('[') {
+        if let Some(end_bracket) = s.find(']') {
+            let host = &s[..=end_bracket];
+            let rest = &s[end_bracket + 1..];
+            let port = if let Some(colon) = rest.strip_prefix(':') {
+                Some(colon.parse::<u16>().ok()?)
+            } else {
+                None
+            };
+            return Some((host.to_ascii_lowercase(), port));
+        }
+        return None;
+    }
+    if let Some((h, p)) = s.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            return Some((h.to_ascii_lowercase(), Some(port)));
+        }
+    }
+    Some((s.to_ascii_lowercase(), None))
+}
+
+fn origin_matches_host(origin_str: &str, host_str: &str) -> bool {
+    let Some((orig_host, orig_port)) = normalize_host_port_from_origin(origin_str) else {
+        return false;
+    };
+    let Some((req_host, req_port)) = normalize_host_port_from_host(host_str) else {
+        return false;
+    };
+    if orig_host != req_host {
+        return false;
+    }
+    match req_port {
+        Some(p) => orig_port == p,
+        None => orig_port == 80 || orig_port == 443,
+    }
+}
+
+fn validate_ws_origin(headers: &axum::http::HeaderMap) -> bool {
+    let origin_value = headers.get(axum::http::header::ORIGIN);
+    let origin_str = match origin_value {
+        Some(val) => match val.to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        },
+        None => return true,
+    };
+    let Some(host_hdr) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    origin_matches_host(origin_str, host_hdr)
+}
+
 /// Upgrade `GET /ws/mqtt` to an MQTT-over-WebSocket session.
-pub async fn ws_mqtt_handler(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
+pub async fn ws_mqtt_handler(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    State(state): State<ApiState>,
+) -> Response {
+    if !validate_ws_origin(&headers) {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(|socket| handle_socket(state, socket))
 }
 
@@ -304,6 +444,14 @@ async fn handle_socket(state: ApiState, mut socket: WebSocket) {
                     // Text frames are not MQTT: ignore, stay connected.
                     continue;
                 };
+                let max_buf = if session.is_none() {
+                    PRE_AUTH_MAX_BYTES
+                } else {
+                    (state.sessions.max_packet_size() as usize).min(MAX_PACKET_BYTES)
+                };
+                if carry.len().saturating_add(bytes.len()) > max_buf {
+                    break;
+                }
                 carry.extend_from_slice(&bytes);
                 match drive_packets(&state, &mut socket, &mut session, conn_id, &tx, &waker, &mut carry).await {
                     Ok(()) => {}
@@ -401,17 +549,19 @@ async fn drive_packets(
         if carry.is_empty() {
             return Ok(());
         }
-        if carry.len() > MAX_PACKET_BYTES {
-            return Err(());
-        }
+        let max_packet = (state.sessions.max_packet_size() as usize).min(MAX_PACKET_BYTES);
         let flags = carry[0] & 0x0F;
         let packet_type = carry[0] >> 4;
-        let (remaining, header_len) = decode_remaining_length(&carry[1..]).ok_or(())?;
+        let (remaining, header_len) = match decode_remaining_length(&carry[1..]) {
+            DecodeRemainingLength::Complete(rem, hlen) => (rem, hlen),
+            DecodeRemainingLength::Incomplete => return Ok(()),
+            DecodeRemainingLength::Malformed => return Err(()),
+        };
         let total = 1 + header_len + remaining;
-        if total > MAX_PACKET_BYTES || carry.len() < total {
-            if carry.len() >= total {
-                return Err(());
-            }
+        if total > max_packet {
+            return Err(());
+        }
+        if carry.len() < total {
             return Ok(());
         }
         let packet: Vec<u8> = carry.drain(..total).collect();
@@ -472,7 +622,7 @@ async fn handle_packet(
                 // first entry so status shows the outage. CONNECT-only;
                 // publish and deliver never touch these counters.
                 state.authn_chain.record_first_failed();
-                send_bin(socket, encode_connack(false, 0x86)).await;
+                send_bin(socket, encode_connack(false, 0x04)).await;
                 return Err(());
             }
             // W2-05: authentication-settings consult. Loads one lock-free
@@ -490,14 +640,14 @@ async fn handle_packet(
             }
             // A non-empty user store always wins: unauthenticated console
             // clients are rejected whenever users exist, exactly like the
-            // BrokerLink bind path (0x87, not authorized).
+            // BrokerLink bind path (MQTT 3.1.1 code 0x05, not authorized).
             if conn.username.is_none() && state.auth.user_count() > 0 {
                 // W2-08: anonymous refusal is a failed verdict on the
                 // first enabled built-in entry when one exists.
                 // CONNECT-only; publish and deliver never touch these
                 // counters.
                 state.authn_chain.record_built_in_failed();
-                send_bin(socket, encode_connack(false, 0x87)).await;
+                send_bin(socket, encode_connack(false, 0x05)).await;
                 return Err(());
             }
             if let Some(username) = conn.username.as_deref() {
@@ -511,7 +661,7 @@ async fn handle_packet(
                     // W2-08: failed credential verdict. CONNECT-only;
                     // publish and deliver never touch these counters.
                     state.authn_chain.record_built_in_failed();
-                    send_bin(socket, encode_connack(false, 0x86)).await;
+                    send_bin(socket, encode_connack(false, 0x04)).await;
                     return Err(());
                 }
                 // W2-03: record the successful credentialed CONNECT in the
@@ -541,7 +691,7 @@ async fn handle_packet(
                     .get_quotas(username)
                     .and_then(|quotas| quotas.max_connections);
                 if !state.sessions.acquire_connection_slot(username, max) {
-                    send_bin(socket, encode_connack(false, 0x8B)).await;
+                    send_bin(socket, encode_connack(false, 0x03)).await;
                     return Err(());
                 }
             }
@@ -643,12 +793,12 @@ async fn handle_subscribe(
                             false,
                         );
                     }
-                    0x87
+                    0x80
                 } else {
+                    // INVARIANT: sub.qos <= 2 validated in enclosing match guard.
                     let qos = QoS::try_from(sub.qos).expect("validated above");
                     // B4-08 bound: a new entry past the subscription-table
-                    // cap is denied fail closed with 0x97 Quota Exceeded
-                    // (the same code the kernel subscribe path reports),
+                    // cap is denied fail closed with 0x80 Failure in MQTT 3.1.1,
                     // registering nothing and changing no session state.
                     // Tenant scope (MT-02): console subscriptions carry
                     // the session's tenant. Console connects never run
@@ -676,7 +826,7 @@ async fn handle_subscribe(
                         },
                     );
                     if !stored {
-                        0x97
+                        0x80
                     } else {
                         // Per-client decision cache (W2-01): record the
                         // grant alongside the session mirror below. Same
@@ -884,10 +1034,31 @@ mod tests {
         ] {
             let mut out = Vec::new();
             encode_remaining_length(n, &mut out);
-            assert_eq!(decode_remaining_length(&out), Some((n, out.len())));
+            assert_eq!(
+                decode_remaining_length(&out),
+                DecodeRemainingLength::Complete(n, out.len())
+            );
         }
-        assert_eq!(decode_remaining_length(&[]), None);
-        assert_eq!(decode_remaining_length(&[0xFF, 0xFF, 0xFF, 0x80]), None);
+        assert_eq!(
+            decode_remaining_length(&[]),
+            DecodeRemainingLength::Incomplete
+        );
+        assert_eq!(
+            decode_remaining_length(&[0x80]),
+            DecodeRemainingLength::Incomplete
+        );
+        assert_eq!(
+            decode_remaining_length(&[0x80, 0x80]),
+            DecodeRemainingLength::Incomplete
+        );
+        assert_eq!(
+            decode_remaining_length(&[0x80, 0x80, 0x80, 0x80]),
+            DecodeRemainingLength::Incomplete
+        );
+        assert_eq!(
+            decode_remaining_length(&[0x80, 0x80, 0x80, 0x80, 0x80]),
+            DecodeRemainingLength::Malformed
+        );
     }
 
     fn connect_bytes(client_id: &str, username: Option<&str>, password: Option<&[u8]>) -> Vec<u8> {
@@ -917,7 +1088,9 @@ mod tests {
 
     fn connect_payload(packet: &[u8]) -> (&[u8], u8) {
         let flags = packet[0] & 0x0F;
-        let (len, header) = decode_remaining_length(&packet[1..]).unwrap();
+        let (len, header) = decode_remaining_length(&packet[1..])
+            .ok()
+            .expect("valid test connect remaining length");
         (&packet[1 + header..1 + header + len], flags)
     }
 
@@ -1000,5 +1173,61 @@ mod tests {
             encode_publish("t", 0, QoS::AtMostOnce, b"hi"),
             vec![0x30, 0x05, 0x00, 0x01, b't', b'h', b'i']
         );
+    }
+
+    #[test]
+    fn test_origin_host_port_normalization_and_matching() {
+        assert_eq!(
+            normalize_host_port_from_origin("http://localhost:18083"),
+            Some(("localhost".to_string(), 18083))
+        );
+        assert_eq!(
+            normalize_host_port_from_origin("https://example.com"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(
+            normalize_host_port_from_origin("http://example.com"),
+            Some(("example.com".to_string(), 80))
+        );
+        assert_eq!(
+            normalize_host_port_from_origin("http://[::1]:8083"),
+            Some(("[::1]".to_string(), 8083))
+        );
+        assert_eq!(normalize_host_port_from_origin("null"), None);
+        assert_eq!(normalize_host_port_from_origin("file:///etc/hosts"), None);
+
+        assert_eq!(
+            normalize_host_port_from_host("localhost:18083"),
+            Some(("localhost".to_string(), Some(18083)))
+        );
+        assert_eq!(
+            normalize_host_port_from_host("example.com"),
+            Some(("example.com".to_string(), None))
+        );
+        assert_eq!(
+            normalize_host_port_from_host("[::1]:8083"),
+            Some(("[::1]".to_string(), Some(8083)))
+        );
+
+        // Matching Host
+        assert!(origin_matches_host(
+            "http://localhost:18083",
+            "localhost:18083"
+        ));
+        assert!(origin_matches_host(
+            "http://127.0.0.1:8083",
+            "127.0.0.1:8083"
+        ));
+        assert!(origin_matches_host("http://example.com", "example.com"));
+        assert!(origin_matches_host("https://example.com", "example.com"));
+        assert!(!origin_matches_host(
+            "http://attacker.com:18083",
+            "localhost:18083"
+        ));
+        assert!(!origin_matches_host(
+            "http://localhost:18083",
+            "localhost:18084"
+        ));
+        assert!(!origin_matches_host("http://localhost:8080", "localhost"));
     }
 }

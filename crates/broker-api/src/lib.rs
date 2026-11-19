@@ -18552,7 +18552,7 @@ config = '{"connector":"mv03b-pending-stored","parameters":{}}'
             .await;
         let suback = denied.recv_msg().await.expect("suback");
         assert_eq!(mqtt_packet_type(&suback), 9);
-        assert_eq!(&suback[4..], &[0x87]);
+        assert_eq!(&suback[4..], &[0x80]);
         let (status, body) = server
             .get_auth(
                 "/api/v5/clients/w2-01-cache-deny/authorization/cache",
@@ -24476,7 +24476,7 @@ config = '{"connector":"mv03b-pending-stored","parameters":{}}'
             .await;
         let suback = client.recv_msg().await.expect("suback");
         assert_eq!(mqtt_packet_type(&suback), 9);
-        assert_eq!(&suback[4..], &[0x87]);
+        assert_eq!(&suback[4..], &[0x80]);
 
         // Delete the rule over HTTP. The next subscribe on the same
         // connection succeeds again, still without a reconnect.
@@ -24734,7 +24734,7 @@ config = '{"connector":"mv03b-pending-stored","parameters":{}}'
             .await;
         let connack = refused.recv_msg().await.expect("connack");
         assert_eq!(mqtt_packet_type(&connack), 2);
-        assert_eq!(connack[3], 0x86);
+        assert_eq!(connack[3], 0x04);
 
         // Restart persistence through the config registry: the chain
         // survives a rebuild from the same data dir.
@@ -25407,7 +25407,7 @@ config = '{"connector":"mv03b-pending-stored","parameters":{}}'
         .await;
         let connack = bad.recv_msg().await.expect("connack");
         assert_eq!(mqtt_packet_type(&connack), 2);
-        assert_eq!(connack[3], 0x86);
+        assert_eq!(connack[3], 0x04);
         let (status, body) = server
             .get_auth(
                 "/api/v5/authentication/password_based:built_in_database/status",
@@ -25537,7 +25537,7 @@ config = '{"connector":"mv03b-pending-stored","parameters":{}}'
         .await;
         let connack = bad.recv_msg().await.expect("connack");
         assert_eq!(mqtt_packet_type(&connack), 2);
-        assert_eq!(connack[3], 0x86);
+        assert_eq!(connack[3], 0x04);
         let (status, body) = server
             .get_auth(
                 "/api/v5/authentication/password_based:built_in_database/status",
@@ -28783,7 +28783,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn test_ws_auth_rejected_with_0x86() {
+    async fn test_ws_auth_rejected_with_0x04() {
         let (server, state) = TestServer::start().await;
         state
             .auth
@@ -28796,7 +28796,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         let connack = client.recv_msg().await.expect("connack");
         assert_eq!(mqtt_packet_type(&connack), 2);
-        assert_eq!(connack[3], 0x86, "bad password must yield 0x86");
+        assert_eq!(connack[3], 0x04, "bad password must yield 0x04");
         // Socket closes right after the failed CONNACK.
         assert!(client.recv_msg().await.is_none());
         assert!(state.sessions.get("console-x").is_none());
@@ -28810,7 +28810,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .add_user("alice", b"s3cret")
             .expect("test user persists");
 
-        // No username while users exist: rejected with 0x87 even though
+        // No username while users exist: rejected with 0x05 even though
         // the console path has no `--allow-anonymous` flag.
         let mut client = WsClient::connect(server.port).await;
         client
@@ -28818,7 +28818,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         let connack = client.recv_msg().await.expect("connack");
         assert_eq!(mqtt_packet_type(&connack), 2);
-        assert_eq!(connack[3], 0x87, "anonymous must yield 0x87");
+        assert_eq!(connack[3], 0x05, "anonymous must yield 0x05");
         // Socket closes right after the failed CONNACK.
         assert!(client.recv_msg().await.is_none());
         assert!(state.sessions.get("console-anon").is_none());
@@ -28833,7 +28833,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn test_ws_subscribe_denied_with_0x87() {
+    async fn test_ws_subscribe_denied_with_0x80() {
         let (server, state) = TestServer::start().await;
         state
             .auth
@@ -28855,13 +28855,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         client.send_bin(&mqtt_subscribe(3, &[("t", 0)])).await;
         let suback = client.recv_msg().await.expect("suback");
         assert_eq!(mqtt_packet_type(&suback), 9);
-        assert_eq!(&suback[4..], &[0x87], "denied filter must yield 0x87");
+        assert_eq!(&suback[4..], &[0x80], "denied filter must yield 0x80");
     }
 
     #[tokio::test]
-    async fn test_ws_subscribe_quota_denied_with_0x97() {
+    async fn test_ws_subscribe_quota_denied_with_0x80() {
         // B4-08 bound: a full subscription table denies the console
-        // subscribe fail closed with 0x97 Quota Exceeded and changes no
+        // subscribe fail closed with 0x80 Failure and changes no
         // session state. Fills the shared router to MAX_SUBSCRIPTIONS
         // with three-level filters so each path copy stays small.
         let (server, state) = TestServer::start().await;
@@ -28898,8 +28898,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(mqtt_packet_type(&suback), 9);
         assert_eq!(
             &suback[4..],
-            &[0x97],
-            "quota denial must yield 0x97, not success"
+            &[0x80],
+            "quota denial must yield 0x80, not success"
         );
 
         // The failed subscribe registers nothing: no session mirror, no
