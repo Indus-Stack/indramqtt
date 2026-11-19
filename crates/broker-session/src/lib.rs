@@ -808,10 +808,12 @@ impl Session {
     /// superuser flag together so the publish path reads one atomic.
     /// Off the hot path (bind only).
     pub fn set_verified_identity(&self, verified: Option<String>, is_superuser: bool) {
-        let store = self.offline_store.read().clone();
-        if let Some(store) = store {
-            let tenant = self.tenant_id.read().clone();
-            let _ = store.set_owner_in_tenant(&tenant, &self.client_id, verified.as_deref());
+        if !self.drops_state_at_disconnect() {
+            let store = self.offline_store.read().clone();
+            if let Some(store) = store {
+                let tenant = self.tenant_id.read().clone();
+                let _ = store.set_owner_in_tenant(&tenant, &self.client_id, verified.as_deref());
+            }
         }
         *self.verified_username.write() = verified;
         self.verified_is_superuser
@@ -3195,7 +3197,12 @@ impl SessionManager {
     ) -> Vec<TopicFilter> {
         // Detach path only (never publish/deliver): owned keys are fine.
         let key = SessionKey::new(tenant, client_id);
-        let (username_to_release, swept, did_detach): (Option<String>, Vec<TopicFilter>, bool) = {
+        let (username_to_release, swept, did_detach, drop_state): (
+            Option<String>,
+            Vec<TopicFilter>,
+            bool,
+            bool,
+        ) = {
             let map = self.sessions.read();
             match map.get(tenant).and_then(|inner| inner.get(client_id)) {
                 Some(session) => {
@@ -3233,14 +3240,24 @@ impl SessionManager {
                         // past [`ENDED_SESSION_TTL_SECS`], so ended
                         // tenants' entries go away instead of accumulating.
                         *session.ended_at_ms.write() = Some(now_ms());
-                        (session.username.read().clone(), swept, was_connected)
+                        (
+                            session.username.read().clone(),
+                            swept,
+                            was_connected,
+                            drop_state,
+                        )
                     } else {
-                        (None, Vec::new(), false)
+                        (None, Vec::new(), false, false)
                     }
                 }
-                None => (None, Vec::new(), false),
+                None => (None, Vec::new(), false, false),
             }
         };
+        if drop_state {
+            if let Some(store) = self.offline_store.read().clone() {
+                store.remove_in_tenant(tenant, client_id);
+            }
+        }
         if did_detach {
             // Verified owner detach of a live session: one fewer connected
             // session. Racing teardowns (wrong conn_id, unknown client)
@@ -3333,10 +3350,14 @@ impl SessionManager {
         if victims.is_empty() {
             return;
         }
+        let store = self.offline_store.read().clone();
         let mut map = self.sessions.write();
         if let Some(inner) = map.get_mut(tenant) {
             for victim in victims {
                 inner.remove(&victim);
+                if let Some(store) = store.as_ref() {
+                    store.remove_in_tenant(tenant, &victim);
+                }
             }
             if inner.is_empty() {
                 map.remove(tenant);
@@ -5078,5 +5099,48 @@ mod tests {
         manager.unbind_connection_in_tenant("tenant-a", "dup", 701);
         assert!(manager.active_client_ids_in_tenant("tenant-a").is_empty());
         assert_eq!(manager.active_client_ids_in_tenant("tenant-b"), vec!["dup"]);
+    }
+
+    #[test]
+    fn clean_authenticated_session_does_not_leave_owner_file() {
+        let dir = unique_offline_dir("clean-owner");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (clean_v4, _) = manager.get_or_create("clean-v4", true);
+        *clean_v4.conn_id.write() = Some(1);
+        clean_v4.set_verified_identity(Some("alice".to_string()), false);
+        assert!(store
+            .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "clean-v4")
+            .is_none());
+        manager.unbind_connection("clean-v4", 1);
+        assert!(store
+            .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "clean-v4")
+            .is_none());
+
+        let (durable_v5, _, _) = manager.get_or_create_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "durable-then-zero",
+            true,
+            5,
+            60,
+            16,
+            0,
+        );
+        *durable_v5.conn_id.write() = Some(2);
+        durable_v5.set_verified_identity(Some("alice".to_string()), false);
+        assert_eq!(
+            store
+                .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "durable-then-zero")
+                .as_deref(),
+            Some("alice")
+        );
+        durable_v5.set_session_expiry(0);
+        manager.unbind_connection("durable-then-zero", 2);
+        assert!(store
+            .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "durable-then-zero")
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

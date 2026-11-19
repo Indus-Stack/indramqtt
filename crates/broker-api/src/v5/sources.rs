@@ -1555,6 +1555,16 @@ mod tests {
             }),
             None,
         )
+        .unwrap_err();
+        let _ = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "sensors/é#"},
+            }),
+            None,
+        )
         .expect_err("invalid MQTT topic filter is refused");
         assert!(bad_topic.contains("topic filter"), "{bad_topic}");
 

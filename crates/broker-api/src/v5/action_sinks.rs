@@ -3978,6 +3978,10 @@ pub(crate) fn build_influxdb_sink(
 /// - `format`: `sql` or `influx`; default `sql`, the sink default
 ///   write shape. The action parameter wins; else the connector
 ///   value applies.
+/// - `collision_seq_column`: optional SQL column name used to
+///   disambiguate same-timestamp collisions when writing to a
+///   deduplicating GreptimeDB table; omitted (`None`) for
+///   `append_only` tables.
 /// - Batching belongs to the action runtime, not this driver. The
 ///   inner sink keeps one row per send with a short linger, so the
 ///   runtime owns the batch size and the batch timer.
@@ -4052,6 +4056,12 @@ pub(crate) fn build_greptimedb_sink(
             ));
         }
     };
+    let collision_seq_column = param_string(record, "collision_seq_column")
+        .or_else(|| {
+            first_string(connector_doc, &["collision_seq_column"]).map(|value| value.into_owned())
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let config = GreptimeDbConfig {
         endpoint,
         database,
@@ -4062,7 +4072,7 @@ pub(crate) fn build_greptimedb_sink(
         batch_size: Some(1),
         buffer_capacity: None,
         timeout_ms: connector_timeout_ms(connector_doc),
-        collision_seq_column: None,
+        collision_seq_column,
     };
     let transport = Arc::new(HttpGreptimeDbTransport::new(&config));
     let sink = GreptimeDbSink::new(config, transport).map_err(|error| {
