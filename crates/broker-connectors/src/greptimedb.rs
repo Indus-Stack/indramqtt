@@ -716,11 +716,10 @@ fn format_queued_sql_insert(
         .iter()
         .map(|item| {
             let mut rec = item.record.clone();
-            if !rec.fields.iter().any(|(k, _)| k == seq_col) {
-                let seq_val = item.uniqueness_seq.unwrap_or(0) as i64;
-                rec.fields
-                    .push((seq_col.to_string(), GreptimeValue::Integer(seq_val)));
-            }
+            let seq_val = item.uniqueness_seq.unwrap_or(0) as i64;
+            rec.fields.retain(|(k, _)| k != seq_col);
+            rec.fields
+                .push((seq_col.to_string(), GreptimeValue::Integer(seq_val)));
             rec
         })
         .collect();
@@ -2263,5 +2262,40 @@ mod tests {
             "qual done: rows={} tables={table},{line_table} cleaned tables",
             2 * PER_PATH
         );
+    }
+
+    #[tokio::test]
+    async fn test_sql_collision_seq_column_overrides_payload_field() {
+        let mut config = sample_sql_config();
+        config.table_template = "metrics".to_string();
+        config.collision_seq_column = Some("_seq".to_string());
+        config.batch_size = Some(2);
+        let transport = Arc::new(MockGreptimeDbTransport::default());
+        let sink = GreptimeDbSink::new(config, transport.clone()).unwrap();
+
+        let payload = Bytes::from_static(br#"{"_seq":999,"temp":21}"#);
+        sink.send(
+            &Topic::new("sensors/a").unwrap(),
+            &payload,
+            QoS::AtLeastOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("sensors/b").unwrap(),
+            &payload,
+            QoS::AtLeastOnce,
+        )
+        .await
+        .unwrap();
+
+        let sent = transport.captured_sqls.lock().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            !sent[0].contains("999"),
+            "payload _seq must not leak: {}",
+            sent[0]
+        );
+        assert!(sent[0].contains("_seq"), "missing _seq col: {}", sent[0]);
     }
 }

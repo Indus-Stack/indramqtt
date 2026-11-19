@@ -2466,7 +2466,7 @@ async fn apply_bind_request_inner(
     // session: snapshot them before `get_or_create` drops the old
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
-    let mut stale_filters_to_sweep: Option<(SessionKey, Vec<broker_protocol::TopicFilter>)> = None;
+
     // Session resolution in the owning tenant (MT-03): same takeover
     // semantics as before, scoped to the key. The tenant is stamped
     // before binding so the `conn_id -> session key` index carries the
@@ -2559,8 +2559,18 @@ async fn apply_bind_request_inner(
             // defaults, so pure 3.1.1 flows behave bit for bit as
             // before, while a reconnect in either version drops an
             // elapsed v5 husk instead of resuming it.
+            let effective_username = if let Some(principal) = &kerberos_principal {
+                Some(principal.clone())
+            } else if let Some(subject) = &jwks_subject {
+                Some(subject.clone())
+            } else {
+                req.username.clone()
+            };
+            let is_superuser = verified_connect_username
+                .as_deref()
+                .is_some_and(|name| shared.auth.is_superuser(name));
             let (session, present, expired_swept, stale_conn) =
-                shared.sessions.get_or_create_v5_with_discard_in_tenant(
+                shared.sessions.connect_bind_v5_in_tenant(
                     &tenant_for_bind,
                     &req.client_id,
                     req.clean_start,
@@ -2569,6 +2579,16 @@ async fn apply_bind_request_inner(
                     req.session_expiry,
                     req.receive_maximum,
                     req.max_packet_size,
+                    Some(broker_session::ConnectBindMeta {
+                        conn_id: frame.header.conn_id,
+                        username: effective_username,
+                        verified_username: verified_connect_username.clone(),
+                        is_superuser,
+                        peerhost: req.peerhost.clone(),
+                        keepalive_secs: req.keepalive_secs,
+                        client_alias_max: req.client_alias_max,
+                        will,
+                    }),
                 );
             if let Some(old_conn_id) = stale_conn {
                 if old_conn_id != frame.header.conn_id {
@@ -2583,25 +2603,6 @@ async fn apply_bind_request_inner(
                     }
                 }
             }
-            stale_filters_to_sweep = Some((
-                SessionKey::new(&tenant_for_bind, &req.client_id),
-                expired_swept.clone(),
-            ));
-            session.set_tenant_id(tenant_for_bind.clone());
-            shared.sessions.bind_session(&session, frame.header.conn_id);
-            *session.keepalive_secs.write() = req.keepalive_secs;
-            // No audit record here. The log holds only post, put and delete.
-            // B4-05: a new connection renegotiates aliases. The inbound
-            // bound is the manager default (advertised below in CONNACK);
-            // the outbound bound is the client's CONNECT maximum (0 when
-            // the bind carries none). Tables start empty.
-            session.clear_aliases();
-            session.set_inbound_alias_max(shared.sessions.max_topic_alias());
-            session.set_outbound_alias_max(req.client_alias_max);
-            // F1-01: the CONNECT last will rides the bind (edge forwards
-            // what CONNECT carried). Stored on the session where the
-            // disconnect decision lives; `None` clears a previous will.
-            session.set_last_will(will);
             // X1-02: version-5 success carries session-present, the
             // granted expiry and the server limits; version-4 success
             // keeps today's 12-byte layout and bytes.
@@ -2629,11 +2630,16 @@ async fn apply_bind_request_inner(
             // resubscribes from nothing like a clean start. Empty
             // unless the expired-drop path ran. Off the hot path
             // (bind only).
-            for filter in &expired_swept {
-                shared
-                    .router
-                    .unsubscribe_in_tenant(filter, &req.client_id, &tenant_for_bind);
-            }
+            shared.sessions.sweep_unsubscribed_filters_in_tenant(
+                &tenant_for_bind,
+                &req.client_id,
+                &expired_swept,
+                |filter| {
+                    shared
+                        .router
+                        .unsubscribe_in_tenant(filter, &req.client_id, &tenant_for_bind);
+                },
+            );
             if !expired_swept.is_empty() {
                 refresh_subscription_stats(shared);
             }
@@ -2648,11 +2654,16 @@ async fn apply_bind_request_inner(
                 .sessions
                 .prune_expired_bounded(&tenant_for_bind, broker_session::MAX_EXPIRY_SWEEP)
             {
-                for filter in &filters {
-                    shared
-                        .router
-                        .unsubscribe_in_tenant(filter, &victim, &tenant_for_bind);
-                }
+                shared.sessions.sweep_unsubscribed_filters_in_tenant(
+                    &tenant_for_bind,
+                    &victim,
+                    &filters,
+                    |filter| {
+                        shared
+                            .router
+                            .unsubscribe_in_tenant(filter, &victim, &tenant_for_bind);
+                    },
+                );
                 if !filters.is_empty() {
                     refresh_subscription_stats(shared);
                 }
@@ -2688,68 +2699,7 @@ async fn apply_bind_request_inner(
     // clean start never removes another tenant's subscription for the
     // same client id. Off the hot path (bind only); fan-out takes no new
     // lock and delivery cost is unchanged.
-    if let Some((stale_key, stale_filters)) = stale_filters_to_sweep {
-        for filter in &stale_filters {
-            shared
-                .router
-                .unsubscribe_in_tenant(filter, &stale_key.client_id, &stale_key.tenant);
-        }
-        if !stale_filters.is_empty() {
-            refresh_subscription_stats(shared);
-        }
-    }
-    // Stamp the effective username for quota release and event
-    // attribution, and the verified identity for the superuser check.
-    // Kerberos and JWT CONNECTs use the verified principal or subject.
-    // A local, directory, database or webhook CONNECT uses the username
-    // that backend verified. Open mode verifies nothing, so it stamps no
-    // verified identity. The values were verified above, never here.
-    if let Ok(req) = parsed.clone() {
-        if let Some(session) = shared
-            .sessions
-            .get_in_tenant(&tenant_for_bind, &req.client_id)
-        {
-            if let Some(principal) = &kerberos_principal {
-                *session.username.write() = Some(principal.clone());
-            } else if let Some(subject) = &jwks_subject {
-                // B5-02: JWT CONNECTs stamp the verified subject (the
-                // username string is unverified protocol metadata).
-                *session.username.write() = Some(subject.clone());
-            } else if let Some(username) = &req.username {
-                *session.username.write() = Some(username.clone());
-            }
-            // Cache the superuser flag at bind. The publish path reads
-            // one atomic, never a lock or a clone.
-            let is_superuser = verified_connect_username
-                .as_deref()
-                .is_some_and(|name| shared.auth.is_superuser(name));
-            session.set_verified_identity(verified_connect_username.clone(), is_superuser);
-        }
-        // Stamp the peer address for publish-time ban checks (B1-03):
-        // only overwritten when the edge forwarded one, so a rebind
-        // without a peer section keeps the last known address.
-        if let (Some(session), Some(peerhost)) = (
-            shared
-                .sessions
-                .get_in_tenant(&tenant_for_bind, &req.client_id),
-            &req.peerhost,
-        ) {
-            *session.peerhost.write() = Some(peerhost.clone());
-        }
-        // The session already carries `tenant_for_bind` (stamped at
-        // creation above); propagate that same tenant onto the will so
-        // the disconnect/kick fire respects tenant isolation (MT-01).
-        // No second registry render here: re-rendering would count one
-        // rejection twice in `fallback_count`.
-        if let Some(session) = shared
-            .sessions
-            .get_in_tenant(&tenant_for_bind, &req.client_id)
-        {
-            if let Some(will) = session.last_will.write().as_mut() {
-                will.tenant = tenant_for_bind.clone();
-            }
-        }
-    }
+
     Some(reply)
 }
 

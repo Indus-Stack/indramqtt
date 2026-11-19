@@ -2069,6 +2069,19 @@ impl Default for SessionManager {
     }
 }
 
+/// Per-CONNECT metadata committed atomically with session resolution and
+/// `conn_id` binding.
+pub struct ConnectBindMeta {
+    pub conn_id: u64,
+    pub username: Option<String>,
+    pub verified_username: Option<String>,
+    pub is_superuser: bool,
+    pub peerhost: Option<String>,
+    pub keepalive_secs: u16,
+    pub client_alias_max: u16,
+    pub will: Option<StoredWill>,
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self::new_with_all_limits(
@@ -3041,10 +3054,72 @@ impl SessionManager {
         receive_max: u16,
         max_packet: u32,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
+        self.connect_bind_v5_in_tenant(
+            tenant,
+            client_id,
+            clean_start,
+            expected_owner,
+            version,
+            expiry,
+            receive_max,
+            max_packet,
+            None,
+        )
+    }
+
+    /// Per-CONNECT metadata committed atomically with session resolution and
+    /// `conn_id` binding so concurrent CONNECTs cannot stamp identity onto
+    /// another connection's session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_bind_v5_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+        expected_owner: Option<Option<&str>>,
+        version: u8,
+        expiry: u32,
+        receive_max: u16,
+        max_packet: u32,
+        bind_meta: Option<ConnectBindMeta>,
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
         let expiry = self.cap_session_expiry(expiry);
         let store = self.offline_store.read().clone();
         let key = SessionKey::new(tenant, client_id);
         let now = now_ms();
+        let new_conn_id = bind_meta.as_ref().map(|m| m.conn_id);
+
+        let apply_meta = move |session: &Arc<Session>| {
+            if let Some(ConnectBindMeta {
+                conn_id,
+                username,
+                verified_username,
+                is_superuser,
+                peerhost,
+                keepalive_secs,
+                client_alias_max,
+                mut will,
+            }) = bind_meta
+            {
+                *session.conn_id.write() = Some(conn_id);
+                *session.connected_at_ms.write() = Some(now);
+                *session.keepalive_secs.write() = keepalive_secs;
+                session.clear_aliases();
+                session.set_inbound_alias_max(self.max_topic_alias());
+                session.set_outbound_alias_max(client_alias_max);
+                if let Some(ref mut w) = will {
+                    w.tenant = tenant.to_string();
+                }
+                session.set_last_will(will);
+                if let Some(u) = username {
+                    *session.username.write() = Some(u);
+                }
+                if let Some(p) = peerhost {
+                    *session.peerhost.write() = Some(p);
+                }
+                session.set_verified_identity(verified_username, is_superuser);
+            }
+        };
 
         let mut map = self.sessions.write();
         let existing = map
@@ -3081,6 +3156,7 @@ impl SessionManager {
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(store);
             session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            apply_meta(&session);
             map.entry(tenant.to_string())
                 .or_default()
                 .insert(client_id.to_string(), session.clone());
@@ -3091,8 +3167,8 @@ impl SessionManager {
             if !stale_connected {
                 self.connected_count.fetch_add(1, Ordering::SeqCst);
             }
+            let mut index = self.conn_index.write();
             if let Some(stale) = stale_conn {
-                let mut index = self.conn_index.write();
                 if index
                     .get(&stale)
                     .map(|owner| owner == &key)
@@ -3101,9 +3177,15 @@ impl SessionManager {
                     index.remove(&stale);
                 }
             }
+            if let Some(conn_id) = new_conn_id {
+                if *session.conn_id.read() == Some(conn_id) {
+                    index.insert(conn_id, key);
+                }
+            }
             (session, false, swept, stale_conn)
         } else if let Some(existing) = existing {
             let was_connected = *existing.connected.read();
+            let prev_conn = *existing.conn_id.read();
             if !was_connected {
                 *existing.connected.write() = true;
                 *existing.connected_at_ms.write() = Some(now);
@@ -3112,7 +3194,27 @@ impl SessionManager {
             }
             existing.set_offline_store(store);
             existing.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-            (existing, true, Vec::new(), None)
+            apply_meta(&existing);
+            drop(map);
+            let mut index = self.conn_index.write();
+            if let Some(prev) = prev_conn {
+                if new_conn_id != Some(prev)
+                    && index.get(&prev).map(|owner| owner == &key).unwrap_or(false)
+                {
+                    index.remove(&prev);
+                }
+            }
+            if let Some(conn_id) = new_conn_id {
+                if *existing.conn_id.read() == Some(conn_id) {
+                    index.insert(conn_id, key);
+                }
+            }
+            (
+                existing,
+                true,
+                Vec::new(),
+                prev_conn.filter(|p| new_conn_id != Some(*p)),
+            )
         } else {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
@@ -3121,6 +3223,7 @@ impl SessionManager {
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(store);
             session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            apply_meta(&session);
             map.entry(tenant.to_string())
                 .or_default()
                 .insert(client_id.to_string(), session.clone());
@@ -3128,7 +3231,37 @@ impl SessionManager {
             Self::enforce_tenant_cap_locked(&mut map, tenant);
             drop(map);
             self.connected_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(conn_id) = new_conn_id {
+                if *session.conn_id.read() == Some(conn_id) {
+                    self.conn_index.write().insert(conn_id, key);
+                }
+            }
             (session, false, Vec::new(), None)
+        }
+    }
+
+    /// Unsubscribe only filters not currently owned by any active replacement
+    /// session for `(tenant, client_id)`.
+    pub fn sweep_unsubscribed_filters_in_tenant<F>(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        filters: &[TopicFilter],
+        mut unsubscribe: F,
+    ) where
+        F: FnMut(&TopicFilter),
+    {
+        if filters.is_empty() {
+            return;
+        }
+        let map = self.sessions.read();
+        let current = map.get(tenant).and_then(|inner| inner.get(client_id));
+        let subs = current.map(|s| s.subscriptions.read());
+        for filter in filters {
+            if subs.as_ref().is_some_and(|m| m.contains_key(filter)) {
+                continue;
+            }
+            unsubscribe(filter);
         }
     }
 
