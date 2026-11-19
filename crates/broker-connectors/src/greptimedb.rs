@@ -1011,7 +1011,11 @@ mod tests {
         );
         let sqls = transport.captured_sqls.lock();
         assert!(!sqls.is_empty());
-        assert!(!sqls[0].contains("_seq"), "SQL insert must not invent _seq column: {}", sqls[0]);
+        assert!(
+            !sqls[0].contains("_seq"),
+            "SQL insert must not invent _seq column: {}",
+            sqls[0]
+        );
     }
 
     #[tokio::test]
