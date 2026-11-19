@@ -2427,6 +2427,27 @@ impl SessionManager {
     /// pair, never the other tenant's session). Borrowed two-level
     /// lookup takes no allocation, so the deliver path pays no new
     /// allocation per subscriber per publish.
+    /// Commit `confirm_offline_consumed` only if `session` is still the active
+    /// generation for its `(tenant, client_id)` key, serialized under
+    /// `self.sessions.read()` so a concurrent replacement's durable queue file
+    /// can never be rewritten or deleted by an older replay.
+    pub fn confirm_offline_consumed_if_current(
+        &self,
+        session: &Arc<Session>,
+        unrouted: Vec<QueuedMessage>,
+    ) {
+        let tenant = session.offline_tenant();
+        let map = self.sessions.read();
+        let is_current = map
+            .get(&tenant)
+            .and_then(|inner| inner.get(&session.client_id))
+            .is_some_and(|cur| cur.id == session.id);
+        if !is_current {
+            return;
+        }
+        session.confirm_offline_consumed(unrouted);
+    }
+
     pub fn get_in_tenant(&self, tenant: &str, client_id: &str) -> Option<Arc<Session>> {
         self.sessions.read().get(tenant)?.get(client_id).cloned()
     }
@@ -2862,6 +2883,7 @@ impl SessionManager {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_subscription_with_options_in_tenant(
         &self,
         tenant: &str,
@@ -5601,5 +5623,79 @@ mod tests {
         assert!(manager.session_for_conn(100).is_none());
         assert!(manager.key_for_conn(100).is_none());
         assert_eq!(manager.session_for_conn(200).unwrap().id, s2.id);
+    }
+
+    #[test]
+    fn confirm_offline_consumed_if_current_skips_replaced_session() {
+        let dir = unique_offline_dir("confirm-gen");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (s1, _, _, _) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "gen-cid",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 10,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let (s2, _, _, _) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "gen-cid",
+            true,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 20,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert_ne!(s1.id, s2.id);
+        s2.push_offline(QueuedMessage {
+            topic: Topic::new("t/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"bob-msg"),
+            publish_at_ms: None,
+        });
+        assert_eq!(
+            store
+                .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
+                .0
+                .len(),
+            1
+        );
+
+        manager.confirm_offline_consumed_if_current(&s1, Vec::new());
+        assert_eq!(
+            store
+                .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
+                .0
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

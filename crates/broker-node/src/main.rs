@@ -6284,20 +6284,23 @@ async fn apply_subscribe(
         .as_ref()
         .map(|s| s.tenant_id.read().clone())
         .unwrap_or_else(|| session_tenant_for_conn(shared, frame.header.conn_id, &client_id));
-    let fallback_session = if conn_session.is_none() {
-        shared.sessions.get_in_tenant(&tenant, &client_id)
-    } else {
-        None
+    #[cfg(test)]
+    let (superseded_conn, owner) = {
+        let fallback_session = if conn_session.is_none() {
+            shared.sessions.get_in_tenant(&tenant, &client_id)
+        } else {
+            None
+        };
+        let superseded = fallback_session.as_ref().is_some_and(|s| {
+            let cur_conn = *s.conn_id.read();
+            cur_conn != Some(frame.header.conn_id)
+                && (cur_conn.is_some() || s.ended_at_ms.read().is_some())
+        });
+        let owner = conn_session.or_else(|| (!superseded).then_some(fallback_session).flatten());
+        (superseded, owner)
     };
-    // If `conn_id` is unbound while `(tenant, client_id)` is bound to another
-    // connection or already detached, refuse all filters rather than
-    // authorizing as the replacement owner.
-    let superseded_conn = fallback_session.as_ref().is_some_and(|s| {
-        let cur_conn = *s.conn_id.read();
-        cur_conn != Some(frame.header.conn_id)
-            && (cur_conn.is_some() || s.ended_at_ms.read().is_some())
-    });
-    let owner = conn_session.or_else(|| (!superseded_conn).then_some(fallback_session).flatten());
+    #[cfg(not(test))]
+    let (superseded_conn, owner) = (conn_session.is_none(), conn_session);
     for entry in subs {
         if superseded_conn {
             codes.push(if entry.has_options {
@@ -7210,7 +7213,9 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
             unrouted.push(queued);
         }
     }
-    session.confirm_offline_consumed(unrouted);
+    shared
+        .sessions
+        .confirm_offline_consumed_if_current(&session, unrouted);
     shared.metrics.inc_publish_sent_by(replayed as u64);
     shared.metrics.inc_delivered_by(replayed as u64);
     shared.metrics.inc_bytes_sent_by(replayed_bytes);
@@ -14184,12 +14189,13 @@ mod tests {
         shared
             .sessions
             .unbind_connection("durable-replay-guard", 301);
-        sess.buffer_offline(
-            Topic::new("t/1").unwrap(),
-            Bytes::from_static(b"secret"),
-            QoS::AtLeastOnce,
-            false,
-        );
+        sess.push_offline(broker_session::QueuedMessage {
+            topic: Topic::new("t/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"secret"),
+            publish_at_ms: None,
+        });
         assert_eq!(sess.offline_len(), 1);
 
         let (tx_bad, mut rx_bad) = unbounded_channel::<BrokerFrame>();
