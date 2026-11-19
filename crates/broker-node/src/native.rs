@@ -3092,10 +3092,7 @@ mod tests {
     /// A missing CA file returns an error.
     #[test]
     fn tls_config_loads_with_and_without_verify() {
-        let base = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../broker-connectors-enterprise/testdata"
-        );
+        let base = k1_05_dir().display().to_string();
         let cert = format!("{base}/server-cert.pem");
         let key = format!("{base}/server-key.pem");
         let off = TlsClientAuth::default();
@@ -3998,10 +3995,7 @@ mod tests {
     /// Opens a TLS session to the secure WebSocket port.
     /// Trusts the test CA only. Sends no HTTP yet.
     async fn wss_test_tls(port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
-        let base = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../broker-connectors-enterprise/testdata"
-        );
+        let base = k1_05_dir().display().to_string();
         use rustls::pki_types::pem::PemObject as _;
         let ca_pem = std::fs::read(format!("{base}/ca-cert.pem")).expect("test CA reads");
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -4031,10 +4025,7 @@ mod tests {
     /// Returns the two ports. The tasks run until the test aborts them.
     async fn wss_test_listeners(shared: Shared) -> (u16, u16) {
         use tokio::net::TcpListener as Listener;
-        let base = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../broker-connectors-enterprise/testdata"
-        );
+        let base = k1_05_dir().display().to_string();
         let cert = format!("{base}/server-cert.pem");
         let key = format!("{base}/server-key.pem");
         let tls = super::load_tls_config(&cert, &key, &super::TlsClientAuth::default())
