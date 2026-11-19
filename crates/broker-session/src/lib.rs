@@ -130,6 +130,9 @@ pub struct Session {
     /// Serializes offline/inflight replay per session so an overlapping
     /// reconnect on the same session waits for any in-progress drain/restore.
     replay_lock: parking_lot::Mutex<()>,
+    /// Retransmissions deferred by Receive Maximum on the current connection,
+    /// drained ahead of fresh `offline_queue` entries as ACKs arrive.
+    pending_replays: RwLock<VecDeque<PendingReplay>>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
     /// resends oldest-first with DUP set. Bounded per session by the
@@ -620,6 +623,30 @@ pub struct Qos2InboundEntry {
 /// waiting for PUBCOMP (payload dropped, packet id retained for dedup).
 /// Replay reuses the packet id in order; PUBLISH replays carry DUP set
 /// while PUBREL replays carry the fixed PUBREL flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReplayKind {
+    Qos1,
+    Qos1Spill,
+    Qos2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingReplay {
+    packet_id: u16,
+    kind: PendingReplayKind,
+}
+
+/// One deferred retransmission item popped from the connection's pending
+/// replay queue when send-window capacity opens.
+#[derive(Debug, Clone)]
+pub enum PendingReplayItem {
+    Qos1 {
+        entry: InflightMessage,
+        is_spill: bool,
+    },
+    Qos2(Qos2OutboundEntry),
+}
+
 #[derive(Debug, Clone)]
 pub struct Qos2OutboundEntry {
     pub packet_id: u16,
@@ -758,6 +785,7 @@ impl Session {
             offline_store: RwLock::new(None),
             offline_persist: std::sync::Mutex::new(()),
             replay_lock: parking_lot::Mutex::new(()),
+            pending_replays: RwLock::new(VecDeque::new()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
             spill_count: AtomicUsize::new(0),
@@ -1819,6 +1847,127 @@ impl Session {
     /// older connection is still routing or restoring unrouted entries.
     pub fn lock_replay(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.replay_lock.lock()
+    }
+
+    /// Total unacknowledged QoS 1 + QoS 2 PUBLISH packets currently in-flight
+    /// on the active connection (excluding retransmissions still deferred in
+    /// `pending_replays` for this connection).
+    pub fn unacked_on_conn_len(&self) -> usize {
+        let total_unacked = self
+            .inflight_total_len()
+            .saturating_add(self.qos2_outbound_len());
+        let deferred = self.pending_replays.read().len();
+        total_unacked.saturating_sub(deferred)
+    }
+
+    /// True when this session has either deferred retransmissions or queued
+    /// offline messages waiting for send-window capacity.
+    pub fn has_pending_replay_or_offline(&self) -> bool {
+        !self.pending_replays.read().is_empty() || !self.offline_queue.read().is_empty()
+    }
+
+    /// Seed `pending_replays` at the start of a connection's replay from the
+    /// session's unacked QoS 1 (window + spill) and QoS 2 PUBLISH state, and
+    /// return any QoS 2 entries already awaiting PUBCOMP (which only need
+    /// PUBREL and do not consume Receive Maximum).
+    pub fn seed_pending_replays(&self) -> Vec<Qos2OutboundEntry> {
+        let mut pending = VecDeque::new();
+        for m in self.inflight.read().iter() {
+            pending.push_back(PendingReplay {
+                packet_id: m.packet_id,
+                kind: PendingReplayKind::Qos1,
+            });
+        }
+        if self.has_spill() {
+            for m in self.inflight_spill.read().iter() {
+                pending.push_back(PendingReplay {
+                    packet_id: m.packet_id,
+                    kind: PendingReplayKind::Qos1Spill,
+                });
+            }
+        }
+        let mut pubrels = Vec::new();
+        for m in self.qos2_outbound.read().iter() {
+            if m.rec_received {
+                pubrels.push(m.clone());
+            } else {
+                pending.push_back(PendingReplay {
+                    packet_id: m.packet_id,
+                    kind: PendingReplayKind::Qos2,
+                });
+            }
+        }
+        *self.pending_replays.write() = pending;
+        pubrels
+    }
+
+    /// Pop the next still-unacked deferred retransmission item for this
+    /// connection, skipping any entry already acknowledged.
+    pub fn pop_next_pending_replay(&self) -> Option<PendingReplayItem> {
+        loop {
+            let next = self.pending_replays.write().pop_front()?;
+            match next.kind {
+                PendingReplayKind::Qos1 => {
+                    if let Some(entry) = self
+                        .inflight
+                        .read()
+                        .iter()
+                        .find(|m| m.packet_id == next.packet_id)
+                        .cloned()
+                    {
+                        return Some(PendingReplayItem::Qos1 {
+                            entry,
+                            is_spill: false,
+                        });
+                    }
+                }
+                PendingReplayKind::Qos1Spill => {
+                    if let Some(entry) = self
+                        .inflight_spill
+                        .read()
+                        .iter()
+                        .find(|m| m.packet_id == next.packet_id)
+                        .cloned()
+                    {
+                        return Some(PendingReplayItem::Qos1 {
+                            entry,
+                            is_spill: true,
+                        });
+                    }
+                }
+                PendingReplayKind::Qos2 => {
+                    if let Some(entry) = self
+                        .qos2_outbound
+                        .read()
+                        .iter()
+                        .find(|m| m.packet_id == next.packet_id && !m.rec_received)
+                        .cloned()
+                    {
+                        return Some(PendingReplayItem::Qos2(entry));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-queue a popped pending retransmission at the front if routing to the
+    /// mailbox failed.
+    pub fn push_front_pending_replay(&self, item: &PendingReplayItem) {
+        let entry = match item {
+            PendingReplayItem::Qos1 { entry, is_spill } => PendingReplay {
+                packet_id: entry.packet_id,
+                kind: if *is_spill {
+                    PendingReplayKind::Qos1Spill
+                } else {
+                    PendingReplayKind::Qos1
+                },
+            },
+            PendingReplayItem::Qos2(entry) => PendingReplay {
+                packet_id: entry.packet_id,
+                kind: PendingReplayKind::Qos2,
+            },
+        };
+        self.pending_replays.write().push_front(entry);
     }
 
     pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {

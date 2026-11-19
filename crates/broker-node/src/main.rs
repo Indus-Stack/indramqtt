@@ -709,7 +709,7 @@ fn v5_egress_refused(
     }
     if effective_qos == 1 || effective_qos == 2 {
         let cap = usize::from(session.client_receive_maximum().max(1));
-        if session.inflight_total_len() >= cap {
+        if session.unacked_on_conn_len() >= cap {
             return Some(V5_RC_QUOTA_EXCEEDED);
         }
     }
@@ -7088,137 +7088,107 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
             }
         };
     let _replay_guard = session.lock_replay();
-    let mut replayed = 0;
+    let mut replayed = 0usize;
     let mut replayed_bytes: u64 = 0;
-    let v5_receive_max = (session.protocol_version() == 5)
-        .then(|| usize::from(session.client_receive_maximum().max(1)));
-    let mut v5_unacked_sent = 0usize;
-    // T-31: unacked downlinks predate anything queued while detached,
-    // so they replay first. Entries stay held until their PUBACK: a
-    // second reconnect without acks replays them again. Same packet id
-    // with DUP set, so resume can never collide with ids in use.
-    for held in session.inflight_snapshot() {
-        if v5_receive_max.is_some_and(|cap| v5_unacked_sent >= cap) {
-            break;
-        }
-        let topic_str = held.topic.as_str();
-        let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
-        meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        meta.extend_from_slice(topic_str.as_bytes());
-        meta.extend_from_slice(&held.packet_id.to_be_bytes());
-        meta.push(u8::from(held.qos));
-        meta.push(u8::from(held.retain));
-        meta.push(1u8); // dup: redelivery of an unacked downlink
-        if let Ok(routed) = BrokerFrame::new(
-            OpCode::PublishOut,
-            frame.header.conn_id,
-            0, // stamped per-destination by ConnTable::route
-            Bytes::from(meta),
-            held.payload.clone(),
-        ) {
+    // Seed this connection's deferred-retransmission queue from all unacked
+    // QoS 1 and QoS 2 PUBLISH state, and send any QoS 2 PUBRELs immediately
+    // (PUBREL does not consume Receive Maximum).
+    let pubrels = session.seed_pending_replays();
+    for held in pubrels {
+        if let Some(routed) = encode_pubrel_out(frame.header.conn_id, held.packet_id) {
             let len = routed.total_frame_len() as u64;
             if shared.conns.route(frame.header.conn_id, routed) {
                 replayed_bytes += len;
                 replayed += 1;
-                v5_unacked_sent += 1;
             }
         }
     }
-    // B4-01: spilled overflow replays immediately after the window, in
-    // arrival order, with DUP set and the original packet ids. Entries
-    // stay held until their PUBACK like the window. This consults the
-    // spilled state written by `build_downlink_frames` on the
-    // publish-to-delivery event; driven by the reconnect (SessionBinding)
-    // event. Each mailbox arrival also bumps `inflight_spill_replayed`
-    // so spill redelivery is never silent. The spill snapshot (one Vec
-    // alloc sized by the spill length plus one frame alloc per spilled
-    // message, all bounded by max_spill) runs only when spill is
-    // non-empty (one relaxed atomic load via `has_spill`);
-    // steady-state reconnect with empty spill allocates exactly what the
-    // window replay allocated before B4-01. Spill-nonempty snapshot
-    // throughput is printed by
-    // `broker-session::test_qos1_inflight_hot_path_timings` (slow-path
-    // section); broker delivery/replay workload before/after numbers
-    // (steady-state `apply_publish` rate as the pre-change baseline vs
-    // spill-overflow and `replay_offline` rates) are printed by
-    // `qos1_inflight_delivery_workload_timings`; functional spill replay
-    // through this path is asserted by
-    // `qos1_inflight_spill_redelivers_everything_with_dup`.
-    if session.has_spill() {
-        for held in session.inflight_spill_snapshot() {
-            if v5_receive_max.is_some_and(|cap| v5_unacked_sent >= cap) {
-                break;
-            }
-            let topic_str = held.topic.as_str();
-            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
-            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-            meta.extend_from_slice(topic_str.as_bytes());
-            meta.extend_from_slice(&held.packet_id.to_be_bytes());
-            meta.push(u8::from(held.qos));
-            meta.push(u8::from(held.retain));
-            meta.push(1u8); // dup: redelivery of a spilled unacked downlink
-            if let Ok(routed) = BrokerFrame::new(
-                OpCode::PublishOut,
-                frame.header.conn_id,
-                0, // stamped per-destination by ConnTable::route
-                Bytes::from(meta),
-                held.payload.clone(),
-            ) {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(frame.header.conn_id, routed) {
-                    replayed_bytes += len;
-                    replayed += 1;
-                    v5_unacked_sent += 1;
-                    shared.metrics.inc_inflight_spill_replayed();
-                }
-            }
-        }
-    }
-    // D1-01: uncompleted QoS 2 downlinks replay in queued order. Waiting
-    // for PUBREC resends PUBLISH with DUP set and the same packet id;
-    // waiting for PUBCOMP resends PUBREL. Entries stay held until their
-    // PUBCOMP, so a second reconnect without completion replays again.
-    for held in session.qos2_outbound_snapshot() {
-        if held.rec_received {
-            if let Some(routed) = encode_pubrel_out(frame.header.conn_id, held.packet_id) {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(frame.header.conn_id, routed) {
-                    replayed_bytes += len;
-                    replayed += 1;
-                }
-            }
-        } else {
-            if v5_receive_max.is_some_and(|cap| v5_unacked_sent >= cap) {
-                continue;
-            }
-            let topic_str = held.topic.as_str();
-            if let Some(routed) = encode_publish_out_with_dup(
-                frame.header.conn_id,
-                topic_str,
-                held.packet_id,
-                2,
-                held.retain,
-                true,
-                0, // B4-05: replays carry the full topic with no alias
-                &held.payload,
-            ) {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(frame.header.conn_id, routed) {
-                    replayed_bytes += len;
-                    replayed += 1;
-                    v5_unacked_sent += 1;
-                }
-            }
-        }
-    }
-    let (queued_replayed, queued_bytes) =
-        replay_queued_offline_locked(shared, &session, frame.header.conn_id, expected_conn_id);
-    replayed += queued_replayed;
-    replayed_bytes += queued_bytes;
+    let (resumed, resumed_bytes) =
+        resume_replay_locked(shared, &session, frame.header.conn_id, expected_conn_id);
+    replayed += resumed;
+    replayed_bytes += resumed_bytes;
     shared.metrics.inc_publish_sent_by(replayed as u64);
     shared.metrics.inc_delivered_by(replayed as u64);
     shared.metrics.inc_bytes_sent_by(replayed_bytes);
     replayed
+}
+
+/// Resume deferred retransmissions first, then drain queued offline messages,
+/// both paced by the same connection-scoped MQTT 5 Receive Maximum (covering
+/// QoS 1 and QoS 2) and session inflight/spill capacity. Caller must hold
+/// `session.lock_replay()`.
+fn resume_replay_locked(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    conn_id: u64,
+    expected_conn_id: Option<u64>,
+) -> (usize, u64) {
+    let mut replayed = 0usize;
+    let mut replayed_bytes = 0u64;
+    let v5_receive_max = (session.protocol_version() == 5)
+        .then(|| usize::from(session.client_receive_maximum().max(1)));
+
+    while v5_receive_max.is_none_or(|cap| session.unacked_on_conn_len() < cap) {
+        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+            break;
+        }
+        let Some(item) = session.pop_next_pending_replay() else {
+            break;
+        };
+        let routed = match &item {
+            broker_session::PendingReplayItem::Qos1 { entry, .. } => {
+                let topic_str = entry.topic.as_str();
+                let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+                meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+                meta.extend_from_slice(topic_str.as_bytes());
+                meta.extend_from_slice(&entry.packet_id.to_be_bytes());
+                meta.push(u8::from(entry.qos));
+                meta.push(u8::from(entry.retain));
+                meta.push(1u8); // dup: redelivery of an unacked downlink
+                BrokerFrame::new(
+                    OpCode::PublishOut,
+                    conn_id,
+                    0,
+                    Bytes::from(meta),
+                    entry.payload.clone(),
+                )
+                .ok()
+            }
+            broker_session::PendingReplayItem::Qos2(held) => encode_publish_out_with_dup(
+                conn_id,
+                held.topic.as_str(),
+                held.packet_id,
+                2,
+                held.retain,
+                true,
+                0,
+                &held.payload,
+            ),
+        };
+        let Some(routed) = routed else {
+            continue;
+        };
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(conn_id, routed) {
+            if matches!(
+                item,
+                broker_session::PendingReplayItem::Qos1 { is_spill: true, .. }
+            ) {
+                shared.metrics.inc_inflight_spill_replayed();
+            }
+            replayed_bytes += len;
+            replayed += 1;
+        } else {
+            session.push_front_pending_replay(&item);
+            break;
+        }
+    }
+
+    let (queued_replayed, queued_bytes) =
+        replay_queued_offline_locked(shared, session, conn_id, expected_conn_id);
+    replayed += queued_replayed;
+    replayed_bytes += queued_bytes;
+    (replayed, replayed_bytes)
 }
 
 /// Drain and route queued offline messages for `session` while the caller
@@ -7244,7 +7214,7 @@ fn replay_queued_offline_locked(
             break;
         }
         if queued.qos != QoS::AtMostOnce
-            && v5_receive_max.is_some_and(|cap| session.inflight_total_len() >= cap)
+            && v5_receive_max.is_some_and(|cap| session.unacked_on_conn_len() >= cap)
         {
             unrouted.push(queued);
             unrouted.extend(retained);
@@ -7255,9 +7225,9 @@ fn replay_queued_offline_locked(
         } else {
             session.next_packet_id()
         };
-        // Reserve QoS 1 inflight/spill tracking capacity before sending so a
-        // full buffer leaves the message queued until ACKs free space instead
-        // of sending without a retry copy.
+        // Reserve QoS 1/2 tracking capacity before sending so a full buffer
+        // leaves the message queued until ACKs free space instead of sending
+        // without a retry copy.
         let mut tracked_qos1_spilled = false;
         if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
             match session.track_inflight_or_spill(broker_session::InflightMessage {
@@ -7279,6 +7249,19 @@ fn replay_queued_offline_locked(
                     break;
                 }
             }
+        } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+            let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
+                packet_id: downlink_id,
+                topic: queued.topic.clone(),
+                retain: queued.retain,
+                payload: queued.payload.clone(),
+                rec_received: false,
+            });
+            if !tracked {
+                unrouted.push(queued);
+                unrouted.extend(retained);
+                break;
+            }
         }
         let topic_str = queued.topic.as_str();
         let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
@@ -7299,6 +7282,8 @@ fn replay_queued_offline_locked(
             Err(_) => {
                 if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
                     let _ = session.ack_inflight(downlink_id);
+                } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                    let _ = session.ack_qos2_pubcomp(downlink_id);
                 }
                 unrouted.push(queued);
                 continue;
@@ -7308,23 +7293,14 @@ fn replay_queued_offline_locked(
         if shared.conns.route(conn_id, routed) {
             if tracked_qos1_spilled {
                 shared.metrics.inc_inflight_spilled();
-            } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
-                let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
-                    packet_id: downlink_id,
-                    topic: queued.topic.clone(),
-                    retain: queued.retain,
-                    payload: queued.payload.clone(),
-                    rec_received: false,
-                });
-                if !tracked {
-                    shared.metrics.inc_inflight_dropped();
-                }
             }
             replayed_bytes += len;
             replayed += 1;
         } else {
             if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
                 let _ = session.ack_inflight(downlink_id);
+            } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
             }
             unrouted.push(queued);
         }
@@ -8355,7 +8331,17 @@ fn apply_qos2_pubcomp(frame: &BrokerFrame, shared: &Shared) {
                 .and_then(|p| shared.sessions.get(p))
         });
     if let Some(session) = session {
-        session.ack_qos2_pubcomp(packet_id);
+        if session.ack_qos2_pubcomp(packet_id) && session.has_pending_replay_or_offline() {
+            let _replay_guard = session.lock_replay();
+            let expected_conn_id = (*session.conn_id.read()).map(|_| frame.header.conn_id);
+            let (resumed, resumed_bytes) =
+                resume_replay_locked(shared, &session, frame.header.conn_id, expected_conn_id);
+            if resumed > 0 {
+                shared.metrics.inc_publish_sent_by(resumed as u64);
+                shared.metrics.inc_delivered_by(resumed as u64);
+                shared.metrics.inc_bytes_sent_by(resumed_bytes);
+            }
+        }
     }
 }
 
@@ -10351,11 +10337,11 @@ fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
     let Some(entry) = session.ack_inflight_timed(packet_id) else {
         return;
     };
-    if session.offline_len() > 0 {
+    if session.has_pending_replay_or_offline() {
         let _replay_guard = session.lock_replay();
         let expected_conn_id = (*session.conn_id.read()).map(|_| frame.header.conn_id);
         let (resumed, resumed_bytes) =
-            replay_queued_offline_locked(shared, &session, frame.header.conn_id, expected_conn_id);
+            resume_replay_locked(shared, &session, frame.header.conn_id, expected_conn_id);
         if resumed > 0 {
             shared.metrics.inc_publish_sent_by(resumed as u64);
             shared.metrics.inc_delivered_by(resumed as u64);
@@ -14440,6 +14426,140 @@ mod tests {
         apply_puback(&puback_frame(102, 2, pid1), &shared);
 
         let f2 = rx.try_recv().expect("second message resumes after PUBACK");
+        assert_eq!(f2.payload, Bytes::from_static(b"two"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_deferred_retransmissions_resume_before_offline_on_puback() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-retrans-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 103,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        assert!(sess.track_inflight(broker_session::InflightMessage {
+            packet_id: 11,
+            topic: Topic::new("rt/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"r1"),
+            enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
+        }));
+        assert!(sess.track_inflight(broker_session::InflightMessage {
+            packet_id: 12,
+            topic: Topic::new("rt/2").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"r2"),
+            enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
+        }));
+        sess.push_offline(QueuedMessage {
+            topic: Topic::new("rt/3").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"q3"),
+            publish_at_ms: None,
+        });
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(103, tx);
+        let bind = bind_frame(103, 1, encode_bind_meta("replay-retrans-rm", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx.try_recv().expect("first retransmission");
+        assert_eq!(f1.payload, Bytes::from_static(b"r1"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+
+        apply_puback(&puback_frame(103, 2, 11), &shared);
+        let f2 = rx.try_recv().expect("second retransmission after PUBACK");
+        assert_eq!(f2.payload, Bytes::from_static(b"r2"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+
+        apply_puback(&puback_frame(103, 3, 12), &shared);
+        let f3 = rx.try_recv().expect("queued message after retransmissions");
+        assert_eq!(f3.payload, Bytes::from_static(b"q3"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_qos2_respects_v5_receive_maximum_and_resumes_on_pubcomp() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-qos2-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 104,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (topic, payload) in [("q2/1", b"one".as_slice()), ("q2/2", b"two".as_slice())] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(104, tx);
+        let bind = bind_frame(104, 1, encode_bind_meta("replay-qos2-rm", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx.try_recv().expect("first QoS 2 within Receive Maximum=1");
+        assert_eq!(f1.payload, Bytes::from_static(b"one"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+        assert_eq!(sess.qos2_outbound_len(), 1);
+
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        let comp = BrokerFrame::new(
+            OpCode::PubCompIn,
+            104,
+            2,
+            Bytes::from(pid1.to_be_bytes().to_vec()),
+            Bytes::new(),
+        )
+        .unwrap();
+        apply_qos2_pubcomp(&comp, &shared);
+
+        let f2 = rx.try_recv().expect("second QoS 2 resumes after PUBCOMP");
         assert_eq!(f2.payload, Bytes::from_static(b"two"));
         assert!(rx.try_recv().is_err());
         assert_eq!(sess.offline_len(), 0);
