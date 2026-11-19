@@ -1,7 +1,7 @@
 {
   "generated_by": "tools/connector_inventory.py",
   "connector_count": 47,
-  "item_count": 775,
+  "item_count": 776,
   "connectors": [
     {
       "kind": "alloydb",
@@ -3196,6 +3196,14 @@
           "path": "timeout_ms",
           "type": "Option<u64>",
           "category": "retry",
+          "origin": "config"
+        },
+        {
+          "id": "greptimedb.collision_seq_column",
+          "field": "collision_seq_column",
+          "path": "collision_seq_column",
+          "type": "Option<String>",
+          "category": "mapping",
           "origin": "config"
         }
       ],

@@ -5,7 +5,7 @@ Run `python3 tools/connector_inventory.py --write` to update it.
 The drift test fails when this file differs from the source.
 
 Connectors: 47.
-Items: 775.
+Items: 776.
 
 | Kind | Crate | Direction | Status | Config type | Items |
 |---|---|---|---|---|---|
@@ -29,7 +29,7 @@ Items: 775.
 | `elasticsearch` | broker-connectors | sink | mvp | `ElasticsearchSinkConfig` | 22 |
 | `gcp_iot` | broker-connectors-enterprise | both | mvp | `GcpIotConfig` | 16 |
 | `gcp_pubsub` | broker-connectors-enterprise | sink | mvp | `GcpPubSubSinkConfig` | 17 |
-| `greptimedb` | broker-connectors | sink | mvp | `GreptimeDbConfig` | 17 |
+| `greptimedb` | broker-connectors | sink | mvp | `GreptimeDbConfig` | 18 |
 | `influxdb` | broker-connectors | sink | mvp | `InfluxDbSinkConfig` | 10 |
 | `iotdb` | broker-connectors-enterprise | sink | mvp | `IotDbSinkConfig` | 22 |
 | `kafka` | broker-connectors | sink | mvp | `KafkaSinkConfig` | 15 |
@@ -594,6 +594,7 @@ Direction: sink. Status: mvp.
 | `greptimedb.batch_size` | `batch_size` | `Option<usize>` | batching |
 | `greptimedb.buffer_capacity` | `buffer_capacity` | `Option<usize>` | buffering |
 | `greptimedb.timeout_ms` | `timeout_ms` | `Option<u64>` | retry |
+| `greptimedb.collision_seq_column` | `collision_seq_column` | `Option<String>` | mapping |
 
 ## `influxdb`
 
