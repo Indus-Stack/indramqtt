@@ -345,6 +345,12 @@ pub const MAX_OBSERVERS_PER_TOPIC: usize = 32;
 /// 12 GB test-host budget and never on the fan-out fast path.
 pub const MAX_OBSERVED_TOPICS: usize = 2048;
 
+/// Maximum total observer entries across all topics.
+///
+/// Bounded to 65536 entries (MAX_OBSERVED_TOPICS * MAX_OBSERVERS_PER_TOPIC)
+/// to prevent unbounded memory growth on the message path.
+pub const MAX_COAP_OBSERVERS: usize = 65536;
+
 impl Default for CoapGatewayHandler {
     fn default() -> Self {
         Self::new()
@@ -415,20 +421,25 @@ impl CoapGatewayHandler {
             return false;
         }
         let mut table = self.observers.write();
-        if let Some(list) = table.get_mut(topic) {
+        if let Some(list) = table.get(topic) {
             if list.iter().any(|o| o.peer == peer && o.token == token) {
                 return true;
             }
             if list.len() >= MAX_OBSERVERS_PER_TOPIC {
                 return false;
             }
-            list.push(CoapObserver { peer, token });
-            return true;
-        }
-        if table.len() >= MAX_OBSERVED_TOPICS {
+        } else if table.len() >= MAX_OBSERVED_TOPICS {
             return false;
         }
-        table.insert(topic.to_string(), vec![CoapObserver { peer, token }]);
+        let total: usize = table.values().map(Vec::len).sum();
+        if total >= MAX_COAP_OBSERVERS {
+            return false;
+        }
+        if let Some(list) = table.get_mut(topic) {
+            list.push(CoapObserver { peer, token });
+        } else {
+            table.insert(topic.to_string(), vec![CoapObserver { peer, token }]);
+        }
         true
     }
 
@@ -789,5 +800,31 @@ mod tests {
             }
         }
         assert_eq!(handler.observer_count(), MAX_OBSERVERS_PER_TOPIC);
+    }
+
+    #[test]
+    fn test_coap_observer_total_capacity_is_bounded() {
+        let handler = CoapGatewayHandler::new();
+        let base = SocketAddr::from(([127, 0, 0, 1], 5683));
+        {
+            let mut table = handler.observers.write();
+            for t in 0..MAX_OBSERVED_TOPICS {
+                let topic = format!("t/{t}");
+                let list = (0..MAX_OBSERVERS_PER_TOPIC)
+                    .map(|i| CoapObserver {
+                        peer: SocketAddr::new(
+                            base.ip(),
+                            base.port().wrapping_add(i as u16).max(1024),
+                        ),
+                        token: Bytes::from_static(b"tok"),
+                    })
+                    .collect();
+                table.insert(topic, list);
+            }
+        }
+        assert_eq!(handler.observer_count(), MAX_COAP_OBSERVERS);
+        let next_peer = SocketAddr::from(([127, 0, 0, 1], 9999));
+        assert!(!handler.register_observer("t/0", next_peer, Bytes::from_static(b"extra")));
+        assert!(!handler.register_observer("t/new", next_peer, Bytes::from_static(b"extra")));
     }
 }

@@ -8511,37 +8511,10 @@ async fn apply_coap_publish(
         shared.metrics.inc_messages_dropped();
         return None;
     }
-    if shared
-        .auth
-        .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, &topic)
-        .await
-        .is_err()
-    {
+    if !authorize_coap_publish(shared, &topic).await {
         warn!("Dropping CoAP publish: access rules deny the topic");
         shared.metrics.inc_messages_dropped();
         return None;
-    }
-    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-        if db
-            .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, &topic)
-            .await
-            .is_err()
-        {
-            warn!("Dropping CoAP publish: database rules deny the topic");
-            shared.metrics.inc_messages_dropped();
-            return None;
-        }
-    }
-    if let Some(webhook) = shared.webhook.as_ref() {
-        if webhook
-            .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, &topic)
-            .await
-            .is_err()
-        {
-            warn!("Dropping CoAP publish: webhook denies the topic");
-            shared.metrics.inc_messages_dropped();
-            return None;
-        }
     }
     shared.metrics.inc_publish_received();
     shared.metrics.inc_qos0_received();
@@ -8598,6 +8571,59 @@ fn maybe_notify_coap_observers(shared: &Shared, topic_str: &str, payload: &Bytes
     });
 }
 
+async fn authorize_coap_publish(shared: &Shared, topic: &Topic) -> bool {
+    let tenant = broker_session::tenant::DEFAULT_TENANT_ID;
+    if shared
+        .auth
+        .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, topic)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+        if db
+            .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, topic)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if let Some(webhook) = shared.webhook.as_ref() {
+        if webhook
+            .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, topic)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn authorize_coap_subscribe(shared: &Shared, filter: &TopicFilter) -> bool {
+    let tenant = broker_session::tenant::DEFAULT_TENANT_ID;
+    if shared
+        .auth
+        .authorize_subscribe_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, filter)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+        if db
+            .authorize_subscribe_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, filter)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Serve the CoAP gateway (B1-04) on an already-bound UDP socket.
 ///
 /// Every datagram is validated as `/ps/<topic>` before it touches the
@@ -8626,42 +8652,23 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
         match req.code {
             CoapCode::POST | CoapCode::PUT => {
                 let Some(topic_str) = CoapGatewayHandler::coap_topic(&req) else {
-                    let resp = CoapMessage {
-                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                        code: CoapCode::BAD_REQUEST,
-                        message_id: req.message_id,
-                        token: req.token.clone(),
-                        options: Vec::new(),
-                        payload: Bytes::from_static(b"Topic cannot be empty"),
-                    };
+                    let resp = req.make_ack(
+                        CoapCode::BAD_REQUEST,
+                        Bytes::from_static(b"Topic cannot be empty"),
+                    );
                     let _ = socket.send_to(&resp.encode(), peer).await;
                     continue;
                 };
                 if Topic::new(topic_str.clone()).is_err() {
-                    let resp = CoapMessage {
-                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                        code: CoapCode::BAD_REQUEST,
-                        message_id: req.message_id,
-                        token: req.token.clone(),
-                        options: Vec::new(),
-                        payload: Bytes::from_static(b"Invalid topic"),
-                    };
+                    let resp =
+                        req.make_ack(CoapCode::BAD_REQUEST, Bytes::from_static(b"Invalid topic"));
                     let _ = socket.send_to(&resp.encode(), peer).await;
                     continue;
                 }
                 let payload = req.payload.clone();
                 let Some(deliveries) = apply_coap_publish(&shared, &topic_str, &payload).await
                 else {
-                    // Denied gateway publish stores nothing and routes
-                    // nothing. Answer 4.01 so the client learns the denial.
-                    let resp = CoapMessage {
-                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                        code: CoapCode::UNAUTHORIZED,
-                        message_id: req.message_id,
-                        token: req.token.clone(),
-                        options: Vec::new(),
-                        payload: Bytes::new(),
-                    };
+                    let resp = req.make_ack(CoapCode::UNAUTHORIZED, Bytes::new());
                     let _ = socket.send_to(&resp.encode(), peer).await;
                     continue;
                 };
@@ -8678,47 +8685,36 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
                 shared.metrics.inc_publish_sent_by(enqueued);
                 shared.metrics.inc_delivered_by(enqueued);
                 shared.metrics.inc_bytes_sent_by(enqueued_bytes);
-                let resp = CoapMessage {
-                    message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                    code: CoapCode::CHANGED,
-                    message_id: req.message_id,
-                    token: req.token.clone(),
-                    options: Vec::new(),
-                    payload: Bytes::new(),
-                };
+                let resp = req.make_ack(CoapCode::CHANGED, Bytes::new());
                 let _ = socket.send_to(&resp.encode(), peer).await;
             }
             CoapCode::GET => {
                 let Some(topic_str) = CoapGatewayHandler::coap_topic(&req) else {
-                    let resp = CoapMessage {
-                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                        code: CoapCode::BAD_REQUEST,
-                        message_id: req.message_id,
-                        token: req.token.clone(),
-                        options: Vec::new(),
-                        payload: Bytes::from_static(b"Topic cannot be empty"),
-                    };
+                    let resp = req.make_ack(
+                        CoapCode::BAD_REQUEST,
+                        Bytes::from_static(b"Topic cannot be empty"),
+                    );
                     let _ = socket.send_to(&resp.encode(), peer).await;
                     continue;
                 };
-                let Ok(topic) = Topic::new(topic_str.clone()) else {
-                    let resp = CoapMessage {
-                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                        code: CoapCode::BAD_REQUEST,
-                        message_id: req.message_id,
-                        token: req.token.clone(),
-                        options: Vec::new(),
-                        payload: Bytes::from_static(b"Invalid topic"),
-                    };
+                let (Ok(topic), Ok(filter)) =
+                    (Topic::new(topic_str.clone()), TopicFilter::new(&topic_str))
+                else {
+                    let resp =
+                        req.make_ack(CoapCode::BAD_REQUEST, Bytes::from_static(b"Invalid topic"));
                     let _ = socket.send_to(&resp.encode(), peer).await;
                     continue;
                 };
+                if !authorize_coap_subscribe(&shared, &filter).await {
+                    let resp = req.make_ack(CoapCode::UNAUTHORIZED, Bytes::new());
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                }
                 let observing = CoapGatewayHandler::is_observe_register(&req);
-                if observing {
-                    shared
+                let registered = observing
+                    && shared
                         .coap
                         .register_observer(&topic_str, peer, req.token.clone());
-                }
                 let retained = shared
                     .retained
                     .get_retained_in_tenant(&topic, broker_session::tenant::DEFAULT_TENANT_ID)
@@ -8727,7 +8723,7 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
                     .flatten();
                 match retained {
                     Some(stored) => {
-                        let resp = if observing {
+                        let resp = if registered {
                             let seq = shared.coap.next_observe_seq();
                             shared
                                 .coap
@@ -8738,7 +8734,7 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
                         let _ = socket.send_to(&resp.encode(), peer).await;
                     }
                     None => {
-                        let resp = if observing {
+                        let resp = if registered {
                             let seq = shared.coap.next_observe_seq();
                             shared.coap.make_observe_response(&req, Bytes::new(), seq)
                         } else {
@@ -8750,35 +8746,33 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
             }
             CoapCode::DELETE => {
                 let Some(topic_str) = CoapGatewayHandler::coap_topic(&req) else {
-                    let resp = CoapMessage {
-                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                        code: CoapCode::BAD_REQUEST,
-                        message_id: req.message_id,
-                        token: req.token.clone(),
-                        options: Vec::new(),
-                        payload: Bytes::from_static(b"Topic cannot be empty"),
-                    };
+                    let resp = req.make_ack(
+                        CoapCode::BAD_REQUEST,
+                        Bytes::from_static(b"Topic cannot be empty"),
+                    );
                     let _ = socket.send_to(&resp.encode(), peer).await;
                     continue;
                 };
-                if let Ok(topic) = Topic::new(topic_str) {
-                    if shared
-                        .retained
-                        .clear_retained_in_tenant(&topic, broker_session::tenant::DEFAULT_TENANT_ID)
-                        .await
-                        .is_ok()
-                    {
-                        sync_retained_stat(&shared).await;
-                    }
-                }
-                let resp = CoapMessage {
-                    message_type: broker_gateway::coap::CoapType::Acknowledgement,
-                    code: CoapCode::DELETED,
-                    message_id: req.message_id,
-                    token: req.token.clone(),
-                    options: Vec::new(),
-                    payload: Bytes::new(),
+                let Ok(topic) = Topic::new(topic_str) else {
+                    let resp =
+                        req.make_ack(CoapCode::BAD_REQUEST, Bytes::from_static(b"Invalid topic"));
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
                 };
+                if !authorize_coap_publish(&shared, &topic).await {
+                    let resp = req.make_ack(CoapCode::UNAUTHORIZED, Bytes::new());
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                }
+                if shared
+                    .retained
+                    .clear_retained_in_tenant(&topic, broker_session::tenant::DEFAULT_TENANT_ID)
+                    .await
+                    .is_ok()
+                {
+                    sync_retained_stat(&shared).await;
+                }
+                let resp = req.make_ack(CoapCode::DELETED, Bytes::new());
                 let _ = socket.send_to(&resp.encode(), peer).await;
             }
             _ => {
