@@ -3,6 +3,8 @@ set -euo pipefail
 OUT_DIR="${1:?usage: gen_test_pki.sh <out_dir>}"
 mkdir -p "$OUT_DIR"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=indramqtt-test-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -keyout "$OUT_DIR/ca-key.pem" -out "$OUT_DIR/ca-cert.pem" 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
     -keyout "$OUT_DIR/server-key.pem" -out "$OUT_DIR/server.csr" 2>/dev/null

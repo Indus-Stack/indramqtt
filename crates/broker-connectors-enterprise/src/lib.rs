@@ -574,6 +574,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) mod test_pki {
     use std::sync::OnceLock;
 

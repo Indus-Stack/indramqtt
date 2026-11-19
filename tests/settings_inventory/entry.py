@@ -36,7 +36,7 @@ def _k1_05_dir() -> Path:
     d = Path(tempfile.mkdtemp(prefix="indra-k1-05-"))
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-         "-subj", "/CN=indra-k1-05-ca", "-keyout", str(d / "ca-key.pem"), "-out", str(d / "ca-cert.pem")],
+         "-subj", "/CN=indra-k1-05-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", str(d / "ca-key.pem"), "-out", str(d / "ca-cert.pem")],
         check=True, capture_output=True,
     )
     for name, subj, ext in [
