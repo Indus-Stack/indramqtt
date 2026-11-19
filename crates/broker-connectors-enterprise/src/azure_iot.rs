@@ -996,6 +996,7 @@ impl AzureIotSink {
             AzureIotAuth::SharedAccessKey { .. } => Ok(self
                 .sas_cache
                 .as_ref()
+                // INVARIANT: sas_cache is always initialized when auth is SharedAccessKey.
                 .expect("cache built with SharedAccessKey")
                 .token_now()),
             AzureIotAuth::SasToken { token } => Ok(token.clone()),

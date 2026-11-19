@@ -797,6 +797,7 @@ impl AwsIotTransport for TlsAwsIotTransport {
         }
         if self.should_ping() {
             let ping_ok = {
+                // INVARIANT: stream is verified Some by the connection check immediately above.
                 let stream = guard.as_mut().expect("checked above");
                 Self::ping_stream(stream, self.io_timeout).await.is_ok()
             };
@@ -810,6 +811,7 @@ impl AwsIotTransport for TlsAwsIotTransport {
         }
         if frame.qos == 0 {
             let outcome = {
+                // INVARIANT: stream is verified Some by the connection check immediately above.
                 let stream = guard.as_mut().expect("checked above");
                 Self::write_publish_qos0(
                     stream,
@@ -834,6 +836,7 @@ impl AwsIotTransport for TlsAwsIotTransport {
         } else {
             let packet_id = self.next_packet_id();
             let outcome = {
+                // INVARIANT: stream is verified Some by the connection check immediately above.
                 let stream = guard.as_mut().expect("checked above");
                 Self::write_publish_qos1(
                     stream,

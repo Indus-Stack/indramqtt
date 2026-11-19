@@ -413,11 +413,13 @@ pub fn murmur3_token(data: &[u8]) -> i64 {
         let mut k1 = u64::from_le_bytes(
             data[block * 16..block * 16 + 8]
                 .try_into()
+                // INVARIANT: slice range (block * 16 .. block * 16 + 8) has constant length 8.
                 .expect("8 bytes"),
         );
         let mut k2 = u64::from_le_bytes(
             data[block * 16 + 8..block * 16 + 16]
                 .try_into()
+                // INVARIANT: slice range (block * 16 + 8 .. block * 16 + 16) has constant length 8.
                 .expect("8 bytes"),
         );
         k1 = k1.wrapping_mul(C1);
