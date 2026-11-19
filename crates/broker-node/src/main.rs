@@ -5971,6 +5971,24 @@ where
                 shared.metrics.inc_connack_sent();
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
+                if accepted
+                    && shared
+                        .sessions
+                        .session_for_conn(frame.header.conn_id)
+                        .is_none()
+                {
+                    if let Ok(close) = BrokerFrame::new(
+                        OpCode::ConnClose,
+                        frame.header.conn_id,
+                        0,
+                        Bytes::from(vec![0x8E]),
+                        Bytes::new(),
+                    ) {
+                        let _ = transport.send(close).await;
+                    }
+                    shared.conns.unregister(frame.header.conn_id);
+                    return Ok(());
+                }
                 let active = shared.metrics.inc_connections();
                 shared.stats.set_connections(active.max(0) as u64);
                 refresh_subscription_stats(shared);
@@ -6912,10 +6930,31 @@ async fn apply_subscribe(
 /// A rewrite rule applies before removal, like subscribe.
 async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     let (packet_id, client_id, filters) = decode_unsubscribe_meta(&frame.metadata)?;
+    let _route_guard = shared.sessions.lock_route_guard();
     // Tenant scope: resolve once from the owning connection, like subscribe.
-    // Two tenants with one client id unsubscribe independently.
-    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
-    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
+    // Two tenants with one client id unsubscribe independently, and a
+    // superseded connection must never remove its replacement's routes.
+    let conn_session = session_for_conn_if_client(shared, frame.header.conn_id, &client_id);
+    let tenant = conn_session
+        .as_ref()
+        .map(|s| s.tenant_id.read().clone())
+        .unwrap_or_else(|| session_tenant_for_conn(shared, frame.header.conn_id, &client_id));
+    #[cfg(test)]
+    let owner = {
+        let fallback_session = if conn_session.is_none() {
+            shared.sessions.get_in_tenant(&tenant, &client_id)
+        } else {
+            None
+        };
+        let superseded = fallback_session.as_ref().is_some_and(|s| {
+            let cur_conn = *s.conn_id.read();
+            cur_conn != Some(frame.header.conn_id)
+                && (cur_conn.is_some() || s.ended_at_ms.read().is_some())
+        });
+        conn_session.or_else(|| (!superseded).then_some(fallback_session).flatten())
+    };
+    #[cfg(not(test))]
+    let owner = conn_session;
     let mut codes = Vec::with_capacity(filters.len());
     let mut removed_any = false;
     let mut removed = Vec::new();
@@ -6933,9 +6972,11 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
             codes.push(V5_UNSUBACK_FILTER_INVALID);
             continue;
         };
-        let existed = owner
-            .as_ref()
-            .is_some_and(|session| session.subscriptions.read().contains_key(&inner));
+        let Some(session) = owner.as_ref() else {
+            codes.push(V5_UNSUBACK_NO_SUBSCRIPTION);
+            continue;
+        };
+        let existed = session.subscriptions.read().contains_key(&inner);
         // Fire the event before removal. Rules belong to the default
         // tenant, so another tenant fires nothing. Check flag first.
         if shared
@@ -6943,7 +6984,7 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
             .is_event_source_selected(broker_rules::EventSource::SessionUnsubscribed)
             && is_default_tenant(&tenant)
         {
-            if let Some(session) = owner.as_ref() {
+            {
                 let username = session.username.read().clone();
                 let peerhost = session.peerhost.read().clone();
                 shared
@@ -6973,6 +7014,7 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
             codes.push(V5_UNSUBACK_NO_SUBSCRIPTION);
         }
     }
+    drop(_route_guard);
     if removed_any {
         refresh_subscription_stats(shared);
     }
@@ -7021,26 +7063,30 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     // prefer the session bound to this connection (tenant-correct when
     // two tenants share the client id), falling back to the
     // default-tenant record for binds that predate the index entry.
-    let session = match session_for_conn_if_client(shared, frame.header.conn_id, client_id) {
-        Some(session) => session,
-        None => {
-            #[cfg(test)]
-            {
-                match shared.sessions.get(client_id).filter(|s| {
-                    let cur = *s.conn_id.read();
-                    cur == Some(frame.header.conn_id)
-                        || (cur.is_none() && s.ended_at_ms.read().is_none())
-                }) {
-                    Some(s) => s,
-                    None => return 0,
+    let (session, expected_conn_id) =
+        match session_for_conn_if_client(shared, frame.header.conn_id, client_id) {
+            Some(session) => (session, Some(frame.header.conn_id)),
+            None => {
+                #[cfg(test)]
+                {
+                    match shared.sessions.get(client_id).filter(|s| {
+                        let cur = *s.conn_id.read();
+                        cur == Some(frame.header.conn_id)
+                            || (cur.is_none() && s.ended_at_ms.read().is_none())
+                    }) {
+                        Some(s) => {
+                            let expected = (*s.conn_id.read()).map(|_| frame.header.conn_id);
+                            (s, expected)
+                        }
+                        None => return 0,
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    return 0;
                 }
             }
-            #[cfg(not(test))]
-            {
-                return 0;
-            }
-        }
-    };
+        };
     let mut replayed = 0;
     let mut replayed_bytes: u64 = 0;
     // T-31: unacked downlinks predate anything queued while detached,
@@ -7189,13 +7235,30 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
         // a delivery.
         let len = routed.total_frame_len() as u64;
         if shared.conns.route(frame.header.conn_id, routed) {
-            // QoS 2 offline replays become live QoS 2 downlinks needing
-            // PUBREC/PUBCOMP, so track them only after the route is
-            // confirmed (QoS 1 offline replays keep their existing
-            // untracked behaviour). Tracking a frame that never reached
-            // the mailbox would leak an unacked entry while the message
-            // is also re-queued below.
-            if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+            // Track both QoS 1 and QoS 2 offline replays as inflight only
+            // after the route reaches the mailbox, so a disconnect before
+            // PUBACK/PUBCOMP keeps the message for the next reconnect
+            // without leaking unrouted entries.
+            if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                match session.track_inflight_or_spill(broker_session::InflightMessage {
+                    packet_id: downlink_id,
+                    topic: queued.topic.clone(),
+                    qos: QoS::AtLeastOnce,
+                    retain: queued.retain,
+                    payload: queued.payload.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                    publish_at_ms: None,
+                }) {
+                    InflightTrackOutcome::Tracked => {}
+                    InflightTrackOutcome::Spilled => {
+                        shared.metrics.inc_inflight_spilled();
+                    }
+                    InflightTrackOutcome::Dropped => {
+                        shared.metrics.inc_inflight_dropped();
+                        shared.metrics.inc_inflight_spill_evicted();
+                    }
+                }
+            } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
                 let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
                     packet_id: downlink_id,
                     topic: queued.topic.clone(),
@@ -7215,7 +7278,7 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     }
     shared
         .sessions
-        .confirm_offline_consumed_if_current(&session, unrouted);
+        .confirm_offline_consumed_if_current(&session, expected_conn_id, unrouted);
     shared.metrics.inc_publish_sent_by(replayed as u64);
     shared.metrics.inc_delivered_by(replayed as u64);
     shared.metrics.inc_bytes_sent_by(replayed_bytes);
@@ -14204,6 +14267,88 @@ mod tests {
         assert_eq!(replay_offline(&bad_bind, &shared).await, 0);
         assert!(rx_bad.try_recv().is_err());
         assert_eq!(sess.offline_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn superseded_conn_cannot_unsubscribe_replacement_routes() {
+        let shared = test_shared();
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "unsub-race",
+            false,
+            Some(Some("alice")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 100,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let replacement = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "unsub-race",
+            false,
+            Some(Some("bob")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 200,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let filter = TopicFilter::new("sensors/race".to_string()).unwrap();
+        let sub_frame = subscribe_frame(
+            200,
+            1,
+            encode_subscribe_meta(1, "unsub-race", &[("sensors/race", 1)]),
+        );
+        let (sub_reply, _) = apply_subscribe(&sub_frame, &shared).await;
+        assert!(sub_reply.is_some());
+
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&1u16.to_be_bytes());
+        meta.extend_from_slice(&(b"unsub-race".len() as u16).to_be_bytes());
+        meta.extend_from_slice(b"unsub-race");
+        meta.extend_from_slice(&1u16.to_be_bytes());
+        meta.extend_from_slice(&(b"sensors/race".len() as u16).to_be_bytes());
+        meta.extend_from_slice(b"sensors/race");
+        let frame = BrokerFrame::new(
+            OpCode::UnsubscribeIn,
+            100,
+            0,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .unwrap();
+        let reply = apply_unsubscribe(&frame, &shared).await.unwrap();
+        assert_eq!(
+            reply.metadata.last().copied(),
+            Some(V5_UNSUBACK_NO_SUBSCRIPTION)
+        );
+        assert!(replacement.0.subscriptions.read().contains_key(&filter));
+        assert!(
+            !shared
+                .router
+                .matches(&Topic::new("sensors/race").unwrap())
+                .is_empty(),
+            "superseded connection must not remove replacement session's route"
+        );
     }
 
     #[tokio::test]

@@ -2434,6 +2434,7 @@ impl SessionManager {
     pub fn confirm_offline_consumed_if_current(
         &self,
         session: &Arc<Session>,
+        expected_conn_id: Option<u64>,
         unrouted: Vec<QueuedMessage>,
     ) {
         let tenant = session.offline_tenant();
@@ -2441,7 +2442,10 @@ impl SessionManager {
         let is_current = map
             .get(&tenant)
             .and_then(|inner| inner.get(&session.client_id))
-            .is_some_and(|cur| cur.id == session.id);
+            .is_some_and(|cur| {
+                cur.id == session.id
+                    && expected_conn_id.is_none_or(|cid| *cur.conn_id.read() == Some(cid))
+            });
         if !is_current {
             return;
         }
@@ -5688,7 +5692,10 @@ mod tests {
             1
         );
 
-        manager.confirm_offline_consumed_if_current(&s1, Vec::new());
+        manager.confirm_offline_consumed_if_current(&s1, Some(10), Vec::new());
+        // Same-session reconnect (same SessionId, new conn_id 30) must also block old conn 20.
+        *s2.conn_id.write() = Some(30);
+        manager.confirm_offline_consumed_if_current(&s2, Some(20), Vec::new());
         assert_eq!(
             store
                 .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
