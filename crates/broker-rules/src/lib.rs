@@ -3087,7 +3087,9 @@ impl RuleEngine {
             return;
         }
         let record = build_record();
+        // INVARIANT: event source string is broker-generated and conforms to valid topic syntax.
         let topic = Topic::new(source.as_str().to_string()).expect("valid event source topic");
+        // INVARIANT: event record is a broker-constructed map containing only JSON-serializable values.
         let payload = Bytes::from(serde_json::to_vec(&record).expect("event record serializes"));
         // Enqueue for deferred action execution only: matching, matchedCnt
         // accounting and rule actions all happen once, in the drain loop of
@@ -5065,6 +5067,7 @@ fn aggregate_partitioned_with_metadata<M: Clone>(
     }
     let mut out = Vec::new();
     for key in order {
+        // INVARIANT: key in order was inserted into groups map during partitioning immediately before removal.
         let (topic, maps, metadata) = groups.remove(&key).expect("group just inserted");
         let ctx = partition_ctx(&topic, &maps[0]);
         let _guard = stdlib::RuleContextGuard::enter(ctx);
@@ -5902,6 +5905,7 @@ pub fn try_evaluate(
     }
     let is_std = !sources.is_empty() || foreach.is_some();
     if let Some(plan) = foreach.as_ref() {
+        // INVARIANT: FOREACH execution plan requires a valid compiled rule statement.
         let stmt_ref = stmt.as_ref().expect("foreach always carries a statement");
         match payload {
             serde_json::Value::Object(_) | serde_json::Value::Array(_) => {

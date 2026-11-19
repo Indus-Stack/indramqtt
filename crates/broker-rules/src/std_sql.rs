@@ -587,6 +587,7 @@ impl Parser {
 
     fn expect_word(&mut self, kw: &str) -> Result<Spanned, StdParseError> {
         if self.peek_word_is(kw) {
+            // INVARIANT: word token was verified present by peek_word_is immediately before calling next.
             Ok(self.next().expect("peeked word"))
         } else {
             Err(self.err_here(format!("expected keyword {kw}")))
@@ -606,6 +607,7 @@ impl Parser {
                 | (Some(Tok::Star), Tok::Star)
         );
         if matches {
+            // INVARIANT: matching punctuation token was verified present immediately before calling next.
             Ok(self.next().expect("peeked token"))
         } else {
             Err(self.err_here(format!("expected {what}")))
@@ -1007,6 +1009,7 @@ fn parse_and(p: &mut Parser) -> Result<Expr, StdParseError> {
 
 fn parse_not(p: &mut Parser) -> Result<Expr, StdParseError> {
     if p.peek_word_is("NOT") {
+        // INVARIANT: NOT keyword was verified present by peek_word_is immediately before calling next.
         let t = p.next().expect("peeked NOT");
         // `NOT BETWEEN` / `NOT IN` / `NOT LIKE` bind at the range level.
         let saved = p.pos;
@@ -1177,6 +1180,7 @@ fn parse_comparison(p: &mut Parser) -> Result<Expr, StdParseError> {
         Some(Tok::Gt) => BinaryOperator::Gt,
         Some(Tok::Gte) => BinaryOperator::Gte,
         Some(Tok::Match) => {
+            // INVARIANT: Tok::Match token was verified present in lookahead immediately before cloning.
             let at = p.peek().cloned().expect("peeked =~");
             p.next();
             return lower_topic_match(left, p, at);
