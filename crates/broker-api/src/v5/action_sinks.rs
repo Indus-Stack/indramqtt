@@ -4062,6 +4062,7 @@ pub(crate) fn build_greptimedb_sink(
         batch_size: Some(1),
         buffer_capacity: None,
         timeout_ms: connector_timeout_ms(connector_doc),
+        collision_seq_column: None,
     };
     let transport = Arc::new(HttpGreptimeDbTransport::new(&config));
     let sink = GreptimeDbSink::new(config, transport).map_err(|error| {

@@ -1794,7 +1794,7 @@ impl Session {
         let drained: Vec<QueuedMessage> = self.offline_queue.write().drain(..).collect();
         if !drained.is_empty() {
             let tenant = self.offline_tenant();
-            store.remove_in_tenant(&tenant, &self.client_id);
+            store.remove_queue_in_tenant(&tenant, &self.client_id);
         }
         drained
     }

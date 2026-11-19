@@ -511,6 +511,11 @@ async fn build_config(entry: &SourceEntry, shared: &Shared) -> Result<MqttSource
         .filter(|topic| !topic.is_empty())
         .ok_or_else(|| "source parameters need a topic (field `parameters.topic`)".to_string())?
         .to_string();
+    if broker_protocol::TopicFilter::new(&topic).is_err()
+        || !broker_connectors::mqtt_source::is_valid_mqtt_filter(&topic)
+    {
+        return Err(format!("invalid source topic filter {topic:?}"));
+    }
     let qos = match entry.parameters.get("qos") {
         None => 1,
         Some(value) => {

@@ -4777,6 +4777,7 @@ pub async fn register_live_sink(
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
+                collision_seq_column: None,
             };
             let transport = Arc::new(broker_connectors::greptimedb::HttpGreptimeDbTransport::new(
                 &config,

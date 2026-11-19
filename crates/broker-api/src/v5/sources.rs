@@ -271,6 +271,23 @@ fn source_resource_duration_error(id: &str, key: &str, value: &serde_json::Value
     format!("source {id:?} field `resource_opts.{key}` value {value} is not a valid duration")
 }
 
+/// Validate MQTT wildcard placement (`+` must occupy an entire level, `#` only at the end).
+fn is_valid_mqtt_wildcards(filter: &str) -> bool {
+    if filter.is_empty() {
+        return false;
+    }
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (idx, level) in levels.iter().enumerate() {
+        if level.contains('#') && (*level != "#" || idx + 1 != levels.len()) {
+            return false;
+        }
+        if level.contains('+') && *level != "+" {
+            return false;
+        }
+    }
+    true
+}
+
 /// Split a create or replace body into envelope fields plus extras.
 /// Returns the error text for a 400 answer.
 fn split_source_body(
@@ -372,6 +389,10 @@ fn split_source_body(
         .ok_or_else(|| "missing required field: parameters.topic".to_string())?;
     broker_protocol::TopicFilter::new(topic)
         .map_err(|err| format!("invalid source topic filter {topic:?}: {err}"))?;
+    // Reject partial-level wildcards such as `sensors/temp+` that the wire driver rejects.
+    if !is_valid_mqtt_wildcards(topic) {
+        return Err(format!("invalid source topic filter {topic:?}"));
+    }
     if let Some(qos_val) = parameters.get("qos") {
         let qos = qos_val
             .as_u64()
@@ -1530,7 +1551,7 @@ mod tests {
                 "type": "mqtt",
                 "name": "in",
                 "connector": "mqtt:up",
-                "parameters": {"topic": "a/#/b"},
+                "parameters": {"topic": "sensors/temp+"},
             }),
             None,
         )

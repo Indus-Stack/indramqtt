@@ -383,7 +383,7 @@ impl OfflineQueueStore {
         records: &[OfflineRecord],
     ) -> Result<()> {
         if records.is_empty() {
-            self.remove_in_tenant(tenant, client_id);
+            self.remove_queue_in_tenant(tenant, client_id);
             return Ok(());
         }
         let Ok(path) = self.log_path_for(tenant, client_id) else {
@@ -498,6 +498,20 @@ impl OfflineQueueStore {
         std::fs::read_to_string(&path)
             .ok()
             .filter(|s| !s.is_empty())
+    }
+
+    /// Delete only the offline queue `.log` file for `(tenant, client_id)`,
+    /// keeping the `.owner` sidecar so the durable session remains owned across
+    /// normal drains and restarts.
+    pub fn remove_queue_in_tenant(&self, tenant: &str, client_id: &str) {
+        let Ok(path) = self.log_path_for(tenant, client_id) else {
+            return;
+        };
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                self.persist_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn remove_in_tenant(&self, tenant: &str, client_id: &str) {

@@ -168,12 +168,23 @@ async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Validate an MQTT subscription topic filter using the driver's own parser.
+pub fn is_valid_mqtt_filter(filter: &str) -> bool {
+    rumqttc::valid_filter(filter)
+}
+
 async fn run_once(
     config: &MqttSourceConfig,
     remaining_previous_topics: &mut Vec<String>,
     handler: &dyn MqttSourceHandler,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
+    if !rumqttc::valid_filter(&config.topic) {
+        return Err(ConnectorError::Dispatch(format!(
+            "invalid source topic filter {:?}",
+            config.topic
+        )));
+    }
     let filter = TopicFilter::new(&config.topic).map_err(|error| {
         ConnectorError::Dispatch(format!(
             "invalid source topic filter {:?}: {error}",

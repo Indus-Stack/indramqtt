@@ -11363,6 +11363,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     batch_size: Some(1),
                     buffer_capacity: None,
                     timeout_ms: None,
+                    collision_seq_column: None,
                 },
                 greptimedb_transport.clone(),
             )

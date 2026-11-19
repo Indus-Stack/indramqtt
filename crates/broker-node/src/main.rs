@@ -19584,6 +19584,8 @@ config = '{"connector":"pending-timescaledb"}'
             let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
             assert_eq!(rc1, 0);
 
+            // Simulate normal CONNECT replay drain before disconnecting.
+            let _ = shared.sessions.get("durable-cid").unwrap().drain_offline();
             shared.sessions.unbind_connection("durable-cid", 850);
             let sess = shared.sessions.get("durable-cid").unwrap();
             let topic = broker_protocol::Topic::new("offline/t").unwrap();

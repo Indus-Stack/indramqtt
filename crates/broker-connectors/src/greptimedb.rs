@@ -143,6 +143,11 @@ pub struct GreptimeDbConfig {
     /// fast enough to retry).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Optional column name to populate with a monotonic collision sequence
+    /// when multiple SQL inserts in the same series share the same wall-clock
+    /// timestamp unit. Leave `None` for existing tables without a sequence column.
+    #[serde(default)]
+    pub collision_seq_column: Option<String>,
 }
 
 impl GreptimeDbConfig {
@@ -698,8 +703,32 @@ struct QueuedRecord {
     uniqueness_seq: Option<u64>,
 }
 
-fn format_queued_sql_insert(table: &str, items: &[QueuedRecord]) -> Result<String> {
-    let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
+fn format_queued_sql_insert(
+    table: &str,
+    items: &[QueuedRecord],
+    collision_seq_column: Option<&str>,
+) -> Result<String> {
+    let Some(seq_col) = collision_seq_column.filter(|c| !c.is_empty()) else {
+        let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
+        return build_greptime_sql_insert(table, &records);
+    };
+    let has_collision = items.iter().any(|i| i.uniqueness_seq.is_some());
+    if !has_collision {
+        let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
+        return build_greptime_sql_insert(table, &records);
+    }
+    let records: Vec<GreptimeRecord> = items
+        .iter()
+        .map(|item| {
+            let mut rec = item.record.clone();
+            if !rec.fields.iter().any(|(k, _)| k == seq_col) {
+                let seq_val = item.uniqueness_seq.unwrap_or(0) as i64;
+                rec.fields
+                    .push((seq_col.to_string(), GreptimeValue::Integer(seq_val)));
+            }
+            rec
+        })
+        .collect();
     build_greptime_sql_insert(table, &records)
 }
 
@@ -778,19 +807,10 @@ impl GreptimeDbSink {
             map.clear();
         }
         match map.get(series_key).copied() {
-            Some(prev) if wall_ts <= prev => match self.config.format {
-                GreptimeFormat::InfluxLineProtocol => {
-                    let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-                    (prev, Some(seq))
-                }
-                GreptimeFormat::SqlInsert => {
-                    // Existing SQL tables may not have a `_seq` column; bump per-series
-                    // timestamp by 1 unit to keep the time index unique without altering schema.
-                    let next = prev.saturating_add(1);
-                    map.insert(series_key.to_string(), next);
-                    (next, None)
-                }
-            },
+            Some(prev) if wall_ts <= prev => {
+                let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                (prev, Some(seq))
+            }
             _ => {
                 map.insert(series_key.to_string(), wall_ts);
                 (wall_ts, None)
@@ -829,7 +849,11 @@ impl GreptimeDbSink {
                     }
                 }
                 for idx in 0..tables.len() {
-                    let sql = match format_queued_sql_insert(&tables[idx], &groups[idx]) {
+                    let sql = match format_queued_sql_insert(
+                        &tables[idx],
+                        &groups[idx],
+                        self.config.collision_seq_column.as_deref(),
+                    ) {
                         Ok(sql) => sql,
                         Err(e) => {
                             self.backoff.lock().failure();
@@ -1080,6 +1104,7 @@ mod tests {
             batch_size: Some(1),
             buffer_capacity: None,
             timeout_ms: None,
+            collision_seq_column: None,
         }
     }
 
@@ -1094,6 +1119,7 @@ mod tests {
             batch_size: Some(1),
             buffer_capacity: None,
             timeout_ms: None,
+            collision_seq_column: None,
         }
     }
 
@@ -1476,6 +1502,7 @@ mod tests {
             batch_size: Some(1),
             buffer_capacity: None,
             timeout_ms: None,
+            collision_seq_column: None,
         };
         let transport = HttpGreptimeDbTransport::new(&cfg);
         assert!(
@@ -1976,6 +2003,7 @@ mod tests {
             batch_size: Some(200),
             buffer_capacity: None,
             timeout_ms: Some(30_000),
+            collision_seq_column: None,
         };
         let mut line_config = sql_config.clone();
         line_config.format = GreptimeFormat::InfluxLineProtocol;
