@@ -562,7 +562,7 @@ psk_enabled = true
 Action:
 
 ```text
-Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.
+Read `GET /api/v5/listeners/ssl:default` and open one TCP connection to the bind.
 ```
 
 Captured output:
@@ -596,7 +596,7 @@ psk_keys_file = ""
 Action:
 
 ```text
-Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.
+Read `GET /api/v5/listeners/ssl:default` and open one TCP connection to the bind.
 ```
 
 Captured output:

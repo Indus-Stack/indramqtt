@@ -2581,15 +2581,17 @@ async fn apply_bind_request_inner(
             // defaults, so pure 3.1.1 flows behave bit for bit as
             // before, while a reconnect in either version drops an
             // elapsed v5 husk instead of resuming it.
-            let (session, present, expired_swept) = shared.sessions.get_or_create_v5_in_tenant(
-                &tenant_for_bind,
-                &req.client_id,
-                req.clean_start || principal_mismatch,
-                req.protocol_version,
-                req.session_expiry,
-                req.receive_maximum,
-                req.max_packet_size,
-            );
+            let (session, present, expired_swept) =
+                shared.sessions.get_or_create_v5_with_discard_in_tenant(
+                    &tenant_for_bind,
+                    &req.client_id,
+                    req.clean_start,
+                    principal_mismatch,
+                    req.protocol_version,
+                    req.session_expiry,
+                    req.receive_maximum,
+                    req.max_packet_size,
+                );
             session.set_tenant_id(tenant_for_bind.clone());
             shared.sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;

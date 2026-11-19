@@ -712,11 +712,6 @@ fn format_queued_sql_insert(
         let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
         return build_greptime_sql_insert(table, &records);
     };
-    let has_collision = items.iter().any(|i| i.uniqueness_seq.is_some());
-    if !has_collision {
-        let records: Vec<GreptimeRecord> = items.iter().map(|i| i.record.clone()).collect();
-        return build_greptime_sql_insert(table, &records);
-    }
     let records: Vec<GreptimeRecord> = items
         .iter()
         .map(|item| {
@@ -934,8 +929,16 @@ impl GreptimeDbSink {
 impl Sink for GreptimeDbSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> Result<()> {
         let mut rec = extract_greptime_record(payload, topic.as_str(), &self.config)?;
-        let series_key = format!("{}|{}", rec.table, topic.as_str());
-        let (ts, uniqueness_seq) = self.next_timestamp_and_seq(&series_key, rec.timestamp);
+        let (ts, mut uniqueness_seq) = self.next_timestamp_and_seq(&rec.table, rec.timestamp);
+        if self
+            .config
+            .collision_seq_column
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+            && uniqueness_seq.is_none()
+        {
+            uniqueness_seq = Some(self.seq.fetch_add(1, Ordering::Relaxed) + 1);
+        }
         rec.timestamp = ts;
         let queued = QueuedRecord {
             record: rec,

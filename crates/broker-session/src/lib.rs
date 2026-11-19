@@ -3010,11 +3010,57 @@ impl SessionManager {
         receive_max: u16,
         max_packet: u32,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
+        self.get_or_create_v5_with_discard_in_tenant(
+            tenant,
+            client_id,
+            clean_start,
+            false,
+            version,
+            expiry,
+            receive_max,
+            max_packet,
+        )
+    }
+
+    /// Resolve a v4/v5 CONNECT, optionally discarding any prior session (e.g. on
+    /// principal mismatch) while preserving the replacement session's own
+    /// `clean_start` persistence policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_or_create_v5_with_discard_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+        force_discard_existing: bool,
+        version: u8,
+        expiry: u32,
+        receive_max: u16,
+        max_packet: u32,
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
         // Cap the CONNECT expiry at the configured maximum.
         // Zero cap means the operator opts into no cap.
         let expiry = self.cap_session_expiry(expiry);
         if clean_start {
             let (session, present) = self.get_or_create_in_tenant(tenant, client_id, true);
+            debug_assert!(!present);
+            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            return (session, false, Vec::new());
+        }
+        if force_discard_existing {
+            let store = self.offline_store.read().clone();
+            {
+                let mut map = self.sessions.write();
+                if let Some(inner) = map.get_mut(tenant) {
+                    inner.remove(client_id);
+                    if inner.is_empty() {
+                        map.remove(tenant);
+                    }
+                }
+                if let Some(store) = store.as_ref() {
+                    store.remove_in_tenant(tenant, client_id);
+                }
+            }
+            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
             debug_assert!(!present);
             session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
             return (session, false, Vec::new());
@@ -3090,9 +3136,14 @@ impl SessionManager {
             let mut map = self.sessions.write();
             if let Some(inner) = map.get_mut(tenant) {
                 for (client_id, _) in &victims {
-                    inner.remove(client_id);
-                    if let Some(store) = store.as_ref() {
-                        store.remove_in_tenant(tenant, client_id);
+                    let still_expired = inner
+                        .get(client_id)
+                        .is_some_and(|session| session.session_expired(now));
+                    if still_expired {
+                        inner.remove(client_id);
+                        if let Some(store) = store.as_ref() {
+                            store.remove_in_tenant(tenant, client_id);
+                        }
                     }
                 }
                 if inner.is_empty() {
@@ -3197,11 +3248,11 @@ impl SessionManager {
     ) -> Vec<TopicFilter> {
         // Detach path only (never publish/deliver): owned keys are fine.
         let key = SessionKey::new(tenant, client_id);
-        let (username_to_release, swept, did_detach, drop_state): (
+        let (username_to_release, swept, did_detach, drop_session_id): (
             Option<String>,
             Vec<TopicFilter>,
             bool,
-            bool,
+            Option<SessionId>,
         ) = {
             let map = self.sessions.read();
             match map.get(tenant).and_then(|inner| inner.get(client_id)) {
@@ -3244,18 +3295,33 @@ impl SessionManager {
                             session.username.read().clone(),
                             swept,
                             was_connected,
-                            drop_state,
+                            if drop_state { Some(session.id) } else { None },
                         )
                     } else {
-                        (None, Vec::new(), false, false)
+                        (None, Vec::new(), false, None)
                     }
                 }
-                None => (None, Vec::new(), false, false),
+                None => (None, Vec::new(), false, None),
             }
         };
-        if drop_state {
-            if let Some(store) = self.offline_store.read().clone() {
-                store.remove_in_tenant(tenant, client_id);
+        if let Some(detached_id) = drop_session_id {
+            let store = self.offline_store.read().clone();
+            if let Some(store) = store {
+                // Serialize disk cleanup with replacement under the session-map
+                // write lock: if a reconnect already installed a new session for
+                // this key, leave its persisted state untouched.
+                let map = self.sessions.write();
+                let same_detached = map
+                    .get(tenant)
+                    .and_then(|inner| inner.get(client_id))
+                    .is_some_and(|current| {
+                        current.id == detached_id
+                            && current.conn_id.read().is_none()
+                            && current.drops_state_at_disconnect()
+                    });
+                if same_detached {
+                    store.remove_in_tenant(tenant, client_id);
+                }
             }
         }
         if did_detach {
@@ -3354,9 +3420,22 @@ impl SessionManager {
         let mut map = self.sessions.write();
         if let Some(inner) = map.get_mut(tenant) {
             for victim in victims {
-                inner.remove(&victim);
-                if let Some(store) = store.as_ref() {
-                    store.remove_in_tenant(tenant, &victim);
+                let still_reapable = inner.get(&victim).is_some_and(|session| {
+                    if !is_ended_stateless(session) {
+                        return false;
+                    }
+                    let ended_ago = session
+                        .ended_at_ms
+                        .read()
+                        .map(|ended_at| now.saturating_sub(ended_at))
+                        .unwrap_or(0);
+                    ended_ago >= ttl_ms
+                });
+                if still_reapable {
+                    inner.remove(&victim);
+                    if let Some(store) = store.as_ref() {
+                        store.remove_in_tenant(tenant, &victim);
+                    }
                 }
             }
             if inner.is_empty() {
@@ -5141,6 +5220,65 @@ mod tests {
         assert!(store
             .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "durable-then-zero")
             .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn principal_mismatch_discard_preserves_v4_persistent_session() {
+        let dir = unique_offline_dir("mismatch-v4");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (old_sess, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "shared-v4",
+            false,
+            false,
+            4,
+            0,
+            65535,
+            0,
+        );
+        old_sess.set_verified_identity(Some("alice".to_string()), false);
+        manager.add_subscription(
+            "shared-v4",
+            TopicFilter::new("alice/topic").unwrap(),
+            QoS::AtLeastOnce,
+        );
+
+        // Bob connects with Clean Session=false (clean_start=false) and force_discard_existing=true.
+        let (new_sess, present, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "shared-v4",
+            false,
+            true,
+            4,
+            0,
+            65535,
+            0,
+        );
+        assert!(!present);
+        assert!(!new_sess.clean_start);
+        assert!(!new_sess.drops_state_at_disconnect());
+        assert!(new_sess.subscriptions.read().is_empty());
+
+        *new_sess.conn_id.write() = Some(10);
+        new_sess.set_verified_identity(Some("bob".to_string()), false);
+        manager.add_subscription(
+            "shared-v4",
+            TopicFilter::new("bob/topic").unwrap(),
+            QoS::AtLeastOnce,
+        );
+        let swept = manager.unbind_connection("shared-v4", 10);
+        assert!(swept.is_empty());
+        assert_eq!(new_sess.subscriptions.read().len(), 1);
+        assert_eq!(
+            store
+                .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "shared-v4")
+                .as_deref(),
+            Some("bob")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

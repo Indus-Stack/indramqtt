@@ -3981,7 +3981,7 @@ pub(crate) fn build_influxdb_sink(
 /// - `collision_seq_column`: optional SQL column name used to
 ///   disambiguate same-timestamp collisions when writing to a
 ///   deduplicating GreptimeDB table; omitted (`None`) for
-///   `append_only` tables.
+///   `append_mode` tables.
 /// - Batching belongs to the action runtime, not this driver. The
 ///   inner sink keeps one row per send with a short linger, so the
 ///   runtime owns the batch size and the batch timer.
