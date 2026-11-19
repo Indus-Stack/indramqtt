@@ -2466,29 +2466,7 @@ async fn apply_bind_request_inner(
     // session: snapshot them before `get_or_create` drops the old
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
-    let principal_mismatch = match parsed.as_ref() {
-        Ok(req) if !req.clean_start => shared
-            .sessions
-            .get_in_tenant(&tenant_for_bind, &req.client_id)
-            .is_some_and(|existing| existing.verified_username() != verified_connect_username),
-        _ => false,
-    };
-    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) = match parsed.clone() {
-        Ok(req) if req.clean_start || principal_mismatch => (
-            SessionKey::new(&tenant_for_bind, &req.client_id),
-            shared
-                .sessions
-                .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
-        ),
-        Ok(req) => (
-            SessionKey::new(&tenant_for_bind, &req.client_id),
-            Vec::new(),
-        ),
-        Err(_) => (
-            SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
-            Vec::new(),
-        ),
-    };
+    let mut stale_filters_to_sweep: Option<(SessionKey, Vec<broker_protocol::TopicFilter>)> = None;
     // Session resolution in the owning tenant (MT-03): same takeover
     // semantics as before, scoped to the key. The tenant is stamped
     // before binding so the `conn_id -> session key` index carries the
@@ -2581,17 +2559,34 @@ async fn apply_bind_request_inner(
             // defaults, so pure 3.1.1 flows behave bit for bit as
             // before, while a reconnect in either version drops an
             // elapsed v5 husk instead of resuming it.
-            let (session, present, expired_swept) =
+            let (session, present, expired_swept, stale_conn) =
                 shared.sessions.get_or_create_v5_with_discard_in_tenant(
                     &tenant_for_bind,
                     &req.client_id,
                     req.clean_start,
-                    principal_mismatch,
+                    Some(verified_connect_username.as_deref()),
                     req.protocol_version,
                     req.session_expiry,
                     req.receive_maximum,
                     req.max_packet_size,
                 );
+            if let Some(old_conn_id) = stale_conn {
+                if old_conn_id != frame.header.conn_id {
+                    if let Ok(close) = BrokerFrame::new(
+                        OpCode::ConnClose,
+                        old_conn_id,
+                        0,
+                        Bytes::from(vec![0x8E]),
+                        Bytes::new(),
+                    ) {
+                        let _ = shared.conns.order_close(old_conn_id, close);
+                    }
+                }
+            }
+            stale_filters_to_sweep = Some((
+                SessionKey::new(&tenant_for_bind, &req.client_id),
+                expired_swept.clone(),
+            ));
             session.set_tenant_id(tenant_for_bind.clone());
             shared.sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;
@@ -2693,13 +2688,15 @@ async fn apply_bind_request_inner(
     // clean start never removes another tenant's subscription for the
     // same client id. Off the hot path (bind only); fan-out takes no new
     // lock and delivery cost is unchanged.
-    for filter in &stale.1 {
-        shared
-            .router
-            .unsubscribe_in_tenant(filter, &stale.0.client_id, &stale.0.tenant);
-    }
-    if !stale.1.is_empty() {
-        refresh_subscription_stats(shared);
+    if let Some((stale_key, stale_filters)) = stale_filters_to_sweep {
+        for filter in &stale_filters {
+            shared
+                .router
+                .unsubscribe_in_tenant(filter, &stale_key.client_id, &stale_key.tenant);
+        }
+        if !stale_filters.is_empty() {
+            refresh_subscription_stats(shared);
+        }
     }
     // Stamp the effective username for quota release and event
     // attribution, and the verified identity for the superuser check.

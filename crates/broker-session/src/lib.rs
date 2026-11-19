@@ -3010,89 +3010,126 @@ impl SessionManager {
         receive_max: u16,
         max_packet: u32,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
-        self.get_or_create_v5_with_discard_in_tenant(
+        let (session, present, swept, _) = self.get_or_create_v5_with_discard_in_tenant(
             tenant,
             client_id,
             clean_start,
-            false,
+            None,
             version,
             expiry,
             receive_max,
             max_packet,
-        )
+        );
+        (session, present, swept)
     }
 
-    /// Resolve a v4/v5 CONNECT, optionally discarding any prior session (e.g. on
-    /// principal mismatch) while preserving the replacement session's own
-    /// `clean_start` persistence policy.
+    /// Resolve a v4/v5 CONNECT atomically under one session-map write lock.
+    /// When `expected_owner` is `Some(want)` and the existing session's
+    /// verified owner differs, the prior session, its durable files, and its
+    /// `conn_index` binding are discarded while preserving the replacement
+    /// session's own `clean_start` persistence policy.
+    /// Returns `(session, present, swept_filters, superseded_conn_id)`.
     #[allow(clippy::too_many_arguments)]
     pub fn get_or_create_v5_with_discard_in_tenant(
         &self,
         tenant: &str,
         client_id: &str,
         clean_start: bool,
-        force_discard_existing: bool,
+        expected_owner: Option<Option<&str>>,
         version: u8,
         expiry: u32,
         receive_max: u16,
         max_packet: u32,
-    ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
-        // Cap the CONNECT expiry at the configured maximum.
-        // Zero cap means the operator opts into no cap.
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
         let expiry = self.cap_session_expiry(expiry);
-        if clean_start {
-            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, true);
-            debug_assert!(!present);
-            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-            return (session, false, Vec::new());
-        }
-        if force_discard_existing {
-            let store = self.offline_store.read().clone();
-            {
-                let mut map = self.sessions.write();
-                if let Some(inner) = map.get_mut(tenant) {
-                    inner.remove(client_id);
-                    if inner.is_empty() {
-                        map.remove(tenant);
-                    }
-                }
-                if let Some(store) = store.as_ref() {
-                    store.remove_in_tenant(tenant, client_id);
-                }
-            }
-            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
-            debug_assert!(!present);
-            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-            return (session, false, Vec::new());
-        }
+        let store = self.offline_store.read().clone();
+        let key = SessionKey::new(tenant, client_id);
         let now = now_ms();
-        let expired = self
-            .get_in_tenant(tenant, client_id)
-            .map(|existing| existing.session_expired(now))
-            .unwrap_or(false);
-        if expired {
-            // Drop the elapsed session first so the replacement starts
-            // clean: snapshot its router filters, remove the object
-            // plus its durable queue file, then create fresh
-            // (present=false).
-            let swept = self.subscription_filters_in_tenant(tenant, client_id);
-            if let Some(store) = self.offline_store.read().clone() {
+
+        let mut map = self.sessions.write();
+        let existing = map
+            .get(tenant)
+            .and_then(|inner| inner.get(client_id))
+            .cloned();
+        let owner_mismatch = existing.as_ref().is_some_and(|s| {
+            expected_owner.is_some_and(|want| s.verified_username().as_deref() != want)
+        });
+        let expired = existing.as_ref().is_some_and(|s| s.session_expired(now));
+        let should_discard = clean_start || owner_mismatch || expired;
+
+        if should_discard {
+            let stale_conn = existing.as_ref().and_then(|s| *s.conn_id.read());
+            let stale_connected = existing
+                .as_ref()
+                .map(|s| *s.connected.read())
+                .unwrap_or(false);
+            let swept: Vec<TopicFilter> = existing
+                .as_ref()
+                .map(|s| s.subscriptions.read().keys().cloned().collect())
+                .unwrap_or_default();
+            if let Some(old) = &existing {
+                *old.conn_id.write() = None;
+                *old.connected.write() = false;
+            }
+            if let Some(store) = store.as_ref() {
                 store.remove_in_tenant(tenant, client_id);
             }
-            {
-                let mut map = self.sessions.write();
-                if let Some(inner) = map.get_mut(tenant) {
-                    inner.remove(client_id);
+            let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
+            let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            session.set_tenant_id(tenant.to_string());
+            self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(store);
+            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            map.entry(tenant.to_string())
+                .or_default()
+                .insert(client_id.to_string(), session.clone());
+            Self::enforce_session_cap_locked(&mut map, tenant);
+            Self::enforce_tenant_cap_locked(&mut map, tenant);
+            drop(map);
+
+            if !stale_connected {
+                self.connected_count.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(stale) = stale_conn {
+                let mut index = self.conn_index.write();
+                if index
+                    .get(&stale)
+                    .map(|owner| owner == &key)
+                    .unwrap_or(false)
+                {
+                    index.remove(&stale);
                 }
             }
-            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
-            debug_assert!(!present);
+            (session, false, swept, stale_conn)
+        } else if let Some(existing) = existing {
+            let was_connected = *existing.connected.read();
+            if !was_connected {
+                *existing.connected.write() = true;
+                *existing.connected_at_ms.write() = Some(now);
+                *existing.ended_at_ms.write() = None;
+                self.connected_count.fetch_add(1, Ordering::SeqCst);
+            }
+            existing.set_offline_store(store);
+            existing.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            (existing, true, Vec::new(), None)
+        } else {
+            let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
+            let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            session.set_tenant_id(tenant.to_string());
+            self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(store);
             session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-            return (session, false, swept);
+            map.entry(tenant.to_string())
+                .or_default()
+                .insert(client_id.to_string(), session.clone());
+            Self::enforce_session_cap_locked(&mut map, tenant);
+            Self::enforce_tenant_cap_locked(&mut map, tenant);
+            drop(map);
+            self.connected_count.fetch_add(1, Ordering::SeqCst);
+            (session, false, Vec::new(), None)
         }
-        let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
-        session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-        (session, present, Vec::new())
     }
 
     /// Reap detached expired v5 sessions in `tenant`, scanning at most
@@ -3109,7 +3146,7 @@ impl SessionManager {
         max_scan: usize,
     ) -> Vec<(String, Vec<TopicFilter>)> {
         let now = now_ms();
-        let victims: Vec<(String, Vec<TopicFilter>)> = {
+        let candidates: Vec<(String, SessionId)> = {
             let map = self.sessions.read();
             let Some(inner) = map.get(tenant) else {
                 return Vec::new();
@@ -3120,29 +3157,31 @@ impl SessionManager {
                 .filter(|(_, session)| {
                     session.protocol_version() == 5 && session.session_expired(now)
                 })
-                .map(|(client_id, session)| {
-                    (
-                        client_id.clone(),
-                        session.subscriptions.read().keys().cloned().collect(),
-                    )
-                })
+                .map(|(client_id, session)| (client_id.clone(), session.id))
                 .collect()
         };
-        if victims.is_empty() {
-            return victims;
+        if candidates.is_empty() {
+            return Vec::new();
         }
         let store = self.offline_store.read().clone();
+        let mut removed = Vec::with_capacity(candidates.len());
         {
             let mut map = self.sessions.write();
             if let Some(inner) = map.get_mut(tenant) {
-                for (client_id, _) in &victims {
-                    let still_expired = inner
-                        .get(client_id)
-                        .is_some_and(|session| session.session_expired(now));
+                for (client_id, victim_id) in candidates {
+                    let still_expired = inner.get(&client_id).is_some_and(|session| {
+                        session.id == victim_id
+                            && session.protocol_version() == 5
+                            && session.session_expired(now)
+                    });
                     if still_expired {
-                        inner.remove(client_id);
-                        if let Some(store) = store.as_ref() {
-                            store.remove_in_tenant(tenant, client_id);
+                        if let Some(session) = inner.remove(&client_id) {
+                            let filters: Vec<TopicFilter> =
+                                session.subscriptions.read().keys().cloned().collect();
+                            if let Some(store) = store.as_ref() {
+                                store.remove_in_tenant(tenant, &client_id);
+                            }
+                            removed.push((client_id, filters));
                         }
                     }
                 }
@@ -3151,7 +3190,7 @@ impl SessionManager {
                 }
             }
         }
-        victims
+        removed
     }
 
     /// Constant-time live-session count for the management count endpoint.
@@ -5230,34 +5269,44 @@ mod tests {
         let manager = SessionManager::new();
         manager.set_offline_store(store.clone());
 
-        let (old_sess, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+        let (old_sess, _, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
             tenant::DEFAULT_TENANT_ID,
             "shared-v4",
             false,
-            false,
+            Some(Some("alice")),
             4,
             0,
             65535,
             0,
         );
+        manager.bind_session(&old_sess, 100);
         old_sess.set_verified_identity(Some("alice".to_string()), false);
         manager.add_subscription(
             "shared-v4",
             TopicFilter::new("alice/topic").unwrap(),
             QoS::AtLeastOnce,
         );
+        assert_eq!(manager.connected_count(), 1);
+        assert!(manager.key_for_conn(100).is_some());
 
-        // Bob connects with Clean Session=false (clean_start=false) and force_discard_existing=true.
-        let (new_sess, present, _) = manager.get_or_create_v5_with_discard_in_tenant(
-            tenant::DEFAULT_TENANT_ID,
-            "shared-v4",
-            false,
-            true,
-            4,
-            0,
-            65535,
-            0,
-        );
+        // Bob connects with Clean Session=false (clean_start=false) and expected_owner=Some(Some("bob")).
+        let (new_sess, present, swept_old, stale_conn) = manager
+            .get_or_create_v5_with_discard_in_tenant(
+                tenant::DEFAULT_TENANT_ID,
+                "shared-v4",
+                false,
+                Some(Some("bob")),
+                4,
+                0,
+                65535,
+                0,
+            );
+        assert_eq!(stale_conn, Some(100));
+        assert!(manager.key_for_conn(100).is_none());
+        assert_eq!(manager.connected_count(), 1);
+        assert_eq!(swept_old.len(), 1);
+        manager.bind_session(&new_sess, 200);
+        assert!(manager.key_for_conn(200).is_some());
         assert!(!present);
         assert!(!new_sess.clean_start);
         assert!(!new_sess.drops_state_at_disconnect());
@@ -5280,5 +5329,40 @@ mod tests {
             Some("bob")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_expired_bounded_returns_only_removed_sessions() {
+        let manager = SessionManager::new();
+        let (s1, _, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "exp-1",
+            false,
+            None,
+            5,
+            1,
+            16,
+            0,
+        );
+        manager.add_subscription("exp-1", TopicFilter::new("a/1").unwrap(), QoS::AtLeastOnce);
+        *s1.connected.write() = false;
+        *s1.ended_at_ms.write() = Some(0);
+
+        let (s2, _, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "exp-1",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+        );
+        assert_ne!(s1.id, s2.id);
+        let removed = manager.prune_expired_bounded(tenant::DEFAULT_TENANT_ID, 10);
+        assert!(removed.is_empty());
+        assert!(manager
+            .get_in_tenant(tenant::DEFAULT_TENANT_ID, "exp-1")
+            .is_some());
     }
 }
