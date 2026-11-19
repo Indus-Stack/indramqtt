@@ -2803,6 +2803,10 @@ async fn apply_auto_subscribe(
             0,
         );
         auto_sub.tenant = tenant.clone().into();
+        let _route_guard = shared.sessions.lock_route_guard();
+        if conn_id != 0 && shared.sessions.session_for_conn(conn_id).is_none() {
+            break;
+        }
         let stored = shared.router.subscribe(&filter, auto_sub);
         if !stored {
             continue;
@@ -6269,12 +6273,36 @@ async fn apply_subscribe(
     // session and never on a default-tenant namesake. Two tenants sharing
     // a client id subscribe independently; a tenant mismatch at publish
     // time delivers nothing, counted, never an error to the publisher.
-    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
-    // X1-03: resolve the owning session without creating it.
-    // Production binds before subscribing, so the session exists.
-    // A missing session records no mirror and changes no state.
-    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
+    let conn_session = shared.sessions.session_for_conn(frame.header.conn_id);
+    let conn_was_bound = conn_session.is_some();
+    let tenant = conn_session
+        .as_ref()
+        .map(|s| s.tenant_id.read().clone())
+        .unwrap_or_else(|| session_tenant_for_conn(shared, frame.header.conn_id, &client_id));
+    let fallback_session = if conn_session.is_none() {
+        shared.sessions.get_in_tenant(&tenant, &client_id)
+    } else {
+        None
+    };
+    // If `conn_id` is unbound while `(tenant, client_id)` is bound to another
+    // connection or already detached, refuse all filters rather than
+    // authorizing as the replacement owner.
+    let superseded_conn = fallback_session.as_ref().is_some_and(|s| {
+        let cur_conn = *s.conn_id.read();
+        cur_conn != Some(frame.header.conn_id)
+            && (cur_conn.is_some() || s.ended_at_ms.read().is_some())
+    });
+    let owner = conn_session.or_else(|| (!superseded_conn).then_some(fallback_session).flatten());
     for entry in subs {
+        if superseded_conn {
+            codes.push(if entry.has_options {
+                V5_SUBACK_NOT_AUTHORIZED
+            } else {
+                V5_SUBACK_UNSPECIFIED
+            });
+            authz_disconnect = true;
+            continue;
+        }
         let raw_filter_str = entry.filter;
         // X1-03: decode the per-filter options. Legacy entries carry a
         // plain QoS byte; extended entries carry the options byte plus a
@@ -6558,6 +6586,27 @@ async fn apply_subscribe(
         sub.group = group;
         sub.tenant = tenant.clone().into();
         let _route_guard = shared.sessions.lock_route_guard();
+        if let Some(bound) = owner.as_ref() {
+            let still_bound = if conn_was_bound {
+                shared
+                    .sessions
+                    .session_for_conn(frame.header.conn_id)
+                    .is_some_and(|cur| cur.id == bound.id)
+            } else {
+                let cur_conn = *bound.conn_id.read();
+                cur_conn == Some(frame.header.conn_id)
+                    || (cur_conn.is_none() && bound.ended_at_ms.read().is_none())
+            };
+            if !still_bound {
+                codes.push(if entry.has_options {
+                    V5_SUBACK_NOT_AUTHORIZED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+                authz_disconnect = true;
+                continue;
+            }
+        }
         let stored = shared.router.subscribe(&filter, sub);
         if !stored {
             codes.push(if entry.has_options {
@@ -6702,13 +6751,28 @@ async fn apply_subscribe(
     // Owning tenant's session (MT-03): retained fetch and downlink ids
     // stay within the subscriber's own tenant, so one tenant never
     // observes another tenant's retained state.
-    let session = session_for_conn_if_client(shared, frame.header.conn_id, &client_id)
-        .or_else(|| shared.sessions.get(&client_id));
+    let still_bound_for_replay = !superseded_conn
+        && owner.as_ref().is_none_or(|bound| {
+            if conn_was_bound {
+                shared
+                    .sessions
+                    .session_for_conn(frame.header.conn_id)
+                    .is_some_and(|cur| cur.id == bound.id)
+            } else {
+                let cur_conn = *bound.conn_id.read();
+                cur_conn == Some(frame.header.conn_id)
+                    || (cur_conn.is_none() && bound.ended_at_ms.read().is_none())
+            }
+        });
+    let session = owner.clone();
     let subscriber_tenant = session
         .as_ref()
         .map(|session| session.tenant_id.read().clone())
-        .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
-    for grant in granted.iter().filter(|grant| grant.send_retained) {
+        .unwrap_or_else(|| tenant.clone());
+    for grant in granted
+        .iter()
+        .filter(|grant| still_bound_for_replay && grant.send_retained)
+    {
         let filter = &grant.filter;
         let sub_qos = grant.qos;
         let matched = match shared
@@ -14072,6 +14136,69 @@ mod tests {
 
         let matches = shared.router.matches(&Topic::new("sport/x").unwrap());
         assert!(matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseded_conn_cannot_subscribe_as_replacement_owner() {
+        let shared = test_shared();
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-race",
+            false,
+            Some(Some("alice")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 100,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-race",
+            false,
+            Some(Some("bob")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 200,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: true,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+
+        let frame = subscribe_frame(
+            100,
+            1,
+            encode_subscribe_meta(1, "sub-race", &[("secret/admin", 1)]),
+        );
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        assert!(retained.is_empty());
+        let reply = reply.expect("suback reply");
+        assert_eq!(reply.header.opcode, OpCode::SubAckOut);
+        assert_eq!(
+            reply.metadata.as_ref().last().copied(),
+            Some(V5_SUBACK_UNSPECIFIED)
+        );
+        assert!(shared
+            .router
+            .matches(&Topic::new("secret/admin").unwrap())
+            .is_empty());
     }
 
     #[tokio::test]
