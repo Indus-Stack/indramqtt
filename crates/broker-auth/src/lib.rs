@@ -39,7 +39,7 @@ pub use db::{
 pub use jwks::{
     JwksAuthenticator, JwksConfig, VerifiedJwt, JWKS_CACHE_MAX_KEYS, JWKS_DEFAULT_DOCUMENT_CAP,
 };
-pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
+pub use kerberos::{random_session_key, KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
 pub use psk::{PskInsertError, PskStore};
@@ -1553,6 +1553,7 @@ impl MemoryAuth {
                     "mqtt_users holds too many users (at most {MAX_AUTHN_USERS} total)"
                 )));
             }
+            // INVARIANT: tenant map contains the target tenant key after insertion check.
             let state = tenants.get_mut(key).expect("tenant just inserted");
             let quotas = state
                 .users
@@ -1981,6 +1982,7 @@ impl MemoryAuth {
                 }
                 tenants.insert(key.to_string(), TenantState::default());
             }
+            // INVARIANT: tenant map contains the target tenant key after insertion check.
             let state = tenants.get_mut(key).expect("tenant just inserted");
             if state.rules.len() >= MAX_ACL_RULES_PER_TENANT {
                 return Err(broker_config::ConfigError::Invalid(format!(
@@ -2928,6 +2930,7 @@ impl MemoryAuth {
         );
         leader.notify.notify_waiters();
         {
+            // INVARIANT: leader guard retains the deduplication key until completion cleanup.
             let key = guard.key.take().expect("leader holds dedup key");
             let mut table = self.verify_inflight.lock().await;
             let same = table

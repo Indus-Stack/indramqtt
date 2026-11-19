@@ -422,6 +422,7 @@ impl AuthzSourceRegistry {
             }
             let mut next = Vec::with_capacity(current.len());
             for source_type in &types {
+                // INVARIANT: every source type exists in current registry after validation.
                 let entry = current
                     .iter()
                     .find(|e| &e.source_type == source_type)

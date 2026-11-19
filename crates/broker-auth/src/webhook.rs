@@ -100,6 +100,9 @@ pub const WEBHOOK_CACHE_MAX_ENTRIES: usize = 1024;
 /// stale-verdict window at one minute. `0` disables the cache.
 pub const WEBHOOK_CACHE_TTL_SECS: u64 = 60;
 
+/// Default HTTP pool idle keepalive in seconds (upstream reqwest default).
+pub const WEBHOOK_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
 fn default_pool_size() -> usize {
     WEBHOOK_POOL_SIZE
 }
@@ -264,26 +267,11 @@ pub struct WebhookAuth {
 }
 
 impl WebhookAuth {
-    pub fn new(config: WebhookConfig) -> Self {
-        let permits = config.effective_pool_size();
-        let timeout = config.effective_request_timeout();
-        // Infallible in practice with a clamped timeout and pool bound;
-        // a builder failure would mean the HTTP stack itself is broken,
-        // which must surface loudly rather than run unverified.
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .pool_max_idle_per_host(permits)
-            // Idle-keepalive 90 s: the HTTP client's upstream default, kept
-            // so a steady publisher reuses one pooled verdict connection
-            // across the 60 s verdict TTL instead of handshaking per TTL
-            // window, while idle sockets still close rather than accumulate.
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .expect("webhook HTTP client builds with a clamped timeout and pool bound");
+    fn from_client(config: WebhookConfig, client: reqwest::Client) -> Self {
         Self {
+            semaphore: Arc::new(Semaphore::new(config.effective_pool_size())),
             config,
             client,
-            semaphore: Arc::new(Semaphore::new(permits)),
             breaker: Mutex::new(BreakerState {
                 kind: BreakerKind::Closed,
                 consecutive_failures: 0,
@@ -291,6 +279,29 @@ impl WebhookAuth {
                 probe_in_flight: false,
             }),
             cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn try_new(config: WebhookConfig) -> crate::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(config.effective_request_timeout())
+            .pool_max_idle_per_host(config.effective_pool_size())
+            // Idle-keepalive 90 s: the HTTP client's upstream default, kept
+            // so a steady publisher reuses one pooled verdict connection
+            // across the 60 s verdict TTL instead of handshaking per TTL
+            // window, while idle sockets still close rather than accumulate.
+            .pool_idle_timeout(Duration::from_secs(WEBHOOK_POOL_IDLE_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| {
+                AuthError::AuthenticationFailed(format!("failed to build webhook HTTP client: {e}"))
+            })?;
+        Ok(Self::from_client(config, client))
+    }
+
+    pub fn new(config: WebhookConfig) -> Self {
+        match Self::try_new(config.clone()) {
+            Ok(auth) => auth,
+            Err(_) => Self::from_client(config, reqwest::Client::new()),
         }
     }
 

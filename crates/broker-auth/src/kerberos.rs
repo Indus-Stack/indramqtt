@@ -791,13 +791,13 @@ fn int_asn1_to_i32(v: &picky_asn1::wrapper::IntegerAsn1) -> Option<i32> {
 }
 
 /// Random 32-byte session key via `ring` system randomness.
-#[cfg(test)]
-fn random_session_key() -> [u8; SERVICE_KEY_LEN] {
+pub fn random_session_key() -> crate::Result<[u8; SERVICE_KEY_LEN]> {
     use ring::rand::{SecureRandom, SystemRandom};
     let rng = SystemRandom::new();
     let mut key = [0u8; SERVICE_KEY_LEN];
-    rng.fill(&mut key).expect("system randomness");
-    key
+    rng.fill(&mut key)
+        .map_err(|_| AuthError::AuthenticationFailed("system randomness failure".to_string()))?;
+    Ok(key)
 }
 
 /// One MIT keytab v2 entry (parsed without external crates).
@@ -1220,7 +1220,7 @@ mod tests {
                 realm: "EXAMPLE.COM".to_string(),
                 service_full: "mqtt/broker.example.com@EXAMPLE.COM".to_string(),
                 service_comps: vec!["mqtt".to_string(), "broker.example.com".to_string()],
-                service_key: super::random_session_key(),
+                service_key: super::random_session_key().unwrap_or([0u8; SERVICE_KEY_LEN]),
             }
         }
 
@@ -1249,7 +1249,7 @@ mod tests {
         }
 
         fn session_key() -> [u8; SERVICE_KEY_LEN] {
-            super::random_session_key()
+            super::random_session_key().unwrap_or([0u8; SERVICE_KEY_LEN])
         }
 
         fn mint(
