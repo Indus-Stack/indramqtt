@@ -389,8 +389,8 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -423,8 +423,8 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -457,8 +457,8 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -491,8 +491,8 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -623,10 +623,10 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify_client_cert = true
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 ```
 
 Action:
@@ -659,10 +659,10 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 ```
 
 Action:
@@ -695,10 +695,10 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 ```
 
 Action:
@@ -731,10 +731,10 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 fail_if_no_peer_cert = true
 ```
 
@@ -768,10 +768,10 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 peer_cert_as_username = "cn"
 ```
 
@@ -805,10 +805,10 @@ Example configuration:
 [listeners.tls]
 enabled = true
 bind = "127.0.0.1:28883"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 peer_cert_as_clientid = "cn"
 ```
 
@@ -977,8 +977,8 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -1011,8 +1011,8 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -1046,8 +1046,8 @@ Example configuration:
 enabled = true
 bind = "127.0.0.1:28884"
 path = "/docs-mqtt"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -1080,8 +1080,8 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -1114,8 +1114,8 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 ```
 
 Action:
@@ -1148,10 +1148,10 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify_client_cert = true
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 ```
 
 Action:
@@ -1184,10 +1184,10 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 ```
 
 Action:
@@ -1220,10 +1220,10 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 ```
 
 Action:
@@ -1256,10 +1256,10 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 fail_if_no_peer_cert = true
 ```
 
@@ -1293,10 +1293,10 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 peer_cert_as_username = "cn"
 ```
 
@@ -1330,10 +1330,10 @@ Example configuration:
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify = "verify_peer"
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 peer_cert_as_clientid = "cn"
 ```
 

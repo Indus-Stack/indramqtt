@@ -1514,9 +1514,10 @@ mod tests {
     /// without TLS); TLS itself is proven offline by
     /// `test_tls_handshake_connect_and_publish_qos0`.
     ///
-    /// Run with e.g.:
+    /// Run with e.g. (using an ephemeral RS256 key generated via
+    /// `openssl genrsa -out /tmp/gcp_iot_device_rs256_private.pem 2048`):
     /// `GCP_IOT_MQTT_URL=mqtt://127.0.0.1:1883 \
-    ///  GCP_IOT_PRIVATE_KEY_FILE=crates/broker-connectors-enterprise/tests/fixtures/gcp_iot_device_rs256_private.pem \
+    ///  GCP_IOT_PRIVATE_KEY_FILE=/tmp/gcp_iot_device_rs256_private.pem \
     ///  cargo test -p broker-connectors-enterprise --lib gcp_iot::tests::test_qualify_tls_write_path -- --ignored --nocapture`
     ///
     /// 500 telemetry rows drive through the broker's rule path (a rule

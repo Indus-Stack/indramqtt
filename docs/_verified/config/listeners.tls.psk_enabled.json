@@ -1,5 +1,5 @@
 {
-  "action": "Read `GET /api/v5/listeners/ssl:default` and connect one plaintext client.",
+  "action": "Read `GET /api/v5/listeners/ssl:default` and open one TCP connection to the bind.",
   "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\npsk_enabled = true\n",
   "item": "listeners.tls.psk_enabled",
   "kind": "setting",

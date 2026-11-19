@@ -1,6 +1,6 @@
 {
   "action": "Connect one TLS client with a valid certificate and a foreign username, then read the client detail.",
-  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem\"\npeer_cert_as_username = \"cn\"\n",
+  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\ncert_file = \"${TLS_DIR}/server-cert.pem\"\nkey_file = \"${TLS_DIR}/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"${TLS_DIR}/ca-cert.pem\"\npeer_cert_as_username = \"cn\"\n",
   "item": "listeners.tls.peer_cert_as_username",
   "kind": "setting",
   "output": "username=k1-05-a",

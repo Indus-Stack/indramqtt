@@ -383,16 +383,19 @@ async fn http_batch_bytes_through_broker() {
         .create_forward_rule("ce01-http-bytes-rule", "ce01/http/bytes", "ce01-http-bytes")
         .await;
     let pad = "a".repeat(800);
+    // Send all rows on one connection with QoS 1 so repeated connects with
+    // the same client_id cannot race and drop a QoS 0 publish under load.
+    let mut publisher = broker.connect("ce01-http-bytes-pub").await;
     for value in 1..=3 {
-        broker
+        publisher
             .publish(
-                "ce01-http-bytes-pub",
                 "ce01/http/bytes",
                 format!(r#"{{"n":{value},"pad":"{pad}"}}"#).as_bytes(),
-                0,
+                1,
             )
             .await;
     }
+    publisher.disconnect().await;
 
     target.expect_batch(3, Duration::from_secs(10)).await;
     let records = target.records();

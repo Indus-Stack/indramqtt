@@ -1,6 +1,6 @@
 {
   "action": "Run one secure WebSocket upgrade, then send MQTT CONNECT and read CONNACK.",
-  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\n",
+  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"${TLS_DIR}/server-cert.pem\"\nkey_file = \"${TLS_DIR}/server-key.pem\"\n",
   "item": "listeners.wss.key_file",
   "kind": "setting",
   "output": "wss-mqtt-ok",
