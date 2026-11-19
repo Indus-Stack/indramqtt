@@ -1106,6 +1106,7 @@ impl Session {
     pub fn ack_inflight_timed(&self, packet_id: u16) -> Option<InflightMessage> {
         let mut inflight = self.inflight.write();
         if let Some(pos) = inflight.iter().position(|m| m.packet_id == packet_id) {
+            // INVARIANT: position was found within inflight queue bounds immediately before removal.
             let entry = inflight.remove(pos).expect("position checked");
             // Promote the oldest spill so the window stays the oldest
             // entries. Nested `inflight` -> `inflight_spill` order matches
@@ -1131,6 +1132,7 @@ impl Session {
         drop(inflight);
         let mut spill = self.inflight_spill.write();
         if let Some(pos) = spill.iter().position(|m| m.packet_id == packet_id) {
+            // INVARIANT: position was found within spill queue bounds immediately before removal.
             let entry = spill.remove(pos).expect("position checked");
             self.spill_count.fetch_sub(1, Ordering::Relaxed);
             return Some(entry);
