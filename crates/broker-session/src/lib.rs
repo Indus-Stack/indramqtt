@@ -1985,10 +1985,35 @@ impl Session {
         payload: Bytes,
         enqueued_at: Instant,
     ) -> Option<(u16, InflightTrackOutcome)> {
+        self.try_alloc_qos1_downlink_v5_checked_for_conn(
+            None,
+            topic,
+            qos,
+            retain,
+            payload,
+            enqueued_at,
+        )
+    }
+
+    /// Connection-bound variant of [`Session::try_alloc_qos1_downlink_v5_checked`]:
+    /// atomically verifies `expected_conn_id` (when `Some`) under `send_quota_lock`
+    /// so a superseded connection cannot consume the replacement's send credit.
+    pub fn try_alloc_qos1_downlink_v5_checked_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        topic: Topic,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+        enqueued_at: Instant,
+    ) -> Option<(u16, InflightTrackOutcome)> {
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return None;
+        }
         if self.protocol_version() != 5 {
             return Some(self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at));
         }
-        let _quota = self.send_quota_lock.lock();
         let cap = usize::from(self.client_receive_maximum().max(1));
         if self.unacked_on_conn_len() >= cap {
             return None;
@@ -2027,6 +2052,21 @@ impl Session {
         retain: bool,
         payload: Bytes,
     ) -> Option<(u16, bool)> {
+        self.try_alloc_qos2_outbound_v5_checked_for_conn(None, topic, retain, payload)
+    }
+
+    /// Connection-bound variant of [`Session::try_alloc_qos2_outbound_v5_checked`].
+    pub fn try_alloc_qos2_outbound_v5_checked_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        topic: Topic,
+        retain: bool,
+        payload: Bytes,
+    ) -> Option<(u16, bool)> {
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return None;
+        }
         if self.protocol_version() != 5 {
             let pid = self.next_packet_id();
             let tracked = self.track_qos2_outbound(Qos2OutboundEntry {
@@ -2038,7 +2078,6 @@ impl Session {
             });
             return Some((pid, tracked));
         }
-        let _quota = self.send_quota_lock.lock();
         let cap = usize::from(self.client_receive_maximum().max(1));
         if self.unacked_on_conn_len() >= cap {
             return None;

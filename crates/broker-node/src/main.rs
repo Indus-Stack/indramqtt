@@ -6078,8 +6078,15 @@ where
                 shared.metrics.inc_suback_sent();
                 transport.send(reply).await?;
                 // SUBACK first, then retained state, per MQTT ordering.
-                for held in &retained {
-                    transport.send(held.clone()).await?;
+                for (idx, held) in retained.iter().enumerate() {
+                    if let Err(err) = transport.send(held.clone()).await {
+                        rollback_unsent_retained_credits(
+                            shared,
+                            frame.header.conn_id,
+                            &retained[idx..],
+                        );
+                        return Err(err.into());
+                    }
                 }
                 shared
                     .metrics
@@ -6264,6 +6271,54 @@ where
 /// retained fetch, and cluster announce so every downstream stage sees
 /// the plain inner filter. Retained deliveries carry `retain = true` at
 /// `min(subscription QoS, stored QoS)`.
+fn defer_retained_match(
+    session: &broker_session::Session,
+    msg: &broker_storage::StoredMessage,
+    effective_qos: u8,
+) {
+    let qos = match effective_qos {
+        0 => QoS::AtMostOnce,
+        2 => QoS::ExactlyOnce,
+        _ => QoS::AtLeastOnce,
+    };
+    session.push_offline(QueuedMessage {
+        topic: msg.topic.clone(),
+        qos,
+        retain: true,
+        payload: msg.payload.clone(),
+        publish_at_ms: None,
+    });
+}
+
+fn rollback_unsent_retained_credits(shared: &Shared, conn_id: u64, unsent: &[BrokerFrame]) {
+    let session = shared.sessions.session_for_conn(conn_id).or_else(|| {
+        shared
+            .sessions
+            .client_id_for_conn(conn_id)
+            .as_deref()
+            .and_then(|p| shared.sessions.get(p))
+    });
+    let Some(session) = session else {
+        return;
+    };
+    for frame in unsent {
+        if frame.header.opcode != OpCode::PublishOut || frame.metadata.len() < 5 {
+            continue;
+        }
+        let tlen = u16::from_be_bytes([frame.metadata[0], frame.metadata[1]]) as usize;
+        if frame.metadata.len() < 2 + tlen + 3 {
+            continue;
+        }
+        let pid = u16::from_be_bytes([frame.metadata[2 + tlen], frame.metadata[2 + tlen + 1]]);
+        let qos = frame.metadata[2 + tlen + 2];
+        if qos == 1 {
+            let _ = session.ack_inflight(pid);
+        } else if qos == 2 {
+            let _ = session.ack_qos2_pubcomp(pid);
+        }
+    }
+}
+
 async fn apply_subscribe(
     frame: &BrokerFrame,
     shared: &Shared,
@@ -6791,6 +6846,13 @@ async fn apply_subscribe(
             }
         });
     let session = owner.clone();
+    let expected_conn_id = session.as_ref().and_then(|bound| {
+        if conn_was_bound {
+            Some(frame.header.conn_id)
+        } else {
+            (*bound.conn_id.read()).map(|_| frame.header.conn_id)
+        }
+    });
     let subscriber_tenant = session
         .as_ref()
         .map(|session| session.tenant_id.read().clone())
@@ -6812,19 +6874,26 @@ async fn apply_subscribe(
                 continue;
             }
         };
-        for msg in matched {
+        let mut matched_iter = matched.into_iter();
+        while let Some(msg) = matched_iter.next() {
+            let conn_still_current = session.as_ref().is_none_or(|bound| {
+                if conn_was_bound {
+                    shared
+                        .sessions
+                        .session_for_conn(frame.header.conn_id)
+                        .is_some_and(|cur| {
+                            cur.id == bound.id
+                                && expected_conn_id
+                                    .is_none_or(|cid| *cur.conn_id.read() == Some(cid))
+                        })
+                } else {
+                    expected_conn_id.is_none_or(|cid| *bound.conn_id.read() == Some(cid))
+                }
+            });
+            if !conn_still_current {
+                break;
+            }
             let effective = std::cmp::min(sub_qos, u8::from(msg.qos));
-            // X1-02: retained replays are fresh deliveries toward this
-            // connection, so the v5 CONNECT caps apply here exactly as
-            // on live fan-out (shed with the documented code, counted,
-            // never silent). Reconnect replay of already-tracked
-            // unacked state (`replay_offline`) is intentionally
-            // uncapped: those frames were accepted under an earlier
-            // window and must redeliver at-least-once.
-            // TODO(parity): should reconnect replay honour a smaller
-            // renegotiated Receive Maximum instead of redelivering the
-            // full unacked set? The rulebook does not decide the replay
-            // policy; current choice redelivers (fail to keep).
             if let Some(session) = &session {
                 if let Some(rc) = v5_egress_refused(
                     session,
@@ -6833,7 +6902,12 @@ async fn apply_subscribe(
                     msg.payload.len(),
                 ) {
                     if rc == V5_RC_QUOTA_EXCEEDED {
-                        shared.metrics.inc_inflight_dropped();
+                        defer_retained_match(session, &msg, effective);
+                        for rest in matched_iter {
+                            let rest_eff = std::cmp::min(sub_qos, u8::from(rest.qos));
+                            defer_retained_match(session, &rest, rest_eff);
+                        }
+                        break;
                     } else {
                         shared.metrics.inc_messages_dropped();
                     }
@@ -6849,15 +6923,24 @@ async fn apply_subscribe(
                 0u16
             } else if effective == 1 {
                 if let Some(session) = &session {
-                    let Some((pid, outcome)) = session.try_alloc_qos1_downlink_v5_checked(
+                    let Some((pid, outcome)) = session.try_alloc_qos1_downlink_v5_checked_for_conn(
+                        expected_conn_id,
                         msg.topic.clone(),
                         QoS::AtLeastOnce,
                         true,
                         msg.payload.clone(),
                         std::time::Instant::now(),
                     ) else {
-                        shared.metrics.inc_inflight_dropped();
-                        continue;
+                        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                        {
+                            break;
+                        }
+                        defer_retained_match(session, &msg, effective);
+                        for rest in matched_iter {
+                            let rest_eff = std::cmp::min(sub_qos, u8::from(rest.qos));
+                            defer_retained_match(session, &rest, rest_eff);
+                        }
+                        break;
                     };
                     match outcome {
                         InflightTrackOutcome::Tracked => {}
@@ -6874,13 +6957,21 @@ async fn apply_subscribe(
                     1u16
                 }
             } else if let Some(session) = &session {
-                let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked(
+                let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked_for_conn(
+                    expected_conn_id,
                     msg.topic.clone(),
                     true,
                     msg.payload.clone(),
                 ) else {
-                    shared.metrics.inc_inflight_dropped();
-                    continue;
+                    if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+                        break;
+                    }
+                    defer_retained_match(session, &msg, effective);
+                    for rest in matched_iter {
+                        let rest_eff = std::cmp::min(sub_qos, u8::from(rest.qos));
+                        defer_retained_match(session, &rest, rest_eff);
+                    }
+                    break;
                 };
                 if !tracked {
                     shared.metrics.inc_inflight_dropped();
@@ -6890,11 +6981,6 @@ async fn apply_subscribe(
                 1u16
             };
             let topic_str = msg.topic.as_str();
-            // A message sent because of a new subscription always has
-            // the retain flag. The retain-as-published option applies
-            // only to messages forwarded from a live publish. The
-            // replay carries the subscription identifier of the grant
-            // (0 = none; the edge then omits the property).
             let sub_id = if grant.sub_id <= broker_router::MAX_SUBSCRIPTION_ID {
                 grant.sub_id
             } else {
@@ -6919,6 +7005,12 @@ async fn apply_subscribe(
                 msg.payload.clone(),
             ) {
                 retained.push(routed);
+            } else if let Some(session) = &session {
+                if effective == 1 {
+                    let _ = session.ack_inflight(downlink_id);
+                } else if effective == 2 {
+                    let _ = session.ack_qos2_pubcomp(downlink_id);
+                }
             }
         }
     }
@@ -14699,6 +14791,8 @@ mod tests {
             .await
             .unwrap();
 
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(106, tx);
         let sub = subscribe_frame(
             106,
             1,
@@ -14708,6 +14802,78 @@ mod tests {
         assert!(reply.is_some());
         assert_eq!(retained.len(), 1);
         assert_eq!(sess.inflight_len(), 1);
+        assert_eq!(sess.offline_len(), 1);
+
+        let f1 = &retained[0];
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        apply_puback(&puback_frame(106, 2, pid1), &shared);
+
+        let f2 = rx
+            .try_recv()
+            .expect("second retained message resumes after PUBACK");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+        assert_ne!(f2.payload, f1.payload);
+    }
+
+    #[tokio::test]
+    async fn superseded_subscribe_cannot_consume_replacement_retained_credit() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-superseded",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 107,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        // Reconnect on conn_id 207 (superseding 107) on the same session.
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-superseded",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 207,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert!(sess
+            .try_alloc_qos1_downlink_v5_checked_for_conn(
+                Some(107),
+                Topic::new("ret/sup").unwrap(),
+                QoS::AtLeastOnce,
+                true,
+                Bytes::from_static(b"stale"),
+                std::time::Instant::now(),
+            )
+            .is_none());
+        assert_eq!(sess.unacked_on_conn_len(), 0);
     }
 
     #[tokio::test]
