@@ -451,18 +451,25 @@ impl RetainedStore for MemoryStore {
     ) -> Result<(Vec<StoredMessage>, bool)> {
         let scope = normalize_tenant_key(tenant);
         let inner = self.retained.read();
-        let mut refs: Vec<&StoredMessage> = inner
+        let mut matches = inner
             .map
             .iter()
             .filter(|((entry_tenant, _), msg)| {
                 entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic)
             })
-            .map(|(_, msg)| msg)
-            .collect();
-        let truncated = refs.len() > limit;
+            .map(|(_, msg)| msg);
+        if limit == 0 {
+            return Ok((Vec::new(), matches.next().is_some()));
+        }
+        let mut refs: Vec<&StoredMessage> = Vec::with_capacity(limit.min(64));
+        for msg in matches {
+            if refs.len() >= limit {
+                return Ok((Vec::new(), true));
+            }
+            refs.push(msg);
+        }
         refs.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
-        let matched = refs.into_iter().take(limit).cloned().collect();
-        Ok((matched, truncated))
+        Ok((refs.into_iter().cloned().collect(), false))
     }
 
     async fn count_retained(&self) -> Result<usize> {
@@ -638,11 +645,27 @@ mod tests {
         assert_eq!(matched[1].topic.as_str(), "device/state");
 
         // Multi-level wildcard.
-        let matched = store
-            .find_matching(&TopicFilter::new("#").unwrap())
+        let f_all = TopicFilter::new("#").unwrap();
+        let matched = store.find_matching(&f_all).await.unwrap();
+        assert_eq!(matched.len(), 3);
+        let (zero, trunc0) = store
+            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 0)
             .await
             .unwrap();
-        assert_eq!(matched.len(), 3);
+        assert!(zero.is_empty());
+        assert!(trunc0);
+        let (over, trunc1) = store
+            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 1)
+            .await
+            .unwrap();
+        assert!(over.is_empty());
+        assert!(trunc1);
+        let (exact, trunc3) = store
+            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 3)
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), 3);
+        assert!(!trunc3);
 
         // No match.
         let matched = store
