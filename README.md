@@ -52,7 +52,9 @@ The subscriber prints `{"device":"heater-1","temp":90}` and exits. Open the [loc
 
 On November 14, 2026, a single IndraMQTT node delivered **48,700 messages/s with a SQL republish rule active** (median of five 120-second runs, zero observed loss). The broker had four pinned CPUs and an 8 GiB memory limit. Each of 1,000 subscribers received its publisher’s MQTT 3.1.1 messages. The rule also republished every reading to a topic with no subscriber.
 
-In a separate MQTT 5 test with 256-byte payloads, IndraMQTT delivered **79,353 messages/s at QoS 1**, compared with **24,947** for EMQX Enterprise 6.3.0 at its default settings. At QoS 0, IndraMQTT delivered **184,829 messages/s** at 200,000 offered. The publisher generator saturated at that step. Each comparison step ran once over plaintext loopback. With 10,000 idle clients connected for 30 seconds, broker memory was **186.3 MiB** for IndraMQTT and **842.3 MiB** for EMQX.
+In the MQTT 5 point-to-point QoS 0 test, subscribers received **all 36 million messages, with zero loss**. Delivery averaged **184,829 messages/s** over the full run. The load generator took 193.7 seconds to publish the batch, and subscribers received the last messages 1.1 seconds later.
+
+At QoS 1, IndraMQTT delivered **79,353 messages/s** and EMQX Enterprise 6.3.0 delivered **24,947 messages/s** with its default settings. Both runs recorded zero loss. Each comparison step ran once over plaintext loopback with 256-byte payloads. With 10,000 idle clients connected for 30 seconds, broker memory was **186.3 MiB** for IndraMQTT and **842.3 MiB** for EMQX.
 
 [November measurements and test conditions](benchmark/2026-11-14.md) · [October one-CPU comparison, including rumqttd](benchmark/README.md) · [Router and SQL microbenchmarks](BENCHMARKS.md)
 
