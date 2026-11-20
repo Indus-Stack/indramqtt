@@ -133,6 +133,9 @@ pub struct Session {
     /// Retransmissions deferred by Receive Maximum on the current connection,
     /// drained ahead of fresh `offline_queue` entries as ACKs arrive.
     pending_replays: RwLock<VecDeque<PendingReplay>>,
+    /// Serializes MQTT 5 connection-scoped send-window checks and tracking
+    /// reservations across live delivery and replay.
+    send_quota_lock: parking_lot::Mutex<()>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
     /// resends oldest-first with DUP set. Bounded per session by the
@@ -626,7 +629,6 @@ pub struct Qos2InboundEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingReplayKind {
     Qos1,
-    Qos1Spill,
     Qos2,
 }
 
@@ -786,6 +788,7 @@ impl Session {
             offline_persist: std::sync::Mutex::new(()),
             replay_lock: parking_lot::Mutex::new(()),
             pending_replays: RwLock::new(VecDeque::new()),
+            send_quota_lock: parking_lot::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
             spill_count: AtomicUsize::new(0),
@@ -1882,7 +1885,7 @@ impl Session {
             for m in self.inflight_spill.read().iter() {
                 pending.push_back(PendingReplay {
                     packet_id: m.packet_id,
-                    kind: PendingReplayKind::Qos1Spill,
+                    kind: PendingReplayKind::Qos1,
                 });
             }
         }
@@ -1902,9 +1905,16 @@ impl Session {
     }
 
     /// Pop the next still-unacked deferred retransmission item for this
-    /// connection, skipping any entry already acknowledged.
-    pub fn pop_next_pending_replay(&self) -> Option<PendingReplayItem> {
+    /// connection, atomically respecting the MQTT 5 Receive Maximum send
+    /// window when `protocol_version() == 5`.
+    pub fn pop_next_pending_replay_paced(&self) -> Option<PendingReplayItem> {
+        let _quota = self.send_quota_lock.lock();
+        let v5_cap = (self.protocol_version() == 5)
+            .then(|| usize::from(self.client_receive_maximum().max(1)));
         loop {
+            if v5_cap.is_some_and(|cap| self.unacked_on_conn_len() >= cap) {
+                return None;
+            }
             let next = self.pending_replays.write().pop_front()?;
             match next.kind {
                 PendingReplayKind::Qos1 => {
@@ -1920,8 +1930,6 @@ impl Session {
                             is_spill: false,
                         });
                     }
-                }
-                PendingReplayKind::Qos1Spill => {
                     if let Some(entry) = self
                         .inflight_spill
                         .read()
@@ -1954,13 +1962,9 @@ impl Session {
     /// mailbox failed.
     pub fn push_front_pending_replay(&self, item: &PendingReplayItem) {
         let entry = match item {
-            PendingReplayItem::Qos1 { entry, is_spill } => PendingReplay {
+            PendingReplayItem::Qos1 { entry, .. } => PendingReplay {
                 packet_id: entry.packet_id,
-                kind: if *is_spill {
-                    PendingReplayKind::Qos1Spill
-                } else {
-                    PendingReplayKind::Qos1
-                },
+                kind: PendingReplayKind::Qos1,
             },
             PendingReplayItem::Qos2(entry) => PendingReplay {
                 packet_id: entry.packet_id,
@@ -1968,6 +1972,82 @@ impl Session {
             },
         };
         self.pending_replays.write().push_front(entry);
+    }
+
+    /// Atomically check the MQTT 5 Receive Maximum send window (for v5
+    /// sessions) and allocate/track one QoS 1 downlink. Returns `None` when
+    /// the v5 Receive Maximum window is full.
+    pub fn try_alloc_qos1_downlink_v5_checked(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+        enqueued_at: Instant,
+    ) -> Option<(u16, InflightTrackOutcome)> {
+        if self.protocol_version() != 5 {
+            return Some(self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at));
+        }
+        let _quota = self.send_quota_lock.lock();
+        let cap = usize::from(self.client_receive_maximum().max(1));
+        if self.unacked_on_conn_len() >= cap {
+            return None;
+        }
+        Some(self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at))
+    }
+
+    /// Atomically check the MQTT 5 Receive Maximum send window (for v5
+    /// sessions) and reserve one QoS 1 replay entry. Returns `None` when the
+    /// v5 Receive Maximum window is full.
+    pub fn try_reserve_replay_qos1(
+        &self,
+        message: InflightMessage,
+    ) -> Option<InflightTrackOutcome> {
+        if self.protocol_version() != 5 {
+            return Some(self.track_inflight_or_spill(message));
+        }
+        let _quota = self.send_quota_lock.lock();
+        let cap = usize::from(self.client_receive_maximum().max(1));
+        if self.unacked_on_conn_len() >= cap {
+            return None;
+        }
+        Some(self.track_inflight_or_spill(message))
+    }
+
+    /// Atomically check the MQTT 5 Receive Maximum send window (for v5
+    /// sessions) and allocate/track one QoS 2 outbound entry. Returns `None`
+    /// when the v5 Receive Maximum window is full; otherwise `Some((pid, tracked))`.
+    pub fn try_alloc_qos2_outbound_v5_checked(
+        &self,
+        topic: Topic,
+        retain: bool,
+        payload: Bytes,
+    ) -> Option<(u16, bool)> {
+        if self.protocol_version() != 5 {
+            let pid = self.next_packet_id();
+            let tracked = self.track_qos2_outbound(Qos2OutboundEntry {
+                packet_id: pid,
+                topic,
+                retain,
+                payload,
+                rec_received: false,
+            });
+            return Some((pid, tracked));
+        }
+        let _quota = self.send_quota_lock.lock();
+        let cap = usize::from(self.client_receive_maximum().max(1));
+        if self.unacked_on_conn_len() >= cap {
+            return None;
+        }
+        let pid = self.next_packet_id();
+        let tracked = self.track_qos2_outbound(Qos2OutboundEntry {
+            packet_id: pid,
+            topic,
+            retain,
+            payload,
+            rec_received: false,
+        });
+        Some((pid, tracked))
     }
 
     pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {
@@ -5885,5 +5965,76 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_replay_resolves_spill_promoted_packet_and_shares_v5_credit() {
+        let session = Session::new(SessionId(1), "spill-promo".to_string(), false);
+        session.set_protocol_version(5);
+        session.set_client_receive_maximum(1);
+        session.set_max_inflight(1);
+        session.set_max_spill(1);
+
+        let topic = Topic::new("t/1").unwrap();
+        assert_eq!(
+            session.track_inflight_or_spill(InflightMessage {
+                packet_id: 1,
+                topic: topic.clone(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"a"),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            }),
+            InflightTrackOutcome::Tracked
+        );
+        assert_eq!(
+            session.track_inflight_or_spill(InflightMessage {
+                packet_id: 2,
+                topic: topic.clone(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"b"),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            }),
+            InflightTrackOutcome::Spilled
+        );
+
+        assert!(session.seed_pending_replays().is_empty());
+        // ACK packet 1 so packet 2 is promoted from inflight_spill -> inflight.
+        assert!(session.ack_inflight(1));
+        assert_eq!(session.inflight_len(), 1);
+        assert!(!session.has_spill());
+
+        // Packet 2 must still resolve from inflight even though it was seeded while spilled.
+        match session.pop_next_pending_replay_paced() {
+            Some(PendingReplayItem::Qos1 { entry, is_spill }) => {
+                assert_eq!(entry.packet_id, 2);
+                assert!(!is_spill);
+            }
+            other => panic!("expected promoted Qos1 entry, got {other:?}"),
+        }
+        // Now the single v5 send credit is used; both live and replay reservations fail.
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"c"),
+                Instant::now(),
+            )
+            .is_none());
+        assert!(session
+            .try_reserve_replay_qos1(InflightMessage {
+                packet_id: 3,
+                topic,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"c"),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            })
+            .is_none());
     }
 }
