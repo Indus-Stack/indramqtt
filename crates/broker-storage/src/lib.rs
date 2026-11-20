@@ -216,7 +216,8 @@ pub const DEFAULT_MAX_RETAINED_PER_TENANT: usize = 0;
 /// retained write pays one lock and two integer compares, never a
 /// scan and never a second lock. The deliver path takes no lock here.
 struct RetainedInner {
-    map: HashMap<(std::sync::Arc<str>, Topic), StoredMessage>,
+    by_tenant: HashMap<std::sync::Arc<str>, HashMap<Topic, StoredMessage>>,
+    total: usize,
     per_tenant: HashMap<std::sync::Arc<str>, usize>,
     caps: HashMap<std::sync::Arc<str>, usize>,
     default_cap: usize,
@@ -225,7 +226,8 @@ struct RetainedInner {
 impl Default for RetainedInner {
     fn default() -> Self {
         Self {
-            map: HashMap::new(),
+            by_tenant: HashMap::new(),
+            total: 0,
             per_tenant: HashMap::new(),
             caps: HashMap::new(),
             default_cap: DEFAULT_MAX_RETAINED_PER_TENANT,
@@ -351,38 +353,44 @@ impl RetainedStore for MemoryStore {
         payload: Bytes,
         tenant: &str,
     ) -> Result<RetainedWriteOutcome> {
-        let key = (normalize_tenant_key(tenant), topic.clone());
+        let scope = normalize_tenant_key(tenant);
         let mut inner = self.retained.write();
-        if inner.map.len() >= MAX_RETAINED_MESSAGES && !inner.map.contains_key(&key) {
+        let is_new = !inner
+            .by_tenant
+            .get(scope.as_ref())
+            .is_some_and(|m| m.contains_key(&topic));
+        if is_new && inner.total >= MAX_RETAINED_MESSAGES {
             return Ok(RetainedWriteOutcome::DroppedGlobalLimit);
         }
-        let is_new = !inner.map.contains_key(&key);
         if is_new {
             let cap = inner
                 .caps
-                .get(key.0.as_ref())
+                .get(scope.as_ref())
                 .copied()
                 .unwrap_or(inner.default_cap);
             if cap > 0 {
-                let used = inner.per_tenant.get(key.0.as_ref()).copied().unwrap_or(0);
+                let used = inner.per_tenant.get(scope.as_ref()).copied().unwrap_or(0);
                 if used >= cap {
                     return Ok(RetainedWriteOutcome::DroppedPerTenantLimit);
                 }
             }
         }
-        inner.map.insert(
-            key.clone(),
-            StoredMessage {
-                offset: 0,
-                topic,
-                qos,
-                retain: true,
-                payload,
-                publish_at_ms: Some(now_ms()),
-            },
-        );
+        let msg = StoredMessage {
+            offset: 0,
+            topic: topic.clone(),
+            qos,
+            retain: true,
+            payload,
+            publish_at_ms: Some(now_ms()),
+        };
+        inner
+            .by_tenant
+            .entry(std::sync::Arc::clone(&scope))
+            .or_default()
+            .insert(topic, msg);
         if is_new {
-            *inner.per_tenant.entry(key.0).or_insert(0) += 1;
+            inner.total += 1;
+            *inner.per_tenant.entry(scope).or_insert(0) += 1;
         }
         Ok(RetainedWriteOutcome::Stored)
     }
@@ -392,21 +400,32 @@ impl RetainedStore for MemoryStore {
         topic: &Topic,
         tenant: &str,
     ) -> Result<Option<StoredMessage>> {
+        let scope = normalize_tenant_key(tenant);
         let inner = self.retained.read();
         Ok(inner
-            .map
-            .get(&(normalize_tenant_key(tenant), topic.clone()))
+            .by_tenant
+            .get(scope.as_ref())
+            .and_then(|m| m.get(topic))
             .cloned())
     }
 
     async fn clear_retained_in_tenant(&self, topic: &Topic, tenant: &str) -> Result<()> {
+        let scope = normalize_tenant_key(tenant);
         let mut inner = self.retained.write();
-        let key = (normalize_tenant_key(tenant), topic.clone());
-        if inner.map.remove(&key).is_some() {
-            if let Some(count) = inner.per_tenant.get_mut(key.0.as_ref()) {
+        let removed = inner.by_tenant.get_mut(scope.as_ref()).and_then(|m| {
+            let res = m.remove(topic);
+            let empty = m.is_empty();
+            res.map(|_| empty)
+        });
+        if let Some(empty) = removed {
+            if empty {
+                inner.by_tenant.remove(scope.as_ref());
+            }
+            inner.total = inner.total.saturating_sub(1);
+            if let Some(count) = inner.per_tenant.get_mut(scope.as_ref()) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    inner.per_tenant.remove(key.0.as_ref());
+                    inner.per_tenant.remove(scope.as_ref());
                 }
             }
         }
@@ -420,9 +439,11 @@ impl RetainedStore for MemoryStore {
             return Ok(0);
         }
         let mut inner = self.retained.write();
-        let before = inner.map.len();
-        inner.map.retain(|(key_tenant, _), _| *key_tenant != scope);
-        let removed = before - inner.map.len();
+        let removed = inner
+            .by_tenant
+            .remove(scope.as_ref())
+            .map_or(0, |m| m.len());
+        inner.total = inner.total.saturating_sub(removed);
         inner.per_tenant.remove(scope.as_ref());
         inner.caps.remove(scope.as_ref());
         Ok(removed)
@@ -435,13 +456,13 @@ impl RetainedStore for MemoryStore {
     ) -> Result<Vec<StoredMessage>> {
         let scope = normalize_tenant_key(tenant);
         let inner = self.retained.read();
-        let mut matched: Vec<StoredMessage> = inner
-            .map
-            .iter()
-            .filter(|((entry_tenant, _), msg)| {
-                entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic)
-            })
-            .map(|(_, msg)| msg.clone())
+        let Some(tenant_map) = inner.by_tenant.get(scope.as_ref()) else {
+            return Ok(Vec::new());
+        };
+        let mut matched: Vec<StoredMessage> = tenant_map
+            .values()
+            .filter(|msg| filter.matches(&msg.topic))
+            .cloned()
             .collect();
         matched.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
         Ok(matched)
@@ -456,14 +477,28 @@ impl RetainedStore for MemoryStore {
     ) -> Result<(Vec<StoredMessage>, bool, usize)> {
         let scope = normalize_tenant_key(tenant);
         let inner = self.retained.read();
+        let Some(tenant_map) = inner.by_tenant.get(scope.as_ref()) else {
+            return Ok((Vec::new(), false, 0));
+        };
+        if !filter.as_str().contains('+') && !filter.as_str().contains('#') {
+            if let Ok(exact_topic) = Topic::new(filter.as_str()) {
+                if let Some(msg) = tenant_map.get(&exact_topic) {
+                    if match_limit == 0 {
+                        return Ok((Vec::new(), true, 1));
+                    }
+                    return Ok((vec![msg.clone()], false, 1));
+                }
+            }
+            return Ok((Vec::new(), false, 0));
+        }
         let mut scanned = 0usize;
         let mut refs: Vec<&StoredMessage> = Vec::with_capacity(match_limit.min(64));
-        for ((entry_tenant, _), msg) in inner.map.iter() {
+        for msg in tenant_map.values() {
             if scanned >= scan_budget {
                 return Ok((Vec::new(), true, scanned));
             }
             scanned += 1;
-            if entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic) {
+            if filter.matches(&msg.topic) {
                 if match_limit == 0 || refs.len() >= match_limit {
                     return Ok((Vec::new(), true, scanned));
                 }
@@ -475,7 +510,7 @@ impl RetainedStore for MemoryStore {
     }
 
     async fn count_retained(&self) -> Result<usize> {
-        Ok(self.retained.read().map.len())
+        Ok(self.retained.read().total)
     }
 
     async fn count_retained_in_tenant(&self, tenant: &str) -> Result<usize> {
@@ -701,5 +736,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_exact_and_tenant_scoped_lookup_ignores_other_tenants() {
+        let store = MemoryStore::new();
+        // Populate tenant-a with 90,000 retained messages (above the old 80,000
+        // global scan budget) and tenant-b with 1 retained message.
+        for i in 0..90_000usize {
+            let topic = Topic::new(format!("bulk/t/{i}")).unwrap();
+            let outcome = store
+                .set_retained_in_tenant_checked(
+                    topic,
+                    QoS::AtLeastOnce,
+                    Bytes::from_static(b"a"),
+                    "tenant-a",
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome, RetainedWriteOutcome::Stored);
+        }
+        let target_topic = Topic::new("devices/sensor-1/state").unwrap();
+        store
+            .set_retained_in_tenant_checked(
+                target_topic.clone(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"ok"),
+                "tenant-b",
+            )
+            .await
+            .unwrap();
+
+        // Exact lookup in tenant-a succeeds in O(1) even with scan_budget = 0.
+        let exact_a = TopicFilter::new("bulk/t/89999").unwrap();
+        let (matched_a, trunc_a, scanned_a) = store
+            .find_matching_in_tenant_bounded(&exact_a, "tenant-a", 10, 0)
+            .await
+            .unwrap();
+        assert!(!trunc_a);
+        assert_eq!(scanned_a, 1);
+        assert_eq!(matched_a.len(), 1);
+
+        // Wildcard lookup in tenant-b scans only tenant-b (1 entry), unaffected
+        // by tenant-a's 90,000 records.
+        let wild_b = TopicFilter::new("devices/+/state").unwrap();
+        let (matched_b, trunc_b, scanned_b) = store
+            .find_matching_in_tenant_bounded(&wild_b, "tenant-b", 10, 5)
+            .await
+            .unwrap();
+        assert!(!trunc_b);
+        assert_eq!(scanned_b, 1);
+        assert_eq!(matched_b.len(), 1);
+        assert_eq!(matched_b[0].topic, target_topic);
+
+        // Clear tenant-a and confirm total count drops to 1.
+        let cleared = store.clear_tenant("tenant-a").await.unwrap();
+        assert_eq!(cleared, 90_000);
+        assert_eq!(store.count_retained().await.unwrap(), 1);
     }
 }

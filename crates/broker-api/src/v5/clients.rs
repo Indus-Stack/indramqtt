@@ -1992,6 +1992,11 @@ async fn do_mgmt_publish(
             state.metrics.inc_qos2_received();
         }
     }
+    let _retained_sub_gate = if retain {
+        Some(state.retained_subscribe_gate.write().await)
+    } else {
+        None
+    };
     handle_mgmt_retained(state, topic, qos, retain, payload).await;
     let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(ApiBrokerSink {
         router: state.router.clone(),

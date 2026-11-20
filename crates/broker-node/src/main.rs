@@ -4673,6 +4673,7 @@ impl Shared {
             metrics: metrics.clone(),
             tenant_limits: tenant_limits.clone(),
         };
+        let retained_subscribe_gate = Arc::new(tokio::sync::RwLock::new(()));
         let sink: Arc<dyn BrokerSink> = Arc::new(InMemoryBrokerSink {
             router: router.clone(),
             sessions: sessions.clone(),
@@ -4680,6 +4681,7 @@ impl Shared {
             metrics: metrics.clone(),
             engine: engine.clone(),
             retain_writer: retain_writer.clone(),
+            retained_subscribe_gate: retained_subscribe_gate.clone(),
         });
         engine.set_broker_sink(sink.clone());
 
@@ -4750,7 +4752,7 @@ impl Shared {
             sink,
             retained,
             retain_writer,
-            retained_subscribe_gate: Arc::new(tokio::sync::RwLock::new(())),
+            retained_subscribe_gate,
             retainer_config,
             auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
             bans: Arc::new(broker_api::v5::banned::BanStore::new()),
@@ -5650,6 +5652,7 @@ struct InMemoryBrokerSink {
     metrics: Arc<Metrics>,
     engine: Arc<RuleEngine>,
     retain_writer: RetainWriter,
+    retained_subscribe_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[async_trait]
@@ -5734,6 +5737,11 @@ impl InMemoryBrokerSink {
         retain: bool,
         props: &PublishV5Props,
     ) {
+        let _retained_sub_gate = if retain {
+            Some(self.retained_subscribe_gate.write().await)
+        } else {
+            None
+        };
         if retain {
             self.retain_writer
                 .apply(&topic, qos, &payload, tenant)
@@ -6801,7 +6809,9 @@ async fn apply_subscribe(
                     (Vec::new(), false, 0)
                 }
             };
-            remaining_scan_budget = remaining_scan_budget.saturating_sub(scanned);
+            if filter.as_str().contains('+') || filter.as_str().contains('#') {
+                remaining_scan_budget = remaining_scan_budget.saturating_sub(scanned);
+            }
             remaining_lookup_budget = remaining_lookup_budget.saturating_sub(matched.len());
             quota_exceeded = truncated;
             let mut matched_iter = matched.into_iter();
@@ -7006,27 +7016,35 @@ async fn apply_subscribe(
             if !still_owner {
                 commit_superseded = true;
             } else {
-                if !deferred_retained.is_empty() {
-                    if let Some(session) = owner.as_ref() {
-                        match session.try_defer_retained_all_or_none_for_conn(
-                            expected_conn_id,
-                            max_deferred_msgs,
-                            deferred_retained,
-                        ) {
-                            broker_session::DeferRetainedOutcome::Admitted => {}
-                            broker_session::DeferRetainedOutcome::QuotaExceeded => {
-                                commit_failed_quota = true;
-                            }
-                            broker_session::DeferRetainedOutcome::Superseded => {
-                                commit_superseded = true;
-                            }
-                        }
-                    }
+                enum DeferCommitErr {
+                    QuotaExceeded,
+                    Superseded,
                 }
-                if !commit_superseded && !commit_failed_quota {
-                    if !shared.router.subscribe(&filter, sub) {
-                        commit_failed_quota = true;
+                let mut deferred_opt = (!deferred_retained.is_empty()).then_some(deferred_retained);
+                match shared.router.try_subscribe_with(&filter, sub, || {
+                    if let Some(deferred) = deferred_opt.take() {
+                        if let Some(session) = owner.as_ref() {
+                            match session.try_defer_retained_all_or_none_for_conn(
+                                expected_conn_id,
+                                max_deferred_msgs,
+                                deferred,
+                            ) {
+                                broker_session::DeferRetainedOutcome::Admitted => Ok(()),
+                                broker_session::DeferRetainedOutcome::QuotaExceeded => {
+                                    Err(DeferCommitErr::QuotaExceeded)
+                                }
+                                broker_session::DeferRetainedOutcome::Superseded => {
+                                    Err(DeferCommitErr::Superseded)
+                                }
+                            }
+                        } else {
+                            Ok(())
+                        }
                     } else {
+                        Ok(())
+                    }
+                }) {
+                    Ok(true) => {
                         if cached_subscribe.is_none() {
                             if let Some(session) = owner.as_ref() {
                                 record_authz_under_policy(
@@ -7050,6 +7068,12 @@ async fn apply_subscribe(
                             u8::from(rap),
                             rh,
                         );
+                    }
+                    Ok(false) | Err(DeferCommitErr::QuotaExceeded) => {
+                        commit_failed_quota = true;
+                    }
+                    Err(DeferCommitErr::Superseded) => {
+                        commit_superseded = true;
                     }
                 }
             }
@@ -11678,6 +11702,7 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // observes the same MQTT ingress state. One `Arc` clone, one short
     // read lock per request, no work on the per-message path.
     state.retained = shared.retained.clone();
+    state.retained_subscribe_gate = shared.retained_subscribe_gate.clone();
     // Share the validated retainer settings (W1-28) so management reads
     // and writes observe the same object the kernel ingress enforces.
     // One Arc clone; the persistence hook stays with the store.
@@ -28595,6 +28620,7 @@ config = '{"connector":"pending-timescaledb"}'
         let mut api_state = broker_api::ApiState::standalone(engine);
         api_state.retainer_config = shared.retainer_config.clone();
         api_state.retained = shared.retained.clone();
+        api_state.retained_subscribe_gate = shared.retained_subscribe_gate.clone();
         api_state.stats = shared.stats.clone();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -30757,5 +30783,53 @@ config = '{"connector":"pending-timescaledb"}'
         // Only the default data frame arrives on the data topic.
         let data = rq04_collect_outputs(&shared, 1031, &mut rx_sub, "data/tenant");
         assert_eq!(data.len(), 1, "only default data delivers: {data:?}");
+    }
+
+    #[tokio::test]
+    async fn subscribe_router_full_0x97_does_not_leave_deferred_retained() {
+        let shared = test_shared();
+        shared
+            .router
+            .set_subscription_count_for_test(broker_router::MAX_SUBSCRIPTIONS);
+
+        // Store two retained QoS 1 messages under sensors/#.
+        for suffix in ["a", "b"] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(format!("sensors/{suffix}")).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from_static(b"1"),
+                    broker_storage::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Bind a v5 client with Receive Maximum 1 so the second retained match
+        // would be deferred if the subscription succeeded.
+        let _rx = rq04_mailbox(&shared, 4001);
+        rq04_bind(&shared, 4001, 1, "sub-full").await;
+        let session = shared.sessions.get("sub-full").expect("bound session");
+        session.set_protocol_version(5);
+        session.set_client_receive_maximum(1);
+        let sub_frame = subscribe_frame(
+            4001,
+            2,
+            encode_subscribe_meta(77, "sub-full", &[("sensors/#", 1)]),
+        );
+        let (suback, _) = apply_subscribe(&sub_frame, &shared).await;
+        let suback = suback.expect("SUBACK must be returned");
+        assert!(
+            suback.metadata.ends_with(&[V5_SUBACK_QUOTA_EXCEEDED])
+                || suback.metadata.ends_with(&[V5_SUBACK_UNSPECIFIED]),
+            "expected quota/unspecified rejection in SUBACK, got {:?}",
+            suback.metadata
+        );
+        assert_eq!(
+            session.pending_retained_len(),
+            0,
+            "rejected 0x97 subscribe must not leave orphaned deferred retained entries"
+        );
     }
 }
