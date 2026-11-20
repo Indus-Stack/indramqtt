@@ -115,20 +115,24 @@ pub trait RetainedStore: Send + Sync {
         tenant: &str,
     ) -> Result<Vec<StoredMessage>>;
 
-    /// Bounded variant of `find_matching_in_tenant`: returns at most `limit`
-    /// sorted matches plus `truncated = true` when additional matches exist.
+    /// Bounded variant of `find_matching_in_tenant`: returns at most
+    /// `match_limit` sorted matches, stops after inspecting `scan_budget`
+    /// entries, and reports `scanned` so callers can charge sparse/empty
+    /// lookups against a request-wide budget.
     async fn find_matching_in_tenant_bounded(
         &self,
         filter: &TopicFilter,
         tenant: &str,
-        limit: usize,
-    ) -> Result<(Vec<StoredMessage>, bool)> {
+        match_limit: usize,
+        scan_budget: usize,
+    ) -> Result<(Vec<StoredMessage>, bool, usize)> {
         let mut matched = self.find_matching_in_tenant(filter, tenant).await?;
-        let truncated = matched.len() > limit;
+        let scanned = matched.len().min(scan_budget);
+        let truncated = matched.len() > match_limit || matched.len() > scan_budget;
         if truncated {
-            matched.truncate(limit);
+            matched.clear();
         }
-        Ok((matched, truncated))
+        Ok((matched, truncated, scanned))
     }
     /// Total retained entries across all tenants (for the global
     /// `stats.retained` counter). O(1) map length, no scan, no allocation.
@@ -447,29 +451,27 @@ impl RetainedStore for MemoryStore {
         &self,
         filter: &TopicFilter,
         tenant: &str,
-        limit: usize,
-    ) -> Result<(Vec<StoredMessage>, bool)> {
+        match_limit: usize,
+        scan_budget: usize,
+    ) -> Result<(Vec<StoredMessage>, bool, usize)> {
         let scope = normalize_tenant_key(tenant);
         let inner = self.retained.read();
-        let mut matches = inner
-            .map
-            .iter()
-            .filter(|((entry_tenant, _), msg)| {
-                entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic)
-            })
-            .map(|(_, msg)| msg);
-        if limit == 0 {
-            return Ok((Vec::new(), matches.next().is_some()));
-        }
-        let mut refs: Vec<&StoredMessage> = Vec::with_capacity(limit.min(64));
-        for msg in matches {
-            if refs.len() >= limit {
-                return Ok((Vec::new(), true));
+        let mut scanned = 0usize;
+        let mut refs: Vec<&StoredMessage> = Vec::with_capacity(match_limit.min(64));
+        for ((entry_tenant, _), msg) in inner.map.iter() {
+            if scanned >= scan_budget {
+                return Ok((Vec::new(), true, scanned));
             }
-            refs.push(msg);
+            scanned += 1;
+            if entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic) {
+                if match_limit == 0 || refs.len() >= match_limit {
+                    return Ok((Vec::new(), true, scanned));
+                }
+                refs.push(msg);
+            }
         }
         refs.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
-        Ok((refs.into_iter().cloned().collect(), false))
+        Ok((refs.into_iter().cloned().collect(), false, scanned))
     }
 
     async fn count_retained(&self) -> Result<usize> {
@@ -648,24 +650,39 @@ mod tests {
         let f_all = TopicFilter::new("#").unwrap();
         let matched = store.find_matching(&f_all).await.unwrap();
         assert_eq!(matched.len(), 3);
-        let (zero, trunc0) = store
-            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 0)
+        let (zero, trunc0, scan0) = store
+            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 0, 10)
             .await
             .unwrap();
         assert!(zero.is_empty());
         assert!(trunc0);
-        let (over, trunc1) = store
-            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 1)
+        assert_eq!(scan0, 1);
+        let (over, trunc1, scan1) = store
+            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 1, 10)
             .await
             .unwrap();
         assert!(over.is_empty());
         assert!(trunc1);
-        let (exact, trunc3) = store
-            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 3)
+        assert_eq!(scan1, 2);
+        let (miss, trunc_miss, scan_miss) = store
+            .find_matching_in_tenant_bounded(
+                &TopicFilter::new("nonexistent/+").unwrap(),
+                DEFAULT_TENANT_ID,
+                10,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(miss.is_empty());
+        assert!(trunc_miss);
+        assert_eq!(scan_miss, 2);
+        let (exact, trunc3, scan3) = store
+            .find_matching_in_tenant_bounded(&f_all, DEFAULT_TENANT_ID, 3, 10)
             .await
             .unwrap();
         assert_eq!(exact.len(), 3);
         assert!(!trunc3);
+        assert_eq!(scan3, 3);
 
         // No match.
         let matched = store

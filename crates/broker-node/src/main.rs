@@ -4240,6 +4240,10 @@ struct Shared {
     retained: Arc<dyn RetainedStore>,
     /// Retained writer shared by the ingress pipeline and the rule sink.
     retain_writer: RetainWriter,
+    /// Coordinates `PUBLISH(retain=true)` (`write`) with `SUBSCRIBE` retained
+    /// snapshot + atomic route commit (`read`) so no retained update falls
+    /// between snapshot and route installation without staging uncommitted routes.
+    retained_subscribe_gate: Arc<tokio::sync::RwLock<()>>,
     /// Retained-delivery settings for W1-28: shared with the management
     /// API so kernel ingress and management publishes enforce the same
     /// configurable limits. One Arc clone at boot; reads take a short
@@ -4746,6 +4750,7 @@ impl Shared {
             sink,
             retained,
             retain_writer,
+            retained_subscribe_gate: Arc::new(tokio::sync::RwLock::new(())),
             retainer_config,
             auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
             bans: Arc::new(broker_api::v5::banned::BanStore::new()),
@@ -6437,6 +6442,7 @@ async fn apply_subscribe(
         .saturating_mul(4)
         .max(1024)
         .min(broker_session::DEFAULT_MAX_OFFLINE_QUEUE.saturating_mul(2));
+    let mut remaining_scan_budget = remaining_lookup_budget.saturating_mul(4);
     let expected_conn_id = owner.as_ref().and_then(|bound| {
         if conn_was_bound {
             Some(frame.header.conn_id)
@@ -6725,8 +6731,6 @@ async fn apply_subscribe(
         // Quota Exceeded; a version-4 client gets 0x80. The denial
         // registers nothing (no session mirror, no grant, no announce,
         // no retained replay).
-        let sub_group = group;
-        let sub_tenant: std::sync::Arc<str> = tenant.clone().into();
         let mut sub = Subscription::with_options(
             client_id.clone(),
             frame.header.conn_id,
@@ -6736,96 +6740,70 @@ async fn apply_subscribe(
             rh,
             sub_id,
         );
-        sub.group = sub_group.clone();
-        sub.tenant = sub_tenant.clone();
-        let _route_guard = shared.sessions.lock_route_guard();
-        if let Some(bound) = owner.as_ref() {
-            let still_bound = if conn_was_bound {
-                shared
-                    .sessions
-                    .session_for_conn(frame.header.conn_id)
-                    .is_some_and(|cur| cur.id == bound.id)
-            } else {
-                let cur_conn = *bound.conn_id.read();
-                cur_conn == Some(frame.header.conn_id)
-                    || (cur_conn.is_none() && bound.ended_at_ms.read().is_none())
-            };
-            if !still_bound {
-                codes.push(if entry.has_options {
-                    V5_SUBACK_NOT_AUTHORIZED
+        sub.group = group;
+        sub.tenant = tenant.clone().into();
+        {
+            let _route_guard = shared.sessions.lock_route_guard();
+            if let Some(bound) = owner.as_ref() {
+                let still_bound = if conn_was_bound {
+                    shared
+                        .sessions
+                        .session_for_conn(frame.header.conn_id)
+                        .is_some_and(|cur| cur.id == bound.id)
                 } else {
-                    V5_SUBACK_UNSPECIFIED
-                });
-                authz_disconnect = true;
-                continue;
+                    let cur_conn = *bound.conn_id.read();
+                    cur_conn == Some(frame.header.conn_id)
+                        || (cur_conn.is_none() && bound.ended_at_ms.read().is_none())
+                };
+                if !still_bound {
+                    codes.push(if entry.has_options {
+                        V5_SUBACK_NOT_AUTHORIZED
+                    } else {
+                        V5_SUBACK_UNSPECIFIED
+                    });
+                    authz_disconnect = true;
+                    continue;
+                }
             }
-        }
-        let prev_sub_opts = owner
-            .as_ref()
-            .and_then(|session| session.subscriptions.read().get(&filter).cloned());
-        let stored = shared.router.subscribe(&filter, sub);
-        if !stored {
-            codes.push(if entry.has_options {
-                V5_SUBACK_QUOTA_EXCEEDED
-            } else {
-                V5_SUBACK_UNSPECIFIED
-            });
-            continue;
         }
         let send_retained = match rh {
             1 => !existed,
             2 => false,
             _ => true,
         };
-        if shared
-            .engine
-            .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
-            && is_default_tenant(&tenant)
-        {
-            if let Some(session) = owner.as_ref() {
-                let username = session.username.read().clone();
-                let peerhost = session.peerhost.read().clone();
-                shared.engine.fire_client_check_authz_complete(
-                    broker_rules::ClientCheckAuthzCompleteEvent {
-                        client_id: client_id.clone(),
-                        username,
-                        peerhost,
-                        action: "subscribe".to_string(),
-                        topic: filter.as_str().to_string(),
-                        qos: qos_raw,
-                        retain: None,
-                        allow: true,
-                        source: "local".to_string(),
-                    },
-                );
-            }
-        }
-        drop(_route_guard);
+        let _retained_sub_gate = if send_retained {
+            Some(shared.retained_subscribe_gate.read().await)
+        } else {
+            None
+        };
+        let mut filter_retained = Vec::new();
+        let mut deferred_retained = Vec::new();
+        let mut quota_exceeded = false;
+        let mut superseded_during_retained = false;
         if send_retained {
             let subscriber_tenant = owner
                 .as_ref()
                 .map(|s| s.tenant_id.read().clone())
                 .unwrap_or_else(|| tenant.clone());
-            let (matched, truncated) = match shared
+            let (matched, truncated, scanned) = match shared
                 .retained
                 .find_matching_in_tenant_bounded(
                     &filter,
                     &subscriber_tenant,
                     remaining_lookup_budget,
+                    remaining_scan_budget,
                 )
                 .await
             {
                 Ok(res) => res,
                 Err(e) => {
                     warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
-                    (Vec::new(), false)
+                    (Vec::new(), false, 0)
                 }
             };
+            remaining_scan_budget = remaining_scan_budget.saturating_sub(scanned);
             remaining_lookup_budget = remaining_lookup_budget.saturating_sub(matched.len());
-            let mut filter_retained = Vec::new();
-            let mut deferred_retained = Vec::new();
-            let mut quota_exceeded = truncated;
-            let mut superseded_during_retained = false;
+            quota_exceeded = truncated;
             let mut matched_iter = matched.into_iter();
             while let Some(msg) = matched_iter.next() {
                 if quota_exceeded {
@@ -6987,92 +6965,28 @@ async fn apply_subscribe(
                     }
                 }
             }
-            if !superseded_during_retained && !quota_exceeded && !deferred_retained.is_empty() {
-                if let Some(session) = owner.as_ref() {
-                    let _rg = shared.sessions.lock_route_guard();
-                    let still_owner = if conn_was_bound {
-                        shared
-                            .sessions
-                            .session_for_conn(frame.header.conn_id)
-                            .is_some_and(|cur| cur.id == session.id)
-                    } else {
-                        true
-                    };
-                    if !still_owner {
-                        superseded_during_retained = true;
-                    } else {
-                        match session.try_defer_retained_all_or_none_for_conn(
-                            expected_conn_id,
-                            max_deferred_msgs,
-                            deferred_retained,
-                        ) {
-                            broker_session::DeferRetainedOutcome::Admitted => {}
-                            broker_session::DeferRetainedOutcome::QuotaExceeded => {
-                                quota_exceeded = true;
-                            }
-                            broker_session::DeferRetainedOutcome::Superseded => {
-                                superseded_during_retained = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if superseded_during_retained || quota_exceeded {
-                rollback_unsent_retained_credits(shared, frame.header.conn_id, &filter_retained);
-                let _rg = shared.sessions.lock_route_guard();
-                let still_owner = owner.as_ref().is_none_or(|bound| {
-                    if conn_was_bound {
-                        shared
-                            .sessions
-                            .session_for_conn(frame.header.conn_id)
-                            .is_some_and(|cur| {
-                                cur.id == bound.id
-                                    && expected_conn_id
-                                        .is_none_or(|cid| *cur.conn_id.read() == Some(cid))
-                            })
-                    } else {
-                        expected_conn_id.is_none_or(|cid| *bound.conn_id.read() == Some(cid))
-                    }
-                });
-                if still_owner {
-                    if let Some(prev) = prev_sub_opts {
-                        let mut restored = Subscription::with_options(
-                            client_id.clone(),
-                            frame.header.conn_id,
-                            prev.qos,
-                            prev.nl != 0,
-                            prev.rap != 0,
-                            prev.rh,
-                            0,
-                        );
-                        restored.group = sub_group;
-                        restored.tenant = sub_tenant;
-                        let _ = shared.router.subscribe(&filter, restored);
-                    } else if !existed {
-                        shared
-                            .router
-                            .unsubscribe_in_tenant(&filter, &client_id, &tenant);
-                    }
-                }
-                if superseded_during_retained || !still_owner {
-                    codes.push(if entry.has_options {
-                        V5_SUBACK_NOT_AUTHORIZED
-                    } else {
-                        V5_SUBACK_UNSPECIFIED
-                    });
-                    authz_disconnect = true;
-                } else {
-                    shared.metrics.inc_messages_dropped();
-                    codes.push(if entry.has_options {
-                        V5_SUBACK_QUOTA_EXCEEDED
-                    } else {
-                        V5_SUBACK_UNSPECIFIED
-                    });
-                }
-                continue;
-            }
-            retained.extend(filter_retained);
         }
+        if superseded_during_retained || quota_exceeded {
+            rollback_unsent_retained_credits(shared, frame.header.conn_id, &filter_retained);
+            if superseded_during_retained {
+                codes.push(if entry.has_options {
+                    V5_SUBACK_NOT_AUTHORIZED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+                authz_disconnect = true;
+            } else {
+                shared.metrics.inc_messages_dropped();
+                codes.push(if entry.has_options {
+                    V5_SUBACK_QUOTA_EXCEEDED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+            }
+            continue;
+        }
+        let mut commit_failed_quota = false;
+        let mut commit_superseded = false;
         {
             let _rg = shared.sessions.lock_route_guard();
             let still_owner = owner.as_ref().is_none_or(|bound| {
@@ -7090,37 +7004,98 @@ async fn apply_subscribe(
                 }
             });
             if !still_owner {
+                commit_superseded = true;
+            } else {
+                if !deferred_retained.is_empty() {
+                    if let Some(session) = owner.as_ref() {
+                        match session.try_defer_retained_all_or_none_for_conn(
+                            expected_conn_id,
+                            max_deferred_msgs,
+                            deferred_retained,
+                        ) {
+                            broker_session::DeferRetainedOutcome::Admitted => {}
+                            broker_session::DeferRetainedOutcome::QuotaExceeded => {
+                                commit_failed_quota = true;
+                            }
+                            broker_session::DeferRetainedOutcome::Superseded => {
+                                commit_superseded = true;
+                            }
+                        }
+                    }
+                }
+                if !commit_superseded && !commit_failed_quota {
+                    if !shared.router.subscribe(&filter, sub) {
+                        commit_failed_quota = true;
+                    } else {
+                        if cached_subscribe.is_none() {
+                            if let Some(session) = owner.as_ref() {
+                                record_authz_under_policy(
+                                    shared,
+                                    session,
+                                    "subscribe",
+                                    filter.as_str(),
+                                    qos_raw,
+                                    false,
+                                    true,
+                                );
+                            }
+                        }
+                        shared.sessions.add_subscription_if_session_in_tenant(
+                            &tenant,
+                            &client_id,
+                            owner.as_ref().map(|s| s.id),
+                            filter.clone(),
+                            qos,
+                            u8::from(no_local),
+                            u8::from(rap),
+                            rh,
+                        );
+                    }
+                }
+            }
+        }
+        drop(_retained_sub_gate);
+        if commit_superseded || commit_failed_quota {
+            rollback_unsent_retained_credits(shared, frame.header.conn_id, &filter_retained);
+            if commit_superseded {
                 codes.push(if entry.has_options {
                     V5_SUBACK_NOT_AUTHORIZED
                 } else {
                     V5_SUBACK_UNSPECIFIED
                 });
                 authz_disconnect = true;
-                continue;
+            } else {
+                shared.metrics.inc_messages_dropped();
+                codes.push(if entry.has_options {
+                    V5_SUBACK_QUOTA_EXCEEDED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
             }
-            if cached_subscribe.is_none() {
-                if let Some(session) = owner.as_ref() {
-                    record_authz_under_policy(
-                        shared,
-                        session,
-                        "subscribe",
-                        filter.as_str(),
-                        qos_raw,
-                        false,
-                        true,
-                    );
-                }
+            continue;
+        }
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
+            && is_default_tenant(&tenant)
+        {
+            if let Some(session) = owner.as_ref() {
+                let username = session.username.read().clone();
+                let peerhost = session.peerhost.read().clone();
+                shared.engine.fire_client_check_authz_complete(
+                    broker_rules::ClientCheckAuthzCompleteEvent {
+                        client_id: client_id.clone(),
+                        username,
+                        peerhost,
+                        action: "subscribe".to_string(),
+                        topic: filter.as_str().to_string(),
+                        qos: qos_raw,
+                        retain: None,
+                        allow: true,
+                        source: "local".to_string(),
+                    },
+                );
             }
-            shared.sessions.add_subscription_if_session_in_tenant(
-                &tenant,
-                &client_id,
-                owner.as_ref().map(|s| s.id),
-                filter.clone(),
-                qos,
-                u8::from(no_local),
-                u8::from(rap),
-                rh,
-            );
         }
         if shared
             .engine
@@ -7144,6 +7119,7 @@ async fn apply_subscribe(
                     });
             }
         }
+        retained.extend(filter_retained);
         granted_filters.push(filter);
         codes.push(qos_raw);
     }
@@ -8910,12 +8886,16 @@ async fn ingress_pipeline_with_publisher_and_props(
     // tenant: retained state never crosses tenants.
     // The writer holds the retained store and the limits it needs, so a
     // rule republish with the retain flag takes the same path.
-    if retain {
+    let _retained_pub_gate = if retain {
+        let gate = shared.retained_subscribe_gate.write().await;
         shared
             .retain_writer
             .apply(topic, qos, payload, publisher_tenant)
             .await;
-    }
+        Some(gate)
+    } else {
+        None
+    };
 
     // Rules execute at ingress on this node, before local fan-out.
     // Republished output re-enters through the sink only, so rules can
@@ -15670,11 +15650,11 @@ mod tests {
         sess.set_client_receive_maximum(1);
         let filter = TopicFilter::new("resub/+").unwrap();
 
-        // Initial SUBSCRIBE at QoS 1 with rh=1 succeeds.
+        // Initial SUBSCRIBE at QoS 1 with rh=1 and sub_id=77 succeeds.
         let sub1 = subscribe_frame(
             115,
             1,
-            encode_subscribe_meta_v5(1, "resub-0x97", &[("resub/+", 1 | (1 << 4), 0)]),
+            encode_subscribe_meta_v5(1, "resub-0x97", &[("resub/+", 1 | (1 << 4), 77)]),
         );
         let (reply1, _) = apply_subscribe(&sub1, &shared).await;
         assert_eq!(reply1.unwrap().metadata.last().copied(), Some(1));
@@ -15722,7 +15702,9 @@ mod tests {
         assert_eq!(opts.rh, 1);
         let matches = shared.router.matches(&Topic::new("resub/1").unwrap());
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches.iter().next().unwrap().qos, QoS::AtLeastOnce);
+        let kept = matches.iter().next().unwrap();
+        assert_eq!(kept.qos, QoS::AtLeastOnce);
+        assert_eq!(kept.subscription_id, 77);
     }
 
     #[tokio::test]
