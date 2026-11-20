@@ -48,11 +48,13 @@ mosquitto_pub -h localhost -t docs/in -m '{"device":"heater-1","temp":90}'
 
 The subscriber prints `{"device":"heater-1","temp":90}` and exits. Open the [local dashboard](http://localhost:18083/dashboard) to inspect the broker. Run `docker compose down` when finished. [Tested rule example](docs/rules/actions.md#tested-example) · [Compose guide](deploy/compose/README.md)
 
-## Broker comparison at 1 CPU and 1 GB
+## Performance
 
-On October 5, 2026, IndraMQTT sustained an offered load of **100,000 MQTT 5 messages/s** for 180 seconds in a point-to-point QoS 0 run. Subscribers received all 18 million 256-byte messages. The broker had one CPU and 1 GiB of memory. The run used plaintext MQTT on a shared host and measured routing with rules and connectors idle.
+On November 14, 2026, a single IndraMQTT node delivered **48,700 messages/s with a SQL republish rule active** (median of five 120-second runs, zero observed loss). The broker had four pinned CPUs and an 8 GiB memory limit. Each of 1,000 subscribers received its publisher’s MQTT 3.1.1 messages. The rule also republished every reading to a topic with no subscriber.
 
-The comparison includes EMQX Enterprise 6.3.0 and rumqttd 0.19.0. In MQTT 5 fan-in, rumqttd sustained 80,000 messages/s and IndraMQTT sustained 40,000. The measured IndraMQTT image still included an idle Erlang edge process, so its memory figures describe that earlier build. [Method, settings, and results](benchmark/README.md) · [Raw MQTT 5 data](benchmark/results/mqtt5-three-brokers.jsonl) · [Router and SQL microbenchmarks](BENCHMARKS.md)
+In a separate MQTT 5 test with 256-byte payloads, IndraMQTT delivered **79,353 messages/s at QoS 1**, compared with **24,947** for EMQX Enterprise 6.3.0 at its default settings. At QoS 0, IndraMQTT delivered **184,829 messages/s** at 200,000 offered. The publisher generator saturated at that step. Each comparison step ran once over plaintext loopback. With 10,000 idle clients connected for 30 seconds, broker memory was **186.3 MiB** for IndraMQTT and **842.3 MiB** for EMQX.
+
+[November measurements and test conditions](benchmark/2026-11-14.md) · [October one-CPU comparison, including rumqttd](benchmark/README.md) · [Router and SQL microbenchmarks](BENCHMARKS.md)
 
 ## What you can evaluate
 

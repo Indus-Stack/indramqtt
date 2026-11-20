@@ -1,8 +1,6 @@
 # Broker comparison at 1 CPU and 1 GB
 
-This directory contains the method, the tool and the raw results of the
-broker comparison in the main README. You can do the test again with
-the tool in this directory.
+This page documents the October 5, 2026 comparison at one CPU. The harness and raw results are included below. For the subsequent four-CPU measurements, including a SQL republish workload, see the [November 14 benchmark summary](2026-11-14.md).
 
 - Date of the runs: 2026-10-05.
 - Tool: [`sustained_load.py`](sustained_load.py).
