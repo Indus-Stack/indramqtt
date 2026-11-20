@@ -3291,7 +3291,6 @@ impl SessionManager {
     /// Mirror a granted subscription only if `(tenant, client_id)` still
     /// resolves to `expected_session_id` (when `Some`), preventing a stale
     /// `SUBSCRIBE` from mutating a replacement session.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_subscription_if_session_in_tenant(
         &self,
         tenant: &str,
