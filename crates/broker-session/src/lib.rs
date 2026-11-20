@@ -133,6 +133,9 @@ pub struct Session {
     /// Retransmissions deferred by Receive Maximum on the current connection,
     /// drained ahead of fresh `offline_queue` entries as ACKs arrive.
     pending_replays: RwLock<VecDeque<PendingReplay>>,
+    /// Retained PUBLISH matches deferred during `SUBSCRIBE` on the current
+    /// connection, drained after `pending_replays` and before `offline_queue`.
+    pending_retained: RwLock<VecDeque<PendingRetained>>,
     /// Serializes MQTT 5 connection-scoped send-window checks and tracking
     /// reservations across live delivery and replay.
     send_quota_lock: parking_lot::Mutex<()>,
@@ -649,6 +652,18 @@ pub enum PendingReplayItem {
     Qos2(Qos2OutboundEntry),
 }
 
+/// One retained PUBLISH match deferred because the connection's MQTT 5 Receive
+/// Maximum (or tracking capacity) was exhausted during `SUBSCRIBE`. Stored
+/// per-connection in memory so it never mutates or evicts the durable offline
+/// queue and preserves the subscription identifier until sent.
+#[derive(Debug, Clone)]
+pub struct PendingRetained {
+    pub topic: Topic,
+    pub qos: QoS,
+    pub payload: Bytes,
+    pub sub_id: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Qos2OutboundEntry {
     pub packet_id: u16,
@@ -788,6 +803,7 @@ impl Session {
             offline_persist: std::sync::Mutex::new(()),
             replay_lock: parking_lot::Mutex::new(()),
             pending_replays: RwLock::new(VecDeque::new()),
+            pending_retained: RwLock::new(VecDeque::new()),
             send_quota_lock: parking_lot::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
@@ -1866,7 +1882,40 @@ impl Session {
     /// True when this session has either deferred retransmissions or queued
     /// offline messages waiting for send-window capacity.
     pub fn has_pending_replay_or_offline(&self) -> bool {
-        !self.pending_replays.read().is_empty() || !self.offline_queue.read().is_empty()
+        !self.pending_replays.read().is_empty()
+            || !self.pending_retained.read().is_empty()
+            || !self.offline_queue.read().is_empty()
+    }
+
+    pub fn pending_retained_len(&self) -> usize {
+        self.pending_retained.read().len()
+    }
+
+    /// Enqueue deferred retained matches for the current connection only,
+    /// serialized with `send_quota_lock`. Returns `false` (without enqueueing)
+    /// if `expected_conn_id` no longer owns this session.
+    pub fn defer_retained_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        items: Vec<PendingRetained>,
+    ) -> bool {
+        if items.is_empty() {
+            return true;
+        }
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return false;
+        }
+        self.pending_retained.write().extend(items);
+        true
+    }
+
+    pub fn pop_next_pending_retained(&self) -> Option<PendingRetained> {
+        self.pending_retained.write().pop_front()
+    }
+
+    pub fn push_front_pending_retained(&self, item: PendingRetained) {
+        self.pending_retained.write().push_front(item);
     }
 
     /// Seed `pending_replays` at the start of a connection's replay from the
@@ -1901,6 +1950,7 @@ impl Session {
             }
         }
         *self.pending_replays.write() = pending;
+        self.pending_retained.write().clear();
         pubrels
     }
 
