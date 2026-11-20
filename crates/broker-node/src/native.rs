@@ -1749,6 +1749,29 @@ struct PublishOutMeta<'a> {
 /// Decodes `TopicLen:16 | Topic | PacketId:16 | QoS | Retain | Dup`,
 /// then optionally `Alias:16`, then optionally `SubId:32`, then
 /// optionally `Format | Expiry:32 | UserCount:16 | pairs`.
+pub(crate) fn encoded_publish_out_len(frame: &BrokerFrame, level: u8) -> Option<usize> {
+    let publish = decode_publish_out(&frame.metadata)?;
+    let mut out = Vec::new();
+    wire::encode_publish(
+        &PublishOut {
+            dup: publish.dup,
+            qos: publish.qos,
+            retain: publish.retain,
+            topic: publish.topic,
+            packet_id: publish.packet_id,
+            alias: publish.alias,
+            subscription_id: publish.subscription_id,
+            payload_format: publish.payload_format,
+            message_expiry: publish.message_expiry,
+            user_properties: &publish.users,
+            payload: &frame.payload,
+        },
+        level,
+        &mut out,
+    );
+    Some(out.len())
+}
+
 fn decode_publish_out(meta: &[u8]) -> Option<PublishOutMeta<'_>> {
     if meta.len() < 7 {
         return None;

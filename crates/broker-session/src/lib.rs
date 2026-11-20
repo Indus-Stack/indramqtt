@@ -135,7 +135,7 @@ pub struct Session {
     pending_replays: RwLock<VecDeque<PendingReplay>>,
     /// Retained PUBLISH matches deferred during `SUBSCRIBE` on the current
     /// connection, drained after `pending_replays` and before `offline_queue`.
-    pending_retained: RwLock<VecDeque<PendingRetained>>,
+    pending_retained: RwLock<PendingRetainedQueue>,
     /// Serializes MQTT 5 connection-scoped send-window checks and tracking
     /// reservations across live delivery and replay.
     send_quota_lock: parking_lot::Mutex<()>,
@@ -664,6 +664,17 @@ pub struct PendingRetained {
     pub sub_id: u32,
 }
 
+/// Hard upper bound on deferred per-connection retained payload bytes so a
+/// client with a full send window cannot exhaust broker memory via repeated
+/// SUBSCRIBEs.
+const MAX_PENDING_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct PendingRetainedQueue {
+    items: VecDeque<PendingRetained>,
+    bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Qos2OutboundEntry {
     pub packet_id: u16,
@@ -803,7 +814,7 @@ impl Session {
             offline_persist: std::sync::Mutex::new(()),
             replay_lock: parking_lot::Mutex::new(()),
             pending_replays: RwLock::new(VecDeque::new()),
-            pending_retained: RwLock::new(VecDeque::new()),
+            pending_retained: RwLock::new(PendingRetainedQueue::default()),
             send_quota_lock: parking_lot::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
@@ -1883,39 +1894,62 @@ impl Session {
     /// offline messages waiting for send-window capacity.
     pub fn has_pending_replay_or_offline(&self) -> bool {
         !self.pending_replays.read().is_empty()
-            || !self.pending_retained.read().is_empty()
+            || !self.pending_retained.read().items.is_empty()
             || !self.offline_queue.read().is_empty()
     }
 
     pub fn pending_retained_len(&self) -> usize {
-        self.pending_retained.read().len()
+        self.pending_retained.read().items.len()
     }
 
     /// Enqueue deferred retained matches for the current connection only,
-    /// serialized with `send_quota_lock`. Returns `false` (without enqueueing)
-    /// if `expected_conn_id` no longer owns this session.
+    /// serialized with `send_quota_lock` and bounded by both
+    /// `offline_queue_limit()` and `MAX_PENDING_RETAINED_BYTES`. Returns
+    /// `Some(dropped)` when `expected_conn_id` owns the session (`dropped` is
+    /// the count rejected once full), or `None` if superseded.
     pub fn defer_retained_for_conn(
         &self,
         expected_conn_id: Option<u64>,
+        max_msgs: usize,
         items: Vec<PendingRetained>,
-    ) -> bool {
+    ) -> Option<usize> {
         if items.is_empty() {
-            return true;
+            return Some(0);
         }
         let _quota = self.send_quota_lock.lock();
         if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
-            return false;
+            return None;
         }
-        self.pending_retained.write().extend(items);
-        true
+        let max_msgs = max_msgs.max(1);
+        let mut queue = self.pending_retained.write();
+        let mut dropped = 0usize;
+        for item in items {
+            let item_bytes = item.topic.as_str().len().saturating_add(item.payload.len());
+            let fits_msgs = queue.items.len() < max_msgs;
+            let fits_bytes = queue.bytes.saturating_add(item_bytes) <= MAX_PENDING_RETAINED_BYTES;
+            if fits_msgs && fits_bytes {
+                queue.bytes = queue.bytes.saturating_add(item_bytes);
+                queue.items.push_back(item);
+            } else {
+                dropped += 1;
+            }
+        }
+        Some(dropped)
     }
 
     pub fn pop_next_pending_retained(&self) -> Option<PendingRetained> {
-        self.pending_retained.write().pop_front()
+        let mut queue = self.pending_retained.write();
+        let item = queue.items.pop_front()?;
+        let item_bytes = item.topic.as_str().len().saturating_add(item.payload.len());
+        queue.bytes = queue.bytes.saturating_sub(item_bytes);
+        Some(item)
     }
 
     pub fn push_front_pending_retained(&self, item: PendingRetained) {
-        self.pending_retained.write().push_front(item);
+        let mut queue = self.pending_retained.write();
+        let item_bytes = item.topic.as_str().len().saturating_add(item.payload.len());
+        queue.bytes = queue.bytes.saturating_add(item_bytes);
+        queue.items.push_front(item);
     }
 
     /// Seed `pending_replays` at the start of a connection's replay from the
@@ -1950,7 +1984,6 @@ impl Session {
             }
         }
         *self.pending_replays.write() = pending;
-        self.pending_retained.write().clear();
         pubrels
     }
 

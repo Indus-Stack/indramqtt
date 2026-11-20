@@ -697,6 +697,17 @@ fn bind_looks_v5(meta: &[u8]) -> bool {
 /// [`broker_session::V5_EGRESS_OVERHEAD_BYTES`] estimate. Both reads
 /// are relaxed atomic loads; uncapped sessions (defaults) return
 /// after two loads with no lock.
+fn v5_encoded_packet_too_large(session: &broker_session::Session, frame: &BrokerFrame) -> bool {
+    if session.protocol_version() != 5 {
+        return false;
+    }
+    let cap = session.client_max_packet_size();
+    if cap == 0 {
+        return false;
+    }
+    native::encoded_publish_out_len(frame, 5).is_some_and(|len| len > cap as usize)
+}
+
 fn v5_packet_size_refused(
     session: &broker_session::Session,
     topic_len: usize,
@@ -7047,6 +7058,20 @@ async fn apply_subscribe(
                 grant.sub_id,
                 msg.payload.clone(),
             ) {
+                if session
+                    .as_ref()
+                    .is_some_and(|s| v5_encoded_packet_too_large(s, &routed))
+                {
+                    shared.metrics.inc_messages_dropped();
+                    if let Some(session) = &session {
+                        if effective == 1 {
+                            let _ = session.ack_inflight(downlink_id);
+                        } else if effective == 2 {
+                            let _ = session.ack_qos2_pubcomp(downlink_id);
+                        }
+                    }
+                    continue;
+                }
                 retained.push(routed);
             } else if let Some(session) = &session {
                 if effective == 1 {
@@ -7068,7 +7093,19 @@ async fn apply_subscribe(
                     true
                 };
                 if still_owner {
-                    let _ = session.defer_retained_for_conn(expected_conn_id, deferred_retained);
+                    let max_msgs = shared
+                        .sessions
+                        .max_offline_queue()
+                        .unwrap_or(broker_session::DEFAULT_MAX_OFFLINE_QUEUE);
+                    if let Some(dropped) = session.defer_retained_for_conn(
+                        expected_conn_id,
+                        max_msgs,
+                        deferred_retained,
+                    ) {
+                        for _ in 0..dropped {
+                            shared.metrics.inc_messages_dropped();
+                        }
+                    }
                 }
             }
         }
@@ -7428,6 +7465,15 @@ fn resume_pending_retained_locked(
             }
             continue;
         };
+        if v5_encoded_packet_too_large(session, &routed) {
+            shared.metrics.inc_messages_dropped();
+            if effective == 1 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if effective == 2 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
+            continue;
+        }
         let len = routed.total_frame_len() as u64;
         if shared.conns.route(conn_id, routed) {
             if tracked_qos1_spilled {
@@ -7550,6 +7596,15 @@ fn replay_queued_offline_locked(
                 continue;
             }
         };
+        if v5_encoded_packet_too_large(session, &routed) {
+            shared.metrics.inc_messages_dropped();
+            if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
+            continue;
+        }
         let len = routed.total_frame_len() as u64;
         if shared.conns.route(conn_id, routed) {
             if tracked_qos1_spilled {
@@ -15030,23 +15085,27 @@ mod tests {
         sess.set_protocol_version(5);
         sess.set_client_receive_maximum(1);
         sess.set_client_max_packet_size(64);
-        assert!(sess.defer_retained_for_conn(
-            Some(109),
-            vec![
-                broker_session::PendingRetained {
-                    topic: Topic::new("rp/big").unwrap(),
-                    qos: QoS::AtLeastOnce,
-                    payload: Bytes::from(vec![b'x'; 128]),
-                    sub_id: 7,
-                },
-                broker_session::PendingRetained {
-                    topic: Topic::new("rp/ok").unwrap(),
-                    qos: QoS::AtLeastOnce,
-                    payload: Bytes::from_static(b"ok"),
-                    sub_id: 7,
-                },
-            ],
-        ));
+        assert_eq!(
+            sess.defer_retained_for_conn(
+                Some(109),
+                100,
+                vec![
+                    broker_session::PendingRetained {
+                        topic: Topic::new("rp/big").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from(vec![b'x'; 128]),
+                        sub_id: 7,
+                    },
+                    broker_session::PendingRetained {
+                        topic: Topic::new("rp/ok").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from_static(b"ok"),
+                        sub_id: 7,
+                    },
+                ],
+            ),
+            Some(0)
+        );
         let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(109, tx);
         let _guard = sess.lock_replay();
@@ -15114,17 +15173,207 @@ mod tests {
                 std::time::Instant::now(),
             )
             .is_none());
-        assert!(!sess.defer_retained_for_conn(
-            Some(107),
-            vec![broker_session::PendingRetained {
-                topic: Topic::new("ret/sup").unwrap(),
-                qos: QoS::AtLeastOnce,
-                payload: Bytes::from_static(b"stale"),
-                sub_id: 1,
-            }],
-        ));
-        assert_eq!(sess.pending_retained_len(), 0);
+        assert!(sess
+            .defer_retained_for_conn(
+                Some(107),
+                100,
+                vec![broker_session::PendingRetained {
+                    topic: Topic::new("ret/sup").unwrap(),
+                    qos: QoS::AtLeastOnce,
+                    payload: Bytes::from_static(b"stale"),
+                    sub_id: 1,
+                }],
+            )
+            .is_none());
+
+        // Bounded admission: exceeding max_msgs drops excess without
+        // unbounded growth.
+        assert_eq!(
+            sess.defer_retained_for_conn(
+                Some(207),
+                1,
+                vec![
+                    broker_session::PendingRetained {
+                        topic: Topic::new("ret/b1").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from_static(b"1"),
+                        sub_id: 1,
+                    },
+                    broker_session::PendingRetained {
+                        topic: Topic::new("ret/b2").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from_static(b"2"),
+                        sub_id: 1,
+                    },
+                ],
+            ),
+            Some(1)
+        );
+        assert_eq!(sess.pending_retained_len(), 1);
         assert_eq!(sess.offline_len(), 0);
+        assert_eq!(sess.unacked_on_conn_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_retained_survives_same_session_reconnect() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-reconnect",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 110,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("rr/1").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"one"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("rr/2").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"two"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+
+        let sub = subscribe_frame(
+            110,
+            1,
+            encode_subscribe_meta_v5(1, "retained-reconnect", &[("rr/+", 1, 9)]),
+        );
+        let (_, retained) = apply_subscribe(&sub, &shared).await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(sess.pending_retained_len(), 1);
+
+        // Reconnect the same persistent session on conn_id 210.
+        let (resumed, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-reconnect",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 210,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert_eq!(resumed.id, sess.id);
+        assert_eq!(resumed.pending_retained_len(), 1);
+        resumed.set_protocol_version(5);
+        resumed.set_client_receive_maximum(1);
+
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(210, tx);
+        let bind = bind_frame(210, 1, encode_bind_meta("retained-reconnect", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx
+            .try_recv()
+            .expect("first message retransmitted on new conn");
+        assert!(rx.try_recv().is_err());
+
+        let tlen1 = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen1], f1.metadata[2 + tlen1 + 1]]);
+        apply_puback(&puback_frame(210, 2, pid1), &shared);
+
+        let f2 = rx
+            .try_recv()
+            .expect("deferred retained message preserved across reconnect and delivered on PUBACK");
+        assert_ne!(f2.payload, f1.payload);
+        assert_eq!(resumed.pending_retained_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_retained_rejects_exact_encoded_packet_size_over_limit() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-exact-size",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 111,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(2);
+        // Topic "a" (1) + payload "bcd" (3) + 10 estimate = 14, whereas encoded
+        // MQTT 5 QoS 1 PUBLISH with Subscription Identifier = 16 bytes.
+        let sample = encode_retained_publish_out(
+            111,
+            &Topic::new("a").unwrap(),
+            1,
+            1,
+            200_000,
+            Bytes::from_static(b"bcd"),
+        )
+        .unwrap();
+        let encoded_len = native::encoded_publish_out_len(&sample, 5).unwrap();
+        assert!(encoded_len > 14);
+        sess.set_client_max_packet_size((encoded_len - 1) as u32);
+
+        assert_eq!(
+            sess.defer_retained_for_conn(
+                Some(111),
+                100,
+                vec![broker_session::PendingRetained {
+                    topic: Topic::new("a").unwrap(),
+                    qos: QoS::AtLeastOnce,
+                    payload: Bytes::from_static(b"bcd"),
+                    sub_id: 200_000,
+                }],
+            ),
+            Some(0)
+        );
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(111, tx);
+        let _guard = sess.lock_replay();
+        let (sent, _) = resume_pending_retained_locked(&shared, &sess, 111, Some(111));
+        assert_eq!(sent, 0);
+        assert!(rx.try_recv().is_err());
         assert_eq!(sess.unacked_on_conn_len(), 0);
     }
 
