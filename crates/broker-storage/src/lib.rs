@@ -114,6 +114,22 @@ pub trait RetainedStore: Send + Sync {
         filter: &TopicFilter,
         tenant: &str,
     ) -> Result<Vec<StoredMessage>>;
+
+    /// Bounded variant of `find_matching_in_tenant`: returns at most `limit`
+    /// sorted matches plus `truncated = true` when additional matches exist.
+    async fn find_matching_in_tenant_bounded(
+        &self,
+        filter: &TopicFilter,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
+        let mut matched = self.find_matching_in_tenant(filter, tenant).await?;
+        let truncated = matched.len() > limit;
+        if truncated {
+            matched.truncate(limit);
+        }
+        Ok((matched, truncated))
+    }
     /// Total retained entries across all tenants (for the global
     /// `stats.retained` counter). O(1) map length, no scan, no allocation.
     async fn count_retained(&self) -> Result<usize>;
@@ -425,6 +441,28 @@ impl RetainedStore for MemoryStore {
             .collect();
         matched.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
         Ok(matched)
+    }
+
+    async fn find_matching_in_tenant_bounded(
+        &self,
+        filter: &TopicFilter,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
+        let scope = normalize_tenant_key(tenant);
+        let inner = self.retained.read();
+        let mut refs: Vec<&StoredMessage> = inner
+            .map
+            .iter()
+            .filter(|((entry_tenant, _), msg)| {
+                entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic)
+            })
+            .map(|(_, msg)| msg)
+            .collect();
+        let truncated = refs.len() > limit;
+        refs.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
+        let matched = refs.into_iter().take(limit).cloned().collect();
+        Ok((matched, truncated))
     }
 
     async fn count_retained(&self) -> Result<usize> {

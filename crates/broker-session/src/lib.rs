@@ -656,6 +656,13 @@ pub enum PendingReplayItem {
 /// Maximum (or tracking capacity) was exhausted during `SUBSCRIBE`. Stored
 /// per-connection in memory so it never mutates or evicts the durable offline
 /// queue and preserves the subscription identifier until sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferRetainedOutcome {
+    Admitted,
+    QuotaExceeded,
+    Superseded,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingRetained {
     pub topic: Topic,
@@ -1954,6 +1961,37 @@ impl Session {
             }
         }
         Some(dropped)
+    }
+
+    /// Atomically admit all `items` into `pending_retained` for
+    /// `expected_conn_id` or admit none when capacity would be exceeded.
+    pub fn try_defer_retained_all_or_none_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        max_msgs: usize,
+        items: Vec<PendingRetained>,
+    ) -> DeferRetainedOutcome {
+        if items.is_empty() {
+            return DeferRetainedOutcome::Admitted;
+        }
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return DeferRetainedOutcome::Superseded;
+        }
+        let max_msgs = max_msgs.max(1);
+        let extra_bytes: usize = items
+            .iter()
+            .map(|i| i.topic.as_str().len().saturating_add(i.payload.len()))
+            .fold(0usize, |acc, b| acc.saturating_add(b));
+        let mut queue = self.pending_retained.write();
+        if queue.items.len().saturating_add(items.len()) > max_msgs
+            || queue.bytes.saturating_add(extra_bytes) > MAX_PENDING_RETAINED_BYTES
+        {
+            return DeferRetainedOutcome::QuotaExceeded;
+        }
+        queue.bytes = queue.bytes.saturating_add(extra_bytes);
+        queue.items.extend(items);
+        DeferRetainedOutcome::Admitted
     }
 
     pub fn pop_next_pending_retained(&self) -> Option<PendingRetained> {

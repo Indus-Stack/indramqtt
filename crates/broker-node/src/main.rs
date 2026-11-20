@@ -6381,14 +6381,8 @@ async fn apply_subscribe(
     let mut codes = Vec::with_capacity(subs.len());
     // Each granted filter, with its retain-handling decision and the
     // subscription identifier that the retained replay carries.
-    struct GrantedSub {
-        filter: TopicFilter,
-        qos: u8,
-        sub_id: u32,
-        send_retained: bool,
-        prefetched_retained: Vec<broker_storage::StoredMessage>,
-    }
-    let mut granted: Vec<GrantedSub> = Vec::with_capacity(subs.len());
+    let mut retained = Vec::new();
+    let mut granted_filters: Vec<TopicFilter> = Vec::with_capacity(subs.len());
     // AP-11: a denied subscribe disconnects when the stored `deny_action`
     // is `disconnect`. The flag accumulates across filters; the close is
     // ordered once below after the SubAck is built, so every filter still
@@ -6423,6 +6417,33 @@ async fn apply_subscribe(
     };
     #[cfg(not(test))]
     let (superseded_conn, owner) = (conn_session.is_none(), conn_session);
+    let max_deferred_msgs = shared
+        .sessions
+        .max_offline_queue()
+        .unwrap_or(broker_session::DEFAULT_MAX_OFFLINE_QUEUE)
+        .max(1);
+    let initial_credits = owner
+        .as_ref()
+        .map(|s| {
+            if s.protocol_version() == 5 {
+                usize::from(s.client_receive_maximum().max(1))
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    let mut remaining_lookup_budget = max_deferred_msgs
+        .saturating_add(initial_credits)
+        .saturating_mul(4)
+        .max(1024)
+        .min(broker_session::DEFAULT_MAX_OFFLINE_QUEUE.saturating_mul(2));
+    let expected_conn_id = owner.as_ref().and_then(|bound| {
+        if conn_was_bound {
+            Some(frame.header.conn_id)
+        } else {
+            (*bound.conn_id.read()).map(|_| frame.header.conn_id)
+        }
+    });
     for entry in subs {
         if superseded_conn {
             codes.push(if entry.has_options {
@@ -6715,29 +6736,6 @@ async fn apply_subscribe(
         );
         sub.group = group;
         sub.tenant = tenant.clone().into();
-        let existed_pre = owner
-            .as_ref()
-            .is_some_and(|session| session.subscriptions.read().contains_key(&filter));
-        let wants_retained = match rh {
-            1 => !existed_pre,
-            2 => false,
-            _ => true,
-        };
-        let prefetched_retained = if wants_retained && owner.is_some() {
-            match shared
-                .retained
-                .find_matching_in_tenant(&filter, &tenant)
-                .await
-            {
-                Ok(matched) => matched,
-                Err(e) => {
-                    warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
         let _route_guard = shared.sessions.lock_route_guard();
         if let Some(bound) = owner.as_ref() {
             let still_bound = if conn_was_bound {
@@ -6758,45 +6756,6 @@ async fn apply_subscribe(
                 });
                 authz_disconnect = true;
                 continue;
-            }
-        }
-        if wants_retained && !prefetched_retained.is_empty() {
-            if let Some(bound) = owner.as_ref() {
-                let available_credits = if bound.protocol_version() == 5 {
-                    usize::from(bound.client_receive_maximum().max(1))
-                        .saturating_sub(bound.unacked_on_conn_len())
-                } else {
-                    usize::MAX
-                };
-                let mut remaining_credits = available_credits;
-                let mut overflow_count = 0usize;
-                let mut overflow_bytes = 0usize;
-                for msg in &prefetched_retained {
-                    let eff = std::cmp::min(qos_raw, u8::from(msg.qos));
-                    if overflow_count == 0 && (eff == 0 || remaining_credits > 0) {
-                        if eff != 0 {
-                            remaining_credits -= 1;
-                        }
-                    } else {
-                        overflow_count += 1;
-                        overflow_bytes = overflow_bytes
-                            .saturating_add(msg.topic.as_str().len())
-                            .saturating_add(msg.payload.len());
-                    }
-                }
-                let max_msgs = shared
-                    .sessions
-                    .max_offline_queue()
-                    .unwrap_or(broker_session::DEFAULT_MAX_OFFLINE_QUEUE);
-                if !bound.pending_retained_can_fit(max_msgs, overflow_count, overflow_bytes) {
-                    shared.metrics.inc_messages_dropped();
-                    codes.push(if entry.has_options {
-                        V5_SUBACK_QUOTA_EXCEEDED
-                    } else {
-                        V5_SUBACK_UNSPECIFIED
-                    });
-                    continue;
-                }
             }
         }
         let stored = shared.router.subscribe(&filter, sub);
@@ -6901,16 +6860,257 @@ async fn apply_subscribe(
         // Each grant goes in the list: the statistics and the cluster
         // announce use all grants. Only the retained replay uses the
         // retain-handling decision.
-        granted.push(GrantedSub {
-            filter,
-            qos: qos_raw,
-            sub_id,
-            send_retained,
-            prefetched_retained,
-        });
+        drop(_route_guard);
+        if send_retained {
+            let subscriber_tenant = owner
+                .as_ref()
+                .map(|s| s.tenant_id.read().clone())
+                .unwrap_or_else(|| tenant.clone());
+            let (matched, truncated) = match shared
+                .retained
+                .find_matching_in_tenant_bounded(
+                    &filter,
+                    &subscriber_tenant,
+                    remaining_lookup_budget,
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
+                    (Vec::new(), false)
+                }
+            };
+            remaining_lookup_budget = remaining_lookup_budget.saturating_sub(matched.len());
+            let mut filter_retained = Vec::new();
+            let mut deferred_retained = Vec::new();
+            let mut quota_exceeded = truncated;
+            let mut superseded_during_retained = false;
+            let mut matched_iter = matched.into_iter();
+            while let Some(msg) = matched_iter.next() {
+                if quota_exceeded {
+                    break;
+                }
+                let conn_still_current = owner.as_ref().is_none_or(|bound| {
+                    if conn_was_bound {
+                        shared
+                            .sessions
+                            .session_for_conn(frame.header.conn_id)
+                            .is_some_and(|cur| {
+                                cur.id == bound.id
+                                    && expected_conn_id
+                                        .is_none_or(|cid| *cur.conn_id.read() == Some(cid))
+                            })
+                    } else {
+                        expected_conn_id.is_none_or(|cid| *bound.conn_id.read() == Some(cid))
+                    }
+                });
+                if !conn_still_current {
+                    superseded_during_retained = true;
+                    break;
+                }
+                let effective = std::cmp::min(qos_raw, u8::from(msg.qos));
+                let probe_id = if effective == 0 { 0u16 } else { 1u16 };
+                let Some(probe_frame) = encode_retained_publish_out(
+                    frame.header.conn_id,
+                    &msg.topic,
+                    probe_id,
+                    effective,
+                    sub_id,
+                    msg.payload.clone(),
+                ) else {
+                    continue;
+                };
+                if owner
+                    .as_ref()
+                    .is_some_and(|s| v5_encoded_packet_too_large(s, &probe_frame))
+                {
+                    shared.metrics.inc_messages_dropped();
+                    continue;
+                }
+                let downlink_id = if effective == 0 {
+                    0u16
+                } else if effective == 1 {
+                    if let Some(session) = owner.as_ref() {
+                        let Some((pid, outcome)) = session
+                            .try_alloc_qos1_downlink_v5_checked_for_conn(
+                                expected_conn_id,
+                                msg.topic.clone(),
+                                QoS::AtLeastOnce,
+                                true,
+                                msg.payload.clone(),
+                                std::time::Instant::now(),
+                            )
+                        else {
+                            if expected_conn_id
+                                .is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                            {
+                                superseded_during_retained = true;
+                                break;
+                            }
+                            deferred_retained.push(make_pending_retained(&msg, effective, sub_id));
+                            for rest in matched_iter {
+                                let rest_eff = std::cmp::min(qos_raw, u8::from(rest.qos));
+                                let Some(rest_probe) = encode_retained_publish_out(
+                                    frame.header.conn_id,
+                                    &rest.topic,
+                                    if rest_eff == 0 { 0 } else { 1 },
+                                    rest_eff,
+                                    sub_id,
+                                    rest.payload.clone(),
+                                ) else {
+                                    continue;
+                                };
+                                if owner
+                                    .as_ref()
+                                    .is_some_and(|s| v5_encoded_packet_too_large(s, &rest_probe))
+                                {
+                                    shared.metrics.inc_messages_dropped();
+                                    continue;
+                                }
+                                deferred_retained
+                                    .push(make_pending_retained(&rest, rest_eff, sub_id));
+                            }
+                            break;
+                        };
+                        match outcome {
+                            InflightTrackOutcome::Tracked => {}
+                            InflightTrackOutcome::Spilled => {
+                                shared.metrics.inc_inflight_spilled();
+                            }
+                            InflightTrackOutcome::Dropped => {
+                                shared.metrics.inc_inflight_dropped();
+                                shared.metrics.inc_inflight_spill_evicted();
+                            }
+                        }
+                        pid
+                    } else {
+                        1u16
+                    }
+                } else if let Some(session) = owner.as_ref() {
+                    let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked_for_conn(
+                        expected_conn_id,
+                        msg.topic.clone(),
+                        true,
+                        msg.payload.clone(),
+                    ) else {
+                        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                        {
+                            superseded_during_retained = true;
+                            break;
+                        }
+                        deferred_retained.push(make_pending_retained(&msg, effective, sub_id));
+                        for rest in matched_iter {
+                            let rest_eff = std::cmp::min(qos_raw, u8::from(rest.qos));
+                            let Some(rest_probe) = encode_retained_publish_out(
+                                frame.header.conn_id,
+                                &rest.topic,
+                                if rest_eff == 0 { 0 } else { 1 },
+                                rest_eff,
+                                sub_id,
+                                rest.payload.clone(),
+                            ) else {
+                                continue;
+                            };
+                            if owner
+                                .as_ref()
+                                .is_some_and(|s| v5_encoded_packet_too_large(s, &rest_probe))
+                            {
+                                shared.metrics.inc_messages_dropped();
+                                continue;
+                            }
+                            deferred_retained.push(make_pending_retained(&rest, rest_eff, sub_id));
+                        }
+                        break;
+                    };
+                    if !tracked {
+                        shared.metrics.inc_inflight_dropped();
+                    }
+                    pid
+                } else {
+                    1u16
+                };
+                if let Some(routed) = encode_retained_publish_out(
+                    frame.header.conn_id,
+                    &msg.topic,
+                    downlink_id,
+                    effective,
+                    sub_id,
+                    msg.payload,
+                ) {
+                    filter_retained.push(routed);
+                } else if let Some(session) = owner.as_ref() {
+                    if effective == 1 {
+                        let _ = session.ack_inflight(downlink_id);
+                    } else if effective == 2 {
+                        let _ = session.ack_qos2_pubcomp(downlink_id);
+                    }
+                }
+            }
+            if !superseded_during_retained && !quota_exceeded && !deferred_retained.is_empty() {
+                if let Some(session) = owner.as_ref() {
+                    let _rg = shared.sessions.lock_route_guard();
+                    let still_owner = if conn_was_bound {
+                        shared
+                            .sessions
+                            .session_for_conn(frame.header.conn_id)
+                            .is_some_and(|cur| cur.id == session.id)
+                    } else {
+                        true
+                    };
+                    if !still_owner {
+                        superseded_during_retained = true;
+                    } else {
+                        match session.try_defer_retained_all_or_none_for_conn(
+                            expected_conn_id,
+                            max_deferred_msgs,
+                            deferred_retained,
+                        ) {
+                            broker_session::DeferRetainedOutcome::Admitted => {}
+                            broker_session::DeferRetainedOutcome::QuotaExceeded => {
+                                quota_exceeded = true;
+                            }
+                            broker_session::DeferRetainedOutcome::Superseded => {
+                                superseded_during_retained = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if superseded_during_retained || quota_exceeded {
+                rollback_unsent_retained_credits(shared, frame.header.conn_id, &filter_retained);
+                if !existed {
+                    let _rg = shared.sessions.lock_route_guard();
+                    shared
+                        .router
+                        .unsubscribe_in_tenant(&filter, &client_id, &tenant);
+                    shared
+                        .sessions
+                        .remove_subscription_in_tenant(&tenant, &client_id, &filter);
+                }
+                if superseded_during_retained {
+                    codes.push(if entry.has_options {
+                        V5_SUBACK_NOT_AUTHORIZED
+                    } else {
+                        V5_SUBACK_UNSPECIFIED
+                    });
+                    authz_disconnect = true;
+                } else {
+                    shared.metrics.inc_messages_dropped();
+                    codes.push(if entry.has_options {
+                        V5_SUBACK_QUOTA_EXCEEDED
+                    } else {
+                        V5_SUBACK_UNSPECIFIED
+                    });
+                }
+                continue;
+            }
+            retained.extend(filter_retained);
+        }
+        granted_filters.push(filter);
         codes.push(qos_raw);
     }
-    if !granted.is_empty() {
+    if !granted_filters.is_empty() {
         refresh_subscription_stats(shared);
     }
 
@@ -6929,199 +7129,9 @@ async fn apply_subscribe(
     // Clustered mode: publish our route summary (filter-level only, never
     // individual subscriptions) so peers forward matching publishes here.
     if let Some(cluster) = &shared.cluster {
-        for grant in &granted {
-            if let Err(e) = cluster.announce_filter(&grant.filter).await {
-                warn!(
-                    "Cluster announce failed for {}: {}",
-                    grant.filter.as_str(),
-                    e
-                );
-            }
-        }
-    }
-
-    // Retained state follows the SubAck on the same transport.
-    let mut retained = Vec::new();
-    // Owning tenant's session (MT-03): retained fetch and downlink ids
-    // stay within the subscriber's own tenant, so one tenant never
-    // observes another tenant's retained state.
-    let still_bound_for_replay = !superseded_conn
-        && owner.as_ref().is_none_or(|bound| {
-            if conn_was_bound {
-                shared
-                    .sessions
-                    .session_for_conn(frame.header.conn_id)
-                    .is_some_and(|cur| cur.id == bound.id)
-            } else {
-                let cur_conn = *bound.conn_id.read();
-                cur_conn == Some(frame.header.conn_id)
-                    || (cur_conn.is_none() && bound.ended_at_ms.read().is_none())
-            }
-        });
-    let session = owner.clone();
-    let expected_conn_id = session.as_ref().and_then(|bound| {
-        if conn_was_bound {
-            Some(frame.header.conn_id)
-        } else {
-            (*bound.conn_id.read()).map(|_| frame.header.conn_id)
-        }
-    });
-    for grant in granted
-        .into_iter()
-        .filter(|grant| still_bound_for_replay && grant.send_retained)
-    {
-        let sub_qos = grant.qos;
-        let mut matched_iter = grant.prefetched_retained.into_iter();
-        let mut deferred_retained = Vec::new();
-        while let Some(msg) = matched_iter.next() {
-            let conn_still_current = session.as_ref().is_none_or(|bound| {
-                if conn_was_bound {
-                    shared
-                        .sessions
-                        .session_for_conn(frame.header.conn_id)
-                        .is_some_and(|cur| {
-                            cur.id == bound.id
-                                && expected_conn_id
-                                    .is_none_or(|cid| *cur.conn_id.read() == Some(cid))
-                        })
-                } else {
-                    expected_conn_id.is_none_or(|cid| *bound.conn_id.read() == Some(cid))
-                }
-            });
-            if !conn_still_current {
-                break;
-            }
-            let effective = std::cmp::min(sub_qos, u8::from(msg.qos));
-            let downlink_id = if effective == 0 {
-                0u16
-            } else if effective == 1 {
-                if let Some(session) = &session {
-                    let Some((pid, outcome)) = session.try_alloc_qos1_downlink_v5_checked_for_conn(
-                        expected_conn_id,
-                        msg.topic.clone(),
-                        QoS::AtLeastOnce,
-                        true,
-                        msg.payload.clone(),
-                        std::time::Instant::now(),
-                    ) else {
-                        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid))
-                        {
-                            break;
-                        }
-                        deferred_retained.push(make_pending_retained(
-                            &msg,
-                            effective,
-                            grant.sub_id,
-                        ));
-                        for rest in matched_iter {
-                            let rest_eff = std::cmp::min(sub_qos, u8::from(rest.qos));
-                            deferred_retained.push(make_pending_retained(
-                                &rest,
-                                rest_eff,
-                                grant.sub_id,
-                            ));
-                        }
-                        break;
-                    };
-                    match outcome {
-                        InflightTrackOutcome::Tracked => {}
-                        InflightTrackOutcome::Spilled => {
-                            shared.metrics.inc_inflight_spilled();
-                        }
-                        InflightTrackOutcome::Dropped => {
-                            shared.metrics.inc_inflight_dropped();
-                            shared.metrics.inc_inflight_spill_evicted();
-                        }
-                    }
-                    pid
-                } else {
-                    1u16
-                }
-            } else if let Some(session) = &session {
-                let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked_for_conn(
-                    expected_conn_id,
-                    msg.topic.clone(),
-                    true,
-                    msg.payload.clone(),
-                ) else {
-                    if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
-                        break;
-                    }
-                    deferred_retained.push(make_pending_retained(&msg, effective, grant.sub_id));
-                    for rest in matched_iter {
-                        let rest_eff = std::cmp::min(sub_qos, u8::from(rest.qos));
-                        deferred_retained.push(make_pending_retained(
-                            &rest,
-                            rest_eff,
-                            grant.sub_id,
-                        ));
-                    }
-                    break;
-                };
-                if !tracked {
-                    shared.metrics.inc_inflight_dropped();
-                }
-                pid
-            } else {
-                1u16
-            };
-            if let Some(routed) = encode_retained_publish_out(
-                frame.header.conn_id,
-                &msg.topic,
-                downlink_id,
-                effective,
-                grant.sub_id,
-                msg.payload.clone(),
-            ) {
-                if session
-                    .as_ref()
-                    .is_some_and(|s| v5_encoded_packet_too_large(s, &routed))
-                {
-                    shared.metrics.inc_messages_dropped();
-                    if let Some(session) = &session {
-                        if effective == 1 {
-                            let _ = session.ack_inflight(downlink_id);
-                        } else if effective == 2 {
-                            let _ = session.ack_qos2_pubcomp(downlink_id);
-                        }
-                    }
-                    continue;
-                }
-                retained.push(routed);
-            } else if let Some(session) = &session {
-                if effective == 1 {
-                    let _ = session.ack_inflight(downlink_id);
-                } else if effective == 2 {
-                    let _ = session.ack_qos2_pubcomp(downlink_id);
-                }
-            }
-        }
-        if !deferred_retained.is_empty() {
-            if let Some(session) = &session {
-                let _route_guard = shared.sessions.lock_route_guard();
-                let still_owner = if conn_was_bound {
-                    shared
-                        .sessions
-                        .session_for_conn(frame.header.conn_id)
-                        .is_some_and(|cur| cur.id == session.id)
-                } else {
-                    true
-                };
-                if still_owner {
-                    let max_msgs = shared
-                        .sessions
-                        .max_offline_queue()
-                        .unwrap_or(broker_session::DEFAULT_MAX_OFFLINE_QUEUE);
-                    if let Some(dropped) = session.defer_retained_for_conn(
-                        expected_conn_id,
-                        max_msgs,
-                        deferred_retained,
-                    ) {
-                        for _ in 0..dropped {
-                            shared.metrics.inc_messages_dropped();
-                        }
-                    }
-                }
+        for filter in &granted_filters {
+            if let Err(e) = cluster.announce_filter(filter).await {
+                warn!("Cluster announce failed for {}: {}", filter.as_str(), e);
             }
         }
     }
@@ -15524,6 +15534,75 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Oversized retransmission (pid 55) was released from inflight.
         assert!(!sess.inflight_snapshot().iter().any(|m| m.packet_id == 55));
+    }
+
+    #[tokio::test]
+    async fn subscribe_multi_filter_reserves_quota_and_excludes_oversized() {
+        let shared = test_shared();
+        shared.sessions.set_max_offline_queue(Some(1));
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-multi-quota",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 114,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        sess.set_client_max_packet_size(64);
+        // Filter 1 ("m1/+") has 1 oversized (>64B) + 1 valid + 1 valid -> 1 sent, 1 deferred, oversized excluded.
+        // Filter 2 ("m2/+") has 2 valid -> exceeds remaining pending_retained (0 slots left) -> 0x97.
+        for (t, p) in [
+            ("m1/big", vec![b'x'; 128]),
+            ("m1/ok1", b"1".to_vec()),
+            ("m1/ok2", b"2".to_vec()),
+            ("m2/a", b"a".to_vec()),
+            ("m2/b", b"b".to_vec()),
+        ] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(t).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from(p),
+                    broker_session::tenant::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+        let sub = subscribe_frame(
+            114,
+            1,
+            encode_subscribe_meta_v5(1, "sub-multi-quota", &[("m1/+", 1, 0), ("m2/+", 1, 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("suback");
+        let n = reply.metadata.len();
+        assert_eq!(reply.metadata[n - 2], 1); // m1/+ granted QoS 1
+        assert_eq!(reply.metadata[n - 1], V5_SUBACK_QUOTA_EXCEEDED); // m2/+ rejected 0x97
+        assert_eq!(retained.len(), 1);
+        assert_eq!(sess.pending_retained_len(), 1);
+        assert!(sess
+            .subscriptions
+            .read()
+            .contains_key(&TopicFilter::new("m1/+").unwrap()));
+        assert!(!sess
+            .subscriptions
+            .read()
+            .contains_key(&TopicFilter::new("m2/+").unwrap()));
     }
 
     #[tokio::test]
