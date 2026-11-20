@@ -1993,7 +1993,11 @@ impl Session {
         if self.unacked_on_conn_len() >= cap {
             return None;
         }
-        Some(self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at))
+        let (pid, outcome) = self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at);
+        if outcome == InflightTrackOutcome::Dropped {
+            return None;
+        }
+        Some((pid, outcome))
     }
 
     /// Atomically check the MQTT 5 Receive Maximum send window (for v5
@@ -2047,7 +2051,10 @@ impl Session {
             payload,
             rec_received: false,
         });
-        Some((pid, tracked))
+        if !tracked {
+            return None;
+        }
+        Some((pid, true))
     }
 
     pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {
@@ -6036,5 +6043,46 @@ mod tests {
                 publish_at_ms: None,
             })
             .is_none());
+    }
+
+    #[test]
+    fn v5_checked_alloc_refuses_when_tracking_capacity_exhausted() {
+        let session = Session::new(SessionId(2), "v5-cap-exhaust".to_string(), false);
+        session.set_protocol_version(5);
+        session.set_client_receive_maximum(3);
+        session.set_max_inflight(1);
+        session.set_max_spill(1);
+
+        let topic = Topic::new("t/cap").unwrap();
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"1"),
+                Instant::now(),
+            )
+            .is_some());
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"2"),
+                Instant::now(),
+            )
+            .is_some());
+        // Tracking capacity (1 window + 1 spill = 2) is now full even though
+        // Receive Maximum is 3: must refuse rather than send untracked.
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic,
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"3"),
+                Instant::now(),
+            )
+            .is_none());
+        assert_eq!(session.unacked_on_conn_len(), 2);
     }
 }

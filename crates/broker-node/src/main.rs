@@ -16,8 +16,7 @@ use broker_router::{
 };
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
-    InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionKey,
-    SessionManager,
+    InflightTrackOutcome, Qos2InboundEntry, QueuedMessage, SessionKey, SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::OfflineQueueStore;
@@ -6848,29 +6847,48 @@ async fn apply_subscribe(
             }
             let downlink_id = if effective == 0 {
                 0u16
-            } else {
-                match &session {
-                    Some(session) => session.next_packet_id(),
-                    None => 1u16,
-                }
-            };
-            // D1-01: retained QoS 2 deliveries enter the two-phase
-            // exchange like live ones (QoS 1 retained keeps its existing
-            // untracked behaviour).
-            if effective == 2 {
+            } else if effective == 1 {
                 if let Some(session) = &session {
-                    let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
-                        packet_id: downlink_id,
-                        topic: msg.topic.clone(),
-                        retain: true,
-                        payload: msg.payload.clone(),
-                        rec_received: false,
-                    });
-                    if !tracked {
+                    let Some((pid, outcome)) = session.try_alloc_qos1_downlink_v5_checked(
+                        msg.topic.clone(),
+                        QoS::AtLeastOnce,
+                        true,
+                        msg.payload.clone(),
+                        std::time::Instant::now(),
+                    ) else {
                         shared.metrics.inc_inflight_dropped();
+                        continue;
+                    };
+                    match outcome {
+                        InflightTrackOutcome::Tracked => {}
+                        InflightTrackOutcome::Spilled => {
+                            shared.metrics.inc_inflight_spilled();
+                        }
+                        InflightTrackOutcome::Dropped => {
+                            shared.metrics.inc_inflight_dropped();
+                            shared.metrics.inc_inflight_spill_evicted();
+                        }
                     }
+                    pid
+                } else {
+                    1u16
                 }
-            }
+            } else if let Some(session) = &session {
+                let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked(
+                    msg.topic.clone(),
+                    true,
+                    msg.payload.clone(),
+                ) else {
+                    shared.metrics.inc_inflight_dropped();
+                    continue;
+                };
+                if !tracked {
+                    shared.metrics.inc_inflight_dropped();
+                }
+                pid
+            } else {
+                1u16
+            };
             let topic_str = msg.topic.as_str();
             // A message sent because of a new subscription always has
             // the retain flag. The retain-as-published option applies
@@ -14633,6 +14651,63 @@ mod tests {
         assert_eq!(f2.payload, Bytes::from_static(b"two"));
         assert!(rx.try_recv().is_err());
         assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_qos1_respects_v5_receive_maximum() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-v5-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 106,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("ret/1").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"r1"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("ret/2").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"r2"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+
+        let sub = subscribe_frame(
+            106,
+            1,
+            encode_subscribe_meta(1, "retained-v5-rm", &[("ret/+", 1)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        assert!(reply.is_some());
+        assert_eq!(retained.len(), 1);
+        assert_eq!(sess.inflight_len(), 1);
     }
 
     #[tokio::test]
