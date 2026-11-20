@@ -6386,6 +6386,7 @@ async fn apply_subscribe(
         qos: u8,
         sub_id: u32,
         send_retained: bool,
+        prefetched_retained: Vec<broker_storage::StoredMessage>,
     }
     let mut granted: Vec<GrantedSub> = Vec::with_capacity(subs.len());
     // AP-11: a denied subscribe disconnects when the stored `deny_action`
@@ -6714,6 +6715,29 @@ async fn apply_subscribe(
         );
         sub.group = group;
         sub.tenant = tenant.clone().into();
+        let existed_pre = owner
+            .as_ref()
+            .is_some_and(|session| session.subscriptions.read().contains_key(&filter));
+        let wants_retained = match rh {
+            1 => !existed_pre,
+            2 => false,
+            _ => true,
+        };
+        let prefetched_retained = if wants_retained && owner.is_some() {
+            match shared
+                .retained
+                .find_matching_in_tenant(&filter, &tenant)
+                .await
+            {
+                Ok(matched) => matched,
+                Err(e) => {
+                    warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let _route_guard = shared.sessions.lock_route_guard();
         if let Some(bound) = owner.as_ref() {
             let still_bound = if conn_was_bound {
@@ -6734,6 +6758,45 @@ async fn apply_subscribe(
                 });
                 authz_disconnect = true;
                 continue;
+            }
+        }
+        if wants_retained && !prefetched_retained.is_empty() {
+            if let Some(bound) = owner.as_ref() {
+                let available_credits = if bound.protocol_version() == 5 {
+                    usize::from(bound.client_receive_maximum().max(1))
+                        .saturating_sub(bound.unacked_on_conn_len())
+                } else {
+                    usize::MAX
+                };
+                let mut remaining_credits = available_credits;
+                let mut overflow_count = 0usize;
+                let mut overflow_bytes = 0usize;
+                for msg in &prefetched_retained {
+                    let eff = std::cmp::min(qos_raw, u8::from(msg.qos));
+                    if overflow_count == 0 && (eff == 0 || remaining_credits > 0) {
+                        if eff != 0 {
+                            remaining_credits -= 1;
+                        }
+                    } else {
+                        overflow_count += 1;
+                        overflow_bytes = overflow_bytes
+                            .saturating_add(msg.topic.as_str().len())
+                            .saturating_add(msg.payload.len());
+                    }
+                }
+                let max_msgs = shared
+                    .sessions
+                    .max_offline_queue()
+                    .unwrap_or(broker_session::DEFAULT_MAX_OFFLINE_QUEUE);
+                if !bound.pending_retained_can_fit(max_msgs, overflow_count, overflow_bytes) {
+                    shared.metrics.inc_messages_dropped();
+                    codes.push(if entry.has_options {
+                        V5_SUBACK_QUOTA_EXCEEDED
+                    } else {
+                        V5_SUBACK_UNSPECIFIED
+                    });
+                    continue;
+                }
             }
         }
         let stored = shared.router.subscribe(&filter, sub);
@@ -6843,6 +6906,7 @@ async fn apply_subscribe(
             qos: qos_raw,
             sub_id,
             send_retained,
+            prefetched_retained,
         });
         codes.push(qos_raw);
     }
@@ -6902,28 +6966,12 @@ async fn apply_subscribe(
             (*bound.conn_id.read()).map(|_| frame.header.conn_id)
         }
     });
-    let subscriber_tenant = session
-        .as_ref()
-        .map(|session| session.tenant_id.read().clone())
-        .unwrap_or_else(|| tenant.clone());
     for grant in granted
-        .iter()
+        .into_iter()
         .filter(|grant| still_bound_for_replay && grant.send_retained)
     {
-        let filter = &grant.filter;
         let sub_qos = grant.qos;
-        let matched = match shared
-            .retained
-            .find_matching_in_tenant(filter, &subscriber_tenant)
-            .await
-        {
-            Ok(matched) => matched,
-            Err(e) => {
-                warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
-                continue;
-            }
-        };
-        let mut matched_iter = matched.into_iter();
+        let mut matched_iter = grant.prefetched_retained.into_iter();
         let mut deferred_retained = Vec::new();
         while let Some(msg) = matched_iter.next() {
             let conn_still_current = session.as_ref().is_none_or(|bound| {
@@ -6944,39 +6992,6 @@ async fn apply_subscribe(
                 break;
             }
             let effective = std::cmp::min(sub_qos, u8::from(msg.qos));
-            if let Some(session) = &session {
-                if let Some(rc) = v5_egress_refused(
-                    session,
-                    effective,
-                    msg.topic.as_str().len(),
-                    msg.payload.len(),
-                ) {
-                    if rc == V5_RC_QUOTA_EXCEEDED {
-                        deferred_retained.push(make_pending_retained(
-                            &msg,
-                            effective,
-                            grant.sub_id,
-                        ));
-                        for rest in matched_iter {
-                            let rest_eff = std::cmp::min(sub_qos, u8::from(rest.qos));
-                            deferred_retained.push(make_pending_retained(
-                                &rest,
-                                rest_eff,
-                                grant.sub_id,
-                            ));
-                        }
-                        break;
-                    } else {
-                        shared.metrics.inc_messages_dropped();
-                    }
-                    tracing::debug!(
-                        client_id = %session.client_id,
-                        reason_code = rc,
-                        "v5 egress cap shed retained delivery"
-                    );
-                    continue;
-                }
-            }
             let downlink_id = if effective == 0 {
                 0u16
             } else if effective == 1 {
@@ -7371,6 +7386,18 @@ fn resume_replay_locked(
         let Some(routed) = routed else {
             continue;
         };
+        if v5_encoded_packet_too_large(session, &routed) {
+            shared.metrics.inc_messages_dropped();
+            match &item {
+                broker_session::PendingReplayItem::Qos1 { entry, .. } => {
+                    let _ = session.ack_inflight(entry.packet_id);
+                }
+                broker_session::PendingReplayItem::Qos2(held) => {
+                    let _ = session.ack_qos2_pubcomp(held.packet_id);
+                }
+            }
+            continue;
+        }
         let len = routed.total_frame_len() as u64;
         if shared.conns.route(conn_id, routed) {
             if matches!(
@@ -7415,11 +7442,7 @@ fn resume_pending_retained_locked(
             session.push_front_pending_retained(item);
             break;
         }
-        if v5_packet_size_refused(session, item.topic.as_str().len(), item.payload.len()).is_some()
-        {
-            shared.metrics.inc_messages_dropped();
-            continue;
-        }
+
         let effective = u8::from(item.qos);
         let mut tracked_qos1_spilled = false;
         let downlink_id = if effective == 0 {
@@ -7514,12 +7537,7 @@ fn replay_queued_offline_locked(
             unrouted.extend(retained);
             break;
         }
-        if v5_packet_size_refused(session, queued.topic.as_str().len(), queued.payload.len())
-            .is_some()
-        {
-            shared.metrics.inc_messages_dropped();
-            continue;
-        }
+
         // Atomically check MQTT 5 Receive Maximum and reserve QoS 1/2
         // tracking capacity before sending so neither concurrent live
         // delivery nor a full buffer can oversubscribe the send window.
@@ -15375,6 +15393,137 @@ mod tests {
         assert_eq!(sent, 0);
         assert!(rx.try_recv().is_err());
         assert_eq!(sess.unacked_on_conn_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_0x97_when_deferred_retained_exceeds_limit() {
+        let shared = test_shared();
+        shared.sessions.set_max_offline_queue(Some(1));
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-0x97",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 112,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (t, p) in [
+            ("q97/1", b"1".as_slice()),
+            ("q97/2", b"2".as_slice()),
+            ("q97/3", b"3".as_slice()),
+        ] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(t).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from_static(p),
+                    broker_session::tenant::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+        let sub = subscribe_frame(
+            112,
+            1,
+            encode_subscribe_meta_v5(1, "sub-0x97", &[("q97/+", 1, 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("suback");
+        assert_eq!(
+            reply.metadata.last().copied(),
+            Some(V5_SUBACK_QUOTA_EXCEEDED)
+        );
+        assert!(retained.is_empty());
+        assert!(!sess
+            .subscriptions
+            .read()
+            .contains_key(&TopicFilter::new("q97/+").unwrap()));
+        assert_eq!(sess.pending_retained_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_retransmission_drops_oversized_and_allows_exact_wire_size() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retrans-size",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 113,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        // Oversized QoS 1 retransmission (payload 32 bytes) + small QoS 1 offline
+        // message ("a" + "bcd" -> 11 bytes encoded vs 14 bytes old estimate).
+        assert!(sess.track_inflight(broker_session::InflightMessage {
+            packet_id: 55,
+            topic: Topic::new("big/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from(vec![b'z'; 32]),
+            enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
+        }));
+        sess.push_offline(QueuedMessage {
+            topic: Topic::new("a").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"bcd"),
+            publish_at_ms: None,
+        });
+        let small = encode_retained_publish_out(
+            113,
+            &Topic::new("a").unwrap(),
+            1,
+            1,
+            0,
+            Bytes::from_static(b"bcd"),
+        )
+        .unwrap();
+        let small_wire = native::encoded_publish_out_len(&small, 5).unwrap();
+        assert!(small_wire <= 12);
+
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(2);
+        sess.set_client_max_packet_size(12);
+
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(113, tx);
+        let bind = bind_frame(113, 1, encode_bind_meta("retrans-size", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f = rx
+            .try_recv()
+            .expect("11-byte packet allowed under 12-byte limit");
+        assert_eq!(f.payload, Bytes::from_static(b"bcd"));
+        assert!(rx.try_recv().is_err());
+        // Oversized retransmission (pid 55) was released from inflight.
+        assert!(!sess.inflight_snapshot().iter().any(|m| m.packet_id == 55));
     }
 
     #[tokio::test]

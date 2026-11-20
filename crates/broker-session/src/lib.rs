@@ -1902,6 +1902,25 @@ impl Session {
         self.pending_retained.read().items.len()
     }
 
+    /// True when `pending_retained` can admit `additional_msgs` /
+    /// `additional_bytes` without exceeding `max_msgs` or
+    /// `MAX_PENDING_RETAINED_BYTES`.
+    pub fn pending_retained_can_fit(
+        &self,
+        max_msgs: usize,
+        additional_msgs: usize,
+        additional_bytes: usize,
+    ) -> bool {
+        if additional_msgs == 0 {
+            return true;
+        }
+        let _quota = self.send_quota_lock.lock();
+        let max_msgs = max_msgs.max(1);
+        let queue = self.pending_retained.read();
+        queue.items.len().saturating_add(additional_msgs) <= max_msgs
+            && queue.bytes.saturating_add(additional_bytes) <= MAX_PENDING_RETAINED_BYTES
+    }
+
     /// Enqueue deferred retained matches for the current connection only,
     /// serialized with `send_quota_lock` and bounded by both
     /// `offline_queue_limit()` and `MAX_PENDING_RETAINED_BYTES`. Returns
