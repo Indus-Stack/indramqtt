@@ -304,6 +304,7 @@ async fn test_e2e_router_and_rules_pipeline() {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
 

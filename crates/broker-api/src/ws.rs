@@ -684,6 +684,7 @@ async fn handle_subscribe(
                             retain_as_published: false,
                             retain_handling: 0,
                             subscription_id: 0,
+                            session_id: 0,
                         },
                     );
                     if !stored {
@@ -802,6 +803,9 @@ async fn handle_publish(
         ) else {
             continue;
         };
+        if sub.session_id != 0 && target.id.0 != sub.session_id {
+            continue;
+        }
         if !*target.connected.read() {
             continue;
         }

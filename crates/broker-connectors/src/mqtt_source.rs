@@ -114,6 +114,13 @@ pub enum MqttSourceEvent {
 #[async_trait]
 pub trait MqttSourceHandler: Send + Sync {
     async fn on_event(&self, event: MqttSourceEvent);
+
+    /// Deliver one message and return `true` if local ingress durably
+    /// accepted it (safe to acknowledge upstream).
+    async fn on_message(&self, message: MqttSourceMessage) -> bool {
+        self.on_event(MqttSourceEvent::Message(message)).await;
+        true
+    }
 }
 
 /// Run one source until the task is stopped. A failed connection reports
@@ -483,14 +490,20 @@ async fn handle_event(
                     QoS::AtLeastOnce => 1,
                     QoS::ExactlyOnce => 2,
                 };
-                handler
-                    .on_event(MqttSourceEvent::Message(MqttSourceMessage {
+                let accepted = handler
+                    .on_message(MqttSourceMessage {
                         topic: publish.topic.clone(),
                         payload: publish.payload.clone(),
                         qos,
                         retain: publish.retain,
-                    }))
+                    })
                     .await;
+                if !accepted {
+                    return Err(ConnectorError::Connection(
+                        "mqtt source local durable handoff failed; withholding upstream ack"
+                            .to_string(),
+                    ));
+                }
             }
             if publish.qos != QoS::AtMostOnce {
                 pending_acks.push_back(publish);
@@ -837,5 +850,67 @@ mod tests {
             .filter(|e| matches!(e, MqttSourceEvent::Message(_)))
             .count();
         assert_eq!(delivered, total);
+    }
+
+    struct RejectingHandler {
+        events: Mutex<Vec<MqttSourceEvent>>,
+    }
+
+    #[async_trait]
+    impl MqttSourceHandler for RejectingHandler {
+        async fn on_event(&self, event: MqttSourceEvent) {
+            self.events.lock().await.push(event);
+        }
+
+        async fn on_message(&self, message: MqttSourceMessage) -> bool {
+            self.events
+                .lock()
+                .await
+                .push(MqttSourceEvent::Message(message));
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_durable_handoff_withholds_upstream_puback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _connect = read_mqtt_packet(&mut stream).await;
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.unwrap();
+            let (_sub_hdr, sub_body) = read_mqtt_packet(&mut stream).await;
+            let pid = u16::from_be_bytes([sub_body[0], sub_body[1]]);
+            stream
+                .write_all(&[0x90, 0x03, (pid >> 8) as u8, pid as u8, 0x01])
+                .await
+                .unwrap();
+
+            let pub_pkt = encode_publish_qos1("durable/t", 7, b"payload");
+            stream.write_all(&pub_pkt).await.unwrap();
+
+            // Must NOT receive PUBACK (packet type 4); connection should drop/disconnect.
+            let mut buf = [0u8; 4];
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await
+            {
+                assert_eq!(
+                    n,
+                    0,
+                    "expected EOF without PUBACK, got bytes {:?}",
+                    &buf[..n]
+                );
+            }
+        });
+
+        let handler = Arc::new(RejectingHandler {
+            events: Mutex::new(Vec::new()),
+        });
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let cfg = base_config(port, "durable/#");
+        let task = tokio::spawn(run_mqtt_source(cfg, handler.clone(), stop_rx));
+        server.await.unwrap();
+        let _ = stop_tx.send(true);
+        let _ = task.await;
     }
 }

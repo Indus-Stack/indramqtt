@@ -446,7 +446,7 @@ impl MqttSourceHandler for DeliveryHandler {
                 .sources
                 .set_runtime_status(&self.source_id, SourceRuntimeStatus::Disconnected(reason)),
             MqttSourceEvent::Message(message) => {
-                self.deliver(message).await;
+                let _ = self.deliver(message).await;
             }
             MqttSourceEvent::Unsubscribed(completed) => {
                 let mut state = self
@@ -459,17 +459,21 @@ impl MqttSourceHandler for DeliveryHandler {
             }
         }
     }
+
+    async fn on_message(&self, message: MqttSourceMessage) -> bool {
+        self.deliver(message).await
+    }
 }
 
 impl DeliveryHandler {
-    async fn deliver(&self, message: MqttSourceMessage) {
+    async fn deliver(&self, message: MqttSourceMessage) -> bool {
         let Ok(topic) = Topic::new(message.topic.as_str()) else {
             warn!(
                 source = self.source_id.as_str(),
                 topic = message.topic.as_str(),
                 "source ingress dropped a message with an invalid topic"
             );
-            return;
+            return true;
         };
         let qos = QoS::try_from(message.qos).unwrap_or(QoS::AtMostOnce);
         // A source record has no tenant field. The reference API scopes a
@@ -477,6 +481,11 @@ impl DeliveryHandler {
         // namespace. The path therefore delivers into the default tenant
         // only. The two-tenant test proves that no message reaches
         // another tenant.
+        let offline_persist_failed_before = self
+            .shared
+            .sessions
+            .offline_store()
+            .map(|s| s.persist_failed());
         let deliveries = ingress_pipeline_with_publisher(
             &self.shared,
             &topic,
@@ -491,6 +500,22 @@ impl DeliveryHandler {
             let _ = self.shared.conns.route(conn_id, routed);
         }
         forward_cluster(&self.shared, &topic, qos, &message.payload, "default").await;
+        let persist_failed = offline_persist_failed_before.is_some_and(|before| {
+            self.shared
+                .sessions
+                .offline_store()
+                .map(|s| s.persist_failed() > before)
+                .unwrap_or(false)
+        });
+        if persist_failed {
+            self.shared.metrics.inc_puback_deferred();
+            warn!(
+                source = self.source_id.as_str(),
+                "Offline queue persist failed: withholding upstream MQTT source ack"
+            );
+            return false;
+        }
+        true
     }
 }
 

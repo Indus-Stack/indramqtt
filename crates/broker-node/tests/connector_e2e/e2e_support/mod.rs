@@ -1142,10 +1142,15 @@ impl TestBroker {
         MqttClient::connect(self.mqtt_port, client_id).await
     }
 
-    /// Publishes one message on a fresh connection.
+    /// Publishes one message on a fresh connection and waits briefly for
+    /// QoS 0 ingress before disconnecting so rapid repeated calls with the
+    /// same client ID do not race session takeover.
     pub async fn publish(&self, client_id: &str, topic: &str, payload: &[u8], qos: u8) {
         let mut client = self.connect(client_id).await;
         client.publish(topic, payload, qos).await;
+        if qos == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         client.disconnect().await;
     }
 

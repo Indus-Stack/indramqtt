@@ -6352,6 +6352,31 @@ fn make_pending_retained(
     }
 }
 
+fn rollback_session_retained_credits(
+    session: Option<&broker_session::Session>,
+    unsent: &[BrokerFrame],
+) {
+    let Some(session) = session else {
+        return;
+    };
+    for frame in unsent {
+        if frame.header.opcode != OpCode::PublishOut || frame.metadata.len() < 5 {
+            continue;
+        }
+        let tlen = u16::from_be_bytes([frame.metadata[0], frame.metadata[1]]) as usize;
+        if frame.metadata.len() < 2 + tlen + 3 {
+            continue;
+        }
+        let pid = u16::from_be_bytes([frame.metadata[2 + tlen], frame.metadata[2 + tlen + 1]]);
+        let qos = frame.metadata[2 + tlen + 2];
+        if qos == 1 {
+            let _ = session.ack_inflight(pid);
+        } else if qos == 2 {
+            let _ = session.ack_qos2_pubcomp(pid);
+        }
+    }
+}
+
 fn rollback_unsent_retained_credits(shared: &Shared, conn_id: u64, unsent: &[BrokerFrame]) {
     let session = shared.sessions.session_for_conn(conn_id).or_else(|| {
         shared
@@ -6750,6 +6775,7 @@ async fn apply_subscribe(
         );
         sub.group = group;
         sub.tenant = tenant.clone().into();
+        sub.session_id = owner.as_ref().map_or(0, |s| s.id.0);
         {
             let _route_guard = shared.sessions.lock_route_guard();
             if let Some(bound) = owner.as_ref() {
@@ -6785,7 +6811,7 @@ async fn apply_subscribe(
             None
         };
         let mut filter_retained = Vec::new();
-        let mut deferred_retained = Vec::new();
+        let mut staged_retained: Vec<(broker_storage::StoredMessage, u8)> = Vec::new();
         let mut quota_exceeded = false;
         let mut superseded_during_retained = false;
         if send_retained {
@@ -6814,8 +6840,7 @@ async fn apply_subscribe(
             }
             remaining_lookup_budget = remaining_lookup_budget.saturating_sub(matched.len());
             quota_exceeded = truncated;
-            let mut matched_iter = matched.into_iter();
-            while let Some(msg) = matched_iter.next() {
+            for msg in matched {
                 if quota_exceeded {
                     break;
                 }
@@ -6856,128 +6881,10 @@ async fn apply_subscribe(
                     shared.metrics.inc_messages_dropped();
                     continue;
                 }
-                let downlink_id = if effective == 0 {
-                    0u16
-                } else if effective == 1 {
-                    if let Some(session) = owner.as_ref() {
-                        let Some((pid, outcome)) = session
-                            .try_alloc_qos1_downlink_v5_checked_for_conn(
-                                expected_conn_id,
-                                msg.topic.clone(),
-                                QoS::AtLeastOnce,
-                                true,
-                                msg.payload.clone(),
-                                std::time::Instant::now(),
-                            )
-                        else {
-                            if expected_conn_id
-                                .is_some_and(|cid| *session.conn_id.read() != Some(cid))
-                            {
-                                superseded_during_retained = true;
-                                break;
-                            }
-                            deferred_retained.push(make_pending_retained(&msg, effective, sub_id));
-                            for rest in matched_iter {
-                                let rest_eff = std::cmp::min(qos_raw, u8::from(rest.qos));
-                                let Some(rest_probe) = encode_retained_publish_out(
-                                    frame.header.conn_id,
-                                    &rest.topic,
-                                    if rest_eff == 0 { 0 } else { 1 },
-                                    rest_eff,
-                                    sub_id,
-                                    rest.payload.clone(),
-                                ) else {
-                                    continue;
-                                };
-                                if owner
-                                    .as_ref()
-                                    .is_some_and(|s| v5_encoded_packet_too_large(s, &rest_probe))
-                                {
-                                    shared.metrics.inc_messages_dropped();
-                                    continue;
-                                }
-                                deferred_retained
-                                    .push(make_pending_retained(&rest, rest_eff, sub_id));
-                            }
-                            break;
-                        };
-                        match outcome {
-                            InflightTrackOutcome::Tracked => {}
-                            InflightTrackOutcome::Spilled => {
-                                shared.metrics.inc_inflight_spilled();
-                            }
-                            InflightTrackOutcome::Dropped => {
-                                shared.metrics.inc_inflight_dropped();
-                                shared.metrics.inc_inflight_spill_evicted();
-                            }
-                        }
-                        pid
-                    } else {
-                        1u16
-                    }
-                } else if let Some(session) = owner.as_ref() {
-                    let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked_for_conn(
-                        expected_conn_id,
-                        msg.topic.clone(),
-                        true,
-                        msg.payload.clone(),
-                    ) else {
-                        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid))
-                        {
-                            superseded_during_retained = true;
-                            break;
-                        }
-                        deferred_retained.push(make_pending_retained(&msg, effective, sub_id));
-                        for rest in matched_iter {
-                            let rest_eff = std::cmp::min(qos_raw, u8::from(rest.qos));
-                            let Some(rest_probe) = encode_retained_publish_out(
-                                frame.header.conn_id,
-                                &rest.topic,
-                                if rest_eff == 0 { 0 } else { 1 },
-                                rest_eff,
-                                sub_id,
-                                rest.payload.clone(),
-                            ) else {
-                                continue;
-                            };
-                            if owner
-                                .as_ref()
-                                .is_some_and(|s| v5_encoded_packet_too_large(s, &rest_probe))
-                            {
-                                shared.metrics.inc_messages_dropped();
-                                continue;
-                            }
-                            deferred_retained.push(make_pending_retained(&rest, rest_eff, sub_id));
-                        }
-                        break;
-                    };
-                    if !tracked {
-                        shared.metrics.inc_inflight_dropped();
-                    }
-                    pid
-                } else {
-                    1u16
-                };
-                if let Some(routed) = encode_retained_publish_out(
-                    frame.header.conn_id,
-                    &msg.topic,
-                    downlink_id,
-                    effective,
-                    sub_id,
-                    msg.payload,
-                ) {
-                    filter_retained.push(routed);
-                } else if let Some(session) = owner.as_ref() {
-                    if effective == 1 {
-                        let _ = session.ack_inflight(downlink_id);
-                    } else if effective == 2 {
-                        let _ = session.ack_qos2_pubcomp(downlink_id);
-                    }
-                }
+                staged_retained.push((msg, effective));
             }
         }
         if superseded_during_retained || quota_exceeded {
-            rollback_unsent_retained_credits(shared, frame.header.conn_id, &filter_retained);
             if superseded_during_retained {
                 codes.push(if entry.has_options {
                     V5_SUBACK_NOT_AUTHORIZED
@@ -6999,6 +6906,7 @@ async fn apply_subscribe(
         let mut commit_superseded = false;
         {
             let _rg = shared.sessions.lock_route_guard();
+            let _replay_guard = owner.as_ref().map(|s| s.lock_replay());
             let still_owner = owner.as_ref().is_none_or(|bound| {
                 if conn_was_bound {
                     shared
@@ -7020,20 +6928,130 @@ async fn apply_subscribe(
                     QuotaExceeded,
                     Superseded,
                 }
-                let mut deferred_opt = (!deferred_retained.is_empty()).then_some(deferred_retained);
+                let mut staged_opt = Some(staged_retained);
                 match shared.router.try_subscribe_with(&filter, sub, || {
-                    if let Some(deferred) = deferred_opt.take() {
+                    let mut deferred_retained = Vec::new();
+                    let mut staged_iter = staged_opt.take().unwrap_or_default().into_iter();
+                    while let Some((msg, effective)) = staged_iter.next() {
+                        let downlink_id = if effective == 0 {
+                            0u16
+                        } else if effective == 1 {
+                            if let Some(session) = owner.as_ref() {
+                                let Some((pid, outcome)) = session
+                                    .try_alloc_qos1_downlink_v5_checked_for_conn(
+                                        expected_conn_id,
+                                        msg.topic.clone(),
+                                        QoS::AtLeastOnce,
+                                        true,
+                                        msg.payload.clone(),
+                                        std::time::Instant::now(),
+                                    )
+                                else {
+                                    if expected_conn_id
+                                        .is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                                    {
+                                        rollback_session_retained_credits(
+                                            owner.as_deref(),
+                                            &filter_retained,
+                                        );
+                                        filter_retained.clear();
+                                        return Err(DeferCommitErr::Superseded);
+                                    }
+                                    deferred_retained
+                                        .push(make_pending_retained(&msg, effective, sub_id));
+                                    for (rest, rest_eff) in staged_iter {
+                                        deferred_retained
+                                            .push(make_pending_retained(&rest, rest_eff, sub_id));
+                                    }
+                                    break;
+                                };
+                                match outcome {
+                                    InflightTrackOutcome::Tracked => {}
+                                    InflightTrackOutcome::Spilled => {
+                                        shared.metrics.inc_inflight_spilled();
+                                    }
+                                    InflightTrackOutcome::Dropped => {
+                                        shared.metrics.inc_inflight_dropped();
+                                        shared.metrics.inc_inflight_spill_evicted();
+                                    }
+                                }
+                                pid
+                            } else {
+                                1u16
+                            }
+                        } else if let Some(session) = owner.as_ref() {
+                            let Some((pid, tracked)) = session
+                                .try_alloc_qos2_outbound_v5_checked_for_conn(
+                                    expected_conn_id,
+                                    msg.topic.clone(),
+                                    true,
+                                    msg.payload.clone(),
+                                )
+                            else {
+                                if expected_conn_id
+                                    .is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                                {
+                                    rollback_session_retained_credits(
+                                        owner.as_deref(),
+                                        &filter_retained,
+                                    );
+                                    filter_retained.clear();
+                                    return Err(DeferCommitErr::Superseded);
+                                }
+                                deferred_retained
+                                    .push(make_pending_retained(&msg, effective, sub_id));
+                                for (rest, rest_eff) in staged_iter {
+                                    deferred_retained
+                                        .push(make_pending_retained(&rest, rest_eff, sub_id));
+                                }
+                                break;
+                            };
+                            if !tracked {
+                                shared.metrics.inc_inflight_dropped();
+                            }
+                            pid
+                        } else {
+                            1u16
+                        };
+                        if let Some(routed) = encode_retained_publish_out(
+                            frame.header.conn_id,
+                            &msg.topic,
+                            downlink_id,
+                            effective,
+                            sub_id,
+                            msg.payload,
+                        ) {
+                            filter_retained.push(routed);
+                        } else if let Some(session) = owner.as_ref() {
+                            if effective == 1 {
+                                let _ = session.ack_inflight(downlink_id);
+                            } else if effective == 2 {
+                                let _ = session.ack_qos2_pubcomp(downlink_id);
+                            }
+                        }
+                    }
+                    if !deferred_retained.is_empty() {
                         if let Some(session) = owner.as_ref() {
                             match session.try_defer_retained_all_or_none_for_conn(
                                 expected_conn_id,
                                 max_deferred_msgs,
-                                deferred,
+                                deferred_retained,
                             ) {
                                 broker_session::DeferRetainedOutcome::Admitted => Ok(()),
                                 broker_session::DeferRetainedOutcome::QuotaExceeded => {
+                                    rollback_session_retained_credits(
+                                        owner.as_deref(),
+                                        &filter_retained,
+                                    );
+                                    filter_retained.clear();
                                     Err(DeferCommitErr::QuotaExceeded)
                                 }
                                 broker_session::DeferRetainedOutcome::Superseded => {
+                                    rollback_session_retained_credits(
+                                        owner.as_deref(),
+                                        &filter_retained,
+                                    );
+                                    filter_retained.clear();
                                     Err(DeferCommitErr::Superseded)
                                 }
                             }
@@ -7080,7 +7098,7 @@ async fn apply_subscribe(
         }
         drop(_retained_sub_gate);
         if commit_superseded || commit_failed_quota {
-            rollback_unsent_retained_credits(shared, frame.header.conn_id, &filter_retained);
+            rollback_session_retained_credits(owner.as_deref(), &filter_retained);
             if commit_superseded {
                 codes.push(if entry.has_options {
                     V5_SUBACK_NOT_AUTHORIZED
@@ -8910,18 +8928,36 @@ async fn ingress_pipeline_with_publisher_and_props(
     // tenant: retained state never crosses tenants.
     // The writer holds the retained store and the limits it needs, so a
     // rule republish with the retain flag takes the same path.
-    let _retained_pub_gate = if retain {
-        let gate = shared.retained_subscribe_gate.write().await;
-        shared
-            .retain_writer
-            .apply(topic, qos, payload, publisher_tenant)
-            .await;
-        Some(gate)
-    } else {
-        None
+    // Keep retained-store mutation and subscriber selection in one short
+    // critical section, releasing the gate before invoking rule actions
+    // (which may republish with `retain = true` and re-acquire this gate).
+    let deliveries = {
+        let _retained_pub_gate = if retain {
+            let gate = shared.retained_subscribe_gate.write().await;
+            shared
+                .retain_writer
+                .apply(topic, qos, payload, publisher_tenant)
+                .await;
+            Some(gate)
+        } else {
+            None
+        };
+        build_downlink_frames_with_publisher_and_props(
+            &shared.router,
+            &shared.sessions,
+            &shared.metrics,
+            topic,
+            qos,
+            retain,
+            payload,
+            publisher,
+            publisher_tenant,
+            v5,
+            Some(&shared.engine),
+        )
     };
 
-    // Rules execute at ingress on this node, before local fan-out.
+    // Rules execute at ingress on this node, after releasing the retained gate.
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
     //
@@ -8960,20 +8996,6 @@ async fn ingress_pipeline_with_publisher_and_props(
     shared
         .collectors
         .feed(publisher_tenant, topic, qos, retain, payload);
-
-    let deliveries = build_downlink_frames_with_publisher_and_props(
-        &shared.router,
-        &shared.sessions,
-        &shared.metrics,
-        topic,
-        qos,
-        retain,
-        payload,
-        publisher,
-        publisher_tenant,
-        v5,
-        Some(&shared.engine),
-    );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
     // returns after a length check, no spawn, no socket work.
@@ -9715,6 +9737,9 @@ fn build_downlink_frames_with_publisher_and_props(
         // in this tenant falls back to the legacy conn-id route below.
         match sessions.get_in_tenant(&sub.tenant, &sub.client_id) {
             Some(session) => {
+                if sub.session_id != 0 && session.id.0 != sub.session_id {
+                    continue;
+                }
                 let connected = *session.connected.read();
                 let live = *session.conn_id.read();
                 match (connected, live) {
@@ -20599,6 +20624,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -20729,6 +20755,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -20756,6 +20783,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -20877,6 +20905,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (slow_tx, _slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -20901,6 +20930,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -22305,6 +22335,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
     }

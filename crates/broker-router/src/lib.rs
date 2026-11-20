@@ -63,6 +63,10 @@ pub struct Subscription {
     pub retain_as_published: bool,
     pub retain_handling: u8,
     pub subscription_id: u32,
+    /// Monotonic `SessionId` owning this subscription copy (`0` when unbound
+    /// or constructed by legacy/test callers). Checked at delivery so an
+    /// already-snapshotted match never delivers to a replacement session.
+    pub session_id: u64,
 }
 
 impl Subscription {
@@ -78,6 +82,7 @@ impl Subscription {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         }
     }
 
@@ -98,6 +103,7 @@ impl Subscription {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         }
     }
 

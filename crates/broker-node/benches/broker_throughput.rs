@@ -166,6 +166,7 @@ fn build_router(subscriptions: usize) -> Router {
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
     }
@@ -186,6 +187,7 @@ fn build_router(subscriptions: usize) -> Router {
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
     }
