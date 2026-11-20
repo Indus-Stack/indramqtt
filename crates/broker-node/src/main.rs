@@ -16,8 +16,7 @@ use broker_router::{
 };
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
-    InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionKey,
-    SessionManager,
+    InflightTrackOutcome, Qos2InboundEntry, QueuedMessage, SessionKey, SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::OfflineQueueStore;
@@ -43,6 +42,7 @@ mod jwks_test_support;
 #[cfg(test)]
 mod link_harness;
 mod native;
+mod source_runtime;
 /// Test directory server (LDAP). Single-sourced in
 /// `crates/broker-auth/src/test_directory_server.rs` (test-only in both
 /// crates), included here with `#[path]` so there is one copy of the
@@ -580,6 +580,10 @@ const SHUTDOWN_DISCONNECT_RC: u8 = 0x8B;
 /// Reason: the removal plan bounds the orderly stop at ten seconds.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Longest wait to drain connector buffers during the stop.
+/// Reason: a down target must not hold the process open.
+const SHUTDOWN_CONNECTOR_FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Server-side reason string for one CONNACK return code (X1-02).
 /// Our own wording, written for this broker (never copied): success
 /// and identifier-rejected omit the property (`None`) to keep the
@@ -693,20 +697,24 @@ fn bind_looks_v5(meta: &[u8]) -> bool {
 /// [`broker_session::V5_EGRESS_OVERHEAD_BYTES`] estimate. Both reads
 /// are relaxed atomic loads; uncapped sessions (defaults) return
 /// after two loads with no lock.
-fn v5_egress_refused(
+fn v5_encoded_packet_too_large(session: &broker_session::Session, frame: &BrokerFrame) -> bool {
+    if session.protocol_version() != 5 {
+        return false;
+    }
+    let cap = session.client_max_packet_size();
+    if cap == 0 {
+        return false;
+    }
+    native::encoded_publish_out_len(frame, 5).is_some_and(|len| len > cap as usize)
+}
+
+fn v5_packet_size_refused(
     session: &broker_session::Session,
-    effective_qos: u8,
     topic_len: usize,
     payload_len: usize,
 ) -> Option<u8> {
     if session.protocol_version() != 5 {
         return None;
-    }
-    if effective_qos == 1 || effective_qos == 2 {
-        let cap = usize::from(session.client_receive_maximum().max(1));
-        if session.inflight_total_len() >= cap {
-            return Some(V5_RC_QUOTA_EXCEEDED);
-        }
     }
     let cap = session.client_max_packet_size();
     if cap != 0 {
@@ -718,6 +726,24 @@ fn v5_egress_refused(
         }
     }
     None
+}
+
+fn v5_egress_refused(
+    session: &broker_session::Session,
+    effective_qos: u8,
+    topic_len: usize,
+    payload_len: usize,
+) -> Option<u8> {
+    if session.protocol_version() != 5 {
+        return None;
+    }
+    if effective_qos == 1 || effective_qos == 2 {
+        let cap = usize::from(session.client_receive_maximum().max(1));
+        if session.unacked_on_conn_len() >= cap {
+            return Some(V5_RC_QUOTA_EXCEEDED);
+        }
+    }
+    v5_packet_size_refused(session, topic_len, payload_len)
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -1210,6 +1236,9 @@ async fn verify_jwks_connect(
 struct ChainAllow {
     /// Id of the entry that allowed. Drives per-entry success counts.
     id: String,
+    /// The built-in local table verified the password. Stamps the
+    /// verified identity.
+    via_local: bool,
     /// The directory cast the deciding verdict. Selects quota handling.
     via_ldap: bool,
     /// Kerberos cast the deciding verdict. Selects quota handling.
@@ -1233,6 +1262,7 @@ impl ChainAllow {
     fn none(id: String) -> Self {
         Self {
             id,
+            via_local: false,
             via_ldap: false,
             via_kerberos: false,
             via_jwks: false,
@@ -1314,7 +1344,9 @@ async fn decide_chain_auth(
                     .await
                     .is_ok();
                 if ok {
-                    return Ok(ChainAllow::none(entry.id.clone()));
+                    let mut allow = ChainAllow::none(entry.id.clone());
+                    allow.via_local = true;
+                    return Ok(allow);
                 }
                 return Err(deny());
             }
@@ -1531,6 +1563,9 @@ async fn apply_bind_request_inner(
     // block on JWKS success and read by the ownership stamp below.
     // CONNECT-only, never on the delivery path.
     let mut jwks_subject: Option<String> = None;
+    // Verified identity for the ownership stamp. Set only when a backend
+    // verified the credential. Open mode leaves it `None`.
+    let mut verified_connect_username: Option<String> = None;
     // B4-05: the CONNACK-negotiated inbound alias bound rides every
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
@@ -1727,6 +1762,7 @@ async fn apply_bind_request_inner(
                 password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
             let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
             let looks_jwt = password.is_some_and(JwksAuthenticator::looks_like_jwt);
+            let mut via_local = false;
             let mut via_ldap = false;
             let mut via_kerberos = false;
             let mut via_jwks = false;
@@ -1752,6 +1788,7 @@ async fn apply_bind_request_inner(
                 .await
                 {
                     Ok(allow) => {
+                        via_local = allow.via_local;
                         via_ldap = allow.via_ldap;
                         via_kerberos = allow.via_kerberos;
                         via_jwks = allow.via_jwks;
@@ -1817,6 +1854,7 @@ async fn apply_bind_request_inner(
                     .is_ok();
                 if local_ok {
                     // Local credential accepted; quotas apply below.
+                    via_local = true;
                 } else if req
                     .username
                     .as_deref()
@@ -2237,6 +2275,19 @@ async fn apply_bind_request_inner(
                     alias_max,
                     server_max_pkt,
                 ));
+            } else if !shared.allow_anonymous {
+                // `auth.allow_anonymous = false` must still fail closed when
+                // no authentication backend is configured, even if CONNECT
+                // carries a username.
+                shared.metrics.inc_auth_failures();
+                shared.authn_chain.record_built_in_failed();
+                return Some(refusal_for_req(
+                    frame,
+                    &req,
+                    0x87,
+                    alias_max,
+                    server_max_pkt,
+                ));
             } else {
                 // Open broker: no users, no directory, no database, no webhook, no enabled Kerberos
                 // or JWKS. Fall through to the session resolution below
@@ -2380,6 +2431,15 @@ async fn apply_bind_request_inner(
             } else if local_has_users {
                 shared.authn_chain.record_built_in_success();
             }
+            verified_connect_username = if via_kerberos {
+                kerberos_principal.clone()
+            } else if via_jwks {
+                jwks_subject.clone()
+            } else if via_local || via_ldap || via_db || via_webhook {
+                req.username.clone()
+            } else {
+                None
+            };
         }
     }
     // Tenant assignment (MT-01..MT-03): resolve the tenant BEFORE session
@@ -2427,22 +2487,7 @@ async fn apply_bind_request_inner(
     // session: snapshot them before `get_or_create` drops the old
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
-    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) = match parsed.clone() {
-        Ok(req) if req.clean_start => (
-            SessionKey::new(&tenant_for_bind, &req.client_id),
-            shared
-                .sessions
-                .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
-        ),
-        Ok(req) => (
-            SessionKey::new(&tenant_for_bind, &req.client_id),
-            Vec::new(),
-        ),
-        Err(_) => (
-            SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
-            Vec::new(),
-        ),
-    };
+
     // Session resolution in the owning tenant (MT-03): same takeover
     // semantics as before, scoped to the key. The tenant is stamped
     // before binding so the `conn_id -> session key` index carries the
@@ -2535,30 +2580,50 @@ async fn apply_bind_request_inner(
             // defaults, so pure 3.1.1 flows behave bit for bit as
             // before, while a reconnect in either version drops an
             // elapsed v5 husk instead of resuming it.
-            let (session, present, expired_swept) = shared.sessions.get_or_create_v5_in_tenant(
-                &tenant_for_bind,
-                &req.client_id,
-                req.clean_start,
-                req.protocol_version,
-                req.session_expiry,
-                req.receive_maximum,
-                req.max_packet_size,
-            );
-            session.set_tenant_id(tenant_for_bind.clone());
-            shared.sessions.bind_session(&session, frame.header.conn_id);
-            *session.keepalive_secs.write() = req.keepalive_secs;
-            // No audit record here. The log holds only post, put and delete.
-            // B4-05: a new connection renegotiates aliases. The inbound
-            // bound is the manager default (advertised below in CONNACK);
-            // the outbound bound is the client's CONNECT maximum (0 when
-            // the bind carries none). Tables start empty.
-            session.clear_aliases();
-            session.set_inbound_alias_max(shared.sessions.max_topic_alias());
-            session.set_outbound_alias_max(req.client_alias_max);
-            // F1-01: the CONNECT last will rides the bind (edge forwards
-            // what CONNECT carried). Stored on the session where the
-            // disconnect decision lives; `None` clears a previous will.
-            session.set_last_will(will);
+            let effective_username = if let Some(principal) = &kerberos_principal {
+                Some(principal.clone())
+            } else if let Some(subject) = &jwks_subject {
+                Some(subject.clone())
+            } else {
+                req.username.clone()
+            };
+            let is_superuser = verified_connect_username
+                .as_deref()
+                .is_some_and(|name| shared.auth.is_superuser(name));
+            let (session, present, expired_swept, stale_conn) =
+                shared.sessions.connect_bind_v5_in_tenant(
+                    &tenant_for_bind,
+                    &req.client_id,
+                    req.clean_start,
+                    Some(verified_connect_username.as_deref()),
+                    req.protocol_version,
+                    req.session_expiry,
+                    req.receive_maximum,
+                    req.max_packet_size,
+                    Some(broker_session::ConnectBindMeta {
+                        conn_id: frame.header.conn_id,
+                        username: effective_username,
+                        verified_username: verified_connect_username.clone(),
+                        is_superuser,
+                        peerhost: req.peerhost.clone(),
+                        keepalive_secs: req.keepalive_secs,
+                        client_alias_max: req.client_alias_max,
+                        will,
+                    }),
+                );
+            if let Some(old_conn_id) = stale_conn {
+                if old_conn_id != frame.header.conn_id {
+                    if let Ok(close) = BrokerFrame::new(
+                        OpCode::ConnClose,
+                        old_conn_id,
+                        0,
+                        Bytes::from(vec![0x8E]),
+                        Bytes::new(),
+                    ) {
+                        let _ = shared.conns.order_close(old_conn_id, close);
+                    }
+                }
+            }
             // X1-02: version-5 success carries session-present, the
             // granted expiry and the server limits; version-4 success
             // keeps today's 12-byte layout and bytes.
@@ -2586,11 +2651,16 @@ async fn apply_bind_request_inner(
             // resubscribes from nothing like a clean start. Empty
             // unless the expired-drop path ran. Off the hot path
             // (bind only).
-            for filter in &expired_swept {
-                shared
-                    .router
-                    .unsubscribe_in_tenant(filter, &req.client_id, &tenant_for_bind);
-            }
+            shared.sessions.sweep_unsubscribed_filters_in_tenant(
+                &tenant_for_bind,
+                &req.client_id,
+                &expired_swept,
+                |filter| {
+                    shared
+                        .router
+                        .unsubscribe_in_tenant(filter, &req.client_id, &tenant_for_bind);
+                },
+            );
             if !expired_swept.is_empty() {
                 refresh_subscription_stats(shared);
             }
@@ -2605,11 +2675,16 @@ async fn apply_bind_request_inner(
                 .sessions
                 .prune_expired_bounded(&tenant_for_bind, broker_session::MAX_EXPIRY_SWEEP)
             {
-                for filter in &filters {
-                    shared
-                        .router
-                        .unsubscribe_in_tenant(filter, &victim, &tenant_for_bind);
-                }
+                shared.sessions.sweep_unsubscribed_filters_in_tenant(
+                    &tenant_for_bind,
+                    &victim,
+                    &filters,
+                    |filter| {
+                        shared
+                            .router
+                            .unsubscribe_in_tenant(filter, &victim, &tenant_for_bind);
+                    },
+                );
                 if !filters.is_empty() {
                     refresh_subscription_stats(shared);
                 }
@@ -2645,58 +2720,7 @@ async fn apply_bind_request_inner(
     // clean start never removes another tenant's subscription for the
     // same client id. Off the hot path (bind only); fan-out takes no new
     // lock and delivery cost is unchanged.
-    for filter in &stale.1 {
-        shared
-            .router
-            .unsubscribe_in_tenant(filter, &stale.0.client_id, &stale.0.tenant);
-    }
-    if !stale.1.is_empty() {
-        refresh_subscription_stats(shared);
-    }
-    // Stamp ownership for quota release and publish attribution. Kerberos
-    // CONNECTs stamp the verified client principal (not the MQTT username
-    // string, which the ticket supersedes); all other paths keep the MQTT
-    // username. The principal was verified above, never re-verified here.
-    if let Ok(req) = parsed.clone() {
-        if let Some(session) = shared
-            .sessions
-            .get_in_tenant(&tenant_for_bind, &req.client_id)
-        {
-            if let Some(principal) = &kerberos_principal {
-                *session.username.write() = Some(principal.clone());
-            } else if let Some(subject) = &jwks_subject {
-                // B5-02: JWT CONNECTs stamp the verified subject (the
-                // username string is unverified protocol metadata).
-                *session.username.write() = Some(subject.clone());
-            } else if let Some(username) = &req.username {
-                *session.username.write() = Some(username.clone());
-            }
-        }
-        // Stamp the peer address for publish-time ban checks (B1-03):
-        // only overwritten when the edge forwarded one, so a rebind
-        // without a peer section keeps the last known address.
-        if let (Some(session), Some(peerhost)) = (
-            shared
-                .sessions
-                .get_in_tenant(&tenant_for_bind, &req.client_id),
-            &req.peerhost,
-        ) {
-            *session.peerhost.write() = Some(peerhost.clone());
-        }
-        // The session already carries `tenant_for_bind` (stamped at
-        // creation above); propagate that same tenant onto the will so
-        // the disconnect/kick fire respects tenant isolation (MT-01).
-        // No second registry render here: re-rendering would count one
-        // rejection twice in `fallback_count`.
-        if let Some(session) = shared
-            .sessions
-            .get_in_tenant(&tenant_for_bind, &req.client_id)
-        {
-            if let Some(will) = session.last_will.write().as_mut() {
-                will.tenant = tenant_for_bind.clone();
-            }
-        }
-    }
+
     Some(reply)
 }
 
@@ -2746,6 +2770,19 @@ async fn apply_auto_subscribe(
     // never observe another tenant's topics. Resolved from the bound
     // connection's own session. Runs once per bind, never per message.
     let tenant = session_tenant_for_conn(shared, conn_id, client_id);
+    // Fast superuser flag first (one atomic, no lock, no clone).
+    // Only a superuser bypass needs the verified name for metrics.
+    let session_for_auth = session_for_conn_if_client(shared, conn_id, client_id);
+    let is_superuser = session_for_auth
+        .as_ref()
+        .is_some_and(|session| session.verified_is_superuser.load(Ordering::Relaxed));
+    let verified_username = if is_superuser {
+        session_for_auth
+            .as_ref()
+            .and_then(|session| session.verified_username.read().clone())
+    } else {
+        None
+    };
     let mut applied = false;
     for entry in &entries {
         let rendered =
@@ -2761,7 +2798,12 @@ async fn apply_auto_subscribe(
         // denied client receives nothing through auto-subscribe (D2).
         if shared
             .auth
-            .authorize_subscribe_in_tenant(&tenant, client_id, &filter)
+            .authorize_subscribe_in_tenant_as(
+                &tenant,
+                client_id,
+                verified_username.as_deref(),
+                &filter,
+            )
             .await
             .is_err()
         {
@@ -2782,6 +2824,10 @@ async fn apply_auto_subscribe(
             0,
         );
         auto_sub.tenant = tenant.clone().into();
+        let _route_guard = shared.sessions.lock_route_guard();
+        if conn_id != 0 && shared.sessions.session_for_conn(conn_id).is_none() {
+            break;
+        }
         let stored = shared.router.subscribe(&filter, auto_sub);
         if !stored {
             continue;
@@ -4194,6 +4240,10 @@ struct Shared {
     retained: Arc<dyn RetainedStore>,
     /// Retained writer shared by the ingress pipeline and the rule sink.
     retain_writer: RetainWriter,
+    /// Coordinates `PUBLISH(retain=true)` (`write`) with `SUBSCRIBE` retained
+    /// snapshot + atomic route commit (`read`) so no retained update falls
+    /// between snapshot and route installation without staging uncommitted routes.
+    retained_subscribe_gate: Arc<tokio::sync::RwLock<()>>,
     /// Retained-delivery settings for W1-28: shared with the management
     /// API so kernel ingress and management publishes enforce the same
     /// configurable limits. One Arc clone at boot; reads take a short
@@ -4623,6 +4673,7 @@ impl Shared {
             metrics: metrics.clone(),
             tenant_limits: tenant_limits.clone(),
         };
+        let retained_subscribe_gate = Arc::new(tokio::sync::RwLock::new(()));
         let sink: Arc<dyn BrokerSink> = Arc::new(InMemoryBrokerSink {
             router: router.clone(),
             sessions: sessions.clone(),
@@ -4630,6 +4681,7 @@ impl Shared {
             metrics: metrics.clone(),
             engine: engine.clone(),
             retain_writer: retain_writer.clone(),
+            retained_subscribe_gate: retained_subscribe_gate.clone(),
         });
         engine.set_broker_sink(sink.clone());
 
@@ -4700,6 +4752,7 @@ impl Shared {
             sink,
             retained,
             retain_writer,
+            retained_subscribe_gate,
             retainer_config,
             auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
             bans: Arc::new(broker_api::v5::banned::BanStore::new()),
@@ -5599,6 +5652,7 @@ struct InMemoryBrokerSink {
     metrics: Arc<Metrics>,
     engine: Arc<RuleEngine>,
     retain_writer: RetainWriter,
+    retained_subscribe_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[async_trait]
@@ -5683,6 +5737,11 @@ impl InMemoryBrokerSink {
         retain: bool,
         props: &PublishV5Props,
     ) {
+        let _retained_sub_gate = if retain {
+            Some(self.retained_subscribe_gate.write().await)
+        } else {
+            None
+        };
         if retain {
             self.retain_writer
                 .apply(&topic, qos, &payload, tenant)
@@ -5946,6 +6005,24 @@ where
                 shared.metrics.inc_connack_sent();
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
+                if accepted
+                    && shared
+                        .sessions
+                        .session_for_conn(frame.header.conn_id)
+                        .is_none()
+                {
+                    if let Ok(close) = BrokerFrame::new(
+                        OpCode::ConnClose,
+                        frame.header.conn_id,
+                        0,
+                        Bytes::from(vec![0x8E]),
+                        Bytes::new(),
+                    ) {
+                        let _ = transport.send(close).await;
+                    }
+                    shared.conns.unregister(frame.header.conn_id);
+                    return Ok(());
+                }
                 let active = shared.metrics.inc_connections();
                 shared.stats.set_connections(active.max(0) as u64);
                 refresh_subscription_stats(shared);
@@ -6004,14 +6081,19 @@ where
                         .await;
                     }
                 }
-                let replayed = match native_bind {
-                    Some(request) => {
-                        Box::pin(replay_offline_client(&frame, &request.client_id, shared)).await
+                let replayed = if accepted {
+                    match native_bind {
+                        Some(request) => {
+                            Box::pin(replay_offline_client(&frame, &request.client_id, shared))
+                                .await
+                        }
+                        #[cfg(test)]
+                        None => Box::pin(replay_offline(&frame, shared)).await,
+                        #[cfg(not(test))]
+                        None => 0,
                     }
-                    #[cfg(test)]
-                    None => Box::pin(replay_offline(&frame, shared)).await,
-                    #[cfg(not(test))]
-                    None => 0,
+                } else {
+                    0
                 };
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
@@ -6031,8 +6113,15 @@ where
                 shared.metrics.inc_suback_sent();
                 transport.send(reply).await?;
                 // SUBACK first, then retained state, per MQTT ordering.
-                for held in &retained {
-                    transport.send(held.clone()).await?;
+                for (idx, held) in retained.iter().enumerate() {
+                    if let Err(err) = transport.send(held.clone()).await {
+                        rollback_unsent_retained_credits(
+                            shared,
+                            frame.header.conn_id,
+                            &retained[idx..],
+                        );
+                        return Err(err.into());
+                    }
                 }
                 shared
                     .metrics
@@ -6217,6 +6306,106 @@ where
 /// retained fetch, and cluster announce so every downstream stage sees
 /// the plain inner filter. Retained deliveries carry `retain = true` at
 /// `min(subscription QoS, stored QoS)`.
+fn encode_retained_publish_out(
+    conn_id: u64,
+    topic: &Topic,
+    downlink_id: u16,
+    effective_qos: u8,
+    sub_id: u32,
+    payload: Bytes,
+) -> Option<BrokerFrame> {
+    let topic_str = topic.as_str();
+    let sub_id = if sub_id <= broker_router::MAX_SUBSCRIPTION_ID {
+        sub_id
+    } else {
+        0
+    };
+    let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3 + 2 + 4);
+    meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic_str.as_bytes());
+    meta.extend_from_slice(&downlink_id.to_be_bytes());
+    meta.push(effective_qos);
+    meta.push(1u8); // retain: replayed retained state
+    meta.push(0u8);
+    meta.extend_from_slice(&protocol_v5::encode_topic_alias(0));
+    if sub_id != 0 {
+        meta.extend_from_slice(&sub_id.to_be_bytes());
+    }
+    BrokerFrame::new(OpCode::PublishOut, conn_id, 0, Bytes::from(meta), payload).ok()
+}
+
+fn make_pending_retained(
+    msg: &broker_storage::StoredMessage,
+    effective_qos: u8,
+    sub_id: u32,
+) -> broker_session::PendingRetained {
+    let qos = match effective_qos {
+        0 => QoS::AtMostOnce,
+        2 => QoS::ExactlyOnce,
+        _ => QoS::AtLeastOnce,
+    };
+    broker_session::PendingRetained {
+        topic: msg.topic.clone(),
+        qos,
+        payload: msg.payload.clone(),
+        sub_id,
+    }
+}
+
+fn rollback_session_retained_credits(
+    session: Option<&broker_session::Session>,
+    unsent: &[BrokerFrame],
+) {
+    let Some(session) = session else {
+        return;
+    };
+    for frame in unsent {
+        if frame.header.opcode != OpCode::PublishOut || frame.metadata.len() < 5 {
+            continue;
+        }
+        let tlen = u16::from_be_bytes([frame.metadata[0], frame.metadata[1]]) as usize;
+        if frame.metadata.len() < 2 + tlen + 3 {
+            continue;
+        }
+        let pid = u16::from_be_bytes([frame.metadata[2 + tlen], frame.metadata[2 + tlen + 1]]);
+        let qos = frame.metadata[2 + tlen + 2];
+        if qos == 1 {
+            let _ = session.ack_inflight(pid);
+        } else if qos == 2 {
+            let _ = session.ack_qos2_pubcomp(pid);
+        }
+    }
+}
+
+fn rollback_unsent_retained_credits(shared: &Shared, conn_id: u64, unsent: &[BrokerFrame]) {
+    let session = shared.sessions.session_for_conn(conn_id).or_else(|| {
+        shared
+            .sessions
+            .client_id_for_conn(conn_id)
+            .as_deref()
+            .and_then(|p| shared.sessions.get(p))
+    });
+    let Some(session) = session else {
+        return;
+    };
+    for frame in unsent {
+        if frame.header.opcode != OpCode::PublishOut || frame.metadata.len() < 5 {
+            continue;
+        }
+        let tlen = u16::from_be_bytes([frame.metadata[0], frame.metadata[1]]) as usize;
+        if frame.metadata.len() < 2 + tlen + 3 {
+            continue;
+        }
+        let pid = u16::from_be_bytes([frame.metadata[2 + tlen], frame.metadata[2 + tlen + 1]]);
+        let qos = frame.metadata[2 + tlen + 2];
+        if qos == 1 {
+            let _ = session.ack_inflight(pid);
+        } else if qos == 2 {
+            let _ = session.ack_qos2_pubcomp(pid);
+        }
+    }
+}
+
 async fn apply_subscribe(
     frame: &BrokerFrame,
     shared: &Shared,
@@ -6230,13 +6419,8 @@ async fn apply_subscribe(
     let mut codes = Vec::with_capacity(subs.len());
     // Each granted filter, with its retain-handling decision and the
     // subscription identifier that the retained replay carries.
-    struct GrantedSub {
-        filter: TopicFilter,
-        qos: u8,
-        sub_id: u32,
-        send_retained: bool,
-    }
-    let mut granted: Vec<GrantedSub> = Vec::with_capacity(subs.len());
+    let mut retained = Vec::new();
+    let mut granted_filters: Vec<TopicFilter> = Vec::with_capacity(subs.len());
     // AP-11: a denied subscribe disconnects when the stored `deny_action`
     // is `disconnect`. The flag accumulates across filters; the close is
     // ordered once below after the SubAck is built, so every filter still
@@ -6248,12 +6432,67 @@ async fn apply_subscribe(
     // session and never on a default-tenant namesake. Two tenants sharing
     // a client id subscribe independently; a tenant mismatch at publish
     // time delivers nothing, counted, never an error to the publisher.
-    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
-    // X1-03: resolve the owning session without creating it.
-    // Production binds before subscribing, so the session exists.
-    // A missing session records no mirror and changes no state.
-    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
+    let conn_session = shared.sessions.session_for_conn(frame.header.conn_id);
+    let conn_was_bound = conn_session.is_some();
+    let tenant = conn_session
+        .as_ref()
+        .map(|s| s.tenant_id.read().clone())
+        .unwrap_or_else(|| session_tenant_for_conn(shared, frame.header.conn_id, &client_id));
+    #[cfg(test)]
+    let (superseded_conn, owner) = {
+        let fallback_session = if conn_session.is_none() {
+            shared.sessions.get_in_tenant(&tenant, &client_id)
+        } else {
+            None
+        };
+        let superseded = fallback_session.as_ref().is_some_and(|s| {
+            let cur_conn = *s.conn_id.read();
+            cur_conn != Some(frame.header.conn_id)
+                && (cur_conn.is_some() || s.ended_at_ms.read().is_some())
+        });
+        let owner = conn_session.or_else(|| (!superseded).then_some(fallback_session).flatten());
+        (superseded, owner)
+    };
+    #[cfg(not(test))]
+    let (superseded_conn, owner) = (conn_session.is_none(), conn_session);
+    let max_deferred_msgs = shared
+        .sessions
+        .max_offline_queue()
+        .unwrap_or(broker_session::DEFAULT_MAX_OFFLINE_QUEUE)
+        .max(1);
+    let initial_credits = owner
+        .as_ref()
+        .map(|s| {
+            if s.protocol_version() == 5 {
+                usize::from(s.client_receive_maximum().max(1))
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    let mut remaining_lookup_budget = max_deferred_msgs
+        .saturating_add(initial_credits)
+        .saturating_mul(4)
+        .max(1024)
+        .min(broker_session::DEFAULT_MAX_OFFLINE_QUEUE.saturating_mul(2));
+    let mut remaining_scan_budget = remaining_lookup_budget.saturating_mul(4);
+    let expected_conn_id = owner.as_ref().and_then(|bound| {
+        if conn_was_bound {
+            Some(frame.header.conn_id)
+        } else {
+            (*bound.conn_id.read()).map(|_| frame.header.conn_id)
+        }
+    });
     for entry in subs {
+        if superseded_conn {
+            codes.push(if entry.has_options {
+                V5_SUBACK_NOT_AUTHORIZED
+            } else {
+                V5_SUBACK_UNSPECIFIED
+            });
+            authz_disconnect = true;
+            continue;
+        }
         let raw_filter_str = entry.filter;
         // X1-03: decode the per-filter options. Legacy entries carry a
         // plain QoS byte; extended entries carry the options byte plus a
@@ -6351,11 +6590,34 @@ async fn apply_subscribe(
         });
         let local_denied = match cached_subscribe {
             Some(allow) => !allow,
-            None => shared
-                .auth
-                .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
-                .await
-                .is_err(),
+            None => {
+                // Fast superuser flag first (one atomic, no lock).
+                // Only the rare superuser bypass clones the name.
+                let is_superuser = owner
+                    .as_ref()
+                    .is_some_and(|session| session.verified_is_superuser.load(Ordering::Relaxed));
+                if is_superuser {
+                    let verified = owner
+                        .as_ref()
+                        .and_then(|s| s.verified_username.read().clone());
+                    shared
+                        .auth
+                        .authorize_subscribe_in_tenant_as(
+                            &tenant,
+                            &client_id,
+                            verified.as_deref(),
+                            &filter,
+                        )
+                        .await
+                        .is_err()
+                } else {
+                    shared
+                        .auth
+                        .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
+                        .await
+                        .is_err()
+                }
+            }
         };
         if local_denied {
             // Per-client decision cache (W2-01): record the denial on the
@@ -6498,12 +6760,10 @@ async fn apply_subscribe(
         // connection's own session, so two tenants sharing a client id
         // subscribe independently.
         // B4-08 bound: a new entry past MAX_SUBSCRIPTIONS is denied fail
-        // closed (existing delivery proceeds); report MQTT 5 0x97 Quota
-        // Exceeded — the same code the broker uses for publish rate quota
-        // — and register nothing (no session mirror, no grant, no announce,
-        // no retained replay), never success for a subscription with no store.
-        // TODO(parity): is 0x97 the observable reference behaviour for a
-        // subscription-table bound, or does it answer 0x80 Unspecified error?
+        // closed. Existing delivery proceeds. A version-5 client gets 0x97
+        // Quota Exceeded; a version-4 client gets 0x80. The denial
+        // registers nothing (no session mirror, no grant, no announce,
+        // no retained replay).
         let mut sub = Subscription::with_options(
             client_id.clone(),
             frame.header.conn_id,
@@ -6515,55 +6775,347 @@ async fn apply_subscribe(
         );
         sub.group = group;
         sub.tenant = tenant.clone().into();
-        let stored = shared.router.subscribe(&filter, sub);
-        if !stored {
-            codes.push(V5_SUBACK_QUOTA_EXCEEDED);
-            continue;
-        }
-        // Per-client decision cache (W2-01): record the grant on the
-        // owning tenant's session alongside the session mirror below.
-        // Same bounded per-session insert, same event; delivery never
-        // touches this lock. Recorded only after the router accepts the
-        // entry so a quota denial records nothing and changes no session
-        // state. A cache hit needs no new insert.
-        if cached_subscribe.is_none() {
-            if let Some(session) = owner.as_ref() {
-                record_authz_under_policy(
-                    shared,
-                    session,
-                    "subscribe",
-                    filter.as_str(),
-                    qos_raw,
-                    false,
-                    true,
-                );
+        sub.session_id = owner.as_ref().map_or(0, |s| s.id.0);
+        {
+            let _route_guard = shared.sessions.lock_route_guard();
+            if let Some(bound) = owner.as_ref() {
+                let still_bound = if conn_was_bound {
+                    shared
+                        .sessions
+                        .session_for_conn(frame.header.conn_id)
+                        .is_some_and(|cur| cur.id == bound.id)
+                } else {
+                    let cur_conn = *bound.conn_id.read();
+                    cur_conn == Some(frame.header.conn_id)
+                        || (cur_conn.is_none() && bound.ended_at_ms.read().is_none())
+                };
+                if !still_bound {
+                    codes.push(if entry.has_options {
+                        V5_SUBACK_NOT_AUTHORIZED
+                    } else {
+                        V5_SUBACK_UNSPECIFIED
+                    });
+                    authz_disconnect = true;
+                    continue;
+                }
             }
         }
-        // Mirror the grant with its full v5 options on the owning
-        // tenant's session for observability (the router stays the
-        // routing authority). Another tenant's namesake session is never
-        // touched.
-        shared.sessions.add_subscription_with_options_in_tenant(
-            &tenant,
-            &client_id,
-            filter.clone(),
-            qos,
-            u8::from(no_local),
-            u8::from(rap),
-            rh,
-        );
-        // X1-03 retain-handling: 2 never replays retained state for this
-        // grant; 1 replays only when the filter is new; 0 always replays.
-        // The decision is recorded here on the subscribe event so the
-        // replay loop below stays a straight filter walk.
         let send_retained = match rh {
             1 => !existed,
             2 => false,
             _ => true,
         };
-        // Fire the subscribe events. Rules belong to the default tenant,
-        // so another tenant fires nothing. Subscribe carries no retain
-        // flag, so retain stays absent. Check flags before any lock.
+        let _retained_sub_gate = if send_retained {
+            Some(shared.retained_subscribe_gate.read().await)
+        } else {
+            None
+        };
+        let mut filter_retained = Vec::new();
+        let mut staged_retained: Vec<(broker_storage::StoredMessage, u8)> = Vec::new();
+        let mut quota_exceeded = false;
+        let mut superseded_during_retained = false;
+        if send_retained {
+            let subscriber_tenant = owner
+                .as_ref()
+                .map(|s| s.tenant_id.read().clone())
+                .unwrap_or_else(|| tenant.clone());
+            let (matched, truncated, scanned) = match shared
+                .retained
+                .find_matching_in_tenant_bounded(
+                    &filter,
+                    &subscriber_tenant,
+                    remaining_lookup_budget,
+                    remaining_scan_budget,
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
+                    (Vec::new(), false, 0)
+                }
+            };
+            if filter.as_str().contains('+') || filter.as_str().contains('#') {
+                remaining_scan_budget = remaining_scan_budget.saturating_sub(scanned);
+            }
+            remaining_lookup_budget = remaining_lookup_budget.saturating_sub(matched.len());
+            quota_exceeded = truncated;
+            for msg in matched {
+                if quota_exceeded {
+                    break;
+                }
+                let conn_still_current = owner.as_ref().is_none_or(|bound| {
+                    if conn_was_bound {
+                        shared
+                            .sessions
+                            .session_for_conn(frame.header.conn_id)
+                            .is_some_and(|cur| {
+                                cur.id == bound.id
+                                    && expected_conn_id
+                                        .is_none_or(|cid| *cur.conn_id.read() == Some(cid))
+                            })
+                    } else {
+                        expected_conn_id.is_none_or(|cid| *bound.conn_id.read() == Some(cid))
+                    }
+                });
+                if !conn_still_current {
+                    superseded_during_retained = true;
+                    break;
+                }
+                let effective = std::cmp::min(qos_raw, u8::from(msg.qos));
+                let probe_id = if effective == 0 { 0u16 } else { 1u16 };
+                let Some(probe_frame) = encode_retained_publish_out(
+                    frame.header.conn_id,
+                    &msg.topic,
+                    probe_id,
+                    effective,
+                    sub_id,
+                    msg.payload.clone(),
+                ) else {
+                    continue;
+                };
+                if owner
+                    .as_ref()
+                    .is_some_and(|s| v5_encoded_packet_too_large(s, &probe_frame))
+                {
+                    shared.metrics.inc_messages_dropped();
+                    continue;
+                }
+                staged_retained.push((msg, effective));
+            }
+        }
+        if superseded_during_retained || quota_exceeded {
+            if superseded_during_retained {
+                codes.push(if entry.has_options {
+                    V5_SUBACK_NOT_AUTHORIZED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+                authz_disconnect = true;
+            } else {
+                shared.metrics.inc_messages_dropped();
+                codes.push(if entry.has_options {
+                    V5_SUBACK_QUOTA_EXCEEDED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+            }
+            continue;
+        }
+        let mut commit_failed_quota = false;
+        let mut commit_superseded = false;
+        {
+            let _rg = shared.sessions.lock_route_guard();
+            let _replay_guard = owner.as_ref().map(|s| s.lock_replay());
+            let still_owner = owner.as_ref().is_none_or(|bound| {
+                if conn_was_bound {
+                    shared
+                        .sessions
+                        .session_for_conn(frame.header.conn_id)
+                        .is_some_and(|cur| {
+                            cur.id == bound.id
+                                && expected_conn_id
+                                    .is_none_or(|cid| *cur.conn_id.read() == Some(cid))
+                        })
+                } else {
+                    expected_conn_id.is_none_or(|cid| *bound.conn_id.read() == Some(cid))
+                }
+            });
+            if !still_owner {
+                commit_superseded = true;
+            } else {
+                enum DeferCommitErr {
+                    QuotaExceeded,
+                    Superseded,
+                }
+                let mut staged_opt = Some(staged_retained);
+                match shared.router.try_subscribe_with(&filter, sub, || {
+                    let mut deferred_retained = Vec::new();
+                    let mut staged_iter = staged_opt.take().unwrap_or_default().into_iter();
+                    while let Some((msg, effective)) = staged_iter.next() {
+                        let downlink_id = if effective == 0 {
+                            0u16
+                        } else if effective == 1 {
+                            if let Some(session) = owner.as_ref() {
+                                let Some((pid, outcome)) = session
+                                    .try_alloc_qos1_downlink_v5_checked_for_conn(
+                                        expected_conn_id,
+                                        msg.topic.clone(),
+                                        QoS::AtLeastOnce,
+                                        true,
+                                        msg.payload.clone(),
+                                        std::time::Instant::now(),
+                                    )
+                                else {
+                                    if expected_conn_id
+                                        .is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                                    {
+                                        rollback_session_retained_credits(
+                                            owner.as_deref(),
+                                            &filter_retained,
+                                        );
+                                        filter_retained.clear();
+                                        return Err(DeferCommitErr::Superseded);
+                                    }
+                                    deferred_retained
+                                        .push(make_pending_retained(&msg, effective, sub_id));
+                                    for (rest, rest_eff) in staged_iter {
+                                        deferred_retained
+                                            .push(make_pending_retained(&rest, rest_eff, sub_id));
+                                    }
+                                    break;
+                                };
+                                match outcome {
+                                    InflightTrackOutcome::Tracked => {}
+                                    InflightTrackOutcome::Spilled => {
+                                        shared.metrics.inc_inflight_spilled();
+                                    }
+                                    InflightTrackOutcome::Dropped => {
+                                        shared.metrics.inc_inflight_dropped();
+                                        shared.metrics.inc_inflight_spill_evicted();
+                                    }
+                                }
+                                pid
+                            } else {
+                                1u16
+                            }
+                        } else if let Some(session) = owner.as_ref() {
+                            let Some((pid, tracked)) = session
+                                .try_alloc_qos2_outbound_v5_checked_for_conn(
+                                    expected_conn_id,
+                                    msg.topic.clone(),
+                                    true,
+                                    msg.payload.clone(),
+                                )
+                            else {
+                                if expected_conn_id
+                                    .is_some_and(|cid| *session.conn_id.read() != Some(cid))
+                                {
+                                    rollback_session_retained_credits(
+                                        owner.as_deref(),
+                                        &filter_retained,
+                                    );
+                                    filter_retained.clear();
+                                    return Err(DeferCommitErr::Superseded);
+                                }
+                                deferred_retained
+                                    .push(make_pending_retained(&msg, effective, sub_id));
+                                for (rest, rest_eff) in staged_iter {
+                                    deferred_retained
+                                        .push(make_pending_retained(&rest, rest_eff, sub_id));
+                                }
+                                break;
+                            };
+                            if !tracked {
+                                shared.metrics.inc_inflight_dropped();
+                            }
+                            pid
+                        } else {
+                            1u16
+                        };
+                        if let Some(routed) = encode_retained_publish_out(
+                            frame.header.conn_id,
+                            &msg.topic,
+                            downlink_id,
+                            effective,
+                            sub_id,
+                            msg.payload,
+                        ) {
+                            filter_retained.push(routed);
+                        } else if let Some(session) = owner.as_ref() {
+                            if effective == 1 {
+                                let _ = session.ack_inflight(downlink_id);
+                            } else if effective == 2 {
+                                let _ = session.ack_qos2_pubcomp(downlink_id);
+                            }
+                        }
+                    }
+                    if !deferred_retained.is_empty() {
+                        if let Some(session) = owner.as_ref() {
+                            match session.try_defer_retained_all_or_none_for_conn(
+                                expected_conn_id,
+                                max_deferred_msgs,
+                                deferred_retained,
+                            ) {
+                                broker_session::DeferRetainedOutcome::Admitted => Ok(()),
+                                broker_session::DeferRetainedOutcome::QuotaExceeded => {
+                                    rollback_session_retained_credits(
+                                        owner.as_deref(),
+                                        &filter_retained,
+                                    );
+                                    filter_retained.clear();
+                                    Err(DeferCommitErr::QuotaExceeded)
+                                }
+                                broker_session::DeferRetainedOutcome::Superseded => {
+                                    rollback_session_retained_credits(
+                                        owner.as_deref(),
+                                        &filter_retained,
+                                    );
+                                    filter_retained.clear();
+                                    Err(DeferCommitErr::Superseded)
+                                }
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    Ok(true) => {
+                        if cached_subscribe.is_none() {
+                            if let Some(session) = owner.as_ref() {
+                                record_authz_under_policy(
+                                    shared,
+                                    session,
+                                    "subscribe",
+                                    filter.as_str(),
+                                    qos_raw,
+                                    false,
+                                    true,
+                                );
+                            }
+                        }
+                        shared.sessions.add_subscription_if_session_in_tenant(
+                            &tenant,
+                            &client_id,
+                            owner.as_ref().map(|s| s.id),
+                            filter.clone(),
+                            qos,
+                            u8::from(no_local),
+                            u8::from(rap),
+                            rh,
+                        );
+                    }
+                    Ok(false) | Err(DeferCommitErr::QuotaExceeded) => {
+                        commit_failed_quota = true;
+                    }
+                    Err(DeferCommitErr::Superseded) => {
+                        commit_superseded = true;
+                    }
+                }
+            }
+        }
+        drop(_retained_sub_gate);
+        if commit_superseded || commit_failed_quota {
+            rollback_session_retained_credits(owner.as_deref(), &filter_retained);
+            if commit_superseded {
+                codes.push(if entry.has_options {
+                    V5_SUBACK_NOT_AUTHORIZED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+                authz_disconnect = true;
+            } else {
+                shared.metrics.inc_messages_dropped();
+                codes.push(if entry.has_options {
+                    V5_SUBACK_QUOTA_EXCEEDED
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
+            }
+            continue;
+        }
         if shared
             .engine
             .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
@@ -6609,18 +7161,11 @@ async fn apply_subscribe(
                     });
             }
         }
-        // Each grant goes in the list: the statistics and the cluster
-        // announce use all grants. Only the retained replay uses the
-        // retain-handling decision.
-        granted.push(GrantedSub {
-            filter,
-            qos: qos_raw,
-            sub_id,
-            send_retained,
-        });
+        retained.extend(filter_retained);
+        granted_filters.push(filter);
         codes.push(qos_raw);
     }
-    if !granted.is_empty() {
+    if !granted_filters.is_empty() {
         refresh_subscription_stats(shared);
     }
 
@@ -6639,130 +7184,9 @@ async fn apply_subscribe(
     // Clustered mode: publish our route summary (filter-level only, never
     // individual subscriptions) so peers forward matching publishes here.
     if let Some(cluster) = &shared.cluster {
-        for grant in &granted {
-            if let Err(e) = cluster.announce_filter(&grant.filter).await {
-                warn!(
-                    "Cluster announce failed for {}: {}",
-                    grant.filter.as_str(),
-                    e
-                );
-            }
-        }
-    }
-
-    // Retained state follows the SubAck on the same transport.
-    let mut retained = Vec::new();
-    // Owning tenant's session (MT-03): retained fetch and downlink ids
-    // stay within the subscriber's own tenant, so one tenant never
-    // observes another tenant's retained state.
-    let session = session_for_conn_if_client(shared, frame.header.conn_id, &client_id)
-        .or_else(|| shared.sessions.get(&client_id));
-    let subscriber_tenant = session
-        .as_ref()
-        .map(|session| session.tenant_id.read().clone())
-        .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
-    for grant in granted.iter().filter(|grant| grant.send_retained) {
-        let filter = &grant.filter;
-        let sub_qos = grant.qos;
-        let matched = match shared
-            .retained
-            .find_matching_in_tenant(filter, &subscriber_tenant)
-            .await
-        {
-            Ok(matched) => matched,
-            Err(e) => {
-                warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
-                continue;
-            }
-        };
-        for msg in matched {
-            let effective = std::cmp::min(sub_qos, u8::from(msg.qos));
-            // X1-02: retained replays are fresh deliveries toward this
-            // connection, so the v5 CONNECT caps apply here exactly as
-            // on live fan-out (shed with the documented code, counted,
-            // never silent). Reconnect replay of already-tracked
-            // unacked state (`replay_offline`) is intentionally
-            // uncapped: those frames were accepted under an earlier
-            // window and must redeliver at-least-once.
-            // TODO(parity): should reconnect replay honour a smaller
-            // renegotiated Receive Maximum instead of redelivering the
-            // full unacked set? The rulebook does not decide the replay
-            // policy; current choice redelivers (fail to keep).
-            if let Some(session) = &session {
-                if let Some(rc) = v5_egress_refused(
-                    session,
-                    effective,
-                    msg.topic.as_str().len(),
-                    msg.payload.len(),
-                ) {
-                    if rc == V5_RC_QUOTA_EXCEEDED {
-                        shared.metrics.inc_inflight_dropped();
-                    } else {
-                        shared.metrics.inc_messages_dropped();
-                    }
-                    tracing::debug!(
-                        client_id = %session.client_id,
-                        reason_code = rc,
-                        "v5 egress cap shed retained delivery"
-                    );
-                    continue;
-                }
-            }
-            let downlink_id = if effective == 0 {
-                0u16
-            } else {
-                match &session {
-                    Some(session) => session.next_packet_id(),
-                    None => 1u16,
-                }
-            };
-            // D1-01: retained QoS 2 deliveries enter the two-phase
-            // exchange like live ones (QoS 1 retained keeps its existing
-            // untracked behaviour).
-            if effective == 2 {
-                if let Some(session) = &session {
-                    let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
-                        packet_id: downlink_id,
-                        topic: msg.topic.clone(),
-                        retain: true,
-                        payload: msg.payload.clone(),
-                        rec_received: false,
-                    });
-                    if !tracked {
-                        shared.metrics.inc_inflight_dropped();
-                    }
-                }
-            }
-            let topic_str = msg.topic.as_str();
-            // A message sent because of a new subscription always has
-            // the retain flag. The retain-as-published option applies
-            // only to messages forwarded from a live publish. The
-            // replay carries the subscription identifier of the grant
-            // (0 = none; the edge then omits the property).
-            let sub_id = if grant.sub_id <= broker_router::MAX_SUBSCRIPTION_ID {
-                grant.sub_id
-            } else {
-                0
-            };
-            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3 + 2 + 4);
-            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-            meta.extend_from_slice(topic_str.as_bytes());
-            meta.extend_from_slice(&downlink_id.to_be_bytes());
-            meta.push(effective);
-            meta.push(1u8); // retain: replayed retained state
-            meta.push(0u8);
-            meta.extend_from_slice(&protocol_v5::encode_topic_alias(0));
-            if sub_id != 0 {
-                meta.extend_from_slice(&sub_id.to_be_bytes());
-            }
-            if let Ok(routed) = BrokerFrame::new(
-                OpCode::PublishOut,
-                frame.header.conn_id,
-                0,
-                Bytes::from(meta),
-                msg.payload.clone(),
-            ) {
-                retained.push(routed);
+        for filter in &granted_filters {
+            if let Err(e) = cluster.announce_filter(filter).await {
+                warn!("Cluster announce failed for {}: {}", filter.as_str(), e);
             }
         }
     }
@@ -6792,10 +7216,31 @@ async fn apply_subscribe(
 /// A rewrite rule applies before removal, like subscribe.
 async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     let (packet_id, client_id, filters) = decode_unsubscribe_meta(&frame.metadata)?;
+    let _route_guard = shared.sessions.lock_route_guard();
     // Tenant scope: resolve once from the owning connection, like subscribe.
-    // Two tenants with one client id unsubscribe independently.
-    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
-    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
+    // Two tenants with one client id unsubscribe independently, and a
+    // superseded connection must never remove its replacement's routes.
+    let conn_session = session_for_conn_if_client(shared, frame.header.conn_id, &client_id);
+    let tenant = conn_session
+        .as_ref()
+        .map(|s| s.tenant_id.read().clone())
+        .unwrap_or_else(|| session_tenant_for_conn(shared, frame.header.conn_id, &client_id));
+    #[cfg(test)]
+    let owner = {
+        let fallback_session = if conn_session.is_none() {
+            shared.sessions.get_in_tenant(&tenant, &client_id)
+        } else {
+            None
+        };
+        let superseded = fallback_session.as_ref().is_some_and(|s| {
+            let cur_conn = *s.conn_id.read();
+            cur_conn != Some(frame.header.conn_id)
+                && (cur_conn.is_some() || s.ended_at_ms.read().is_some())
+        });
+        conn_session.or_else(|| (!superseded).then_some(fallback_session).flatten())
+    };
+    #[cfg(not(test))]
+    let owner = conn_session;
     let mut codes = Vec::with_capacity(filters.len());
     let mut removed_any = false;
     let mut removed = Vec::new();
@@ -6813,9 +7258,11 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
             codes.push(V5_UNSUBACK_FILTER_INVALID);
             continue;
         };
-        let existed = owner
-            .as_ref()
-            .is_some_and(|session| session.subscriptions.read().contains_key(&inner));
+        let Some(session) = owner.as_ref() else {
+            codes.push(V5_UNSUBACK_NO_SUBSCRIPTION);
+            continue;
+        };
+        let existed = session.subscriptions.read().contains_key(&inner);
         // Fire the event before removal. Rules belong to the default
         // tenant, so another tenant fires nothing. Check flag first.
         if shared
@@ -6823,7 +7270,7 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
             .is_event_source_selected(broker_rules::EventSource::SessionUnsubscribed)
             && is_default_tenant(&tenant)
         {
-            if let Some(session) = owner.as_ref() {
+            {
                 let username = session.username.read().clone();
                 let peerhost = session.peerhost.read().clone();
                 shared
@@ -6853,6 +7300,7 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
             codes.push(V5_UNSUBACK_NO_SUBSCRIPTION);
         }
     }
+    drop(_route_guard);
     if removed_any {
         refresh_subscription_stats(shared);
     }
@@ -6901,34 +7349,39 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
     // prefer the session bound to this connection (tenant-correct when
     // two tenants share the client id), falling back to the
     // default-tenant record for binds that predate the index entry.
-    let session = match session_for_conn_if_client(shared, frame.header.conn_id, client_id)
-        .or_else(|| shared.sessions.get(client_id))
-    {
-        Some(session) => session,
-        None => return 0,
-    };
-    let mut replayed = 0;
+    let (session, expected_conn_id) =
+        match session_for_conn_if_client(shared, frame.header.conn_id, client_id) {
+            Some(session) => (session, Some(frame.header.conn_id)),
+            None => {
+                #[cfg(test)]
+                {
+                    match shared.sessions.get(client_id).filter(|s| {
+                        let cur = *s.conn_id.read();
+                        cur == Some(frame.header.conn_id)
+                            || (cur.is_none() && s.ended_at_ms.read().is_none())
+                    }) {
+                        Some(s) => {
+                            let expected = (*s.conn_id.read()).map(|_| frame.header.conn_id);
+                            (s, expected)
+                        }
+                        None => return 0,
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    return 0;
+                }
+            }
+        };
+    let _replay_guard = session.lock_replay();
+    let mut replayed = 0usize;
     let mut replayed_bytes: u64 = 0;
-    // T-31: unacked downlinks predate anything queued while detached,
-    // so they replay first. Entries stay held until their PUBACK: a
-    // second reconnect without acks replays them again. Same packet id
-    // with DUP set, so resume can never collide with ids in use.
-    for held in session.inflight_snapshot() {
-        let topic_str = held.topic.as_str();
-        let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
-        meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        meta.extend_from_slice(topic_str.as_bytes());
-        meta.extend_from_slice(&held.packet_id.to_be_bytes());
-        meta.push(u8::from(held.qos));
-        meta.push(u8::from(held.retain));
-        meta.push(1u8); // dup: redelivery of an unacked downlink
-        if let Ok(routed) = BrokerFrame::new(
-            OpCode::PublishOut,
-            frame.header.conn_id,
-            0, // stamped per-destination by ConnTable::route
-            Bytes::from(meta),
-            held.payload.clone(),
-        ) {
+    // Seed this connection's deferred-retransmission queue from all unacked
+    // QoS 1 and QoS 2 PUBLISH state, and send any QoS 2 PUBRELs immediately
+    // (PUBREL does not consume Receive Maximum).
+    let pubrels = session.seed_pending_replays();
+    for held in pubrels {
+        if let Some(routed) = encode_pubrel_out(frame.header.conn_id, held.packet_id) {
             let len = routed.total_frame_len() as u64;
             if shared.conns.route(frame.header.conn_id, routed) {
                 replayed_bytes += len;
@@ -6936,98 +7389,269 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
             }
         }
     }
-    // B4-01: spilled overflow replays immediately after the window, in
-    // arrival order, with DUP set and the original packet ids. Entries
-    // stay held until their PUBACK like the window. This consults the
-    // spilled state written by `build_downlink_frames` on the
-    // publish-to-delivery event; driven by the reconnect (SessionBinding)
-    // event. Each mailbox arrival also bumps `inflight_spill_replayed`
-    // so spill redelivery is never silent. The spill snapshot (one Vec
-    // alloc sized by the spill length plus one frame alloc per spilled
-    // message, all bounded by max_spill) runs only when spill is
-    // non-empty (one relaxed atomic load via `has_spill`);
-    // steady-state reconnect with empty spill allocates exactly what the
-    // window replay allocated before B4-01. Spill-nonempty snapshot
-    // throughput is printed by
-    // `broker-session::test_qos1_inflight_hot_path_timings` (slow-path
-    // section); broker delivery/replay workload before/after numbers
-    // (steady-state `apply_publish` rate as the pre-change baseline vs
-    // spill-overflow and `replay_offline` rates) are printed by
-    // `qos1_inflight_delivery_workload_timings`; functional spill replay
-    // through this path is asserted by
-    // `qos1_inflight_spill_redelivers_everything_with_dup`.
-    if session.has_spill() {
-        for held in session.inflight_spill_snapshot() {
-            let topic_str = held.topic.as_str();
-            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
-            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-            meta.extend_from_slice(topic_str.as_bytes());
-            meta.extend_from_slice(&held.packet_id.to_be_bytes());
-            meta.push(u8::from(held.qos));
-            meta.push(u8::from(held.retain));
-            meta.push(1u8); // dup: redelivery of a spilled unacked downlink
-            if let Ok(routed) = BrokerFrame::new(
-                OpCode::PublishOut,
-                frame.header.conn_id,
-                0, // stamped per-destination by ConnTable::route
-                Bytes::from(meta),
-                held.payload.clone(),
-            ) {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(frame.header.conn_id, routed) {
-                    replayed_bytes += len;
-                    replayed += 1;
-                    shared.metrics.inc_inflight_spill_replayed();
-                }
-            }
+    let (resumed, resumed_bytes) =
+        resume_replay_locked(shared, &session, frame.header.conn_id, expected_conn_id);
+    replayed += resumed;
+    replayed_bytes += resumed_bytes;
+    shared.metrics.inc_publish_sent_by(replayed as u64);
+    shared.metrics.inc_delivered_by(replayed as u64);
+    shared.metrics.inc_bytes_sent_by(replayed_bytes);
+    replayed
+}
+
+/// Resume deferred retransmissions first, then drain queued offline messages,
+/// both paced by the same connection-scoped MQTT 5 Receive Maximum (covering
+/// QoS 1 and QoS 2) and session inflight/spill capacity. Caller must hold
+/// `session.lock_replay()`.
+fn resume_replay_locked(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    conn_id: u64,
+    expected_conn_id: Option<u64>,
+) -> (usize, u64) {
+    let mut replayed = 0usize;
+    let mut replayed_bytes = 0u64;
+    loop {
+        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+            break;
         }
-    }
-    // D1-01: uncompleted QoS 2 downlinks replay in queued order. Waiting
-    // for PUBREC resends PUBLISH with DUP set and the same packet id;
-    // waiting for PUBCOMP resends PUBREL. Entries stay held until their
-    // PUBCOMP, so a second reconnect without completion replays again.
-    for held in session.qos2_outbound_snapshot() {
-        if held.rec_received {
-            if let Some(routed) = encode_pubrel_out(frame.header.conn_id, held.packet_id) {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(frame.header.conn_id, routed) {
-                    replayed_bytes += len;
-                    replayed += 1;
-                }
+        let Some(item) = session.pop_next_pending_replay_paced() else {
+            break;
+        };
+        let routed = match &item {
+            broker_session::PendingReplayItem::Qos1 { entry, .. } => {
+                let topic_str = entry.topic.as_str();
+                let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+                meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+                meta.extend_from_slice(topic_str.as_bytes());
+                meta.extend_from_slice(&entry.packet_id.to_be_bytes());
+                meta.push(u8::from(entry.qos));
+                meta.push(u8::from(entry.retain));
+                meta.push(1u8); // dup: redelivery of an unacked downlink
+                BrokerFrame::new(
+                    OpCode::PublishOut,
+                    conn_id,
+                    0,
+                    Bytes::from(meta),
+                    entry.payload.clone(),
+                )
+                .ok()
             }
-        } else {
-            let topic_str = held.topic.as_str();
-            if let Some(routed) = encode_publish_out_with_dup(
-                frame.header.conn_id,
-                topic_str,
+            broker_session::PendingReplayItem::Qos2(held) => encode_publish_out_with_dup(
+                conn_id,
+                held.topic.as_str(),
                 held.packet_id,
                 2,
                 held.retain,
                 true,
-                0, // B4-05: replays carry the full topic with no alias
+                0,
                 &held.payload,
-            ) {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(frame.header.conn_id, routed) {
-                    replayed_bytes += len;
-                    replayed += 1;
+            ),
+        };
+        let Some(routed) = routed else {
+            continue;
+        };
+        if v5_encoded_packet_too_large(session, &routed) {
+            shared.metrics.inc_messages_dropped();
+            match &item {
+                broker_session::PendingReplayItem::Qos1 { entry, .. } => {
+                    let _ = session.ack_inflight(entry.packet_id);
+                }
+                broker_session::PendingReplayItem::Qos2(held) => {
+                    let _ = session.ack_qos2_pubcomp(held.packet_id);
                 }
             }
+            continue;
+        }
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(conn_id, routed) {
+            if matches!(
+                item,
+                broker_session::PendingReplayItem::Qos1 { is_spill: true, .. }
+            ) {
+                shared.metrics.inc_inflight_spill_replayed();
+            }
+            replayed_bytes += len;
+            replayed += 1;
+        } else {
+            session.push_front_pending_replay(&item);
+            break;
         }
     }
-    // B4-06 SLOP-1: drain retained, delete/rewrite only after confirmed
-    // route. The file survives a crash mid-replay (at-least-once); entries
-    // that never reach the new mailbox are re-queued by
-    // `confirm_offline_consumed` instead of being dropped. Unroutable
-    // frames are already counted inside `ConnTable::route`
-    // (`unknown_conn_dropped` / `dead_mailbox_dropped`).
-    let retained = session.take_offline_retained();
-    let mut unrouted: Vec<QueuedMessage> = Vec::new();
-    for queued in retained {
-        let downlink_id = if queued.qos == QoS::AtMostOnce {
+
+    let (ret_replayed, ret_bytes) =
+        resume_pending_retained_locked(shared, session, conn_id, expected_conn_id);
+    replayed += ret_replayed;
+    replayed_bytes += ret_bytes;
+
+    let (queued_replayed, queued_bytes) =
+        replay_queued_offline_locked(shared, session, conn_id, expected_conn_id);
+    replayed += queued_replayed;
+    replayed_bytes += queued_bytes;
+    (replayed, replayed_bytes)
+}
+
+/// Drain deferred retained matches for the current connection while holding
+/// `session.lock_replay()`, preserving `sub_id` and enforcing both MQTT 5
+/// Maximum Packet Size and Receive Maximum.
+fn resume_pending_retained_locked(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    conn_id: u64,
+    expected_conn_id: Option<u64>,
+) -> (usize, u64) {
+    let mut replayed = 0usize;
+    let mut replayed_bytes = 0u64;
+    while let Some(item) = session.pop_next_pending_retained() {
+        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+            session.push_front_pending_retained(item);
+            break;
+        }
+
+        let effective = u8::from(item.qos);
+        let mut tracked_qos1_spilled = false;
+        let downlink_id = if effective == 0 {
             0u16
+        } else if effective == 1 {
+            let Some((pid, outcome)) = session.try_alloc_qos1_downlink_v5_checked_for_conn(
+                expected_conn_id,
+                item.topic.clone(),
+                QoS::AtLeastOnce,
+                true,
+                item.payload.clone(),
+                std::time::Instant::now(),
+            ) else {
+                session.push_front_pending_retained(item);
+                break;
+            };
+            tracked_qos1_spilled = outcome == InflightTrackOutcome::Spilled;
+            pid
         } else {
-            session.next_packet_id()
+            let Some((pid, _)) = session.try_alloc_qos2_outbound_v5_checked_for_conn(
+                expected_conn_id,
+                item.topic.clone(),
+                true,
+                item.payload.clone(),
+            ) else {
+                session.push_front_pending_retained(item);
+                break;
+            };
+            pid
+        };
+        let Some(routed) = encode_retained_publish_out(
+            conn_id,
+            &item.topic,
+            downlink_id,
+            effective,
+            item.sub_id,
+            item.payload.clone(),
+        ) else {
+            if effective == 1 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if effective == 2 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
+            continue;
+        };
+        if v5_encoded_packet_too_large(session, &routed) {
+            shared.metrics.inc_messages_dropped();
+            if effective == 1 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if effective == 2 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
+            continue;
+        }
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(conn_id, routed) {
+            if tracked_qos1_spilled {
+                shared.metrics.inc_inflight_spilled();
+            }
+            replayed_bytes += len;
+            replayed += 1;
+        } else {
+            if effective == 1 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if effective == 2 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
+            session.push_front_pending_retained(item);
+            break;
+        }
+    }
+    (replayed, replayed_bytes)
+}
+
+/// Drain and route queued offline messages for `session` while the caller
+/// holds `session.lock_replay()`. Paces QoS 1/2 deliveries by both the
+/// client's negotiated MQTT 5 Receive Maximum and the session's inflight/spill
+/// capacity, leaving any overflow queued until ACKs free space.
+fn replay_queued_offline_locked(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    conn_id: u64,
+    expected_conn_id: Option<u64>,
+) -> (usize, u64) {
+    let mut replayed = 0usize;
+    let mut replayed_bytes = 0u64;
+    let mut retained = session.take_offline_retained().into_iter();
+    let mut unrouted: Vec<QueuedMessage> = Vec::new();
+    while let Some(queued) = retained.next() {
+        if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
+            unrouted.push(queued);
+            unrouted.extend(retained);
+            break;
+        }
+
+        // Atomically check MQTT 5 Receive Maximum and reserve QoS 1/2
+        // tracking capacity before sending so neither concurrent live
+        // delivery nor a full buffer can oversubscribe the send window.
+        let mut tracked_qos1_spilled = false;
+        let downlink_id = match queued.qos {
+            QoS::AtMostOnce => 0u16,
+            QoS::AtLeastOnce => {
+                let pid = session.next_packet_id();
+                match session.try_reserve_replay_qos1(broker_session::InflightMessage {
+                    packet_id: pid,
+                    topic: queued.topic.clone(),
+                    qos: QoS::AtLeastOnce,
+                    retain: queued.retain,
+                    payload: queued.payload.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                    publish_at_ms: None,
+                }) {
+                    Some(InflightTrackOutcome::Tracked) => pid,
+                    Some(InflightTrackOutcome::Spilled) => {
+                        tracked_qos1_spilled = true;
+                        pid
+                    }
+                    Some(InflightTrackOutcome::Dropped) | None => {
+                        unrouted.push(queued);
+                        unrouted.extend(retained);
+                        break;
+                    }
+                }
+            }
+            QoS::ExactlyOnce => {
+                match session.try_alloc_qos2_outbound_v5_checked(
+                    queued.topic.clone(),
+                    queued.retain,
+                    queued.payload.clone(),
+                ) {
+                    Some((pid, true)) => pid,
+                    Some((pid, false)) => {
+                        let _ = session.ack_qos2_pubcomp(pid);
+                        unrouted.push(queued);
+                        unrouted.extend(retained);
+                        break;
+                    }
+                    None => {
+                        unrouted.push(queued);
+                        unrouted.extend(retained);
+                        break;
+                    }
+                }
+            }
         };
         let topic_str = queued.topic.as_str();
         let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
@@ -7039,51 +7663,51 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
         meta.push(0u8);
         let routed = match BrokerFrame::new(
             OpCode::PublishOut,
-            frame.header.conn_id,
+            conn_id,
             0, // stamped per-destination by ConnTable::route
             Bytes::from(meta),
             queued.payload.clone(),
         ) {
             Ok(routed) => routed,
             Err(_) => {
+                if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                    let _ = session.ack_inflight(downlink_id);
+                } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                    let _ = session.ack_qos2_pubcomp(downlink_id);
+                }
                 unrouted.push(queued);
                 continue;
             }
         };
-        // Only replays that reached the live mailbox count; a dead
-        // mailbox is already counted inside `ConnTable::route`, never
-        // a delivery.
+        if v5_encoded_packet_too_large(session, &routed) {
+            shared.metrics.inc_messages_dropped();
+            if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
+            continue;
+        }
         let len = routed.total_frame_len() as u64;
-        if shared.conns.route(frame.header.conn_id, routed) {
-            // QoS 2 offline replays become live QoS 2 downlinks needing
-            // PUBREC/PUBCOMP, so track them only after the route is
-            // confirmed (QoS 1 offline replays keep their existing
-            // untracked behaviour). Tracking a frame that never reached
-            // the mailbox would leak an unacked entry while the message
-            // is also re-queued below.
-            if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
-                let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
-                    packet_id: downlink_id,
-                    topic: queued.topic.clone(),
-                    retain: queued.retain,
-                    payload: queued.payload.clone(),
-                    rec_received: false,
-                });
-                if !tracked {
-                    shared.metrics.inc_inflight_dropped();
-                }
+        if shared.conns.route(conn_id, routed) {
+            if tracked_qos1_spilled {
+                shared.metrics.inc_inflight_spilled();
             }
             replayed_bytes += len;
             replayed += 1;
         } else {
+            if queued.qos == QoS::AtLeastOnce && downlink_id != 0 {
+                let _ = session.ack_inflight(downlink_id);
+            } else if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                let _ = session.ack_qos2_pubcomp(downlink_id);
+            }
             unrouted.push(queued);
         }
     }
-    session.confirm_offline_consumed(unrouted);
-    shared.metrics.inc_publish_sent_by(replayed as u64);
-    shared.metrics.inc_delivered_by(replayed as u64);
-    shared.metrics.inc_bytes_sent_by(replayed_bytes);
-    replayed
+    shared
+        .sessions
+        .confirm_offline_consumed_if_current(session, expected_conn_id, unrouted);
+    (replayed, replayed_bytes)
 }
 
 /// Route one `PublishIn` frame: an optional `PubAckOut` for the publisher
@@ -7305,11 +7929,34 @@ async fn apply_publish(
         });
         let allowed = match cached_publish {
             Some(allow) => allow,
-            None => shared
-                .auth
-                .authorize_publish_in_tenant(tenant, &publisher, topic)
-                .await
-                .is_ok(),
+            None => {
+                // Fast superuser flag first (one atomic, no lock).
+                // Only the rare superuser bypass clones the name.
+                let is_superuser = publisher_session
+                    .as_ref()
+                    .is_some_and(|session| session.verified_is_superuser.load(Ordering::Relaxed));
+                if is_superuser {
+                    let verified_username = publisher_session
+                        .as_ref()
+                        .and_then(|session| session.verified_username.read().clone());
+                    shared
+                        .auth
+                        .authorize_publish_in_tenant_as(
+                            tenant,
+                            &publisher,
+                            verified_username.as_deref(),
+                            topic,
+                        )
+                        .await
+                        .is_ok()
+                } else {
+                    shared
+                        .auth
+                        .authorize_publish_in_tenant(tenant, &publisher, topic)
+                        .await
+                        .is_ok()
+                }
+            }
         };
         // Per-client decision cache (W2-01): record the publish decision
         // so the management read observes edge publishers. One bounded
@@ -8036,8 +8683,26 @@ async fn apply_qos2_pubrel(
 /// PUBREL and retain only the packet id until PUBCOMP. A duplicate
 /// PUBREC for an entry already waiting for PUBCOMP resends PUBREL (the
 /// PUBREL was lost). Unknown ids are ignored.
+fn maybe_resume_replay_on_ack(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    conn_id: u64,
+) {
+    if !session.has_pending_replay_or_offline() {
+        return;
+    }
+    let _replay_guard = session.lock_replay();
+    let expected_conn_id = (*session.conn_id.read()).map(|_| conn_id);
+    let (resumed, resumed_bytes) = resume_replay_locked(shared, session, conn_id, expected_conn_id);
+    if resumed > 0 {
+        shared.metrics.inc_publish_sent_by(resumed as u64);
+        shared.metrics.inc_delivered_by(resumed as u64);
+        shared.metrics.inc_bytes_sent_by(resumed_bytes);
+    }
+}
+
 fn apply_qos2_pubrec(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
-    let packet_id = decode_qos2_meta(&frame.metadata)?;
+    let (packet_id, reason_code) = decode_qos2_meta_with_reason(&frame.metadata)?;
     // Owner session first (MT-03), legacy lookup behind.
     let session = shared
         .sessions
@@ -8049,6 +8714,12 @@ fn apply_qos2_pubrec(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame
                 .as_deref()
                 .and_then(|p| shared.sessions.get(p))
         })?;
+    if reason_code >= 0x80 {
+        if session.ack_qos2_pubcomp(packet_id) {
+            maybe_resume_replay_on_ack(shared, &session, frame.header.conn_id);
+        }
+        return None;
+    }
     if session.complete_qos2_pubrec(packet_id) {
         return qos2_reply(OpCode::PubRelOut, frame, packet_id);
     }
@@ -8083,7 +8754,9 @@ fn apply_qos2_pubcomp(frame: &BrokerFrame, shared: &Shared) {
                 .and_then(|p| shared.sessions.get(p))
         });
     if let Some(session) = session {
-        session.ack_qos2_pubcomp(packet_id);
+        if session.ack_qos2_pubcomp(packet_id) {
+            maybe_resume_replay_on_ack(shared, &session, frame.header.conn_id);
+        }
     }
 }
 
@@ -8255,14 +8928,36 @@ async fn ingress_pipeline_with_publisher_and_props(
     // tenant: retained state never crosses tenants.
     // The writer holds the retained store and the limits it needs, so a
     // rule republish with the retain flag takes the same path.
-    if retain {
-        shared
-            .retain_writer
-            .apply(topic, qos, payload, publisher_tenant)
-            .await;
-    }
+    // Keep retained-store mutation and subscriber selection in one short
+    // critical section, releasing the gate before invoking rule actions
+    // (which may republish with `retain = true` and re-acquire this gate).
+    let deliveries = {
+        let _retained_pub_gate = if retain {
+            let gate = shared.retained_subscribe_gate.write().await;
+            shared
+                .retain_writer
+                .apply(topic, qos, payload, publisher_tenant)
+                .await;
+            Some(gate)
+        } else {
+            None
+        };
+        build_downlink_frames_with_publisher_and_props(
+            &shared.router,
+            &shared.sessions,
+            &shared.metrics,
+            topic,
+            qos,
+            retain,
+            payload,
+            publisher,
+            publisher_tenant,
+            v5,
+            Some(&shared.engine),
+        )
+    };
 
-    // Rules execute at ingress on this node, before local fan-out.
+    // Rules execute at ingress on this node, after releasing the retained gate.
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
     //
@@ -8301,20 +8996,6 @@ async fn ingress_pipeline_with_publisher_and_props(
     shared
         .collectors
         .feed(publisher_tenant, topic, qos, retain, payload);
-
-    let deliveries = build_downlink_frames_with_publisher_and_props(
-        &shared.router,
-        &shared.sessions,
-        &shared.metrics,
-        topic,
-        qos,
-        retain,
-        payload,
-        publisher,
-        publisher_tenant,
-        v5,
-        Some(&shared.engine),
-    );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
     // returns after a length check, no spawn, no socket work.
@@ -9056,6 +9737,9 @@ fn build_downlink_frames_with_publisher_and_props(
         // in this tenant falls back to the legacy conn-id route below.
         match sessions.get_in_tenant(&sub.tenant, &sub.client_id) {
             Some(session) => {
+                if sub.session_id != 0 && session.id.0 != sub.session_id {
+                    continue;
+                }
                 let connected = *session.connected.read();
                 let live = *session.conn_id.read();
                 match (connected, live) {
@@ -9086,15 +9770,19 @@ fn build_downlink_frames_with_publisher_and_props(
                         }
                         let mut downlink_id = 0u16;
                         // PF-02: one pass assigns the id and holds the
-                        // entry, so hot sessions pay one scan, not two.
+                        // entry, atomically enforcing the v5 Receive Maximum
+                        // send window across live delivery and replay.
                         if effective == 1 {
-                            let (pid, outcome) = session.alloc_qos1_downlink(
+                            let Some((pid, outcome)) = session.try_alloc_qos1_downlink_v5_checked(
                                 topic.clone(),
                                 QoS::AtLeastOnce,
                                 delivered_retain,
                                 shared.clone(),
                                 std::time::Instant::now(),
-                            );
+                            ) else {
+                                metrics.inc_inflight_dropped();
+                                continue;
+                            };
                             downlink_id = pid;
                             match outcome {
                                 InflightTrackOutcome::Tracked => {}
@@ -9107,20 +9795,15 @@ fn build_downlink_frames_with_publisher_and_props(
                                 }
                             }
                         } else if effective == 2 {
-                            downlink_id = session.next_packet_id();
-                        }
-                        // D1-01: hold every QoS 2 downlink until its
-                        // PUBCOMP arrives (message until PUBREC, packet id
-                        // until PUBCOMP). Same overflow policy as QoS 1:
-                        // live delivery still goes out once, untracked.
-                        if effective == 2 {
-                            let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
-                                packet_id: downlink_id,
-                                topic: topic.clone(),
-                                retain: delivered_retain,
-                                payload: shared.clone(),
-                                rec_received: false,
-                            });
+                            let Some((pid, tracked)) = session.try_alloc_qos2_outbound_v5_checked(
+                                topic.clone(),
+                                delivered_retain,
+                                shared.clone(),
+                            ) else {
+                                metrics.inc_inflight_dropped();
+                                continue;
+                            };
+                            downlink_id = pid;
                             if !tracked {
                                 metrics.inc_inflight_dropped();
                             }
@@ -9899,6 +10582,7 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     // Capture the publish-time identity before detaching (the detach
     // clears the binding the checks below read).
     let username = session.username.read().clone();
+    let verified_username = session.verified_username.read().clone();
     let peerhost = session.peerhost.read().clone();
     let tenant = session.tenant_id.read().clone();
     let will = session.take_last_will();
@@ -9971,7 +10655,12 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         Some(allow) => allow,
         None => shared
             .auth
-            .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
+            .authorize_publish_in_tenant_as(
+                &tenant,
+                &client_id,
+                verified_username.as_deref(),
+                &will.topic,
+            )
             .await
             .is_ok(),
     };
@@ -10073,6 +10762,7 @@ fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
     let Some(entry) = session.ack_inflight_timed(packet_id) else {
         return;
     };
+    maybe_resume_replay_on_ack(shared, &session, frame.header.conn_id);
     // Fire the ack event. Rules belong to the default tenant.
     // Check flag before any lock. Ack path only, never publish.
     if shared
@@ -10980,6 +11670,12 @@ async fn shutdown(shared: &Shared) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // Drain each connector buffer so a partial batch reaches its target.
+    let _ = tokio::time::timeout(
+        SHUTDOWN_CONNECTOR_FLUSH,
+        shared.engine.connectors().flush_all(),
+    )
+    .await;
     // Flush durable state. Each append already flushes and fsyncs, so
     // only the directory entry still needs a sync for renames.
     if let Some(store) = shared.sessions.offline_store() {
@@ -10995,6 +11691,10 @@ fn start_background_tasks(shared: &Shared) {
     if shared.cluster.is_some() {
         tokio::spawn(run_cluster_inbox(shared.clone()));
     }
+    // Source ingress (MV-08): reconcile the stored sources with the
+    // running consumers. The task reads one bounded snapshot off the
+    // publish path and stops an old consumer before it starts a new one.
+    source_runtime::spawn(shared.clone());
 }
 
 /// Serve the management REST API on an already-bound listener.
@@ -11027,6 +11727,7 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // observes the same MQTT ingress state. One `Arc` clone, one short
     // read lock per request, no work on the per-message path.
     state.retained = shared.retained.clone();
+    state.retained_subscribe_gate = shared.retained_subscribe_gate.clone();
     // Share the validated retainer settings (W1-28) so management reads
     // and writes observe the same object the kernel ingress enforces.
     // One Arc clone; the persistence hook stays with the store.
@@ -11579,9 +12280,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     shared.auth.set_policy(hash_policy);
-    // Superusers (MV-09a): apply the configured list from boot.
-    // An empty list keeps current behaviour with no bypass.
-    shared.auth.set_superusers(cfg.auth.superusers.clone());
+    // Superusers (MV-09a): apply the configured list from boot while
+    // authentication is enabled. With `auth.enabled = false` the list
+    // does not apply, so a matching username gets no bypass. An empty
+    // list keeps current behaviour with no bypass.
+    let superusers = if cfg.auth.enabled {
+        cfg.auth.superusers.clone()
+    } else {
+        Vec::new()
+    };
+    shared.auth.set_superusers(superusers);
     // Authenticator chain (W2-02): seed the shared chain in place (the
     // same instance `serve_api` shares with `ApiState`), so the CONNECT
     // consult enforces the persisted chain from the first connection.
@@ -13982,6 +14690,1219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unbound_conn_cannot_replay_or_consume_durable_offline_queue() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "durable-replay-guard",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 301,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        shared
+            .sessions
+            .unbind_connection("durable-replay-guard", 301);
+        sess.push_offline(broker_session::QueuedMessage {
+            topic: Topic::new("t/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"secret"),
+            publish_at_ms: None,
+        });
+        assert_eq!(sess.offline_len(), 1);
+
+        let (tx_bad, mut rx_bad) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(999, tx_bad);
+        let bad_bind = bind_frame(999, 1, encode_bind_meta("durable-replay-guard", false, 60));
+        assert_eq!(replay_offline(&bad_bind, &shared).await, 0);
+        assert!(rx_bad.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_qos1_full_inflight_leaves_overflow_in_offline_queue() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-cap",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 101,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_max_inflight(1);
+        sess.set_max_spill(1);
+        for (topic, payload) in [
+            ("cap/1", b"one".as_slice()),
+            ("cap/2", b"two".as_slice()),
+            ("cap/3", b"thr".as_slice()),
+        ] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(101, tx);
+        let bind = bind_frame(101, 1, encode_bind_meta("replay-cap", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 2);
+        let f1 = rx.try_recv().expect("first replayed publish");
+        let f2 = rx.try_recv().expect("second replayed publish");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.inflight_snapshot().len(), 1);
+        assert_eq!(sess.offline_len(), 1);
+
+        let pid_of = |f: &BrokerFrame| -> u16 {
+            let tlen = u16::from_be_bytes([f.metadata[0], f.metadata[1]]) as usize;
+            u16::from_be_bytes([f.metadata[2 + tlen], f.metadata[2 + tlen + 1]])
+        };
+        apply_puback(&puback_frame(101, 2, pid_of(&f1)), &shared);
+        apply_puback(&puback_frame(101, 3, pid_of(&f2)), &shared);
+
+        let f3 = rx.try_recv().expect("third message resumes after PUBACK");
+        assert_eq!(f3.payload, Bytes::from_static(b"thr"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_respects_v5_receive_maximum_and_resumes_on_puback() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-v5-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 102,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (topic, payload) in [("rm/1", b"one".as_slice()), ("rm/2", b"two".as_slice())] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(102, tx);
+        let bind = bind_frame(102, 1, encode_bind_meta("replay-v5-rm", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx
+            .try_recv()
+            .expect("first message within Receive Maximum=1");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        apply_puback(&puback_frame(102, 2, pid1), &shared);
+
+        let f2 = rx.try_recv().expect("second message resumes after PUBACK");
+        assert_eq!(f2.payload, Bytes::from_static(b"two"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_deferred_retransmissions_resume_before_offline_on_puback() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-retrans-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 103,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        assert!(sess.track_inflight(broker_session::InflightMessage {
+            packet_id: 11,
+            topic: Topic::new("rt/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"r1"),
+            enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
+        }));
+        assert!(sess.track_inflight(broker_session::InflightMessage {
+            packet_id: 12,
+            topic: Topic::new("rt/2").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"r2"),
+            enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
+        }));
+        sess.push_offline(QueuedMessage {
+            topic: Topic::new("rt/3").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"q3"),
+            publish_at_ms: None,
+        });
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(103, tx);
+        let bind = bind_frame(103, 1, encode_bind_meta("replay-retrans-rm", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx.try_recv().expect("first retransmission");
+        assert_eq!(f1.payload, Bytes::from_static(b"r1"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+
+        apply_puback(&puback_frame(103, 2, 11), &shared);
+        let f2 = rx.try_recv().expect("second retransmission after PUBACK");
+        assert_eq!(f2.payload, Bytes::from_static(b"r2"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+
+        apply_puback(&puback_frame(103, 3, 12), &shared);
+        let f3 = rx.try_recv().expect("queued message after retransmissions");
+        assert_eq!(f3.payload, Bytes::from_static(b"q3"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_qos2_respects_v5_receive_maximum_and_resumes_on_pubcomp() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-qos2-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 104,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (topic, payload) in [("q2/1", b"one".as_slice()), ("q2/2", b"two".as_slice())] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(104, tx);
+        let bind = bind_frame(104, 1, encode_bind_meta("replay-qos2-rm", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx.try_recv().expect("first QoS 2 within Receive Maximum=1");
+        assert_eq!(f1.payload, Bytes::from_static(b"one"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+        assert_eq!(sess.qos2_outbound_len(), 1);
+
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        let comp = BrokerFrame::new(
+            OpCode::PubCompIn,
+            104,
+            2,
+            Bytes::from(pid1.to_be_bytes().to_vec()),
+            Bytes::new(),
+        )
+        .unwrap();
+        apply_qos2_pubcomp(&comp, &shared);
+
+        let f2 = rx.try_recv().expect("second QoS 2 resumes after PUBCOMP");
+        assert_eq!(f2.payload, Bytes::from_static(b"two"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_qos2_negative_pubrec_releases_credit_and_advances_replay() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "replay-qos2-neg-pubrec",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 105,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (topic, payload) in [("q2n/1", b"one".as_slice()), ("q2n/2", b"two".as_slice())] {
+            sess.push_offline(QueuedMessage {
+                topic: Topic::new(topic).unwrap(),
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                payload: Bytes::from_static(payload),
+                publish_at_ms: None,
+            });
+        }
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(105, tx);
+        let bind = bind_frame(
+            105,
+            1,
+            encode_bind_meta("replay-qos2-neg-pubrec", false, 60),
+        );
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx.try_recv().expect("first QoS 2 within Receive Maximum=1");
+        assert_eq!(f1.payload, Bytes::from_static(b"one"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 1);
+        assert_eq!(sess.qos2_outbound_len(), 1);
+
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        let mut neg_meta = pid1.to_be_bytes().to_vec();
+        neg_meta.push(0x80);
+        let neg_rec = BrokerFrame::new(
+            OpCode::PubRecIn,
+            105,
+            2,
+            Bytes::from(neg_meta),
+            Bytes::new(),
+        )
+        .unwrap();
+        assert!(apply_qos2_pubrec(&neg_rec, &shared).is_none());
+
+        let f2 = rx
+            .try_recv()
+            .expect("second QoS 2 resumes after negative PUBREC");
+        assert_eq!(f2.payload, Bytes::from_static(b"two"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_qos1_respects_v5_receive_maximum() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-v5-rm",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 106,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("ret/1").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"r1"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("ret/2").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"r2"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+
+        // Pre-populate offline_queue to verify deferred retained matches do not
+        // touch or evict durable offline entries.
+        sess.push_offline(QueuedMessage {
+            topic: Topic::new("offline/keep").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"keep"),
+            publish_at_ms: None,
+        });
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(106, tx);
+        let sub = subscribe_frame(
+            106,
+            1,
+            encode_subscribe_meta_v5(1, "retained-v5-rm", &[("ret/+", 1, 42)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        assert!(reply.is_some());
+        assert_eq!(retained.len(), 1);
+        assert_eq!(sess.inflight_len(), 1);
+        assert_eq!(sess.pending_retained_len(), 1);
+        assert_eq!(sess.offline_len(), 1);
+
+        let f1 = &retained[0];
+        let tlen = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen], f1.metadata[2 + tlen + 1]]);
+        // Verify Subscription Identifier 42 is preserved on the deferred frame.
+        apply_puback(&puback_frame(106, 2, pid1), &shared);
+
+        let f2 = rx
+            .try_recv()
+            .expect("second retained message resumes after PUBACK");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.pending_retained_len(), 0);
+        assert_ne!(f2.payload, f1.payload);
+        let tlen2 = u16::from_be_bytes([f2.metadata[0], f2.metadata[1]]) as usize;
+        let sub_id_offset = 2 + tlen2 + 2 + 3 + 2;
+        assert_eq!(
+            u32::from_be_bytes([
+                f2.metadata[sub_id_offset],
+                f2.metadata[sub_id_offset + 1],
+                f2.metadata[sub_id_offset + 2],
+                f2.metadata[sub_id_offset + 3],
+            ]),
+            42
+        );
+
+        // Next PUBACK drains the pre-existing offline message untouched.
+        let pid2 = u16::from_be_bytes([f2.metadata[2 + tlen2], f2.metadata[2 + tlen2 + 1]]);
+        apply_puback(&puback_frame(106, 3, pid2), &shared);
+        let f3 = rx
+            .try_recv()
+            .expect("offline message preserved and delivered");
+        assert_eq!(f3.payload, Bytes::from_static(b"keep"));
+        assert_eq!(sess.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_retained_respects_max_packet_size_on_resume() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-max-pkt",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 109,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        sess.set_client_max_packet_size(64);
+        assert_eq!(
+            sess.defer_retained_for_conn(
+                Some(109),
+                100,
+                vec![
+                    broker_session::PendingRetained {
+                        topic: Topic::new("rp/big").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from(vec![b'x'; 128]),
+                        sub_id: 7,
+                    },
+                    broker_session::PendingRetained {
+                        topic: Topic::new("rp/ok").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from_static(b"ok"),
+                        sub_id: 7,
+                    },
+                ],
+            ),
+            Some(0)
+        );
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(109, tx);
+        let _guard = sess.lock_replay();
+        let (sent, _) = resume_pending_retained_locked(&shared, &sess, 109, Some(109));
+        assert_eq!(sent, 1);
+        let f = rx.try_recv().expect("small retained delivered");
+        assert_eq!(f.payload, Bytes::from_static(b"ok"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.pending_retained_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn superseded_subscribe_cannot_consume_replacement_retained_credit() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-superseded",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 107,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        // Reconnect on conn_id 207 (superseding 107) on the same session.
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-superseded",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 207,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert!(sess
+            .try_alloc_qos1_downlink_v5_checked_for_conn(
+                Some(107),
+                Topic::new("ret/sup").unwrap(),
+                QoS::AtLeastOnce,
+                true,
+                Bytes::from_static(b"stale"),
+                std::time::Instant::now(),
+            )
+            .is_none());
+        assert!(sess
+            .defer_retained_for_conn(
+                Some(107),
+                100,
+                vec![broker_session::PendingRetained {
+                    topic: Topic::new("ret/sup").unwrap(),
+                    qos: QoS::AtLeastOnce,
+                    payload: Bytes::from_static(b"stale"),
+                    sub_id: 1,
+                }],
+            )
+            .is_none());
+
+        // Bounded admission: exceeding max_msgs drops excess without
+        // unbounded growth.
+        assert_eq!(
+            sess.defer_retained_for_conn(
+                Some(207),
+                1,
+                vec![
+                    broker_session::PendingRetained {
+                        topic: Topic::new("ret/b1").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from_static(b"1"),
+                        sub_id: 1,
+                    },
+                    broker_session::PendingRetained {
+                        topic: Topic::new("ret/b2").unwrap(),
+                        qos: QoS::AtLeastOnce,
+                        payload: Bytes::from_static(b"2"),
+                        sub_id: 1,
+                    },
+                ],
+            ),
+            Some(1)
+        );
+        assert_eq!(sess.pending_retained_len(), 1);
+        assert_eq!(sess.offline_len(), 0);
+        assert_eq!(sess.unacked_on_conn_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_retained_survives_same_session_reconnect() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-reconnect",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 110,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("rr/1").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"one"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new("rr/2").unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"two"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+
+        let sub = subscribe_frame(
+            110,
+            1,
+            encode_subscribe_meta_v5(1, "retained-reconnect", &[("rr/+", 1, 9)]),
+        );
+        let (_, retained) = apply_subscribe(&sub, &shared).await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(sess.pending_retained_len(), 1);
+
+        // Reconnect the same persistent session on conn_id 210.
+        let (resumed, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-reconnect",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 210,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert_eq!(resumed.id, sess.id);
+        assert_eq!(resumed.pending_retained_len(), 1);
+        resumed.set_protocol_version(5);
+        resumed.set_client_receive_maximum(1);
+
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(210, tx);
+        let bind = bind_frame(210, 1, encode_bind_meta("retained-reconnect", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f1 = rx
+            .try_recv()
+            .expect("first message retransmitted on new conn");
+        assert!(rx.try_recv().is_err());
+
+        let tlen1 = u16::from_be_bytes([f1.metadata[0], f1.metadata[1]]) as usize;
+        let pid1 = u16::from_be_bytes([f1.metadata[2 + tlen1], f1.metadata[2 + tlen1 + 1]]);
+        apply_puback(&puback_frame(210, 2, pid1), &shared);
+
+        let f2 = rx
+            .try_recv()
+            .expect("deferred retained message preserved across reconnect and delivered on PUBACK");
+        assert_ne!(f2.payload, f1.payload);
+        assert_eq!(resumed.pending_retained_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_retained_rejects_exact_encoded_packet_size_over_limit() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retained-exact-size",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 111,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(2);
+        // Topic "a" (1) + payload "bcd" (3) + 10 estimate = 14, whereas encoded
+        // MQTT 5 QoS 1 PUBLISH with Subscription Identifier = 16 bytes.
+        let sample = encode_retained_publish_out(
+            111,
+            &Topic::new("a").unwrap(),
+            1,
+            1,
+            200_000,
+            Bytes::from_static(b"bcd"),
+        )
+        .unwrap();
+        let encoded_len = native::encoded_publish_out_len(&sample, 5).unwrap();
+        assert!(encoded_len > 14);
+        sess.set_client_max_packet_size((encoded_len - 1) as u32);
+
+        assert_eq!(
+            sess.defer_retained_for_conn(
+                Some(111),
+                100,
+                vec![broker_session::PendingRetained {
+                    topic: Topic::new("a").unwrap(),
+                    qos: QoS::AtLeastOnce,
+                    payload: Bytes::from_static(b"bcd"),
+                    sub_id: 200_000,
+                }],
+            ),
+            Some(0)
+        );
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(111, tx);
+        let _guard = sess.lock_replay();
+        let (sent, _) = resume_pending_retained_locked(&shared, &sess, 111, Some(111));
+        assert_eq!(sent, 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sess.unacked_on_conn_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_0x97_when_deferred_retained_exceeds_limit() {
+        let shared = test_shared();
+        shared.sessions.set_max_offline_queue(Some(1));
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-0x97",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 112,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        for (t, p) in [
+            ("q97/1", b"1".as_slice()),
+            ("q97/2", b"2".as_slice()),
+            ("q97/3", b"3".as_slice()),
+        ] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(t).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from_static(p),
+                    broker_session::tenant::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+        let sub = subscribe_frame(
+            112,
+            1,
+            encode_subscribe_meta_v5(1, "sub-0x97", &[("q97/+", 1, 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("suback");
+        assert_eq!(
+            reply.metadata.last().copied(),
+            Some(V5_SUBACK_QUOTA_EXCEEDED)
+        );
+        assert!(retained.is_empty());
+        assert!(!sess
+            .subscriptions
+            .read()
+            .contains_key(&TopicFilter::new("q97/+").unwrap()));
+        assert_eq!(sess.pending_retained_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_retransmission_drops_oversized_and_allows_exact_wire_size() {
+        let shared = test_shared();
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "retrans-size",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 113,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        // Oversized QoS 1 retransmission (payload 32 bytes) + small QoS 1 offline
+        // message ("a" + "bcd" -> 11 bytes encoded vs 14 bytes old estimate).
+        assert!(sess.track_inflight(broker_session::InflightMessage {
+            packet_id: 55,
+            topic: Topic::new("big/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from(vec![b'z'; 32]),
+            enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
+        }));
+        sess.push_offline(QueuedMessage {
+            topic: Topic::new("a").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"bcd"),
+            publish_at_ms: None,
+        });
+        let small = encode_retained_publish_out(
+            113,
+            &Topic::new("a").unwrap(),
+            1,
+            1,
+            0,
+            Bytes::from_static(b"bcd"),
+        )
+        .unwrap();
+        let small_wire = native::encoded_publish_out_len(&small, 5).unwrap();
+        assert!(small_wire <= 12);
+
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(2);
+        sess.set_client_max_packet_size(12);
+
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(113, tx);
+        let bind = bind_frame(113, 1, encode_bind_meta("retrans-size", false, 60));
+        assert_eq!(replay_offline(&bind, &shared).await, 1);
+        let f = rx
+            .try_recv()
+            .expect("11-byte packet allowed under 12-byte limit");
+        assert_eq!(f.payload, Bytes::from_static(b"bcd"));
+        assert!(rx.try_recv().is_err());
+        // Oversized retransmission (pid 55) was released from inflight.
+        assert!(!sess.inflight_snapshot().iter().any(|m| m.packet_id == 55));
+    }
+
+    #[tokio::test]
+    async fn subscribe_multi_filter_reserves_quota_and_excludes_oversized() {
+        let shared = test_shared();
+        shared.sessions.set_max_offline_queue(Some(1));
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-multi-quota",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 114,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        sess.set_client_max_packet_size(64);
+        // Filter 1 ("m1/+") has 1 oversized (>64B) + 1 valid + 1 valid -> 1 sent, 1 deferred, oversized excluded.
+        // Filter 2 ("m2/+") has 2 valid -> exceeds remaining pending_retained (0 slots left) -> 0x97.
+        for (t, p) in [
+            ("m1/big", vec![b'x'; 128]),
+            ("m1/ok1", b"1".to_vec()),
+            ("m1/ok2", b"2".to_vec()),
+            ("m2/a", b"a".to_vec()),
+            ("m2/b", b"b".to_vec()),
+        ] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(t).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from(p),
+                    broker_session::tenant::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+        let sub = subscribe_frame(
+            114,
+            1,
+            encode_subscribe_meta_v5(1, "sub-multi-quota", &[("m1/+", 1, 0), ("m2/+", 1, 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("suback");
+        let n = reply.metadata.len();
+        assert_eq!(reply.metadata[n - 2], 1); // m1/+ granted QoS 1
+        assert_eq!(reply.metadata[n - 1], V5_SUBACK_QUOTA_EXCEEDED); // m2/+ rejected 0x97
+        assert_eq!(retained.len(), 1);
+        assert_eq!(sess.pending_retained_len(), 1);
+        assert!(sess
+            .subscriptions
+            .read()
+            .contains_key(&TopicFilter::new("m1/+").unwrap()));
+        assert!(!sess
+            .subscriptions
+            .read()
+            .contains_key(&TopicFilter::new("m2/+").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resubscribe_rejected_0x97_preserves_existing_qos_and_options() {
+        let shared = test_shared();
+        shared.sessions.set_max_offline_queue(Some(1));
+        let (sess, _, _, _) = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "resub-0x97",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 115,
+                username: None,
+                verified_username: None,
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        sess.set_protocol_version(5);
+        sess.set_client_receive_maximum(1);
+        let filter = TopicFilter::new("resub/+").unwrap();
+
+        // Initial SUBSCRIBE at QoS 1 with rh=1 and sub_id=77 succeeds.
+        let sub1 = subscribe_frame(
+            115,
+            1,
+            encode_subscribe_meta_v5(1, "resub-0x97", &[("resub/+", 1 | (1 << 4), 77)]),
+        );
+        let (reply1, _) = apply_subscribe(&sub1, &shared).await;
+        assert_eq!(reply1.unwrap().metadata.last().copied(), Some(1));
+
+        for (t, p) in [
+            ("resub/1", b"1".as_slice()),
+            ("resub/2", b"2".as_slice()),
+            ("resub/3", b"3".as_slice()),
+        ] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(t).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from_static(p),
+                    broker_session::tenant::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Re-subscribe at QoS 2 with nl=1, rap=1, rh=0 exceeds retained quota -> 0x97.
+        let sub2 = subscribe_frame(
+            115,
+            2,
+            encode_subscribe_meta_v5(2, "resub-0x97", &[("resub/+", 2 | (1 << 2) | (1 << 3), 0)]),
+        );
+        let (reply2, retained2) = apply_subscribe(&sub2, &shared).await;
+        assert_eq!(
+            reply2.unwrap().metadata.last().copied(),
+            Some(V5_SUBACK_QUOTA_EXCEEDED)
+        );
+        assert!(retained2.is_empty());
+
+        // Existing session options and router QoS 1 must remain intact.
+        let opts = sess
+            .subscriptions
+            .read()
+            .get(&filter)
+            .cloned()
+            .expect("existing subscription preserved");
+        assert_eq!(opts.qos, QoS::AtLeastOnce);
+        assert_eq!(opts.nl, 0);
+        assert_eq!(opts.rap, 0);
+        assert_eq!(opts.rh, 1);
+        let matches = shared.router.matches(&Topic::new("resub/1").unwrap());
+        assert_eq!(matches.len(), 1);
+        let kept = matches.iter().next().unwrap();
+        assert_eq!(kept.qos, QoS::AtLeastOnce);
+        assert_eq!(kept.subscription_id, 77);
+    }
+
+    #[tokio::test]
+    async fn superseded_conn_cannot_unsubscribe_replacement_routes() {
+        let shared = test_shared();
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "unsub-race",
+            false,
+            Some(Some("alice")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 100,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let replacement = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "unsub-race",
+            false,
+            Some(Some("bob")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 200,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let filter = TopicFilter::new("sensors/race".to_string()).unwrap();
+        let sub_frame = subscribe_frame(
+            200,
+            1,
+            encode_subscribe_meta(1, "unsub-race", &[("sensors/race", 1)]),
+        );
+        let (sub_reply, _) = apply_subscribe(&sub_frame, &shared).await;
+        assert!(sub_reply.is_some());
+
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&1u16.to_be_bytes());
+        meta.extend_from_slice(&(b"unsub-race".len() as u16).to_be_bytes());
+        meta.extend_from_slice(b"unsub-race");
+        meta.extend_from_slice(&1u16.to_be_bytes());
+        meta.extend_from_slice(&(b"sensors/race".len() as u16).to_be_bytes());
+        meta.extend_from_slice(b"sensors/race");
+        let frame = BrokerFrame::new(
+            OpCode::UnsubscribeIn,
+            100,
+            0,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .unwrap();
+        let reply = apply_unsubscribe(&frame, &shared).await.unwrap();
+        assert_eq!(
+            reply.metadata.last().copied(),
+            Some(V5_UNSUBACK_NO_SUBSCRIPTION)
+        );
+        assert!(replacement.0.subscriptions.read().contains_key(&filter));
+        assert!(
+            !shared
+                .router
+                .matches(&Topic::new("sensors/race").unwrap())
+                .is_empty(),
+            "superseded connection must not remove replacement session's route"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_conn_cannot_subscribe_as_replacement_owner() {
+        let shared = test_shared();
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-race",
+            false,
+            Some(Some("alice")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 100,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let _ = shared.sessions.connect_bind_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "sub-race",
+            false,
+            Some(Some("bob")),
+            5,
+            60,
+            16,
+            0,
+            Some(broker_session::ConnectBindMeta {
+                conn_id: 200,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: true,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+
+        let frame = subscribe_frame(
+            100,
+            1,
+            encode_subscribe_meta(1, "sub-race", &[("secret/admin", 1)]),
+        );
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        assert!(retained.is_empty());
+        let reply = reply.expect("suback reply");
+        assert_eq!(reply.header.opcode, OpCode::SubAckOut);
+        assert_eq!(
+            reply.metadata.as_ref().last().copied(),
+            Some(V5_SUBACK_UNSPECIFIED)
+        );
+        assert!(shared
+            .router
+            .matches(&Topic::new("secret/admin").unwrap())
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn subscribe_malformed_meta_yields_no_reply() {
         let shared = test_shared();
         let frame = subscribe_frame(21, 4, Bytes::from(vec![0x00, 0x07, 0xAA]));
@@ -14231,11 +16152,11 @@ mod tests {
                 encode_subscribe_meta_v5(1, client, &[("nl/topic", opts, 0)]),
             );
             apply_subscribe(&frame, &shared).await.0.expect("subscribe");
-            let (session, _) = shared.sessions.get_or_create(client, true);
+            let (session, _) = shared.sessions.get_or_create(client, false);
             *session.conn_id.write() = Some(conn);
         }
         // Publish from the no-local client through the broker path.
-        let (pub_session, _) = shared.sessions.get_or_create("nl-self", true);
+        let (pub_session, _) = shared.sessions.get_or_create("nl-self", false);
         *pub_session.conn_id.write() = Some(31);
         shared.sessions.bind_session(&pub_session, 31);
         let (meta, payload) = encode_publish_meta("nl/topic", 0, 0, false, b"x");
@@ -18703,6 +20624,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -18833,6 +20755,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -18860,6 +20783,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -18981,6 +20905,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (slow_tx, _slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -19005,6 +20930,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -19349,6 +21275,151 @@ config = '{"connector":"pending-timescaledb"}'
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_auth_rejects_username_without_backend_when_allow_anonymous_is_false() {
+        let mut shared = test_shared();
+        shared.allow_anonymous = false;
+
+        let frame = bind_frame(
+            840,
+            1,
+            encode_bind_meta_creds("dev-user-no-backend", true, 60, "alice", b"secret"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(
+            rc, 0x87,
+            "CONNECT with username and no backend must fail closed when allow_anonymous=false"
+        );
+        assert!(!present);
+        assert!(shared.sessions.get("dev-user-no-backend").is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_resume_with_different_principal_drops_cached_authz_and_subscriptions() {
+        let shared = test_shared();
+        shared.auth.add_user("super", b"p1").unwrap();
+        shared.auth.add_user("bob", b"p2").unwrap();
+
+        let frame1 = bind_frame(
+            841,
+            1,
+            encode_bind_meta_creds("shared-cid", false, 60, "super", b"p1"),
+        );
+        let reply1 = apply_bind(&frame1, &shared).await.expect("bind1 replies");
+        let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
+        assert_eq!(rc1, 0);
+
+        let sess1 = shared.sessions.get("shared-cid").unwrap();
+        sess1.record_authz_decision("publish", "secret/topic", 1, false, true);
+        let filter = broker_protocol::TopicFilter::new("secret/#").unwrap();
+        shared
+            .sessions
+            .add_subscription("shared-cid", filter, QoS::AtLeastOnce);
+        shared.sessions.unbind_connection("shared-cid", 841);
+
+        let frame2 = bind_frame(
+            842,
+            1,
+            encode_bind_meta_creds("shared-cid", false, 60, "bob", b"p2"),
+        );
+        let reply2 = apply_bind(&frame2, &shared).await.expect("bind2 replies");
+        let (_, present2, rc2) = decode_session_binding_meta(&reply2.metadata);
+        assert_eq!(rc2, 0);
+        assert!(
+            !present2,
+            "resuming another principal's session must not report session_present"
+        );
+
+        let sess2 = shared.sessions.get("shared-cid").unwrap();
+        assert_eq!(sess2.verified_username().as_deref(), Some("bob"));
+        assert!(
+            sess2.authz_cache_snapshot().is_empty(),
+            "new principal must not inherit prior principal's authz_cache"
+        );
+        assert!(
+            shared
+                .sessions
+                .subscription_filters("shared-cid")
+                .is_empty(),
+            "new principal must not inherit prior principal's subscriptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_authenticated_session_preserves_offline_queue_across_restart() {
+        let dir = std::env::temp_dir().join(format!("indra-owner-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        {
+            let shared = test_shared();
+            shared.sessions.set_offline_store(store.clone());
+            shared.auth.add_user("alice", b"p1").unwrap();
+
+            let frame1 = bind_frame(
+                850,
+                1,
+                encode_bind_meta_creds("durable-cid", false, 60, "alice", b"p1"),
+            );
+            let reply1 = apply_bind(&frame1, &shared).await.expect("bind1 replies");
+            let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
+            assert_eq!(rc1, 0);
+
+            // Simulate normal CONNECT replay drain before disconnecting.
+            let _ = shared.sessions.get("durable-cid").unwrap().drain_offline();
+            shared.sessions.unbind_connection("durable-cid", 850);
+            let sess = shared.sessions.get("durable-cid").unwrap();
+            let topic = broker_protocol::Topic::new("offline/t").unwrap();
+            sess.push_offline(broker_session::QueuedMessage {
+                topic,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"msg1"),
+                publish_at_ms: None,
+            });
+            assert_eq!(sess.offline_len(), 1);
+        }
+
+        // Simulate broker restart: new SessionManager restores from the same OfflineQueueStore.
+        let shared2 = test_shared();
+        shared2.auth.add_user("alice", b"p1").unwrap();
+        shared2.sessions.set_offline_store(store.clone());
+        let stats = shared2.sessions.restore_offline_queues();
+        assert_eq!(stats.messages, 1);
+        assert_eq!(
+            store.owner_in_tenant("default", "durable-cid").as_deref(),
+            Some("alice"),
+            "owner file missing"
+        );
+        assert_eq!(
+            shared2
+                .sessions
+                .get("durable-cid")
+                .unwrap()
+                .verified_username()
+                .as_deref(),
+            Some("alice"),
+            "restored session missing verified_username"
+        );
+
+        let frame2 = bind_frame(
+            851,
+            1,
+            encode_bind_meta_creds("durable-cid", false, 60, "alice", b"p1"),
+        );
+        let reply2 = apply_bind(&frame2, &shared2).await.expect("bind2 replies");
+        let (_, present2, rc2) = decode_session_binding_meta(&reply2.metadata);
+        assert_eq!(rc2, 0);
+        assert!(
+            present2,
+            "same authenticated owner must resume durable session after restart"
+        );
+        let sess2 = shared2.sessions.get("durable-cid").unwrap();
+        assert_eq!(sess2.offline_len(), 1, "offline queue must survive restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -20264,6 +22335,7 @@ config = '{"connector":"pending-timescaledb"}'
                 retain_as_published: false,
                 retain_handling: 0,
                 subscription_id: 0,
+                session_id: 0,
             },
         );
     }
@@ -26579,6 +28651,7 @@ config = '{"connector":"pending-timescaledb"}'
         let mut api_state = broker_api::ApiState::standalone(engine);
         api_state.retainer_config = shared.retainer_config.clone();
         api_state.retained = shared.retained.clone();
+        api_state.retained_subscribe_gate = shared.retained_subscribe_gate.clone();
         api_state.stats = shared.stats.clone();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -28741,5 +30814,53 @@ config = '{"connector":"pending-timescaledb"}'
         // Only the default data frame arrives on the data topic.
         let data = rq04_collect_outputs(&shared, 1031, &mut rx_sub, "data/tenant");
         assert_eq!(data.len(), 1, "only default data delivers: {data:?}");
+    }
+
+    #[tokio::test]
+    async fn subscribe_router_full_0x97_does_not_leave_deferred_retained() {
+        let shared = test_shared();
+        shared
+            .router
+            .set_subscription_count_for_test(broker_router::MAX_SUBSCRIPTIONS);
+
+        // Store two retained QoS 1 messages under sensors/#.
+        for suffix in ["a", "b"] {
+            shared
+                .retained
+                .set_retained_in_tenant(
+                    Topic::new(format!("sensors/{suffix}")).unwrap(),
+                    QoS::AtLeastOnce,
+                    Bytes::from_static(b"1"),
+                    broker_storage::DEFAULT_TENANT_ID,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Bind a v5 client with Receive Maximum 1 so the second retained match
+        // would be deferred if the subscription succeeded.
+        let _rx = rq04_mailbox(&shared, 4001);
+        rq04_bind(&shared, 4001, 1, "sub-full").await;
+        let session = shared.sessions.get("sub-full").expect("bound session");
+        session.set_protocol_version(5);
+        session.set_client_receive_maximum(1);
+        let sub_frame = subscribe_frame(
+            4001,
+            2,
+            encode_subscribe_meta(77, "sub-full", &[("sensors/#", 1)]),
+        );
+        let (suback, _) = apply_subscribe(&sub_frame, &shared).await;
+        let suback = suback.expect("SUBACK must be returned");
+        assert!(
+            suback.metadata.ends_with(&[V5_SUBACK_QUOTA_EXCEEDED])
+                || suback.metadata.ends_with(&[V5_SUBACK_UNSPECIFIED]),
+            "expected quota/unspecified rejection in SUBACK, got {:?}",
+            suback.metadata
+        );
+        assert_eq!(
+            session.pending_retained_len(),
+            0,
+            "rejected 0x97 subscribe must not leave orphaned deferred retained entries"
+        );
     }
 }

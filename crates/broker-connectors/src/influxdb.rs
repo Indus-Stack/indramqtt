@@ -133,31 +133,16 @@ fn escape_tag(value: &str) -> String {
 }
 
 /// Escape double quotes, backslashes, newlines and carriage returns in
-/// string field values. A raw newline or carriage return splits one
-/// line-protocol row into two records. A backslash or quote would be
-/// misread by the line-protocol parser. A backslash that already
-/// introduces an `\n` or `\r` sequence (for example inside a JSON
-/// payload) is copied unchanged instead of doubled, so the sequence is
-/// not corrupted.
+/// string field values. Every backslash is doubled. A raw newline turns
+/// into `\n` and a raw carriage return into `\r`. A quote turns into `\"`.
 fn escape_field_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in value.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            '\\' => {
-                if matches!(chars.peek(), Some('n' | 'r')) {
-                    // An already-escaped newline or carriage return (for
-                    // example inside a JSON payload): copy it unchanged
-                    // instead of doubling the backslash.
-                    out.push('\\');
-                    out.push(chars.next().unwrap());
-                } else {
-                    out.push_str("\\\\");
-                }
-            }
+            '\\' => out.push_str("\\\\"),
             c => out.push(c),
         }
     }
@@ -210,7 +195,7 @@ fn render_line_at(
 }
 
 /// InfluxDB sink: buffers validated rows, POSTs line-protocol batches.
-pub struct InfluxDbSink {
+struct InfluxDbSinkInner {
     config: InfluxDbSinkConfig,
     client: reqwest::Client,
     buffer: parking_lot::Mutex<BatchQueue<InfluxRow>>,
@@ -225,37 +210,88 @@ pub struct InfluxDbSink {
     last_timestamp: AtomicI64,
 }
 
+/// InfluxDB sink: buffers validated rows, POSTs line-protocol batches.
+pub struct InfluxDbSink {
+    inner: Arc<InfluxDbSinkInner>,
+}
+
 impl InfluxDbSink {
     pub fn new(config: InfluxDbSinkConfig, client: reqwest::Client) -> Result<Self> {
         config.validate()?;
         let linger = Duration::from_millis(config.batch_timeout_ms);
-        Ok(Self {
+        let inner = Arc::new(InfluxDbSinkInner {
             buffer: parking_lot::Mutex::new(BatchQueue::new(config.batch_size, linger)),
             config,
             client,
             backoff: parking_lot::Mutex::new(BackoffState::default()),
             sent_batches: AtomicU64::new(0),
             last_timestamp: AtomicI64::new(0),
-        })
+        });
+        // A stale partial batch must flush without a new publish.
+        // The sweep holds the inner weakly, so a dropped sink stops it.
+        // It skips an empty queue. A full queue already fails closed.
+        // Reason: batch_timeout_ms must flush without a new publish.
+        // Source: the connector qualification demands a timed flush.
+        if !linger.is_zero() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let weak = Arc::downgrade(&inner);
+                handle.spawn(async move {
+                    loop {
+                        tokio::time::sleep(linger).await;
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        let should_flush = {
+                            let queue = inner.buffer.lock();
+                            !queue.is_empty() && queue.is_stale()
+                        };
+                        if should_flush {
+                            let _ = inner.flush().await;
+                        }
+                    }
+                });
+            }
+        }
+        Ok(Self { inner })
     }
 
     pub fn config(&self) -> &InfluxDbSinkConfig {
-        &self.config
+        &self.inner.config
     }
 
     pub fn sent_batches(&self) -> u64 {
-        self.sent_batches.load(Ordering::Relaxed)
+        self.inner.sent_batches.load(Ordering::Relaxed)
     }
 
     pub fn buffered_rows(&self) -> usize {
-        self.buffer.lock().len()
+        self.inner.buffer.lock().len()
     }
 
+    /// Write URL: `{endpoint}/api/v2/write`.
+    pub fn write_url(&self) -> String {
+        self.inner.write_url()
+    }
+
+    /// Flush buffered rows as one write (no-op when empty). While
+    /// backing off, fails fast without touching the transport. Any
+    /// failure restores the buffer, engages backoff, and propagates.
+    pub async fn flush(&self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    /// Validate one event into a buffered line. Returns true when the
+    /// batch is full (caller flushes). Rejects empty topics and
+    /// non-UTF-8 payloads (string field values must be UTF-8). Fails
+    /// closed with a connection error once `MAX_BUFFERED_ROWS` rows are
+    /// buffered instead of growing without bound.
+    fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<bool> {
+        self.inner.buffer_row(topic, payload, qos)
+    }
+}
+
+impl InfluxDbSinkInner {
     /// Next timestamp in the configured precision, strictly greater
-    /// than every previously handed-out timestamp. Uses the wall clock
-    /// when it has advanced, otherwise bumps the last value by one
-    /// precision unit so concurrent or sub-precision writes never share
-    /// a timestamp on the same series.
+    /// than every previously handed-out timestamp.
     fn next_timestamp(&self) -> i64 {
         let mut last = self.last_timestamp.load(Ordering::Relaxed);
         loop {
@@ -274,7 +310,7 @@ impl InfluxDbSink {
     }
 
     /// Write URL: `{endpoint}/api/v2/write`.
-    pub fn write_url(&self) -> String {
+    fn write_url(&self) -> String {
         format!(
             "{}/api/v2/write",
             self.config.endpoint.trim_end_matches('/')
@@ -284,7 +320,7 @@ impl InfluxDbSink {
     /// Flush buffered rows as one write (no-op when empty). While
     /// backing off, fails fast without touching the transport. Any
     /// failure restores the buffer, engages backoff, and propagates.
-    pub async fn flush(&self) -> Result<()> {
+    async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
         if rows.is_empty() {
@@ -428,6 +464,24 @@ mod tests {
     #[test]
     fn sb27_measurement_escapes_newline_and_carriage_return() {
         assert_eq!(escape_measurement("a\nb\rc,d e"), "a\\nb\\rc\\,d\\ e");
+    }
+
+    #[test]
+    fn mn10_escape_field_string_pairs() {
+        // Form 1: the two characters '\' and 'n' give three characters "\\n".
+        assert_eq!(escape_field_string("\\n"), "\\\\n");
+        // Form 2: a raw line feed (0x0A) gives two characters "\n".
+        assert_eq!(escape_field_string("\n"), "\\n");
+        // Form 3: the two characters '\' and 'r' give three characters "\\r".
+        assert_eq!(escape_field_string("\\r"), "\\\\r");
+        // Form 4: a raw carriage return (0x0D) gives two characters "\r".
+        assert_eq!(escape_field_string("\r"), "\\r");
+        // Form 5: a quote gives '\"'.
+        assert_eq!(escape_field_string("\""), "\\\"");
+        // Form 6: a backslash alone gives "\\".
+        assert_eq!(escape_field_string("\\"), "\\\\");
+        // A raw line feed or carriage return never ends the record.
+        assert_eq!(escape_field_string("a\nb\rc").lines().count(), 1);
     }
 
     #[test]

@@ -56,6 +56,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::admin_users::RecoverGuard;
 use crate::ApiState;
 
 /// Upper bound for configured backends. Inserts past this size are
@@ -229,15 +230,19 @@ impl PendingSsoLogin {
 /// The pending-flow table beside it takes one short mutex per login attempt
 /// (sweep plus insert); publish and deliver never touch it either.
 pub struct SsoStore {
+    /// Recover: backend records are plain values, so a poisoned guard reads.
     inner: RwLock<HashMap<String, SsoBackend>>,
     /// Initiated login flows, swept for expiry on every attempt and capped
     /// at [`MAX_PENDING_SSO_LOGINS`]. Management-plane only.
+    /// Recover: each flow is a plain value and every entry expires.
     pending: Mutex<HashMap<String, PendingSsoLogin>>,
     /// Kernel config registry receiving every mutation (`None` in unit
     /// tests and standalone state, which stay memory-only).
+    /// Recover: the handle is a plain optional `Arc`.
     registry: RwLock<Option<Arc<ConfigRegistry>>>,
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
+    /// Recover: the guard carries no data and only orders disk saves.
     save_lock: Mutex<()>,
     /// The login flow endpoints answer requests only when this is true.
     /// The default is false. See the module documentation.
@@ -283,7 +288,7 @@ impl SsoStore {
     /// yields today's empty behaviour.
     pub fn from_registry(registry: &Arc<ConfigRegistry>) -> Self {
         let store = Self::from_snapshot(&registry.snapshot().sso_backends);
-        *store.registry.write().expect("sso store lock") = Some(Arc::clone(registry));
+        *store.registry.write().recover("sso registry") = Some(Arc::clone(registry));
         store
     }
 
@@ -291,11 +296,11 @@ impl SsoStore {
     /// snapshot, in place on the same instance.
     pub fn seed_from_registry(&self, registry: &Arc<ConfigRegistry>) {
         self.seed_from_snapshot(&registry.snapshot().sso_backends);
-        *self.registry.write().expect("sso store lock") = Some(Arc::clone(registry));
+        *self.registry.write().recover("sso registry") = Some(Arc::clone(registry));
     }
 
     fn seed_from_snapshot(&self, conf: &SsoBackendsConf) {
-        let mut map = self.inner.write().expect("sso store lock");
+        let mut map = self.inner.write().recover("sso backends");
         map.clear();
         for entry in &conf.backends {
             let config = if entry.config.trim().is_empty() {
@@ -330,7 +335,7 @@ impl SsoStore {
 
     /// Snapshot of live backends sorted by name for stable reads.
     pub fn list(&self) -> Vec<SsoBackend> {
-        let map = self.inner.read().expect("sso store lock");
+        let map = self.inner.read().recover("sso backends");
         let mut out: Vec<SsoBackend> = map.values().cloned().collect();
         out.sort_by(|a, b| a.backend.cmp(&b.backend));
         out
@@ -347,7 +352,7 @@ impl SsoStore {
     // broker tracks only the registry slot (no provider client), so the
     // current choice reports every enabled slot until the checker pins it.
     pub fn running(&self) -> Vec<String> {
-        let map = self.inner.read().expect("sso store lock");
+        let map = self.inner.read().recover("sso backends");
         let mut out: Vec<String> = map
             .values()
             .filter(|backend| backend.enable)
@@ -362,7 +367,7 @@ impl SsoStore {
     pub fn get(&self, backend: &str) -> Option<SsoBackend> {
         self.inner
             .read()
-            .expect("sso store lock")
+            .recover("sso backends")
             .get(backend)
             .cloned()
     }
@@ -379,7 +384,7 @@ impl SsoStore {
     // recorded, until the checker pins it.
     pub fn record_login_attempt(&self, backend: &str, username: &str) -> String {
         let flow_id = format!("{:032x}", rand::random::<u128>());
-        let mut pending = self.pending.lock().expect("sso pending lock");
+        let mut pending = self.pending.lock().recover("sso pending logins");
         let now = Instant::now();
         pending.retain(|_, flow| !flow.expired(now));
         while pending.len() >= MAX_PENDING_SSO_LOGINS {
@@ -419,7 +424,7 @@ impl SsoStore {
     /// Management-plane only: one short mutex per callback; publish and
     /// deliver never touch this table.
     fn consume_pending_state(&self, state: &str) -> Option<PendingSsoLogin> {
-        let mut pending = self.pending.lock().expect("sso pending lock");
+        let mut pending = self.pending.lock().recover("sso pending logins");
         let now = Instant::now();
         pending.retain(|_, flow| !flow.expired(now));
         pending.remove(state)
@@ -429,7 +434,7 @@ impl SsoStore {
     /// hook; the login route itself never reads it.
     #[cfg(test)]
     fn pending_len(&self) -> usize {
-        let mut pending = self.pending.lock().expect("sso pending lock");
+        let mut pending = self.pending.lock().recover("sso pending logins");
         let now = Instant::now();
         pending.retain(|_, flow| !flow.expired(now));
         pending.len()
@@ -445,7 +450,7 @@ impl SsoStore {
     pub fn insert(&self, backend: SsoBackend) -> Result<SsoBackend, SsoInsertError> {
         validate_backend(&backend)?;
         {
-            let mut map = self.inner.write().expect("sso store lock");
+            let mut map = self.inner.write().recover("sso backends");
             if map.contains_key(&backend.backend) {
                 return Err(SsoInsertError::Duplicate);
             }
@@ -455,7 +460,7 @@ impl SsoStore {
             map.insert(backend.backend.clone(), backend.clone());
         }
         if let Err(reason) = self.persist() {
-            let mut map = self.inner.write().expect("sso store lock");
+            let mut map = self.inner.write().recover("sso backends");
             map.remove(&backend.backend);
             return Err(SsoInsertError::Persist(reason));
         }
@@ -484,14 +489,14 @@ impl SsoStore {
             SsoInsertError::Persist(reason) => SsoUpsertError::Persist(reason),
         })?;
         let previous = {
-            let mut map = self.inner.write().expect("sso store lock");
+            let mut map = self.inner.write().recover("sso backends");
             if !map.contains_key(&backend.backend) && map.len() >= MAX_SSO_BACKENDS {
                 return Err(SsoUpsertError::Full);
             }
             map.insert(backend.backend.clone(), backend.clone())
         };
         if let Err(reason) = self.persist() {
-            let mut map = self.inner.write().expect("sso store lock");
+            let mut map = self.inner.write().recover("sso backends");
             match previous {
                 Some(old) => {
                     map.insert(old.backend.clone(), old);
@@ -513,14 +518,14 @@ impl SsoStore {
     /// and the loss is never silent.
     pub fn remove(&self, backend: &str) -> Result<bool, String> {
         let removed = {
-            let mut map = self.inner.write().expect("sso store lock");
+            let mut map = self.inner.write().recover("sso backends");
             map.remove(backend)
         };
         let Some(old) = removed else {
             return Ok(false);
         };
         if let Err(reason) = self.persist() {
-            let mut map = self.inner.write().expect("sso store lock");
+            let mut map = self.inner.write().recover("sso backends");
             map.insert(old.backend.clone(), old);
             return Err(reason);
         }
@@ -530,7 +535,7 @@ impl SsoStore {
     /// Export the current contents as a validated config root, sorted by
     /// backend name so the persisted file is deterministic.
     fn export_conf(&self) -> SsoBackendsConf {
-        let map = self.inner.read().expect("sso store lock");
+        let map = self.inner.read().recover("sso backends");
         let mut entries: Vec<broker_config::SsoBackendEntry> = map
             .values()
             .map(|backend| broker_config::SsoBackendEntry {
@@ -551,11 +556,11 @@ impl SsoStore {
     /// a registry; any commit or save failure surfaces as a message so
     /// callers answer 500 and the loss is never silent.
     fn persist(&self) -> Result<(), String> {
-        let registry = self.registry.read().expect("sso store lock").clone();
+        let registry = self.registry.read().recover("sso registry").clone();
         let Some(registry) = registry else {
             return Ok(());
         };
-        let _guard = self.save_lock.lock().expect("sso save lock");
+        let _guard = self.save_lock.lock().recover("sso save");
         let conf = self.export_conf();
         registry
             .commit_sso_backends(conf)

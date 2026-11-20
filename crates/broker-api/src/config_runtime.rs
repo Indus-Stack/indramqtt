@@ -74,6 +74,17 @@ struct ErrorBody {
     error: String,
 }
 
+fn forbidden(message: impl Into<String>) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "code": "FORBIDDEN",
+            "message": message.into(),
+        })),
+    )
+        .into_response()
+}
+
 fn bad_request(message: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -174,6 +185,7 @@ async fn apply_candidate(
     candidate: &FullSnapshot,
     actor: &str,
     summary: &str,
+    is_full_admin: bool,
 ) -> Result<ReloadResult, Box<Response>> {
     // 1. Validate whole before anything applies; the running snapshot is
     // untouched on failure and every offending setting is named.
@@ -184,6 +196,11 @@ async fn apply_candidate(
         return Err(Box::new(bad_request(err)));
     }
     let previous = state.config.snapshot();
+    // A new pending IoT record is refused at the file-load entry. A record
+    // already stored by an older version stays readable and is kept.
+    if let Some(message) = refuse_new_pending_iot(&previous, candidate) {
+        return Err(Box::new(bad_request(message)));
+    }
     // An empty administrator list restores the default account and its
     // default password. Refuse a candidate that removes all the
     // administrators of an installation. Thus a reload or a restore
@@ -191,6 +208,16 @@ async fn apply_candidate(
     if candidate.admin_users.users.is_empty() && !previous.admin_users.users.is_empty() {
         return Err(Box::new(bad_request(
             "admin_users.users must keep at least one administrator: an empty list would restore the default account (field `admin_users.users`)",
+        )));
+    }
+    if !is_full_admin
+        && crate::v5::backup::admin_user_rights_change(
+            &candidate.admin_users,
+            &previous.admin_users,
+        )
+    {
+        return Err(Box::new(forbidden(
+            "this change modifies dashboard user roles, scopes or membership: a full administrator is required",
         )));
     }
     let diff = state.config.diff(&previous, candidate);
@@ -302,6 +329,7 @@ async fn apply_restore(
     state: &ApiState,
     id: u64,
     actor: &str,
+    is_full_admin: bool,
 ) -> Result<ReloadResult, Box<Response>> {
     let version = match state.config.history_get(id) {
         Some(version) => version,
@@ -319,6 +347,16 @@ async fn apply_restore(
         return Err(Box::new(bad_request(err)));
     }
     let previous = state.config.snapshot();
+    if !is_full_admin
+        && crate::v5::backup::admin_user_rights_change(
+            &candidate.admin_users,
+            &previous.admin_users,
+        )
+    {
+        return Err(Box::new(forbidden(
+            "this change modifies dashboard user roles, scopes or membership: a full administrator is required",
+        )));
+    }
     let diff = state.config.diff(&previous, &candidate);
     if let Err(err) = state.auth.apply_snapshot_conf(&candidate.mqtt_users) {
         return Err(Box::new(apply_failed(format!(
@@ -471,6 +509,40 @@ fn validate_connector_io_settings(snapshot: &FullSnapshot) -> Result<(), String>
         crate::v5::action_sinks::validate_connector_io_bounds(&params, &entry.id, "config file")?;
     }
     Ok(())
+}
+
+/// Refuse a candidate that adds a pending IoT connector or action.
+///
+/// A stored record with the same id and kind is kept, so an older state
+/// file still reads and deletes. Only a new file-load entry is refused.
+fn refuse_new_pending_iot(previous: &FullSnapshot, candidate: &FullSnapshot) -> Option<String> {
+    for entry in &candidate.connectors.connectors {
+        if !crate::v5::rules::is_mvp_pending_iot_kind(&entry.connector_type) {
+            continue;
+        }
+        let stored = previous
+            .connectors
+            .connectors
+            .iter()
+            .any(|old| old.id == entry.id && old.connector_type == entry.connector_type);
+        if !stored {
+            return crate::v5::rules::kind_refusal(&entry.connector_type);
+        }
+    }
+    for entry in &candidate.actions.actions {
+        if !crate::v5::rules::is_mvp_pending_iot_kind(&entry.action_type) {
+            continue;
+        }
+        let stored = previous
+            .actions
+            .actions
+            .iter()
+            .any(|old| old.id == entry.id && old.action_type == entry.action_type);
+        if !stored {
+            return crate::v5::rules::kind_refusal(&entry.action_type);
+        }
+    }
+    None
 }
 
 fn resolve_params_secrets_in_place(
@@ -706,11 +778,13 @@ fn apply_zone_live(
 /// rejects mid-apply (every owner rolled back to the previous snapshot).
 pub async fn reload_config(
     State(state): State<ApiState>,
+    full_admin: Option<axum::Extension<crate::api_auth::FullAdministrator>>,
     Json(body): Json<ReloadBody>,
 ) -> Response {
     let actor = body.actor.as_deref().unwrap_or("api");
     let summary = body.summary.as_deref().unwrap_or("reload via API");
-    match apply_candidate(&state, &body.snapshot, actor, summary).await {
+    let is_full_admin = full_admin.is_some_and(|flag| flag.0 .0);
+    match apply_candidate(&state, &body.snapshot, actor, summary, is_full_admin).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(response) => *response,
     }
@@ -778,10 +852,12 @@ pub async fn get_history_version(
 pub async fn restore_history_version(
     State(state): State<ApiState>,
     Path(id): Path<u64>,
+    full_admin: Option<axum::Extension<crate::api_auth::FullAdministrator>>,
     Json(body): Json<RestoreBody>,
 ) -> Response {
     let actor = body.actor.as_deref().unwrap_or("api");
-    match apply_restore(&state, id, actor).await {
+    let is_full_admin = full_admin.is_some_and(|flag| flag.0 .0);
+    match apply_restore(&state, id, actor, is_full_admin).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(response) => *response,
     }
@@ -2441,5 +2517,33 @@ mod tests {
         }
         receiver.abort();
         std::fs::remove_dir_all(&secret_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn reload_and_restore_refuse_admin_role_or_scope_change_without_full_admin() {
+        let harness = Harness::start().await;
+        let mut candidate = (*harness.state.config.snapshot()).clone();
+        candidate.admin_users.users.push(broker_config::AdminUser {
+            username: "escalated".to_string(),
+            password_hash: "$2b$12$000000000000000000000u0000000000000000000000000000000"
+                .to_string(),
+            role: "administrator".to_string(),
+            description: String::new(),
+            must_change_password: false,
+            scopes: None,
+            mfa_enabled: false,
+            mfa_secret: String::new(),
+            mfa_last_step: None,
+        });
+        let err = apply_candidate(
+            &harness.state,
+            &candidate,
+            "scoped-admin",
+            "escalate",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 }

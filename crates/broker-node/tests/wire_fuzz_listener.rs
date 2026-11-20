@@ -774,6 +774,10 @@ async fn listener_wire_fuzz_stays_correct() {
             );
         }
     }
+    assert!(
+        index > 0,
+        "fuzz loop exercised no random streams; index stayed at 0"
+    );
 
     // The kernel must still accept a clean client.
     {

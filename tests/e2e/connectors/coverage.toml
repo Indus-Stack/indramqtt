@@ -1,0 +1,308 @@
+# Coverage map for the connector end-to-end inventory.
+# Each item is generated into inventory.json by tools/connector_inventory.py.
+# An item names one test, or a not-built reason with a file and line.
+
+# webhook
+[items."webhook.auth"]
+test = "http_auth_modes_through_broker"
+
+[items."webhook.auth.ApiKey"]
+test = "http_auth_modes_through_broker"
+
+[items."webhook.auth.Basic"]
+test = "http_auth_modes_through_broker"
+
+[items."webhook.auth.Bearer"]
+test = "http_auth_modes_through_broker"
+
+[items."webhook.auth.None"]
+test = "http_auth_modes_through_broker"
+
+[items."webhook.batch_bytes"]
+test = "http_batch_bytes_through_broker"
+
+[items."webhook.batch_size"]
+test = "http_batch_array_through_broker"
+
+[items."webhook.body_format"]
+test = "http_batch_array_through_broker"
+
+[items."webhook.body_format.FormUrlEncoded"]
+test = "http_form_urlencoded_through_broker"
+
+[items."webhook.body_format.JsonBatchArray"]
+test = "http_batch_array_through_broker"
+
+[items."webhook.body_format.RawJson"]
+test = "http_forward_raw_json_through_broker"
+
+[items."webhook.buffer_capacity"]
+test = "http_buffer_capacity_fails_closed_through_broker"
+
+[items."webhook.headers"]
+test = "http_headers_template_through_broker"
+
+[items."webhook.initial_backoff_ms"]
+test = "http_initial_backoff_ms_through_broker"
+
+[items."webhook.linger_ms"]
+test = "http_partial_batch_flush_on_linger"
+ignored = true
+note = "defect: no timer flush; the partial batch waits for the next publish"
+
+[items."webhook.max_backoff_ms"]
+test = "http_max_backoff_ms_through_broker"
+
+[items."webhook.max_retries"]
+test = "http_retry_after_429_through_broker"
+
+[items."webhook.method"]
+test = "http_methods_through_broker"
+
+[items."webhook.method.Patch"]
+test = "http_methods_through_broker"
+
+[items."webhook.method.Post"]
+test = "http_methods_through_broker"
+
+[items."webhook.method.Put"]
+test = "http_methods_through_broker"
+
+[items."webhook.signature"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.signature.algorithm"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.signature.algorithm.Sha1"]
+test = "http_hmac_sha1_base64_through_broker"
+
+[items."webhook.signature.algorithm.Sha256"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.signature.encoding"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.signature.encoding.Base64"]
+test = "http_hmac_sha1_base64_through_broker"
+
+[items."webhook.signature.encoding.Hex"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.signature.header_name"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.signature.secret"]
+test = "http_hmac_sha256_hex_through_broker"
+
+[items."webhook.timeout_ms"]
+test = "http_timeout_is_applied_through_broker"
+
+[items."webhook.tls"]
+test = "http_tls_through_broker"
+
+[items."webhook.url"]
+test = "http_forward_raw_json_through_broker"
+
+# mqtt_bridge
+[items."mqtt_bridge.broker_address"]
+test = "mqtt_bridge_forward_through_broker"
+
+[items."mqtt_bridge.clean_start"]
+test = "mqtt_bridge_forward_through_broker"
+
+[items."mqtt_bridge.client_id"]
+test = "mqtt_bridge_forward_through_broker"
+
+[items."mqtt_bridge.keep_alive_secs"]
+test = "mqtt_bridge_forward_through_broker"
+
+[items."mqtt_bridge.linger_ms"]
+test = "mqtt_bridge_partial_batch_flush_on_linger"
+ignored = true
+note = "defect: no timer flush; the partial batch waits for the next publish"
+
+[items."mqtt_bridge.max_batch_size"]
+test = "mqtt_bridge_batching_through_broker"
+
+[items."mqtt_bridge.max_inflight"]
+test = "mqtt_bridge_inflight_cap_through_broker"
+
+[items."mqtt_bridge.password"]
+test = "mqtt_bridge_auth_through_broker"
+
+[items."mqtt_bridge.payload_template"]
+test = "mqtt_bridge_payload_template_through_broker"
+
+[items."mqtt_bridge.protocol"]
+test = "mqtt_bridge_v50_through_broker"
+
+[items."mqtt_bridge.protocol.V311"]
+test = "mqtt_bridge_forward_through_broker"
+
+[items."mqtt_bridge.protocol.V50"]
+test = "mqtt_bridge_v50_through_broker"
+
+[items."mqtt_bridge.qos_override"]
+test = "mqtt_bridge_topic_mapping_through_broker"
+
+[items."mqtt_bridge.retain_override"]
+test = "mqtt_bridge_topic_mapping_through_broker"
+
+[items."mqtt_bridge.tls"]
+test = "mqtt_bridge_tls_fails_closed_through_broker"
+note = "mqtts is not built; the transport rejects it at connect (crates/broker-connectors/src/mqtt_bridge.rs:635-641)"
+
+[items."mqtt_bridge.topic_prefix"]
+test = "mqtt_bridge_topic_mapping_through_broker"
+
+[items."mqtt_bridge.topic_template"]
+test = "mqtt_bridge_topic_mapping_through_broker"
+
+[items."mqtt_bridge.username"]
+test = "mqtt_bridge_auth_through_broker"
+
+# greptimedb
+[items."greptimedb.endpoint"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.database"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.auth"]
+test = "greptimedb_auth_header_through_broker"
+
+[items."greptimedb.auth.username"]
+test = "greptimedb_auth_header_through_broker"
+
+[items."greptimedb.auth.password"]
+test = "greptimedb_auth_header_through_broker"
+
+[items."greptimedb.format"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.format.SqlInsert"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.format.InfluxLineProtocol"]
+test = "greptimedb_influx_line_protocol_through_broker"
+
+[items."greptimedb.table_template"]
+test = "greptimedb_sql_insert_through_broker"
+
+[items."greptimedb.timestamp_precision"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Nanosecond"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Microsecond"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Millisecond"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.timestamp_precision.Second"]
+test = "greptimedb_timestamp_precision_through_broker"
+
+[items."greptimedb.batch_size"]
+test = "greptimedb_batch_size_through_broker"
+
+[items."greptimedb.buffer_capacity"]
+test = "greptimedb_buffer_capacity_fails_closed_through_broker"
+
+[items."greptimedb.timeout_ms"]
+test = "greptimedb_timeout_applied_through_broker"
+
+# kafka
+[items."kafka.bootstrap_servers"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.topic_template"]
+test = "kafka_topic_template_through_broker"
+
+[items."kafka.partition_key_field"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.key_template"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.partitions"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.client_id"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.acks"]
+test = "kafka_forward_through_broker"
+
+[items."kafka.batch_max_records"]
+test = "kafka_batch_through_broker"
+
+[items."kafka.batch_max_bytes"]
+test = "kafka_batch_through_broker"
+
+[items."kafka.random_partition"]
+test = "kafka_random_partition_through_broker"
+
+[items."kafka.headers_template"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.extra_headers"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.header_encode_mode"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.header_encode_mode.None"]
+test = "kafka_headers_none_through_broker"
+
+[items."kafka.header_encode_mode.Json"]
+test = "kafka_headers_json_through_broker"
+
+# influxdb
+[items."influxdb.endpoint"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.bucket"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.org"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.token"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.measurement_template"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.precision"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.batch_size"]
+test = "influxdb_end_to_end_through_broker"
+
+[items."influxdb.batch_timeout_ms"]
+test = "influxdb_batch_timeout_through_broker"
+
+[items."influxdb.request_timeout_ms"]
+test = "influxdb_request_timeout_through_broker"
+
+[items."influxdb.tls"]
+not_built = { file = "crates/broker-connectors/src/influxdb.rs", line = 44, reason = "InfluxDbSinkConfig has no tls field; the sink speaks plaintext HTTP via reqwest with no TLS option" }
+
+# mysql
+[items."mysql.connection_url"]
+test = "mysql_auth_through_broker"
+
+[items."mysql.sql_template"]
+test = "mysql_forward_through_broker"
+
+[items."mysql.pool_size"]
+test = "mysql_pool_size_through_broker"
+
+[items."mysql.batch_size"]
+test = "mysql_batch_size_through_broker"
+
+[items."mysql.batch_timeout_ms"]
+test = "mysql_batch_timeout_through_broker"

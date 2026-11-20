@@ -3116,14 +3116,37 @@ impl MemoryAuth {
     /// After: four lock-free loads and one atomic add, no lock, no clone,
     /// no allocation. A non-empty tenant adds one short tenant read lock.
     /// An unmatched scan adds one lock-free settings load.
+    ///
+    /// This path has no verified identity, so it never grants a superuser
+    /// bypass. The MQTT and console paths call
+    /// [`Self::authorize_publish_in_tenant_as`] with the session's verified
+    /// identity.
     pub async fn authorize_publish_in_tenant(
         &self,
         tenant: &str,
         client_id: &str,
         topic: &Topic,
     ) -> Result<()> {
+        self.authorize_publish_in_tenant_as(tenant, client_id, None, topic)
+            .await
+    }
+
+    /// Authorize one publish in one tenant for a session whose verified
+    /// identity is `authenticated_username`.
+    ///
+    /// Pass only a username that a backend verified at CONNECT. Never
+    /// pass the claimed MQTT username or the client id. A configured
+    /// superuser username bypasses every ACL rule. `None` means the
+    /// session has no verified identity and never bypasses.
+    pub async fn authorize_publish_in_tenant_as(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        authenticated_username: Option<&str>,
+        topic: &Topic,
+    ) -> Result<()> {
         // Superusers bypass all ACL checks.
-        if self.is_superuser(client_id) {
+        if authenticated_username.is_some_and(|identity| self.is_superuser(identity)) {
             self.record_authz_verdict(true);
             return Ok(());
         }
@@ -3205,14 +3228,37 @@ impl MemoryAuth {
 
     /// Authorize one subscribe in one tenant (MT-06): same per-tenant
     /// isolation as publish. Same lock/allocation discipline.
+    ///
+    /// This path has no verified identity, so it never grants a superuser
+    /// bypass. The MQTT and console paths call
+    /// [`Self::authorize_subscribe_in_tenant_as`] with the session's
+    /// verified identity.
     pub async fn authorize_subscribe_in_tenant(
         &self,
         tenant: &str,
         client_id: &str,
         filter: &TopicFilter,
     ) -> Result<()> {
+        self.authorize_subscribe_in_tenant_as(tenant, client_id, None, filter)
+            .await
+    }
+
+    /// Authorize one subscribe in one tenant for a session whose verified
+    /// identity is `authenticated_username`.
+    ///
+    /// Pass only a username that a backend verified at CONNECT. Never
+    /// pass the claimed MQTT username or the client id. A configured
+    /// superuser username bypasses every ACL rule. `None` means the
+    /// session has no verified identity and never bypasses.
+    pub async fn authorize_subscribe_in_tenant_as(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        authenticated_username: Option<&str>,
+        filter: &TopicFilter,
+    ) -> Result<()> {
         // Superusers bypass all ACL checks.
-        if self.is_superuser(client_id) {
+        if authenticated_username.is_some_and(|identity| self.is_superuser(identity)) {
             self.record_authz_verdict(true);
             return Ok(());
         }

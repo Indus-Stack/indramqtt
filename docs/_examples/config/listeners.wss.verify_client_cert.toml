@@ -10,10 +10,10 @@ config = '''
 [listeners.wss]
 enabled = true
 bind = "127.0.0.1:28884"
-cert_file = "/work/tree/crates/broker-node/tests/k1_05/server-cert.pem"
-key_file = "/work/tree/crates/broker-node/tests/k1_05/server-key.pem"
+cert_file = "${TLS_DIR}/server-cert.pem"
+key_file = "${TLS_DIR}/server-key.pem"
 verify_client_cert = true
-cacertfile = "/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem"
+cacertfile = "${TLS_DIR}/ca-cert.pem"
 '''
 script = '''
 from config_probe import *
@@ -23,7 +23,8 @@ import socket
 import ssl
 import struct
 
-CERT = "/work/tree/crates/broker-node/tests/k1_05"
+import os
+CERT = os.environ["TLS_DIR"]
 
 def connect_bytes(client, username=None, password=None):
     flags = 0x02 | (0x80 if username else 0) | (0x40 if password else 0)

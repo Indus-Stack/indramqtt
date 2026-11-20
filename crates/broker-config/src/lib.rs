@@ -254,6 +254,39 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "pubsub",
     "azure",
     "eventhubs",
+    // MN-05 action aliases. Each maps through `canonical_action_kind`
+    // to its base kind. Reason: the reference lists each alias as an
+    // accepted action type.
+    "mariadb",
+    "cockroach",
+    "postgresql",
+    "google_alloydb",
+    "alloy_db",
+    "minio",
+    "ddb",
+    "rabbit",
+    "amqp",
+    "bq",
+    "gbq",
+    "snowflake_aggregated",
+    "ots",
+    "delta_lake",
+    "opcua",
+    "sparkplug",
+    "spb",
+    "rest",
+    "logger",
+    "gcp_pubsub_consumer",
+    "azure_event_hubs",
+    "oci",
+    "aws_iot_core",
+    "azure_iot_hub",
+    "azure_iothub",
+    "iothub",
+    "gcp_iot_core",
+    "cloud_iot",
+    "confluent_kafka",
+    "confluent_cloud",
 ];
 
 /// Returns true for an action kind the kernel can execute.
@@ -4802,6 +4835,32 @@ impl ConfigRegistry {
         }
         Ok(())
     }
+}
+
+/// Parse a human-readable duration string such as `250ms`, `15s`, or `1h`.
+pub fn parse_duration_str(text: &str) -> std::result::Result<std::time::Duration, &'static str> {
+    let text = text.trim().to_ascii_lowercase();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .ok_or("missing duration unit")?;
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().map_err(|_| "invalid duration number")?;
+    if !number.is_finite() || number < 0.0 {
+        return Err("duration must be finite and non-negative");
+    }
+    let nanos = match unit.trim() {
+        "ns" => number,
+        "us" | "µs" => number * 1_000.0,
+        "ms" => number * 1_000_000.0,
+        "s" => number * 1_000_000_000.0,
+        "m" => number * 60.0 * 1_000_000_000.0,
+        "h" => number * 3600.0 * 1_000_000_000.0,
+        _ => return Err("unsupported duration unit"),
+    };
+    if nanos > u64::MAX as f64 {
+        return Err("duration overflows u64 nanoseconds");
+    }
+    Ok(std::time::Duration::from_nanos(nanos as u64))
 }
 
 #[cfg(test)]

@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::admin_users::AdminRole;
+use crate::admin_users::{AdminRole, RecoverGuard};
 use crate::v5::auth::TokenInfo;
 
 /// Upper bound on stored operator API keys. Inserts past the cap fail;
@@ -70,6 +70,7 @@ const API_KEY_USERNAME: &str = "api-key";
 /// Bounded set of valid operator API keys (opaque strings).
 #[derive(Debug, Default)]
 pub struct ApiKeyStore {
+    /// Recover: the set holds opaque strings, so a poisoned guard still reads.
     keys: Mutex<HashMap<String, ()>>,
 }
 
@@ -94,10 +95,14 @@ impl ApiKeyStore {
                 too_short += 1;
                 continue;
             }
-            if store.keys.lock().unwrap().len() >= MAX_API_KEYS {
+            if store.keys.lock().recover("api keys").len() >= MAX_API_KEYS {
                 break;
             }
-            store.keys.lock().unwrap().insert(key.to_string(), ());
+            store
+                .keys
+                .lock()
+                .recover("api keys")
+                .insert(key.to_string(), ());
         }
         if too_short > 0 {
             // The log shows the count only. A key is a credential.
@@ -122,7 +127,7 @@ impl ApiKeyStore {
                 "api key must be at least {MIN_API_KEY_LEN} characters"
             ));
         }
-        let mut keys = self.keys.lock().unwrap();
+        let mut keys = self.keys.lock().recover("api keys");
         if keys.len() >= MAX_API_KEYS && !keys.contains_key(key) {
             return Err(format!("api key store is full ({MAX_API_KEYS} keys)"));
         }
@@ -133,13 +138,13 @@ impl ApiKeyStore {
     /// Number of stored keys (management introspection only).
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.keys.lock().unwrap().len()
+        self.keys.lock().recover("api keys").len()
     }
 
     /// Whether the store holds no keys (management introspection only).
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.keys.lock().unwrap().is_empty()
+        self.keys.lock().recover("api keys").is_empty()
     }
 
     /// Resolve one presented Bearer key to an operator identity, or `None`
@@ -149,7 +154,7 @@ impl ApiKeyStore {
         if presented.is_empty() {
             return None;
         }
-        let keys = self.keys.lock().unwrap();
+        let keys = self.keys.lock().recover("api keys");
         let mut matched = false;
         for stored in keys.keys() {
             if secure_eq(stored.as_bytes(), presented.as_bytes()) {

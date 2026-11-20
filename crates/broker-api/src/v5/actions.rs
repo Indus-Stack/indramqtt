@@ -779,6 +779,18 @@ pub async fn create_action(
     // reason and the run reads `disconnected` until the connector
     // arrives. A connector that resolves but stays incomplete (its own
     // credential is missing) stores the same way.
+    // For a bigquery action, refuse up front (400) when the referenced
+    // connector's service_account_json is malformed: the build feature
+    // is off so the sink builder never reaches its own credential check.
+    if crate::v5::action_sinks::canonical_action_kind(&entry.action_type) == "bigquery"
+        && !entry.connector.is_empty()
+    {
+        if let Some(doc) = state.connectors.get(&entry.connector) {
+            if let Err(msg) = super::rules::validate_service_account_json(&doc, &entry.id) {
+                return ApiError::BadRequest(msg).into_response();
+            }
+        }
+    }
     let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
         Ok(staged) => staged,
         Err(message) => return ApiError::AlreadyExists(message).into_response(),
@@ -969,6 +981,16 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     // reaches the old target.
     let previous = state.engine.connectors().get(&key);
     state.engine.connectors().unregister(&key);
+    // A console record shares its runtime under the bare connector
+    // name, as create does. Remove it with the delete; an unknown
+    // name is a no-op. The shared generation drains through the key
+    // flush above.
+    if crate::v5::action_sinks::canonical_action_kind(stored.action_type.as_str()) == "console" {
+        let bare_name = stored.connector.trim();
+        if !bare_name.is_empty() {
+            state.engine.connectors().unregister(bare_name);
+        }
+    }
     if let Some(old) = previous {
         let _ = old.flush().await;
     }
@@ -1050,6 +1072,13 @@ pub async fn update_action(
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // Old console bare name for the shared capture below. Create
+    // registers the console runtime under the dispatch key and the
+    // bare connector name; update and delete mirror that rule.
+    let old_bare = stored.connector.trim().to_string();
+    let old_console_bare =
+        crate::v5::action_sinks::canonical_action_kind(stored.action_type.as_str()) == "console"
+            && !old_bare.is_empty();
     // MV-01/R2: the connector's flag rides along with every dispatch
     // mirror and with the rollback below. Probed from the OLD record:
     // the update can move the action to another connector, so the
@@ -1118,6 +1147,13 @@ pub async fn update_action(
     let previous = state.engine.connectors().get(&key);
     let wiring = staged.wiring;
     let probe_on_create = staged.probe_on_create;
+    // New console bare name for the shared capture. Only a console
+    // record with a non-empty trimmed connector shares the runtime
+    // under the bare name, as create does.
+    let new_bare = entry.connector.trim().to_string();
+    let new_console_bare =
+        crate::v5::action_sinks::canonical_action_kind(entry.action_type.as_str()) == "console"
+            && !new_bare.is_empty();
     match &staged.sink {
         Some(sink) => {
             let sink = crate::v5::action_sinks::wrap_action_runtime(
@@ -1138,6 +1174,19 @@ pub async fn update_action(
                 .engine
                 .connectors()
                 .register(key.clone(), Arc::clone(&sink));
+            // A stale bare name leaves with the old generation: the
+            // bare name changed or the record is no longer a console
+            // record with a bare name. The same bare name still
+            // console keeps one registration through the write below.
+            if old_console_bare && (!new_console_bare || old_bare != new_bare) {
+                state.engine.connectors().unregister(&old_bare);
+            }
+            if new_console_bare {
+                state
+                    .engine
+                    .connectors()
+                    .register(new_bare, Arc::clone(&sink));
+            }
             state
                 .alarms
                 .deactivate(&format!("action_build_failed:{bare}"));
@@ -1148,6 +1197,11 @@ pub async fn update_action(
             // drains below through `previous`.
             if previous.is_some() {
                 state.engine.connectors().unregister(&key);
+            }
+            // No new runtime exists, so no bare name can share it. A
+            // stale bare name from the old record is removed.
+            if old_console_bare {
+                state.engine.connectors().unregister(&old_bare);
             }
             if let crate::v5::actions::ActionWiring::Failed(message) = &wiring {
                 state.alarms.activate(
@@ -1465,6 +1519,10 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // The connector's flag rides along with this operation. A stopped
+    // connector keeps its dependent action off even when the action
+    // starts, exactly like the enable route.
+    let connector_on = crate::v5::action_sinks::action_connector_enable(&state.connectors, &stored);
     let enable = match operation {
         "start" => true,
         "stop" => false,
@@ -1485,7 +1543,9 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
     // starts/stops delivery through the connector without touching the
     // publish path itself. MV-01: the key is the action's dispatch key.
     let key = broker_config::v5_action_sink_key(&bare);
-    state.engine.set_action_enabled(&key, enable);
+    state
+        .engine
+        .set_action_enabled(&key, enable && connector_on);
     if !enable {
         if let Some(sink) = state.engine.connectors().get(&key) {
             let _ = sink.flush().await;

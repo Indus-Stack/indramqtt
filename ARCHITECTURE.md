@@ -11,7 +11,7 @@ In-process microbenchmarks measure routing and rule evaluation. File `crates/bro
 - `bench_sql_ingress_throughput` reports ingress events at ~4.77M per second. It runs single-threaded with 100 percent sink delivery.
 - These rates are hardware-dependent function-call rates. They are not end-to-end network throughput.
 - Re-run them on your hardware with `cargo test --release --bench broker_throughput -- --nocapture`.
-- File `benchmark_suite/benchmark_results_v5.json` contains end-to-end loopback results. It contains CPU, memory, OS and network in the `environment` block.
+- File `benchmark/results/benchmark_results_v5.json` contains historical end-to-end loopback results from the retired `benchmark_suite/` harness. It contains CPU, memory, OS and network in the `environment` block.
 
 When the kernel stops, it closes the client sockets. Clients connect again. The broker claims no restart immunity. No idle-RSS benchmark exists in-tree. This document claims no idle footprint figure.
 

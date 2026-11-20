@@ -922,6 +922,12 @@ impl Sink for HttpSink {
         Ok(())
     }
 
+    /// Drain the buffer through the lifecycle entry.
+    /// Reason: a replaced or stopped sink must lose no row.
+    async fn flush(&self) -> Result<()> {
+        HttpSink::flush(self).await
+    }
+
     fn kind(&self) -> &'static str {
         "webhook"
     }

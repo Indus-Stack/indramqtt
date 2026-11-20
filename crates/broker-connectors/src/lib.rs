@@ -45,6 +45,7 @@ pub mod influxdb;
 pub mod kafka;
 pub mod kinesis;
 pub mod mqtt_bridge;
+pub mod mqtt_source;
 pub mod mssql;
 pub mod mysql;
 pub mod opentsdb;
@@ -695,6 +696,18 @@ impl ConnectorManager {
     pub fn unregister(&self, id: &str) -> bool {
         self.v1_ids.write().remove(id);
         self.connectors.write().remove(id).is_some()
+    }
+
+    /// Flush every live sink once for an orderly lifecycle stop.
+    /// Reason: a buffered batch must reach its target before exit.
+    pub async fn flush_all(&self) {
+        let sinks: Vec<Arc<dyn Sink>> = {
+            let live = self.connectors.read();
+            live.values().map(|entry| Arc::clone(&entry.sink)).collect()
+        };
+        for sink in sinks {
+            let _ = sink.flush().await;
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn Sink>> {

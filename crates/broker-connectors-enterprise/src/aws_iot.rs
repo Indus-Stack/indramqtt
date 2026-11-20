@@ -950,9 +950,8 @@ impl AwsIotSink {
     }
 
     /// Flush buffered rows (no-op when empty). Throttles and
-    /// disconnects retry in-loop with backoff. Exhaustion drops the
-    /// batch and engages backoff. Rejections restore the buffer
-    /// and propagate.
+    /// disconnects retry in-loop with backoff. Exhaustion restores
+    /// the buffer, engages backoff and returns the error.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
@@ -1433,7 +1432,7 @@ mod tests {
         // and fails fast.
         let mut config = mtls_test_config("127.0.0.1:8883");
         config.auth = AwsIotAuth::Mtls {
-            ca_cert_pem: TEST_CA_PEM.to_string(),
+            ca_cert_pem: crate::test_pki::get().ca_pem.as_str().to_string(),
             client_cert_pem: String::new(),
             client_key_pem: String::new(),
         };
@@ -1443,8 +1442,8 @@ mod tests {
         ));
         let mut bad_key = mtls_test_config("127.0.0.1:8883");
         bad_key.auth = AwsIotAuth::Mtls {
-            ca_cert_pem: TEST_CA_PEM.to_string(),
-            client_cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
+            ca_cert_pem: crate::test_pki::get().ca_pem.as_str().to_string(),
+            client_cert_pem: crate::test_pki::get().client_cert_pem.as_str().to_string(),
             client_key_pem: "not-a-pem".to_string(),
         };
         assert!(matches!(
@@ -1479,21 +1478,15 @@ mod tests {
         assert!(custom.effective_alpn().is_empty());
     }
 
-    const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
-    const TEST_SERVER_CERT_PEM: &str = include_str!("../testdata/server-cert.pem");
-    const TEST_SERVER_KEY_PEM: &str = include_str!("../testdata/server-key.pem");
-    const TEST_CLIENT_CERT_PEM: &str = include_str!("../testdata/client-cert.pem");
-    const TEST_CLIENT_KEY_PEM: &str = include_str!("../testdata/client-key.pem");
-
     fn mtls_test_config(endpoint: &str) -> AwsIotConfig {
         AwsIotConfig {
             endpoint: endpoint.to_string(),
             region: "us-east-1".to_string(),
             client_id: "edge-gateway-1".to_string(),
             auth: AwsIotAuth::Mtls {
-                ca_cert_pem: TEST_CA_PEM.to_string(),
-                client_cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
-                client_key_pem: TEST_CLIENT_KEY_PEM.to_string(),
+                ca_cert_pem: crate::test_pki::get().ca_pem.as_str().to_string(),
+                client_cert_pem: crate::test_pki::get().client_cert_pem.as_str().to_string(),
+                client_key_pem: crate::test_pki::get().client_key_pem.as_str().to_string(),
             },
             topic_mappings: vec![BridgeTopicMapping {
                 local_topic: "devices/+/telemetry".to_string(),
@@ -1519,9 +1512,9 @@ mod tests {
         use tokio::net::TcpListener;
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
-            Some(TEST_CA_PEM),
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
+            Some(crate::test_pki::get().ca_pem.as_str()),
         )
         .expect("test server config");
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
@@ -1607,9 +1600,9 @@ mod tests {
         use tokio::net::TcpListener;
 
         let server_config = broker_connectors::cloud_tls::test_certs::server_config(
-            TEST_SERVER_CERT_PEM,
-            TEST_SERVER_KEY_PEM,
-            Some(TEST_CA_PEM),
+            crate::test_pki::get().server_cert_pem.as_str(),
+            crate::test_pki::get().server_key_pem.as_str(),
+            Some(crate::test_pki::get().ca_pem.as_str()),
         )
         .expect("test server config");
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);

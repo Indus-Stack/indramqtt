@@ -1457,6 +1457,9 @@ fn build_publish_deliveries_in_tenant(
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
         match state.sessions.get_in_tenant(tenant, sub.client_id.as_ref()) {
             Some(session) => {
+                if sub.session_id != 0 && session.id.0 != sub.session_id {
+                    continue;
+                }
                 let connected = *session.connected.read();
                 let live = *session.conn_id.read();
                 match (connected, live) {
@@ -1714,6 +1717,9 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
             match self.sessions.get_in_tenant(tenant, sub.client_id.as_ref()) {
                 Some(session) => {
+                    if sub.session_id != 0 && session.id.0 != sub.session_id {
+                        continue;
+                    }
                     let connected = *session.connected.read();
                     let live = *session.conn_id.read();
                     match (connected, live) {
@@ -1992,6 +1998,11 @@ async fn do_mgmt_publish(
             state.metrics.inc_qos2_received();
         }
     }
+    let _retained_sub_gate = if retain {
+        Some(state.retained_subscribe_gate.write().await)
+    } else {
+        None
+    };
     handle_mgmt_retained(state, topic, qos, retain, payload).await;
     let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(ApiBrokerSink {
         router: state.router.clone(),
@@ -2636,6 +2647,7 @@ mod tests {
                     retain_as_published: false,
                     retain_handling: 0,
                     subscription_id: 0,
+                    session_id: 0,
                 },
             );
         }

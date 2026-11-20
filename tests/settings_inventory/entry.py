@@ -26,6 +26,70 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+
+_EPHEMERAL_K1_05 = None
+
+def _k1_05_dir() -> Path:
+    global _EPHEMERAL_K1_05
+    if _EPHEMERAL_K1_05 is not None:
+        return _EPHEMERAL_K1_05
+    d = Path(tempfile.mkdtemp(prefix="indra-k1-05-"))
+    for ca_prefix, cn in [("ca", "/CN=indra-k1-05-ca"), ("wrong-ca", "/CN=indra-wrong-ca")]:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-subj", cn, "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+             "-keyout", str(d / f"{ca_prefix}-key.pem"), "-out", str(d / f"{ca_prefix}-cert.pem")],
+            check=True, capture_output=True,
+        )
+    for name, subj, ext, ca_prefix in [
+        ("server", "/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n", "ca"),
+        ("client-a", "/CN=k1-05-a", "extendedKeyUsage=clientAuth\n", "ca"),
+        ("client-b", "/CN=k1-05-b", "extendedKeyUsage=clientAuth\n", "ca"),
+        ("wrong-client", "/CN=wrong-client", "extendedKeyUsage=clientAuth\n", "wrong-ca"),
+    ]:
+        csr = d / f"{name}.csr"
+        extf = d / f"{name}.ext"
+        extf.write_text(ext)
+        subprocess.run(
+            ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", subj,
+             "-keyout", str(d / f"{name}-key.pem"), "-out", str(csr)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(d / f"{ca_prefix}-cert.pem"),
+             "-CAkey", str(d / f"{ca_prefix}-key.pem"), "-CAcreateserial", "-days", "1",
+             "-extfile", str(extf), "-out", str(d / f"{name}-cert.pem")],
+            check=True, capture_output=True,
+        )
+    # Generate expired-client using `openssl ca` with backdated validity.
+    (d / "index.txt").write_text("")
+    (d / "serial").write_text("1000\n")
+    (d / "newcerts").mkdir(exist_ok=True)
+    ca_cnf = d / "ca.cnf"
+    ca_cnf.write_text(
+        f"[ ca ]\ndefault_ca = CA_default\n"
+        f"[ CA_default ]\ndir = {d}\ndatabase = {d}/index.txt\nnew_certs_dir = {d}/newcerts\n"
+        f"certificate = {d}/ca-cert.pem\nprivate_key = {d}/ca-key.pem\nserial = {d}/serial\n"
+        f"default_md = sha256\npolicy = policy_any\nx509_extensions = v3_cli\n"
+        f"[ policy_any ]\ncommonName = supplied\n"
+        f"[ v3_cli ]\nextendedKeyUsage = clientAuth\n"
+    )
+    exp_csr = d / "expired-client.csr"
+    subprocess.run(
+        ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=expired-client",
+         "-keyout", str(d / "expired-client-key.pem"), "-out", str(exp_csr)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["openssl", "ca", "-batch", "-config", str(ca_cnf),
+         "-startdate", "20200101000000Z", "-enddate", "20200102000000Z",
+         "-in", str(exp_csr), "-out", str(d / "expired-client-cert.pem")],
+        check=True, capture_output=True,
+    )
+    _EPHEMERAL_K1_05 = d
+    return d
+
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(sys.argv.pop(1)).resolve()
 
@@ -1373,25 +1437,47 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(messages["meta"]["count"], 0)
 
     # // AZ-01 inventory: current behaviour; owner MV-08
-    def test_source_accepts_missing_connector_and_keeps_unused_parameters(self):
+    def test_source_requires_connector_and_topic_and_keeps_unused_parameters(self):
         b = self.boot()
-        config = {"type": "console", "name": "inventorysource", "enable": True,
-                  "connector": "missing", "parameters": {"topic": "inventory/#"},
-                  "resource_opts": {"health_check_interval": "1ms", "health_check_interval_jitter": "1ms",
-                                    "health_check_timeout": "1ms", "inventory_unknown": "requested"},
-                  "inventory_unknown": {"policy": "requested"},
-                  "description": "inventory", "tags": ["audit"]}
+        base = {"type": "mqtt", "name": "inventorysource", "enable": True,
+                "parameters": {"topic": "inventory/#"},
+                "resource_opts": {"health_check_interval": "1ms", "health_check_interval_jitter": "1ms",
+                                  "health_check_timeout": "1ms"},
+                "inventory_unknown": {"policy": "requested"},
+                "description": "inventory", "tags": ["audit"]}
+        missing_connector = {key: value for key, value in base.items() if key != "connector"}
+        status, error = b.http("POST", "/api/v5/sources", missing_connector)
+        self.assertEqual(status, 400)
+        self.assertIn("connector", error["message"])
+        missing_topic = {**base, "connector": "missing", "parameters": {}}
+        status, error = b.http("POST", "/api/v5/sources", missing_topic)
+        self.assertEqual(status, 400)
+        self.assertIn("parameters.topic", error["message"])
+        config = {**base, "connector": "missing"}
         status, created = b.http("POST", "/api/v5/sources", config)
         self.assertEqual(status, 201)
-        self.assertEqual(created["status"], "connected")
         self.assertEqual(created["connector"], "missing")
-        pub, _ = b.connect("source-publisher")
-        publish(b, pub, "inventory/source", b"input")
+        self.assertNotEqual(created["status"], "connected")
         status, source = b.http("GET", "/api/v5/sources/inventorysource")
         self.assertEqual(status, 200)
         self.assertEqual(source["parameters"], config["parameters"])
         self.assertEqual(source["resource_opts"], config["resource_opts"])
         self.assertEqual(source["inventory_unknown"], config["inventory_unknown"])
+        unknown_opt = {**config, "name": "inventorysourceopt",
+                       "resource_opts": {**config["resource_opts"],
+                                         "inventory_unknown": "requested"}}
+        status, error = b.http("POST", "/api/v5/sources", unknown_opt)
+        self.assertEqual(status, 400)
+        self.assertIn("resource_opts.inventory_unknown", error["message"])
+        status, _ = b.http("GET", "/api/v5/sources/inventorysourceopt")
+        self.assertEqual(status, 404)
+        status, error = b.http("PUT", "/api/v5/sources/inventorysource",
+                               {**config, "resource_opts": {"health_check_interval": "soon"}})
+        self.assertEqual(status, 400)
+        self.assertIn("not a valid duration", error["message"])
+        status, source = b.http("GET", "/api/v5/sources/inventorysource")
+        self.assertEqual(status, 200)
+        self.assertEqual(source["resource_opts"], config["resource_opts"])
         status, _ = b.http("PUT", "/api/v5/sources/inventorysource",
                            {**config, "parameters": "invalid"})
         self.assertEqual(status, 400)
@@ -1457,7 +1543,7 @@ class InventoryEntry(unittest.TestCase):
     # // AZ-01 inventory: current behaviour; owner new: listener lifecycle
     def test_created_listener_is_only_a_transient_record(self):
         b = self.boot()
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         ports = set()
         while len(ports) < 4:
             ports.add(port())
@@ -2551,7 +2637,7 @@ class InventoryEntry(unittest.TestCase):
 
     def test_certificate_upload_is_an_artifact_and_refused_update_keeps_bytes(self):
         b = self.boot()
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         files = {"key": (fixture / "server-key.pem").read_text(),
                  "chain": (fixture / "server-cert.pem").read_text(),
                  "ca": (fixture / "ca-cert.pem").read_text(),
@@ -2796,10 +2882,10 @@ class InventoryEntry(unittest.TestCase):
                   "application_name": "inventory-app", "pool_size": 3,
                   "disable_prepared_statements": True, "auto_reconnect": False,
                   "ssl": {"enable": True, "verify": "verify_peer",
-                          "cacertfile": str(ROOT / "crates/broker-node/tests/k1_05/ca-cert.pem"),
+                          "cacertfile": str(_k1_05_dir() / "ca-cert.pem"),
                           "cacerts": False,
-                          "certfile": str(ROOT / "crates/broker-node/tests/k1_05/client-a-cert.pem"),
-                          "keyfile": str(ROOT / "crates/broker-node/tests/k1_05/client-a-key.pem"),
+                          "certfile": str(_k1_05_dir() / "client-a-cert.pem"),
+                          "keyfile": str(_k1_05_dir() / "client-a-key.pem"),
                           "ciphers": ["TLS_AES_256_GCM_SHA384"], "versions": ["tlsv1.3"],
                           "depth": 1, "hibernate_after": "7s", "log_level": "warning",
                           "middlebox_comp_mode": False, "partial_chain": False,
@@ -3858,7 +3944,7 @@ class InventoryEntry(unittest.TestCase):
 
     # // AZ-01 inventory: current behaviour; owner MV-02a
     def test_sql_connector_keeps_encoded_password_and_refuses_application_name(self):
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(fixture / "server-cert.pem", fixture / "server-key.pem")
         peer = PgAuthenticationPeer(context)
@@ -4147,7 +4233,7 @@ class InventoryEntry(unittest.TestCase):
         receiver = HttpReceiver()
         self.addCleanup(receiver.close)
         b = self.boot()
-        key = (ROOT / "crates/broker-connectors-enterprise/tests/fixtures/gcp_iot_device_rs256_private.pem").read_text()
+        key = subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"], check=True, capture_output=True, text=True).stdout
         config = {"type": "snowflake", "name": "inventorystreaming",
                   "account": "audit_account", "user": "audit_user", "database": "audit_database",
                   "schema": "audit_schema", "table": "audit_table", "private_key_pem": key,
@@ -4276,7 +4362,7 @@ class InventoryEntry(unittest.TestCase):
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
     def test_alloydb_inline_credentials_reach_tls_and_file_password_is_resolved(self):
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(fixture / "server-cert.pem", fixture / "server-key.pem")
         peer = PgAuthenticationPeer(context)
@@ -4538,7 +4624,7 @@ class InventoryEntry(unittest.TestCase):
             ("static_clientids", [{"node": "az-01-entry", "ids": ["requested-static-0"]}]),
             ("tcp_opts", {"nodelay": False}),
             ("ssl", {"enable": True, "verify": "verify_peer",
-                     "cacertfile": str(ROOT / "crates/broker-node/tests/k1_05/ca-cert.pem")}),
+                     "cacertfile": str(_k1_05_dir() / "ca-cert.pem")}),
         ]:
             status, error = b.http("POST", "/api/v5/connectors", {
                 **config, "name": "inventorymqtt-" + field, field: value})
@@ -4695,7 +4781,7 @@ class InventoryEntry(unittest.TestCase):
     def test_file_tls_policy_reaches_handshake_and_certificate_identity(self):
         b = self.broker
         b.configure()
-        fixture = ROOT / "crates/broker-node/tests/k1_05"
+        fixture = _k1_05_dir()
         tls_port = port()
         config_path = b.cfg / "indra.toml"
         base = config_path.read_text()

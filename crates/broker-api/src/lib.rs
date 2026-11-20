@@ -44,6 +44,7 @@ pub mod mfa_totp;
 pub mod node_scope;
 pub mod pagination;
 pub mod swagger;
+mod v1_disk_log;
 pub mod v5;
 pub mod ws;
 
@@ -123,6 +124,9 @@ pub struct ApiState {
     /// clone at most one message, so they never block delivery.
     /// Bounded by `broker_storage::MAX_RETAINED_MESSAGES`.
     pub retained: Arc<dyn broker_storage::RetainedStore>,
+    /// Coordinates retained writes + fan-out against concurrent `SUBSCRIBE`
+    /// retained-snapshot + route installation (shared with the kernel).
+    pub retained_subscribe_gate: Arc<tokio::sync::RwLock<()>>,
     /// Slow-subscription recorder for `GET/DELETE /api/v5/slow_subscriptions`
     /// (W1-30): bounded ranked table of slow deliveries. Management-plane
     /// only; never touched on the per-message path.
@@ -651,6 +655,7 @@ impl ApiState {
             readiness: Arc::new(NodeReadiness::new()),
             retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
             retained: Arc::new(broker_storage::MemoryStore::new()),
+            retained_subscribe_gate: Arc::new(tokio::sync::RwLock::new(())),
             slow_subs: Arc::new(crate::v5::slow_subscriptions::SlowSubsStore::new()),
             slow_subs_settings: Arc::new(
                 crate::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
@@ -765,6 +770,7 @@ impl ApiState {
             readiness: Arc::new(NodeReadiness::new()),
             retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
             retained: Arc::new(broker_storage::MemoryStore::new()),
+            retained_subscribe_gate: Arc::new(tokio::sync::RwLock::new(())),
             slow_subs: Arc::new(crate::v5::slow_subscriptions::SlowSubsStore::new()),
             slow_subs_settings: Arc::new(
                 crate::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
@@ -1667,7 +1673,7 @@ pub struct CreateConnectorRequest {
 
 async fn create_connector(
     State(state): State<ApiState>,
-    Json(req): Json<CreateConnectorRequest>,
+    Json(mut req): Json<CreateConnectorRequest>,
 ) -> Response {
     if req.id.trim().is_empty() {
         return bad_request("connector id must not be empty");
@@ -1684,6 +1690,13 @@ async fn create_connector(
             "connector id {:?} is reserved: ids starting with `action:` name action sinks (field `id`)",
             req.id
         ));
+    }
+    if matches!(kind.as_str(), "disk_log" | "disklog" | "disk") {
+        if let Err(message) =
+            v1_disk_log::prepare_v1_disk_log(&mut req, &state.connectors.data_dir())
+        {
+            return bad_request(message);
+        }
     }
     let built = build_connector(&req).await;
     match built {
@@ -2590,9 +2603,12 @@ pub async fn build_connector(
                 let transport = std::sync::Arc::new(
                     broker_connectors::HttpGreptimeDbTransport::new(&config),
                 );
-                let sink = broker_connectors::GreptimeDbSink::new(config, transport)
-                    .map_err(|e| format!("invalid greptimedb sink: {e}"))?;
-                Ok(("greptimedb".to_string(), std::sync::Arc::new(sink)
+                let sink = std::sync::Arc::new(
+                    broker_connectors::GreptimeDbSink::new(config, transport)
+                        .map_err(|e| format!("invalid greptimedb sink: {e}"))?,
+                );
+                sink.start_linger_flush();
+                Ok(("greptimedb".to_string(), sink
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "datalayers" | "data_layers" | "datalayers_db" => {
@@ -2632,6 +2648,9 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[path = "mn08_tests.rs"]
+    mod mn08;
+
     /// Serialises the connector tests that share the process-global v5
     /// connector store. Parallel creates/persists export the whole global
     /// into each test's own data dir, so one test's snapshot can resurrect
@@ -2641,11 +2660,17 @@ mod tests {
     /// depends on it; it only orders tests.
     static CONNECTOR_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Settle delay before a dead-target leg. Reason: a closed socket
+    /// becomes visible at the next poll.
+    const DEAD_SOCKET_SETTLE_MS: u64 = 300;
+
     /// In-process HTTP round-trip over loopback TCP: no extra crates, no
     /// daemons. The server is spawned per test and aborted at the end.
     struct TestServer {
         port: u16,
         task: tokio::task::JoinHandle<()>,
+        mqtt_task: tokio::task::JoinHandle<()>,
+        mqtt_port: u16,
     }
 
     struct TestState {
@@ -2716,7 +2741,16 @@ mod tests {
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.expect("serve test app");
             });
-            (Self { port, task }, state)
+            let (mqtt_port, mqtt_task) = mv03c_start_mqtt_ingress(engine.clone()).await;
+            (
+                Self {
+                    port,
+                    task,
+                    mqtt_task,
+                    mqtt_port,
+                },
+                state,
+            )
         }
 
         async fn request(&self, raw: &str) -> (u16, Value) {
@@ -3233,7 +3267,7 @@ mod tests {
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"id": "pending-keep-source", "type": "console"}),
+                json!({"id": "pending-keep-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/pending-keep-source"}}),
                 &token,
             )
             .await;
@@ -3288,7 +3322,7 @@ mod tests {
             .get_auth("/api/v5/sources/pending-keep-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
 
         // Create of a pending action and source also stores nothing.
         for (path, id) in [
@@ -3482,12 +3516,19 @@ mod tests {
                 "source_types lists non-ready kind {kind}"
             );
         }
-        // MV-03a sets the message-broker source kinds ready, so the
-        // listing holds the ready names and no pending kind.
-        for ready in ["mqtt", "kafka_consumer", "rabbitmq"] {
+        // MV-08 lists only the source kinds with a working ingress
+        // runtime. The MQTT subscriber runs here. The other reference
+        // kinds stay out until their driver consumer lands; a create of
+        // one answers 400 instead of claiming a source that receives
+        // nothing.
+        assert!(
+            source_kinds.contains(&"mqtt"),
+            "source_types lists the ready ingress kind mqtt: {source_kinds:?}"
+        );
+        for unsupported in ["kafka_consumer", "gcp_pubsub_consumer", "rabbitmq"] {
             assert!(
-                source_kinds.contains(&ready),
-                "source_types lists the ready kind {ready}: {source_kinds:?}"
+                !source_kinds.contains(&unsupported),
+                "source_types lists no kind without ingress {unsupported}: {source_kinds:?}"
             );
         }
         for pending in ["timescaledb", "oci_streaming"] {
@@ -5217,6 +5258,167 @@ connector_id = "pending-good"
         assert_eq!(status, 202, "publish drives the rule path");
     }
 
+    /// Next MQTT client number for through-broker publishes.
+    static MV03C_MQTT_CLIENT_SEQ: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    /// Publish one JSON event through a real MQTT client socket. The
+    /// socket connects to the broker listener and sends QoS 0 on the
+    /// topic. The call returns after the send; the caller polls the
+    /// target fake or the action metrics for the delivery.
+    async fn mv03c_publish_mqtt(port: u16, topic: &str, payload: &str) {
+        let id = MV03C_MQTT_CLIENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let client_id = format!("mv03c-pub-{id}");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect mqtt listener");
+        stream
+            .write_all(&mqtt_connect(&client_id, None, None))
+            .await
+            .expect("write CONNECT");
+        let mut connack = [0u8; 4];
+        stream
+            .read_exact(&mut connack)
+            .await
+            .expect("connack answers");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0, "anonymous connect succeeds");
+        stream
+            .write_all(&mqtt_publish(topic, 0, 0, payload.as_bytes()))
+            .await
+            .expect("write PUBLISH");
+        let _ = stream.flush().await;
+        let _ = stream.write_all(&[0xE0, 0x00]).await;
+        let _ = stream.shutdown().await;
+    }
+
+    /// Read one MQTT variable-byte integer from the ingress socket.
+    async fn mv03c_mqtt_read_varint(stream: &mut tokio::net::TcpStream) -> Option<usize> {
+        let mut value = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.ok()?;
+            value |= ((byte[0] & 0x7F) as usize) << shift;
+            if byte[0] & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+            if shift > 21 {
+                return None;
+            }
+        }
+    }
+
+    /// Serve one raw MQTT ingress connection. Each QoS 0 PUBLISH
+    /// drives the stored rule path through `dispatch_ingress`.
+    async fn mv03c_handle_mqtt_conn(mut stream: tokio::net::TcpStream, engine: Arc<RuleEngine>) {
+        let mut fixed = [0u8; 1];
+        if stream.read_exact(&mut fixed).await.is_err() {
+            return;
+        }
+        if fixed[0] >> 4 != 1 {
+            return;
+        }
+        let Some(len) = mv03c_mqtt_read_varint(&mut stream).await else {
+            return;
+        };
+        let mut body = vec![0u8; len];
+        if stream.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        if stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.is_err() {
+            return;
+        }
+        loop {
+            let mut head = [0u8; 1];
+            if stream.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            match head[0] >> 4 {
+                3 => {
+                    let Some(len) = mv03c_mqtt_read_varint(&mut stream).await else {
+                        return;
+                    };
+                    let mut rest = vec![0u8; len];
+                    if stream.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    if rest.len() < 2 {
+                        continue;
+                    }
+                    let topic_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                    if rest.len() < 2 + topic_len {
+                        continue;
+                    }
+                    let topic = String::from_utf8_lossy(&rest[2..2 + topic_len]).to_string();
+                    let qos = (head[0] & 0x06) >> 1;
+                    let (packet_id, payload) = if qos == 0 {
+                        (0u16, rest[2 + topic_len..].to_vec())
+                    } else {
+                        if rest.len() < 2 + topic_len + 2 {
+                            continue;
+                        }
+                        let pid = u16::from_be_bytes([rest[2 + topic_len], rest[3 + topic_len]]);
+                        (pid, rest[4 + topic_len..].to_vec())
+                    };
+                    if let Ok(parsed) = Topic::new(topic) {
+                        let sink: Arc<dyn broker_rules::BrokerSink> = Arc::new(NoopBrokerSink);
+                        let _ = engine
+                            .dispatch_ingress(
+                                &parsed,
+                                &bytes::Bytes::from(payload),
+                                QoS::AtMostOnce,
+                                &sink,
+                            )
+                            .await;
+                    }
+                    if qos == 1
+                        && stream
+                            .write_all(&[
+                                0x40,
+                                0x02,
+                                (packet_id >> 8) as u8,
+                                (packet_id & 0xFF) as u8,
+                            ])
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                12 => {
+                    if stream.write_all(&[0xD0, 0x00]).await.is_err() {
+                        return;
+                    }
+                }
+                14 => return,
+                _ => return,
+            }
+        }
+    }
+
+    /// Start a raw MQTT listener for through-broker tests. Each
+    /// PUBLISH on it runs the rule engine. Returns the port and task handle.
+    async fn mv03c_start_mqtt_ingress(
+        engine: Arc<RuleEngine>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mqtt ingress");
+        let port = listener.local_addr().expect("mqtt addr").port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let engine = Arc::clone(&engine);
+                tokio::spawn(mv03c_handle_mqtt_conn(stream, engine));
+            }
+        });
+        (port, handle)
+    }
+
     /// Poll one action's metrics until `failed` reaches `want`.
     /// Exact equality: a duplicate failure count fails instead of passing.
     async fn mv03a_wait_failed(server: &TestServer, token: &str, action: &str, want: u64) {
@@ -5558,6 +5760,7 @@ connector_id = "pending-good"
     struct Mv03aKafkaFake {
         port: u16,
         produced: std::sync::Arc<std::sync::Mutex<Vec<Mv03aKafkaProduced>>>,
+        #[cfg(feature = "confluent")]
         auth_bytes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         error_acks: std::sync::Arc<std::sync::Mutex<bool>>,
         _task: tokio::task::JoinHandle<()>,
@@ -5600,11 +5803,13 @@ connector_id = "pending-good"
 
         async fn serve(listener: tokio::net::TcpListener, port: u16, sasl: bool) -> Self {
             let produced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            #[cfg(feature = "confluent")]
             let auth_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let error_acks = std::sync::Arc::new(std::sync::Mutex::new(false));
             let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let task_produced = std::sync::Arc::clone(&produced);
+            #[cfg(feature = "confluent")]
             let task_auth = std::sync::Arc::clone(&auth_bytes);
             let task_error = std::sync::Arc::clone(&error_acks);
             let task_connections = std::sync::Arc::clone(&connections);
@@ -5614,6 +5819,7 @@ connector_id = "pending-good"
                         break;
                     };
                     let produced = std::sync::Arc::clone(&task_produced);
+                    #[cfg(feature = "confluent")]
                     let auth_bytes = std::sync::Arc::clone(&task_auth);
                     let error_acks = std::sync::Arc::clone(&task_error);
                     let connection = tokio::spawn(async move {
@@ -5723,6 +5929,7 @@ connector_id = "pending-good"
                                     if frame.len() < 8 {
                                         break;
                                     }
+                                    #[cfg(feature = "confluent")]
                                     auth_bytes
                                         .lock()
                                         .expect("fake records")
@@ -5920,6 +6127,7 @@ connector_id = "pending-good"
             Self {
                 port,
                 produced,
+                #[cfg(feature = "confluent")]
                 auth_bytes,
                 error_acks,
                 _task: task,
@@ -10499,7 +10707,7 @@ connector_id = "pending-good"
             .rsplit_once(' ')
             .unwrap_or_else(|| panic!("line: {text}"));
         assert_eq!(
-            head, "m,topic=mv02b/nl\\nrow qos=0i,payload=\"{\\\"msg\\\":\\\"line1\\nline2\\\"}\"",
+            head, "m,topic=mv02b/nl\\nrow qos=0i,payload=\"{\\\"msg\\\":\\\"line1\\\\nline2\\\"}\"",
             "line: {text}"
         );
         assert!(
@@ -14156,30 +14364,29 @@ connector_id = "pending-good"
             );
         }
         // A stored record of a pending kind stays readable but never starts.
-        let mut candidate = state.config.snapshot().as_ref().clone();
-        candidate
-            .connectors
-            .connectors
-            .push(broker_config::ConnectorEntry {
-                id: "mv03b-pending-stored".to_string(),
-                connector_type: "aws_iot".to_string(),
-                enable: true,
-                config: "{}".to_string(),
-            });
-        candidate.actions.actions.push(broker_config::ActionEntry {
-            id: "mv03b-pending-stored-act".to_string(),
-            action_type: "aws_iot".to_string(),
-            enable: true,
-            config: json!({"connector": "mv03b-pending-stored", "parameters": {}}).to_string(),
-        });
-        let (status, out) = server
-            .post_auth(
-                "/api/v1/config/reload",
-                json!({"snapshot": candidate, "actor": "mv03b", "summary": "pending iot"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 200, "a stored pending record reloads: {out}");
+        // Write it to the boot file, as an older state file would hold it.
+        drop(server);
+        drop(state);
+        let dir = unique_data_dir("mv03b-pending-stored");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let pending_state = r#"
+[[connectors.connectors]]
+id = "mv03b-pending-stored"
+connector_type = "aws_iot"
+enable = true
+config = '{}'
+
+[[actions.actions]]
+id = "mv03b-pending-stored-act"
+action_type = "aws_iot"
+enable = true
+config = '{"connector":"mv03b-pending-stored","parameters":{}}'
+"#;
+        std::fs::write(dir.join("state.toml"), pending_state).expect("write pending state");
+        let registry =
+            Arc::new(ConfigRegistry::load_for_boot(&dir).expect("pending state loads for boot"));
+        let (server, state) = TestServer::start_with_registry(registry).await;
+        let token = server.login_as_admin().await;
         assert!(
             state
                 .engine
@@ -14200,6 +14407,120 @@ connector_id = "pending-good"
                 .contains("not available"),
             "the stored connector names the refusal: {stored}"
         );
+        // A stored pending action never starts either.
+        assert!(
+            state
+                .engine
+                .connectors()
+                .get(&broker_config::v5_action_sink_key(
+                    "mv03b-pending-stored-act"
+                ))
+                .is_none(),
+            "a stored pending action does not start"
+        );
+        let (status, stored) = server
+            .get_auth("/api/v5/actions/mv03b-pending-stored-act", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(stored["status"], json!("disconnected"));
+        assert!(
+            stored["status_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not available"),
+            "the stored action names the refusal: {stored}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03b_pending_iot_kinds_refuse_at_probe_and_replay_stored_state() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Same driver bodies as the create-refusal test.
+        let bodies = [
+            (
+                "aws_iot",
+                json!({"endpoint": "127.0.0.1:8883", "region": "us-east-1",
+                       "client_id": "pending-1",
+                       "client_cert_pem": "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----",
+                       "client_key_pem": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----"}),
+            ),
+            (
+                "azure_iot",
+                json!({"iot_hub_name": "127.0.0.1:8883", "device_id": "edge-1",
+                       "shared_access_key": "secret"}),
+            ),
+            (
+                "oci_streaming",
+                json!({"endpoint": "https://cell-1.streaming.us-east-1.oraclecloud.com",
+                       "stream_pool_id": "ocid1.streampool.oc1.phx.aaa",
+                       "stream_id": "ocid1.stream.oc1.phx.aaa",
+                       "tenancy_ocid": "ocid1.tenancy.oc1..aaa",
+                       "user_ocid": "ocid1.user.oc1..aaa",
+                       "fingerprint": "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
+                       "private_key_pem": "key"}),
+            ),
+        ];
+        for (kind, fields) in &bodies {
+            let mut body = fields.as_object().expect("object").clone();
+            body.insert("type".to_string(), json!(kind));
+            body.insert(
+                "name".to_string(),
+                json!(format!("mv03b-pending-probe-{kind}")),
+            );
+            // Each probe entry refuses before any dial.
+            for path in ["/api/v5/connectors_probe", "/api/v5/actions_probe"] {
+                let (status, out) = server
+                    .post_auth(path, Value::Object(body.clone()), &token)
+                    .await;
+                assert_eq!(status, 400, "{kind} probe {path} refuses: {out}");
+                assert_eq!(
+                    out["code"], "TEST_FAILED",
+                    "{kind} probe {path} code: {out}"
+                );
+                let message = out["message"].as_str().unwrap_or("");
+                assert!(
+                    message.contains("not available"),
+                    "{kind} probe {path} names the refusal: {out}"
+                );
+                assert!(
+                    message.contains(kind),
+                    "{kind} probe {path} names the kind: {out}"
+                );
+            }
+        }
+        // A file load that carries a pending kind refuses.
+        for (kind, _) in &bodies {
+            let mut candidate = state.config.snapshot().as_ref().clone();
+            candidate
+                .connectors
+                .connectors
+                .push(broker_config::ConnectorEntry {
+                    id: format!("mv03b-pending-file-{kind}"),
+                    connector_type: kind.to_string(),
+                    enable: true,
+                    config: "{}".to_string(),
+                });
+            let (status, out) = server
+                .post_auth(
+                    "/api/v1/config/reload",
+                    json!({"snapshot": candidate, "actor": "mv03b", "summary": "refuse pending iot"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "a file load refuses {kind}: {out}");
+            let text = out.to_string();
+            assert!(
+                text.contains("not available"),
+                "{kind} file load names the refusal: {out}"
+            );
+            assert!(
+                text.contains(kind),
+                "{kind} file load names the kind: {out}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14240,7 +14561,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 201);
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":21}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":21}").await;
         let got = fake.wait_for(1).await;
         assert_eq!(got[0].method, "POST");
         assert!(
@@ -14264,7 +14585,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 200);
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":22}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":22}").await;
         let got = fake.wait_for(2).await;
         assert!(
             got[1].path.contains("/updated/mv03c/http"),
@@ -14282,7 +14603,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 400, "a non-string header refuses: {body}");
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":23}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":23}").await;
         let got = fake.wait_for(3).await;
         assert!(
             got[2].path.contains("/updated/mv03c/http"),
@@ -14290,7 +14611,7 @@ connector_id = "pending-good"
             got[2].path
         );
         drop(fake);
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":24}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":24}").await;
         let mut failed = 0;
         for _ in 0..100 {
             let (status, metrics) = server
@@ -14321,7 +14642,7 @@ connector_id = "pending-good"
             .await;
         assert_eq!(status, 200, "stored entry survives the restart");
         let fake = Mv02bFake::start_on(port, 200, "{}").await;
-        mv02b_publish(&server, &token, "mv03c/http", "{\"v\":25}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/http", "{\"v\":25}").await;
         // Metrics are memory-only, so the restarted broker starts at
         // zero and this first delivery reads one success.
         mv02b_wait_success(&server, &token, "mv03c-http-act", 1).await;
@@ -14980,7 +15301,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 201);
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":21}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":21}").await;
         for _ in 0..100 {
             if !received.lock().expect("fake lock").is_empty() {
                 break;
@@ -15006,7 +15327,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 200);
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":22}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":22}").await;
         for _ in 0..100 {
             if received.lock().expect("fake lock").len() >= 2 {
                 break;
@@ -15037,9 +15358,8 @@ connector_id = "pending-good"
         }
         // Let the driver observe the closed sockets before the next send.
         // Reason: a closed socket becomes visible at the next poll.
-        const DEAD_SOCKET_SETTLE_MS: u64 = 300;
         tokio::time::sleep(std::time::Duration::from_millis(DEAD_SOCKET_SETTLE_MS)).await;
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":23}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":23}").await;
         let mut failed = 0;
         for _ in 0..100 {
             let (status, metrics) = server
@@ -15067,7 +15387,7 @@ connector_id = "pending-good"
             endpoint_for_fake,
             std::sync::Arc::clone(&connections),
         ));
-        mv02b_publish(&server, &token, "mv03c/opc", "{\"v\":24}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/opc", "{\"v\":24}").await;
         for _ in 0..100 {
             if received.lock().expect("fake lock").len() >= 3 {
                 break;
@@ -15248,7 +15568,7 @@ connector_id = "pending-good"
             "spBv1.0/plant1/NBIRTH/edge1",
             "spBv1.0/plant1/NDEATH/edge1",
         ] {
-            mv02b_publish(&server, &token, topic, "{\"metrics\":{\"temp\":21}}").await;
+            mv03c_publish_mqtt(server.mqtt_port, topic, "{\"metrics\":{\"temp\":21}}").await;
         }
         for _ in 0..100 {
             if received.lock().expect("fake lock").len() >= 3 {
@@ -15289,9 +15609,8 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 200);
-        mv02b_publish(
-            &server,
-            &token,
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":22}}",
         )
@@ -15326,9 +15645,8 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 400, "a wildcard prefix refuses: {body}");
-        mv02b_publish(
-            &server,
-            &token,
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":23}}",
         )
@@ -15351,10 +15669,10 @@ connector_id = "pending-good"
         }
         // Let the driver's event loop observe the closed socket before
         // the next send, so the dead-target failure is deterministic.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        mv02b_publish(
-            &server,
-            &token,
+        // Reason: a closed socket becomes visible at the next poll.
+        tokio::time::sleep(std::time::Duration::from_millis(DEAD_SOCKET_SETTLE_MS)).await;
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":24}}",
         )
@@ -15437,9 +15755,8 @@ connector_id = "pending-good"
                 }
             }
         });
-        mv02b_publish(
-            &server,
-            &token,
+        mv03c_publish_mqtt(
+            server.mqtt_port,
             "spBv1.0/plant1/NDATA/edge1",
             "{\"metrics\":{\"temp\":25}}",
         )
@@ -15503,7 +15820,7 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 201);
-        mv02b_publish(&server, &token, "mv03c/local", "{\"v\":21}").await;
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/local", "{\"v\":21}").await;
         mv02b_wait_success(&server, &token, "mv03c-console-act", 1).await;
         let sink = state
             .engine
@@ -15530,6 +15847,213 @@ connector_id = "pending-good"
             )
             .await;
         assert_eq!(status, 400, "the test kind refuses in a release build");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03c_console_action_update_follows_the_new_connector_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03c-consupd");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        for name in ["mv03c-cons-upd-a", "mv03c-cons-upd-b"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"type": "console", "name": name}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201);
+        }
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": "mv03c-cons-upd-a"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03c-cons-upd-rule", "name": "mv03c-cons-upd-rule",
+                       "sql": "SELECT * FROM \"mv03c/consupd\"",
+                       "actions": ["mv03c-cons-upd-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":21}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-upd-act", 1).await;
+        let sink = state
+            .engine
+            .connectors()
+            .get("mv03c-cons-upd-a")
+            .expect("console stays registered under the old bare name");
+        assert_eq!(sink.local_deliveries(), Some(1));
+        assert!(
+            sink.local_last_preview()
+                .expect("console keeps captured output")
+                .contains("21"),
+            "console captures the delivery value"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03c-cons-upd-a", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Move the action to the second connector.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03c-cons-upd-act",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": "mv03c-cons-upd-b"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":22}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-upd-act", 2).await;
+        let sink = state
+            .engine
+            .connectors()
+            .get("mv03c-cons-upd-b")
+            .expect("console follows the new bare name");
+        assert_eq!(sink.local_deliveries(), Some(1));
+        assert!(
+            sink.local_last_preview()
+                .expect("console keeps captured output")
+                .contains("22"),
+            "the connector read shows the new capture"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03c-cons-upd-b", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert!(
+            state.engine.connectors().get("mv03c-cons-upd-a").is_none(),
+            "no stale capture stays under the old name"
+        );
+        // The same bare name still console keeps one registration.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03c-cons-upd-act",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": "mv03c-cons-upd-b"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":23}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-upd-act", 3).await;
+        let sink = state
+            .engine
+            .connectors()
+            .get("mv03c-cons-upd-b")
+            .expect("console keeps the same bare name");
+        assert_eq!(sink.local_deliveries(), Some(1));
+        assert!(sink
+            .local_last_preview()
+            .expect("console keeps captured output")
+            .contains("23"));
+        // An empty bare name registers nothing and removes the old one.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv03c-cons-upd-act",
+                json!({"type": "console", "name": "mv03c-cons-upd-act",
+                       "connector": ""}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consupd", "{\"v\":24}").await;
+        assert!(
+            state.engine.connectors().get("mv03c-cons-upd-b").is_none(),
+            "the empty bare name removes the old registration"
+        );
+        let mut failed = 0;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv03c-cons-upd-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            failed = metrics["metrics"]["failed"].as_u64().unwrap_or(0);
+            if failed >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            failed >= 1,
+            "a console action without a connector counts one failure"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv03c_console_action_delete_removes_the_bare_capture_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv03c-consdel");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "console", "name": "mv03c-cons-del"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "console", "name": "mv03c-cons-del-act",
+                       "connector": "mv03c-cons-del"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv03c-cons-del-rule", "name": "mv03c-cons-del-rule",
+                       "sql": "SELECT * FROM \"mv03c/consdel\"",
+                       "actions": ["mv03c-cons-del-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consdel", "{\"v\":21}").await;
+        mv02b_wait_success(&server, &token, "mv03c-cons-del-act", 1).await;
+        assert!(
+            state.engine.connectors().get("mv03c-cons-del").is_some(),
+            "console stays registered under the bare name"
+        );
+        // The delete refuses while a rule still references the action.
+        let (status, _) = server
+            .delete_auth("/api/v5/rules/mv03c-cons-del-rule", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/mv03c-cons-del-act", &token)
+            .await;
+        assert_eq!(status, 204);
+        mv03c_publish_mqtt(server.mqtt_port, "mv03c/consdel", "{\"v\":22}").await;
+        assert!(
+            state.engine.connectors().get("mv03c-cons-del").is_none(),
+            "no capture stays after the delete"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/mv03c-cons-del", &token)
+            .await;
+        assert_eq!(status, 200, "the connector record stays readable");
+        let (status, _) = server
+            .get_auth("/api/v5/actions/mv03c-cons-del-act", &token)
+            .await;
+        assert_eq!(status, 404, "the action is gone");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -16287,6 +16811,7 @@ connector_id = "pending-good"
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.task.abort();
+            self.mqtt_task.abort();
         }
     }
 
@@ -19976,6 +20501,7 @@ connector_id = "pending-good"
                 "bigquery" => {
                     json!({"authentication": {"private_key": SECRET, "client_email": "a@b.c"}})
                 }
+                "gcp_pubsub" => json!({"service_account_json": null}),
                 "datalayers" => {
                     json!({"username": "u", "database": "d", "table": "t", "token": null})
                 }
@@ -21497,6 +22023,54 @@ connector_id = "pending-good"
     }
 
     #[tokio::test]
+    async fn poisoned_admin_user_store_lock_keeps_http_api_answering() {
+        let (server, state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        // Poison the user-map lock: the thread panics while it holds the
+        // write guard, so every later acquisition sees a poisoned lock.
+        let store = Arc::clone(&state.admin_users);
+        let poisoned = tokio::task::spawn_blocking(move || {
+            store.poison_user_store_for_test();
+        })
+        .await;
+        assert!(poisoned.is_err(), "the poison thread must panic");
+
+        // A read through the poisoned lock still answers over HTTP.
+        let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("users data array")
+            .iter()
+            .map(|user| user["username"].as_str().expect("username"))
+            .collect();
+        assert!(names.contains(&"admin"));
+
+        // A write through the poisoned lock also recovers.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "after-poison", "password": "P0ison-pass", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(created["username"], json!("after-poison"));
+
+        // The broker stays up: the next read sees the new user.
+        let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("users data array")
+            .iter()
+            .map(|user| user["username"].as_str().expect("username"))
+            .collect();
+        assert!(names.contains(&"after-poison"));
+    }
+
+    #[tokio::test]
     async fn demoted_admin_token_loses_admin_rights() {
         let (server, _state) = TestServer::start().await;
         let admin_token = server.login_as_admin().await;
@@ -22697,7 +23271,7 @@ connector_id = "pending-good"
     async fn connector_duplicate_create_rejected_without_poisoning() {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         // TK-03: a duplicate create must be rejected with the documented
-        // conflict code before the store is mutated, so later
+        // code before the store is mutated, so later
         // POST/PUT/DELETE keep working (no poisoned persistence).
         let dir = unique_data_dir("tk03-conn-dup");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
@@ -22714,7 +23288,7 @@ connector_id = "pending-good"
             .await;
         assert_eq!(status, 201);
 
-        // Duplicate by `name`: the documented conflict, not a 500.
+        // Duplicate by `name`: the documented 400, not a 500.
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
@@ -26109,14 +26683,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("mqtt_bridge"));
 
-        // Disk log sink: validated against an isolated temp directory.
-        let disk_dir = std::env::temp_dir().join(format!("indra-test-disk-{}", std::process::id()));
+        // Disk log sink: validated against a relative path inside the data directory.
+        let disk_dir = format!("indra-test-disk-{}", std::process::id());
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "disk-1",
                        "kind": "disk_log",
-                       "config": {"directory": disk_dir.to_string_lossy(),
+                       "config": {"directory": disk_dir,
                                   "filename_prefix": "audit",
                                   "filename_extension": "log",
                                   "format": "ndjson",
@@ -26127,7 +26701,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("disk_log"));
-        std::fs::remove_dir_all(&disk_dir).ok();
 
         // Sparkplug B sink: the driver connects at the first write, thus
         // the create step does not need a server.
@@ -26667,6 +27240,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // SigV4/WebSocket is intentionally not built (no licence-compliant
         // WebSocket client); SigV4 configs are rejected at registration.
         // X1-09: gated behind Cargo feature `aws_iot`.
+        let (ca_pem, client_cert_pem, client_key_pem) = {
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_p.distinguished_name
+                .push(rcgen::DnType::CommonName, "indramqtt-test-ca");
+            let ca_cert = ca_p.self_signed(&ca_key).unwrap();
+            let cli_key = rcgen::KeyPair::generate().unwrap();
+            let mut cli_p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            cli_p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let cli_cert = cli_p.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
+            (ca_cert.pem(), cli_cert.pem(), cli_key.serialize_pem())
+        };
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -26676,9 +27262,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                                   "region": "us-east-1",
                                   "client_id": "indra-bridge-1",
                                   "auth": {"type": "mtls",
-                                            "ca_cert_pem": include_str!("../../broker-connectors-enterprise/testdata/ca-cert.pem"),
-                                            "client_cert_pem": include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem"),
-                                            "client_key_pem": include_str!("../../broker-connectors-enterprise/testdata/client-key.pem")},
+                                            "ca_cert_pem": ca_pem,
+                                            "client_cert_pem": client_cert_pem,
+                                            "client_key_pem": client_key_pem},
                                   "topic_mappings": [{"local_topic": "sensors/+",
                                                       "remote_topic": "indra/up",
                                                       "direction": "localtoremote"}],
@@ -30644,6 +31230,142 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn action_start_keeps_the_connector_stop() {
+        // SR-01 item 4: starting a stopped action must not resume
+        // delivery through a stopped connector. Broker-through: the
+        // connector, action and rule are written through HTTP, every
+        // publish enters through the HTTP publish route, and the
+        // destination is a registered sink counted at the rule path.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "sr01-conn", "type": "webhook",
+                       "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "connector create: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sr01-act", "type": "console", "server": "127.0.0.1:1883",
+                       "connector": "sr01-conn"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "action create: {body}");
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("sr01-act"),
+            counter.clone(),
+        );
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "sr01-act-rule",
+                    "sql": "SELECT * FROM \"sr01/action\"",
+                    "actions": ["sr01-act"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule create: {rule_body}");
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let publish = |payload: &'static str| json!({"topic": "sr01/action", "payload": payload, "qos": 0, "retain": false});
+        let (status, body) = server
+            .post_auth("/api/v5/publish", publish("first"), &token)
+            .await;
+        assert_eq!(status, 202, "first publish: {body}");
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "an enabled action delivers once"
+        );
+
+        // Stop the connector, then start the action. The action's own
+        // flag is true again, but the connector still holds delivery off.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sr01-conn/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .send("POST", "/api/v5/actions/sr01-act/start", None, Some(&token))
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth("/api/v5/publish", publish("stopped"), &token)
+            .await;
+        assert_eq!(status, 202, "publish while stopped: {body}");
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "a stopped connector must keep the restarted action off"
+        );
+
+        // Start the connector again: delivery resumes.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sr01-conn/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth("/api/v5/publish", publish("resumed"), &token)
+            .await;
+        assert_eq!(status, 202, "publish after connector start: {body}");
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "a started connector restores delivery"
+        );
+
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server.delete_auth("/api/v5/actions/sr01-act", &token).await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/sr01-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn node_action_operation_round_trip() {
         // W3-09 (C06-13) broker-through test: create an action via the
         // W3-02 route, run `stop`/`start` through the node-scoped route
@@ -31457,15 +32179,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 201, "action create: {body}");
         let above_max = (tokio::sync::Semaphore::MAX_PERMITS as u64) + 1;
+        // `health_check_timeout` is applied (default 60s), so a
+        // non-default value parses and is not in the refused list.
         let bad_fields = [
             ("dispatch_strategy", json!({"dispatch_strategy": "random"})),
             (
                 "health_check_interval_jitter",
                 json!({"health_check_interval_jitter": "1s"}),
-            ),
-            (
-                "health_check_timeout",
-                json!({"health_check_timeout": "30s"}),
             ),
             ("no_such_option", json!({"no_such_option": 1})),
             ("batch_time", json!({"batch_time": "infinity"})),
@@ -32159,7 +32879,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-29-source", "type": "console"}),
+                json!({"name": "w3-29-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-29-source"}}),
                 &token,
             )
             .await;
@@ -32578,7 +33298,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // reports zeroes (W3-31 restores the source directory, so the
         // absence check reads the live summary, not a 404).
         let (status, _) = server
-            .post_auth("/api/v5/sources_probe", json!({"type": "console"}), &token)
+            .post_auth("/api/v5/sources_probe", json!({"type": "mqtt"}), &token)
             .await;
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
@@ -32634,7 +33354,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "sum-src-a", "type": "console"}),
+                json!({"name": "sum-src-a", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/sum-src-a"}}),
                 &token,
             )
             .await;
@@ -32642,7 +33362,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "sum-src-b", "type": "console", "enable": false}),
+                json!({"name": "sum-src-b", "type": "mqtt", "enable": false, "connector": "mqtt:up", "parameters": {"topic": "in/sum-src-b"}}),
                 &token,
             )
             .await;
@@ -32721,13 +33441,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-26-source", "type": "console"}),
+                json!({"name": "w3-26-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-26-source"}}),
                 &token,
             )
             .await;
         assert_eq!(status, 201);
         assert_eq!(body["id"], json!("w3-26-source"));
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
@@ -32743,7 +33463,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-26-source", "type": "console"}),
+                json!({"name": "w3-26-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-26-source"}}),
                 &token,
             )
             .await;
@@ -32788,7 +33508,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-27-source", "type": "console"}),
+                json!({"name": "w3-27-source", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-27-source"}}),
                 &token,
             )
             .await;
@@ -32799,7 +33519,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-27-source"));
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         assert_eq!(body["enable"], json!(true));
         // Unknown query parameters are ignored on the single read.
         let (status, _) = server
@@ -32810,26 +33530,26 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/w3-27-source",
-                json!({"type": "console", "enable": false}),
+                json!({"type": "mqtt", "enable": false, "connector": "mqtt:up", "parameters": {"topic": "in/w3-27-source"}}),
                 &token,
             )
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-27-source"));
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         assert_eq!(body["enable"], json!(false));
         // Read again sees the new values.
         let (status, body) = server
             .get_auth("/api/v5/sources/w3-27-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         assert_eq!(body["enable"], json!(false));
         // Update of an unknown id is 404 and creates nothing.
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/no-such-source",
-                json!({"type": "console"}),
+                json!({"type": "mqtt"}),
                 &token,
             )
             .await;
@@ -32863,12 +33583,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/sources/w3-27-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("console"));
+        assert_eq!(body["type"], json!("mqtt"));
         // Mismatched body id is rejected instead of renaming.
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/w3-27-source",
-                json!({"id": "other-source", "type": "console"}),
+                json!({"id": "other-source", "type": "mqtt"}),
                 &token,
             )
             .await;
@@ -32894,7 +33614,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "restart-src", "type": "console"}),
+                json!({"name": "restart-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/restart-src"}}),
                 &token,
             )
             .await;
@@ -32968,7 +33688,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-23-src", "type": "console"}),
+                json!({"name": "w3-23-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-23-src"}}),
                 &token,
             )
             .await;
@@ -33102,7 +33822,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-28-src", "type": "console"}),
+                json!({"name": "w3-28-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-28-src"}}),
                 &token,
             )
             .await;
@@ -33270,7 +33990,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-24-src", "type": "console"}),
+                json!({"name": "w3-24-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w3-24-src"}}),
                 &token,
             )
             .await;
@@ -36289,10 +37009,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "listed kind {name} is documented"
             );
         }
-        for ready in ["mqtt", "kafka_consumer", "rabbitmq"] {
+        assert!(
+            kinds.contains(&"mqtt"),
+            "type list holds the documented ingress kind mqtt"
+        );
+        for unsupported in ["kafka_consumer", "gcp_pubsub_consumer", "rabbitmq"] {
             assert!(
-                kinds.contains(ready),
-                "type list holds the documented ready kind {ready}"
+                !kinds.contains(unsupported),
+                "type list has no ingress-less kind {unsupported}"
             );
         }
         for pending in ["timescaledb", "oci_streaming"] {
@@ -36319,7 +37043,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w325-probe-src", "type": "console"}),
+                json!({"name": "w325-probe-src", "type": "mqtt", "connector": "mqtt:up", "parameters": {"topic": "in/w325-probe-src"}}),
                 &token,
             )
             .await;
@@ -36579,22 +37303,22 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn ap05_sources_typed_round_trip() {
-        // AP-05/KC-00: ready kinds (webhook and pgsql) round trip. Pending
+        // AP-05/KC-00: the ready MQTT ingress kind round trips. Pending
         // timescaledb and oci_streaming are refused and store nothing.
-        // MV-03a sets mqtt and kafka_consumer ready, so they no longer
-        // prove the pending refusal here.
+        // MV-08 keeps only the MQTT subscriber as a source with a runtime.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let cases = [
             (
-                "ap05-src-webhook",
-                json!({"type": "webhook", "name": "ap05-src-webhook",
-                       "connector": "webhook:ap05-up",
+                "ap05-src-mqtt-a",
+                json!({"type": "mqtt", "name": "ap05-src-mqtt-a",
+                       "connector": "mqtt:ap05-up",
                        "parameters": {"topic": "in/ap05"}}),
             ),
             (
-                "ap05-src-pgsql",
-                json!({"type": "postgres", "name": "ap05-src-pgsql",
+                "ap05-src-mqtt-b",
+                json!({"type": "mqtt", "name": "ap05-src-mqtt-b",
+                       "connector": "mqtt:ap05-up",
                        "parameters": {"topic": "in/ap05"}}),
             ),
         ];
@@ -36603,7 +37327,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(status, 201, "create for {bare}");
             assert_eq!(created["name"], json!(bare));
             assert!(created["parameters"].is_object());
-            assert_eq!(created["status"], json!("connected"));
+            assert_eq!(created["status"], json!("disconnected"));
+            assert_eq!(created["status_reason"], json!("source is starting"));
             let (status, _) = server
                 .get_auth(&format!("/api/v5/sources/{bare}"), &token)
                 .await;
@@ -37058,6 +37783,223 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn backup_import_rights_change_needs_full_administrator() {
+        // SR-01 item 2: a system-scoped administrator cannot raise its
+        // own rights through an import. The same archive applies for a
+        // full administrator. Broker-through: user create, login, upload
+        // and import all use the served API.
+        use base64::Engine as _;
+        let dir = unique_data_dir("sr01-import-rights");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let admin = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "sr01-scoped", "password": "Scoped-pass-1a",
+                       "role": "administrator", "scopes": ["system"]}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "scoped user create: {body}");
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "sr01-scoped", "password": "Scoped-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "scoped login: {body}");
+        let scoped = body["token"].as_str().expect("scoped token").to_string();
+
+        let file = build_test_backup(
+            "sr01-rights-0",
+            &["admin_users"],
+            &[(
+                "snapshot/admin_users.json",
+                json!({"users": [
+                    {"username": "admin", "role": "administrator", "description": "",
+                     "must_change_password": false, "scopes": null, "scopes_set": false},
+                    {"username": "sr01-scoped", "role": "administrator", "description": "",
+                     "must_change_password": false, "scopes": null, "scopes_set": false},
+                ]}),
+            )],
+        );
+        let content = base64::engine::general_purpose::STANDARD.encode(&file);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "conf-sr01-rights.tar.gz", "content": content}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // The scoped administrator may not widen its own row.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "conf-sr01-rights.tar.gz"}),
+                &scoped,
+            )
+            .await;
+        assert_eq!(status, 403, "scoped import must be refused: {body}");
+        assert_eq!(body["code"], json!("FORBIDDEN"));
+        assert_eq!(body.as_object().expect("error shape").len(), 2);
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-scoped"))
+            .expect("scoped user stays");
+        assert_eq!(row["scopes"], json!(["system"]), "the old scopes stay");
+
+        // A full administrator applies the same archive.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "conf-sr01-rights.tar.gz"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204, "full administrator import: {body}");
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-scoped"))
+            .expect("scoped user stays");
+        assert_eq!(
+            row["scopes"],
+            json!("unset"),
+            "the full administrator import applies the new default"
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/data/files/conf-sr01-rights.tar.gz", &admin)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn backup_export_and_old_import_keep_dashboard_scopes() {
+        // SR-01 item 3: the export writes the explicit scopes and the
+        // flag, so a round trip keeps a restricted administrator
+        // restricted. An archive from an older release carries no scope
+        // field and keeps the stored scopes. Broker-through: every step
+        // uses the served API or the export file it wrote.
+        let dir = unique_data_dir("sr01-export-scopes");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let admin = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "sr01-restricted", "password": "Restricted-pass-1a",
+                       "role": "administrator", "scopes": ["system"]}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "restricted user create: {body}");
+
+        let (status, body) = server
+            .post_auth("/api/v5/data/export", json!({}), &admin)
+            .await;
+        assert_eq!(status, 200);
+        let filename = body["filename"].as_str().expect("export names file");
+        let path = dir.join("backup").join(filename);
+        let parts = read_backup_file(&path);
+        let admin_part = parts
+            .iter()
+            .find(|(name, _)| name.ends_with("/snapshot/admin_users.json"))
+            .expect("admin users part ships");
+        let exported: Value = serde_json::from_str(&admin_part.1).expect("admin part is JSON");
+        let row = exported["users"]
+            .as_array()
+            .expect("users array")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-restricted"))
+            .expect("restricted user ships");
+        assert_eq!(row["scopes"], json!(["system"]), "the export keeps scopes");
+        assert_eq!(row["scopes_set"], json!(true), "the export names the list");
+
+        // Import the unchanged archive: the restriction stays.
+        let (status, body) = server
+            .post_auth("/api/v5/data/import", json!({"filename": filename}), &admin)
+            .await;
+        assert_eq!(status, 204, "round-trip import: {body}");
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-restricted"))
+            .expect("restricted user stays");
+        assert_eq!(
+            row["scopes"],
+            json!(["system"]),
+            "the round trip keeps the restriction"
+        );
+
+        // An archive with no scope field keeps the stored scopes.
+        let old = build_test_backup(
+            "sr01-old-scopes-0",
+            &["admin_users"],
+            &[(
+                "snapshot/admin_users.json",
+                json!({"users": [
+                    {"username": "admin", "role": "administrator", "description": "",
+                     "must_change_password": false},
+                    {"username": "sr01-restricted", "role": "administrator", "description": "",
+                     "must_change_password": false},
+                ]}),
+            )],
+        );
+        use base64::Engine as _;
+        let content = base64::engine::general_purpose::STANDARD.encode(&old);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "conf-sr01-old.tar.gz", "content": content}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "conf-sr01-old.tar.gz"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204, "old archive import: {body}");
+        let (status, users) = server.get_auth("/api/v5/users", &admin).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("user list")
+            .iter()
+            .find(|entry| entry["username"] == json!("sr01-restricted"))
+            .expect("restricted user stays");
+        assert_eq!(
+            row["scopes"],
+            json!(["system"]),
+            "an old archive never widens stored scopes"
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/data/files/conf-sr01-old.tar.gz", &admin)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn backup_import_unknown_root_is_refused_through_broker() {
         // An unknown root is refused whole through the API.
         // Broker-through: upload and import go through the served API.
@@ -37173,7 +38115,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             serde_json::to_vec(&json!({"filename": "any.tar.gz"})).expect("body is JSON"),
         );
         let response =
-            crate::v5::backup::import_data(axum::extract::State(state.clone()), body).await;
+            crate::v5::backup::import_data(axum::extract::State(state.clone()), None, body).await;
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         let raw = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
@@ -37187,7 +38129,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let body = bytes::Bytes::from(
             serde_json::to_vec(&json!({"filename": "missing-file.tar.gz"})).expect("body is JSON"),
         );
-        let response = crate::v5::backup::import_data(axum::extract::State(state), body).await;
+        let response =
+            crate::v5::backup::import_data(axum::extract::State(state), None, body).await;
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
         let raw = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await

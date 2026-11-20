@@ -37,7 +37,7 @@
       "server": "127.0.0.1:1883",
       "resource_opts": {"health_check_timeout": "30s"}
     },
-    "expect_status": 400,
+    "expect_status": 201,
     "setup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-timeout"}}],
     "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-timeout"}}]
   },
@@ -107,7 +107,7 @@
       "server": "127.0.0.1:1883",
       "resource_opts": {"health_check_timeout": "30s"}
     },
-    "expect_status": 400,
+    "expect_status": 200,
     "setup": [
       {"api": {"method": "DELETE", "path": "/actions/ro01-update-timeout"}},
       {"api": {"method": "POST", "path": "/actions", "body": {

@@ -600,8 +600,9 @@ impl AzureEventHubsSink {
     }
 
     /// Flush buffered rows (no-op when empty). 429/503 retry in place
-    /// up to `max_retries`. Exhaustion drops the batch and engages
-    /// backoff. Terminal failures restore the buffer and propagate.
+    /// up to `max_retries`. Exhaustion restores the buffer, engages
+    /// backoff and returns the error. Terminal failures restore the
+    /// buffer and propagate.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {

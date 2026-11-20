@@ -1,6 +1,6 @@
 {
   "action": "Connect one secure WebSocket client with a valid certificate and an ignored identifier, then read the client detail.",
-  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem\"\npeer_cert_as_clientid = \"cn\"\n",
+  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"${TLS_DIR}/server-cert.pem\"\nkey_file = \"${TLS_DIR}/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"${TLS_DIR}/ca-cert.pem\"\npeer_cert_as_clientid = \"cn\"\n",
   "item": "listeners.wss.peer_cert_as_clientid",
   "kind": "setting",
   "output": "clientid=k1-05-a",

@@ -7,9 +7,9 @@ sidebar:
 
 # Kafka consumer
 
-The `kafka_consumer` name is the documented Kafka ingress source. The v5 source store keeps its registration and its enable flag. The v5 connectors route also accepts the name and maps it to the `kafka` sink runtime. The v1 connectors route does not accept the name.
+The `kafka_consumer` name is the documented Kafka ingress source. This build has no Kafka pull loop, so create and update refuse the source name. The v5 connectors route still accepts the name and maps it to the `kafka` sink runtime. The v1 connectors route does not accept the name.
 
-Use it when a tool sends the documented consumer name. You get a stored source row. This build has no Kafka pull loop, so the broker does not read a topic.
+Use it only when a tool sends the documented consumer name. The broker refuses the source name and stores nothing. This build has no Kafka pull loop, so the broker does not read a topic.
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
 
 ## Settings
 
-Register the source with `POST /api/v5/sources`.
+`POST /api/v5/sources` refuses the source name.
 
 | Setting | Required | Meaning |
 |---|---|---|
@@ -40,7 +40,7 @@ Register the source with `POST /api/v5/sources`.
 | `parameters` | no | Object of source parameters. Default empty. |
 | `resource_opts` | no | Object of resource options. Default empty. |
 
-The source store validates the type and keeps `parameters` unchanged. It does not validate the parameter names. The store holds at most 512 sources.
+Create and update refuse the type because this build has no ingress runtime. Nothing is stored. The store holds at most 512 sources.
 
 The v5 connectors route runs the `kafka` runtime. It reads `bootstrap_hosts` or `servers` (default `127.0.0.1:9092`). It fixes `topic_template` to `events-${topic}`, `partition_key_field` to none, `partitions` to 1, and `client_id` to `indramqtt-<name>`. It fixes `acks` to `1`, `batch_max_records` to 1, and `batch_max_bytes` to 65536. It registers the name and the alias `kafka:name`.
 
@@ -63,11 +63,11 @@ Example:
 ```
 
 > [!NOTE]
-> The docs run registers this source and creates the connector name. The default build refuses the connector route with 400 and names the `kafka` feature. A full build returns 201. The pull path does not exist in this build. See the record in [Verification failures](../_verification/failures.md).
+> The docs run refuses the source name and creates the connector name. The default build refuses the connector route with 400 and names the `kafka` feature. A full build returns 201. The pull path does not exist in this build. See the record in [Verification failures](../_verification/failures.md).
 
 ## Check that it works
 
-Register the source and create the connector name. The source answers 201. The connector route answers 201 or 400. Both answers print `ok`.
+Register the source and create the connector name. The source answers 400. The connector route answers 201 or 400. Both answers print `ok`.
 
 ```toml test
 [node]
@@ -106,16 +106,15 @@ def call(method, path, body=None):
 
 status, types = call("GET", "/api/v5/source_types")
 assert status == 200, (status, types)
-assert "kafka_consumer" in types, types
+assert "kafka_consumer" not in types, types
 
 s1, b1 = call("POST", "/api/v5/sources",
               {"id": "kafka-consumer-1",
                "type": "kafka_consumer",
                "parameters": {"bootstrap_hosts": "127.0.0.1:9092",
                               "topic": "events"}})
-assert s1 == 201, (s1, b1)
-assert b1["type"] == "kafka_consumer", b1
-assert b1["enable"] is True, b1
+assert s1 == 400, (s1, b1)
+assert "ingress runtime" in json.dumps(b1).lower(), b1
 
 s2, b2 = call("POST", "/api/v1/connectors",
               {"id": "kafka-consumer-v1",

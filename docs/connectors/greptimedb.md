@@ -35,8 +35,9 @@ Set `kind` to `greptimedb`. The alias `greptime` selects the same runtime.
 | `password` | no | GreptimeDB password. Needs `username` too. |
 | `precision` | no | `s`, `ms`, `us` or `ns`. Default `ms`. |
 | `format` | no | `sql` or `influx`. Default `sql`. |
+| `collision_seq_column` | no | Optional SQL sequence column for same-timestamp rows on deduplicating tables. |
 
-The action may override `table`, `precision` and `format` per target.
+The action may override `table`, `precision`, `format` and `collision_seq_column` per target. `collision_seq_column` assigns a per-sink monotonic sequence (starting at 1 per sink instance), so it prevents same-timestamp merges across topics within one action/sink. If multiple actions or sinks share the same deduplicating table, create the table with `append_mode = 'true'` unless the primary key distinguishes each writer.
 
 ### `server`
 

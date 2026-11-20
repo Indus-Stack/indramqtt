@@ -158,54 +158,1959 @@ names the groups with their tool counts.
 
 ## Tools
 
-- `get_api_v5_status` reads the node status. `get_status` is its
-  public alias. Both run the same handler through the router.
-- `post_api_v5_publish` runs the management publish operation. It
-  takes the same body as HTTP `POST /api/v5/publish` and returns the
-  same answer. It sits in the `publish` toolset, in the `core` set.
-  The key needs the `publish` scope, as over HTTP.
-- `subscribe_collect` subscribes briefly and collects matching
-  messages. It has no HTTP route. It takes `topic_filter` (required),
-  `max_messages` (1 to 100, default 10), `timeout_seconds` (1 to 30,
-  default 5) and `qos` (0 or 1, required). It returns one row per
-  message with `topic`, `qos`, `retain`, `payload`,
-  `payload_encoding` (`plain`, or `base64` for binary payloads) and
-  `truncated` (true when the payload passed 64 KiB and was cut). It
-  removes its temporary subscription on every exit path, including a
-  client disconnect mid-collect. It sits in the `publish` toolset, in
-  the `core` set. It needs the `publish` scope: the HTTP subscribe
-  operation is a POST (a write), so read-only mode and viewer keys
-  hide it.
-- `broker_status` reads the version, uptime and node name without a
-  router round trip. It proves the path end to end.
-- `list_toolsets` names the tool groups with their tool counts. It is
-  always present, for every key and every query.
-- Every other tool maps to one HTTP operation. The build scans the
-  router source and emits one row per `(method, path)` pair. The tool
-  list derives from that table. One shared route table serves every
-  call. The first call builds it; later calls clone it and set the
-  live state. Authentication still runs per request. No hand-written copy
-  of a schema exists.
-- The tool name derives from the method and the path in snake case,
-  for example `get_api_v5_clients_by_clientid`. Names stay stable while
-  routes stay stable.
-- The tool description keeps the first doc line of the handler and
-  names the route after it, for example
-  `List all clients. (GET /api/v5/clients)`. A route without docs
-  falls back to `METHOD path`. Descriptions never copy the reference
-  text.
-- `inputSchema` derives from the path template and the method:
-  path segments become required string fields, `query` carries query
-  keys, `body` carries the JSON body, `body_base64` carries raw bytes
-  in base64. Use either `body` or `body_base64`, never both.
-- Annotations: `readOnlyHint` is true for `GET`; `destructiveHint` is
-  true for `DELETE` and for operations that stop, kick, purge, reset,
-  restart, deactivate or evacuate.
-- `tools/call` returns the JSON body as text content. An HTTP status
-  of 400 or more gives `isError: true` with the code and message of
-  the API. A binary answer (file downloads) returns base64 inside a
-  small JSON envelope with its content type. Text answers return as
-  text.
+One entry per tool, in route-table order within each toolset. The
+`inputSchema` shape is mechanical: path segments become required string
+fields, `query` carries query keys, `body` carries the JSON body and
+`body_base64` carries raw bytes in base64 (use either `body` or
+`body_base64`, never both). Verified examples were captured against a
+running broker with an Administrator API key. The full catalogue with
+one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
+
+### `broker_status`
+
+- Toolset: `status`
+- Route: `GET /api/v5/status`
+- Description: Read the version, uptime and node name of this node. (GET /api/v5/status)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "broker_status",
+  "arguments": {
+   "query": {
+    "format": "json"
+   }
+  }
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"version":"0.1.0","uptime_ms":112883,"node":"indra-node-1@bfe554c525c5"}
+```
+
+### `get_api_v5_status`
+
+- Toolset: `status`
+- Route: `GET /api/v5/status`
+- Description: `GET /api/v5/status`: node status read. It needs no token, as the (GET /api/v5/status)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_status",
+  "arguments": {
+   "query": {
+    "format": "json"
+   }
+  }
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"rel_vsn":"v0.1.0","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
+```
+
+### `get_status`
+
+- Toolset: `status`
+- Route: `GET /status`
+- Description: `GET /api/v5/status`: node status read. It needs no token, as the (GET /status)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_status",
+  "arguments": {
+   "query": {
+    "format": "json"
+   }
+  }
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"rel_vsn":"v0.1.0","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
+```
+
+### `list_toolsets`
+
+- Toolset: `status`
+- Description: List the MCP toolsets with their tool counts.
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "list_toolsets",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"toolsets":[...]}
+```
+
+### `delete_api_v5_banned`
+
+- Toolset: `clients`
+- Route: `DELETE /api/v5/banned`
+- Description: `DELETE /banned`: drop every entry and report success with 204. (DELETE /api/v5/banned)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_banned_by_as_by_who`
+
+- Toolset: `clients`
+- Route: `DELETE /api/v5/banned/:as/:who`
+- Description: `DELETE /banned/{as}/{who}`: drop one entry addressed by its kind plus (DELETE /api/v5/banned/:as/:who)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["as", "who"],
+  "properties": {
+    "as": {"type":"string","description":"Value for the :as path segment"},
+    "who": {"type":"string","description":"Value for the :who path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_clients_by_clientid`
+
+- Toolset: `clients`
+- Route: `DELETE /api/v5/clients/:clientid`
+- Description: DELETE /api/v5/clients/:clientid
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_clients_by_clientid_authorization_cache`
+
+- Toolset: `clients`
+- Route: `DELETE /api/v5/clients/:clientid/authorization/cache`
+- Description: Per-client authorization decision cache clear. (DELETE /api/v5/clients/:clientid/authorization/cache)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v1_clients`
+
+- Toolset: `clients`
+- Route: `GET /api/v1/clients`
+- Description: Sorted ids of currently connected clients. (GET /api/v1/clients)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v1_clients",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+[]
+```
+
+### `get_api_v1_clients_by_id`
+
+- Toolset: `clients`
+- Route: `GET /api/v1/clients/:id`
+- Description: Full detail row for one client session. (GET /api/v1/clients/:id)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["id"],
+  "properties": {
+    "id": {"type":"string","description":"Value for the :id path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_banned`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/banned`
+- Description: `GET /banned`: wrapped page (`data` plus `meta`). An empty store reads (GET /api/v5/banned)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_banned",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"data":[],"meta":{"page":1,"limit":100,"count":0,"hasnext":false}}
+```
+
+### `get_api_v5_clients`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients`
+- Description: GET /api/v5/clients
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_clients",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"data":[],"meta":{"page":1,"limit":100,"count":0,"hasnext":false}}
+```
+
+### `get_api_v5_clients_by_clientid`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients/:clientid`
+- Description: GET /api/v5/clients/:clientid
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_clients_by_clientid_authorization_cache`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients/:clientid/authorization/cache`
+- Description: Per-client authorization decision cache read. (GET /api/v5/clients/:clientid/authorization/cache)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_clients_by_clientid_inflight_messages`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients/:clientid/inflight_messages`
+- Description: GET /api/v5/clients/:clientid/inflight_messages
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_clients_by_clientid_mqueue_messages`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients/:clientid/mqueue_messages`
+- Description: GET /api/v5/clients/:clientid/mqueue_messages
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_clients_by_clientid_subscriptions`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients/:clientid/subscriptions`
+- Description: GET /api/v5/clients/:clientid/subscriptions
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_clients_v2`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/clients_v2`
+- Description: GET /api/v5/clients_v2
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_sessions_count`
+
+- Toolset: `clients`
+- Route: `GET /api/v5/sessions_count`
+- Description: `GET /sessions_count`: the number of sessions that have not expired. (GET /api/v5/sessions_count)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_sessions_count",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+"0"
+```
+
+### `post_api_v5_banned`
+
+- Toolset: `clients`
+- Route: `POST /api/v5/banned`
+- Description: `POST /banned`: create one entry from a who-value plus what-kind and (POST /api/v5/banned)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_clients_by_clientid_subscribe`
+
+- Toolset: `clients`
+- Route: `POST /api/v5/clients/:clientid/subscribe`
+- Description: POST /api/v5/clients/:clientid/subscribe
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_clients_by_clientid_subscribe_bulk`
+
+- Toolset: `clients`
+- Route: `POST /api/v5/clients/:clientid/subscribe/bulk`
+- Description: POST /api/v5/clients/:clientid/subscribe/bulk
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_clients_by_clientid_unsubscribe`
+
+- Toolset: `clients`
+- Route: `POST /api/v5/clients/:clientid/unsubscribe`
+- Description: POST /api/v5/clients/:clientid/unsubscribe
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_clients_by_clientid_unsubscribe_bulk`
+
+- Toolset: `clients`
+- Route: `POST /api/v5/clients/:clientid/unsubscribe/bulk`
+- Description: POST /api/v5/clients/:clientid/unsubscribe/bulk
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_clients_kickout_bulk`
+
+- Toolset: `clients`
+- Route: `POST /api/v5/clients/kickout/bulk`
+- Description: `POST /clients/kickout/bulk`: disconnect many clients. The reference (POST /api/v5/clients/kickout/bulk)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `put_api_v5_clients_by_clientid_keepalive`
+
+- Toolset: `clients`
+- Route: `PUT /api/v5/clients/:clientid/keepalive`
+- Description: Update the keepalive of one connected client. (PUT /api/v5/clients/:clientid/keepalive)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["clientid"],
+  "properties": {
+    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_subscriptions`
+
+- Toolset: `subscriptions`
+- Route: `GET /api/v5/subscriptions`
+- Description: GET /api/v5/subscriptions
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_subscriptions",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+[]
+```
+
+### `get_api_v5_topics`
+
+- Toolset: `topics`
+- Route: `GET /api/v5/topics`
+- Description: Topic list as a paged collection (W1-15). (GET /api/v5/topics)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_topics",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"data":[],"meta":{"page":1,"limit":100,"count":0,"hasnext":false}}
+```
+
+### `get_api_v5_topics_by_topic`
+
+- Toolset: `topics`
+- Route: `GET /api/v5/topics/:topic`
+- Description: Topic detail for one exact topic name (W1-15). (GET /api/v5/topics/:topic)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["topic"],
+  "properties": {
+    "topic": {"type":"string","description":"Value for the :topic path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_publish`
+
+- Toolset: `publish`
+- Route: `POST /api/v5/publish`
+- Description: POST /api/v5/publish
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_publish_bulk`
+
+- Toolset: `publish`
+- Route: `POST /api/v5/publish/bulk`
+- Description: Bulk management publish through the single-entry injection routine. (POST /api/v5/publish/bulk)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `subscribe_collect`
+
+- Toolset: `publish`
+- Route: none (built-in messaging tool)
+- Description: Subscribe briefly and collect matching messages.
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["topic_filter", "qos"],
+  "properties": {
+    "topic_filter": {"type":"string","description":"Value for the :topic_filter path segment"},
+    "max_messages": {"type":"string","description":"Value for the :max_messages path segment"},
+    "timeout_seconds": {"type":"string","description":"Value for the :timeout_seconds path segment"},
+    "qos": {"type":"string","description":"Value for the :qos path segment"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_alarms`
+
+- Toolset: `metrics`
+- Route: `DELETE /api/v5/alarms`
+- Description: `DELETE /alarms`: deactivate every alarm (active entries move to the (DELETE /api/v5/alarms)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_monitor`
+
+- Toolset: `metrics`
+- Route: `DELETE /api/v5/monitor`
+- Description: `DELETE /monitor`: drop every history point and report success with (DELETE /api/v5/monitor)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_slow_subscriptions`
+
+- Toolset: `metrics`
+- Route: `DELETE /api/v5/slow_subscriptions`
+- Description: `DELETE /slow_subscriptions`: drop every recorded slow delivery and (DELETE /api/v5/slow_subscriptions)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_trace`
+
+- Toolset: `metrics`
+- Route: `DELETE /api/v5/trace`
+- Description: `DELETE /trace`: drop every session and report success with 204. (DELETE /api/v5/trace)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `delete_api_v5_trace_by_name`
+
+- Toolset: `metrics`
+- Route: `DELETE /api/v5/trace/:name`
+- Description: `DELETE /trace/{name}`: drop one session and report success with 204. (DELETE /api/v5/trace/:name)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": {"type":"string","description":"Value for the :name path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v1_metrics`
+
+- Toolset: `metrics`
+- Route: `GET /api/v1/metrics`
+- Description: Prometheus text exposition of node counters and gauges. (GET /api/v1/metrics)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v1_metrics",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# HELP indramqtt_messages_received_total Total MQTT ingress messages accepted over BrokerLink.
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 0
+# HELP indramqtt_messages_forwarded_total Total PublishOut frames admitted into the shard transport mailbox (transport enqueue, not edge arrival; compare with transport_sent).
+# TYPE indramqtt_messages_forwarded_total counter
+indramqtt_messages_forwarded_total 0
+# HELP indramqtt_messages_dropped_total Total ingress messages dropped by quota/rate policing.
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# HELP indramqtt_rules_executed_total Total ingress rules whose filter matched.
+... (truncated)
+```
+
+### `get_api_v5_alarms`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/alarms`
+- Description: `GET /alarms`: wrapped page (`data` plus `meta`). An empty store reads (GET /api/v5/alarms)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_alarms",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"data":[],"meta":{"page":1,"limit":100,"count":0,"hasnext":false}}
+```
+
+### `get_api_v5_metrics`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/metrics`
+- Description: Documented `GET /metrics` snapshot: a flat object of named counters. (GET /api/v5/metrics)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_metrics",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"bytes.received":0,"bytes.sent":0,"packets.received":0,"packets.sent":0,"packets.connect.received":0,"packets.connack.sent":0,"packets.connack.error":0,"packets.connack.auth_error":0,"packets.publish.received":0,"packets.publish.sent":0,"packets.subscribe.received":0,"packets.suback.sent":0,"packets.pingreq.received":0,"packets.pingresp.sent":0,"messages.received":0,"messages.sent":0,"messages.dropped":0,"messages.delivered":0,"messages.delayed":0,"messages.qos0.received":0,"messages.qos1.received":0,"messages.qos2.received":0,"delivery.dropped":0,"delivery.dropped.no_subscribers":0,"delivery.dropped.qos0_msg":0,"delivery.dropped.queue_full":0,"client.connect":0,"client.connack":0,"client.c
+... (truncated)
+```
+
+### `get_api_v5_monitor`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/monitor`
+- Description: `GET /monitor`: ordered history array (oldest first). An empty store (GET /api/v5/monitor)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_monitor",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+[{"time_stamp":1794824957,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824967,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824977,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824987,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824997,"connections":0,"live_
+... (truncated)
+```
+
+### `get_api_v5_monitor_current`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/monitor_current`
+- Description: Documented `GET /monitor_current` snapshot: one object with the (GET /api/v5/monitor_current)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_monitor_current",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"cluster_sessions":0,"retained_msg_count":0,"received_msg_rate":0,"sent_msg_rate":0,"dropped_msg_rate":0,"rules_matched_rate":0}
+```
+
+### `get_api_v5_monitor_current_nodes_by_node`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/monitor_current/nodes/:node`
+- Description: `GET /monitor_current/nodes/{node}`: node-scoped read of the same (GET /api/v5/monitor_current/nodes/:node)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["node"],
+  "properties": {
+    "node": {"type":"string","description":"Value for the :node path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_monitor_nodes_by_node`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/monitor/nodes/:node`
+- Description: `GET /monitor/nodes/{node}`: node-scoped read over the same bounded (GET /api/v5/monitor/nodes/:node)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["node"],
+  "properties": {
+    "node": {"type":"string","description":"Value for the :node path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_prometheus`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus`
+- Description: `GET /prometheus`: the stored exporter settings in the documented (GET /api/v5/prometheus)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"collectors":{"mnesia":"disabled","vm_dist":"disabled","vm_memory":"disabled","vm_msacc":"disabled","vm_statistics":"disabled","vm_system_info":"disabled"},"enable_basic_auth":true,"latency_buckets":"10ms, 100ms, 1s, 5s, 30s","push_gateway":{"enable":false,"headers":{},"interval":"15s","job_name":"${name}/instance/${name}~${host}","method":"put","url":"http://127.0.0.1:9091"}}
+```
+
+### `get_api_v5_prometheus_auth`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/auth`
+- Description: `GET /prometheus/auth`: same exposition as `/prometheus/stats`. One (GET /api/v5/prometheus/auth)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_auth",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_prometheus_data_integration`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/data_integration`
+- Description: `GET /prometheus/data_integration`: same exposition as (GET /api/v5/prometheus/data_integration)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_data_integration",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_prometheus_message_transformation`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/message_transformation`
+- Description: `GET /prometheus/message_transformation`: same exposition as (GET /api/v5/prometheus/message_transformation)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_message_transformation",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_prometheus_namespaced_stats`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/namespaced_stats`
+- Description: `GET /prometheus/namespaced_stats`: same exposition as (GET /api/v5/prometheus/namespaced_stats)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_namespaced_stats",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_prometheus_schema_validation`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/schema_validation`
+- Description: `GET /prometheus/schema_validation`: same exposition as (GET /api/v5/prometheus/schema_validation)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_schema_validation",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_prometheus_stats`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/stats`
+- Description: `GET /prometheus/stats`: text exposition of the node counters and (GET /api/v5/prometheus/stats)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_stats",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_prometheus_topic_metrics`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/prometheus/topic_metrics`
+- Description: `GET /prometheus/topic_metrics`: same exposition as (GET /api/v5/prometheus/topic_metrics)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_prometheus_topic_metrics",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+# Same true counters as GET /metrics and GET /stats, one line per key.
+# TYPE indramqtt_actions_executed_total counter
+indramqtt_actions_executed_total 0
+# TYPE indramqtt_bytes_received_total counter
+indramqtt_bytes_received_total 0
+# TYPE indramqtt_bytes_sent_total counter
+indramqtt_bytes_sent_total 0
+# TYPE indramqtt_client_connack_total counter
+indramqtt_client_connack_total 0
+# TYPE indramqtt_client_connect_total counter
+indramqtt_client_connect_total 0
+# TYPE indramqtt_client_connected_total counter
+indramqtt_client_connected_total 0
+# TYPE indramqtt_client_subscribe_total counter
+indramqtt_client_subscribe_total 0
+# TYPE indramqtt_delivery_dropped_total counter
+indramqtt_delivery_dropp
+... (truncated)
+```
+
+### `get_api_v5_slow_subscriptions`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/slow_subscriptions`
+- Description: `GET /slow_subscriptions`: paged list of recorded slow deliveries. (GET /api/v5/slow_subscriptions)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_slow_subscriptions",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"data":[],"meta":{"page":1,"limit":100,"count":0,"hasnext":false}}
+```
+
+### `get_api_v5_slow_subscriptions_settings`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/slow_subscriptions/settings`
+- Description: `GET /slow_subscriptions/settings`: current thresholds. (GET /api/v5/slow_subscriptions/settings)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_slow_subscriptions_settings",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"enable":true,"threshold":"500ms","top_k_num":10,"expire_interval":"300s","stats_type":"whole"}
+```
+
+### `get_api_v5_stats`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/stats`
+- Description: Documented `GET /stats` snapshot: aggregated resource and session statistics. (GET /api/v5/stats)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_stats",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+[{"channels.count":0,"channels.max":0,"connections.count":0,"connections.max":0,"delayed.count":0,"live_connections.count":0,"live_connections.max":0,"cluster_sessions.count":0,"cluster_sessions.max":0,"retained.count":0,"retained.max":0,"sessions.count":0,"sessions.max":0,"suboptions.count":0,"suboptions.max":0,"subscriptions.count":0,"subscriptions.max":0,"topics.count":0,"topics.max":0,"node":"indra-node-1@bfe554c525c5"}]
+```
+
+### `get_api_v5_telemetry_data`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/telemetry/data`
+- Description: `GET /telemetry/data`: miss. Telemetry is disabled, and the documented (GET /api/v5/telemetry/data)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_telemetry_data",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+NOT_FOUND: telemetry is currently not enabled
+```
+
+### `get_api_v5_telemetry_status`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/telemetry/status`
+- Description: `GET /telemetry/status`: disabled. The broker collects no telemetry. (GET /api/v5/telemetry/status)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_telemetry_status",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"enable":false}
+```
+
+### `get_api_v5_trace`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/trace`
+- Description: `GET /trace`: list sessions as a bare JSON array (newest first). (GET /api/v5/trace)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_trace",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+[]
+```
+
+### `get_api_v5_trace_by_name_download`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/trace/:name/download`
+- Description: `GET /trace/{name}/download`: serve one session's captured log as a (GET /api/v5/trace/:name/download)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": {"type":"string","description":"Value for the :name path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_trace_by_name_log`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/trace/:name/log`
+- Description: `GET /trace/{name}/log`: paged inline read over one session's captured (GET /api/v5/trace/:name/log)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": {"type":"string","description":"Value for the :name path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_trace_by_name_log_detail`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/trace/:name/log_detail`
+- Description: `GET /trace/{name}/log_detail`: file facts for one session. (GET /api/v5/trace/:name/log_detail)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": {"type":"string","description":"Value for the :name path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `get_api_v5_tracing`
+
+- Toolset: `metrics`
+- Route: `GET /api/v5/tracing`
+- Description: `GET /tracing`: whether packet tracing is active. (GET /api/v5/tracing)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"}
+  }
+}
+```
+
+**Verified `tools/call`**
+```json
+{
+ "jsonrpc": "2.0",
+ "method": "tools/call",
+ "params": {
+  "name": "get_api_v5_tracing",
+  "arguments": {}
+ },
+ "id": 9
+}
+```
+
+**Output**
+```
+{"enable":false}
+```
+
+### `post_api_v5_alarms_force_deactivate`
+
+- Toolset: `metrics`
+- Route: `POST /api/v5/alarms/force_deactivate`
+- Description: `POST /alarms/force_deactivate`: deactivate one named active alarm. (POST /api/v5/alarms/force_deactivate)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `post_api_v5_trace`
+
+- Toolset: `metrics`
+- Route: `POST /api/v5/trace`
+- Description: `POST /trace`: create one session from a filter plus name. (POST /api/v5/trace)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `put_api_v5_prometheus`
+
+- Toolset: `metrics`
+- Route: `PUT /api/v5/prometheus`
+- Description: `PUT /prometheus`: validated settings replace, answered in the (PUT /api/v5/prometheus)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `put_api_v5_slow_subscriptions_settings`
+
+- Toolset: `metrics`
+- Route: `PUT /api/v5/slow_subscriptions/settings`
+- Description: `PUT /slow_subscriptions/settings`: validated update. (PUT /api/v5/slow_subscriptions/settings)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `put_api_v5_telemetry_status`
+
+- Toolset: `metrics`
+- Route: `PUT /api/v5/telemetry/status`
+- Description: `PUT /telemetry/status`: refused. The broker collects no telemetry. (PUT /api/v5/telemetry/status)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `put_api_v5_trace_by_name_stop`
+
+- Toolset: `metrics`
+- Route: `PUT /api/v5/trace/:name/stop`
+- Description: `PUT /trace/{name}/stop`: halt capture for one session, keeping it listed. (PUT /api/v5/trace/:name/stop)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": {"type":"string","description":"Value for the :name path segment"},
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
+### `put_api_v5_tracing`
+
+- Toolset: `metrics`
+- Route: `PUT /api/v5/tracing`
+- Description: `PUT /tracing`: flip the packet-tracing flag. (PUT /api/v5/tracing)
+
+**inputSchema**
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {"type":"object","description":"Query keys of the operation"},
+    "body": {"description":"Body of the operation"},
+    "body_base64": {"description":"Body of the operation"}
+  }
+}
+```
+
+_No live example captured: this operation requires a path-segment value or a request body (see `inputSchema` above)._
+
 
 ## Check that it works
 
@@ -215,6 +2120,10 @@ Call the status tool through `/mcp` with an API key:
 {"jsonrpc": "2.0", "method": "tools/call",
  "params": {"name": "get_api_v5_status",
             "arguments": {"query": {"format": "json"}}}, "id": 1}
+```
+
+```output
+{"result":{"content":[{"type":"text","text":"{\"rel_vsn\":\"v0.1.0\",\"node_name\":\"indra-node-1@bfe554c525c5\",\"broker_status\":\"started\",\"app_status\":\"running\"}"}]},"jsonrpc":"2.0","id":1}
 ```
 
 The result content holds the same JSON as HTTP
@@ -266,15 +2175,13 @@ The code holds one exclusion table with a reason for each entry:
 
 ## Limits
 
-- One `/mcp` body holds 8 MiB or less. A larger body gets `413`.
-  Keep tool arguments small.
-- One tool answer holds 8 MiB or less. Larger files stay available
-  over the HTTP route directly.
+- An envelope above 8 MiB gets HTTP 413.
+- A `body_base64` value that is not base64 gives a tool error.
 - At most 8 collects run at once. The ninth fails closed. Each
   collect holds at most 128 queued messages of at most 64 KiB each.
 - No multipart operation exists in the router. File uploads take JSON
   or raw bytes through `body` or `body_base64`; file downloads return
-  through the base64 envelope. The same 8 MiB limit applies both ways.
+  through the base64 envelope.
 - The management API defines no request rate limit, so `/mcp` defines
   none either. TODO(parity): decide a shared management rate limit.
 - Each inner handler still applies its own body cap to the re-entered

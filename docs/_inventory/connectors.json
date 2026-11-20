@@ -1,11 +1,23 @@
 {
   "connectors": [
     {
+      "kind": "alloy_db",
+      "tier": "community"
+    },
+    {
       "kind": "alloydb",
       "tier": "community"
     },
     {
+      "kind": "amqp",
+      "tier": "community"
+    },
+    {
       "kind": "aws_iot",
+      "tier": "community"
+    },
+    {
+      "kind": "aws_iot_core",
       "tier": "community"
     },
     {
@@ -37,6 +49,10 @@
       "tier": "community"
     },
     {
+      "kind": "azure_event_hubs",
+      "tier": "community"
+    },
+    {
       "kind": "azure_eventhubs",
       "tier": "community"
     },
@@ -45,7 +61,19 @@
       "tier": "community"
     },
     {
+      "kind": "azure_iot_hub",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_iothub",
+      "tier": "community"
+    },
+    {
       "kind": "bigquery",
+      "tier": "community"
+    },
+    {
+      "kind": "bq",
       "tier": "community"
     },
     {
@@ -65,11 +93,27 @@
       "tier": "community"
     },
     {
+      "kind": "cloud_iot",
+      "tier": "community"
+    },
+    {
+      "kind": "cockroach",
+      "tier": "community"
+    },
+    {
       "kind": "cockroachdb",
       "tier": "community"
     },
     {
       "kind": "confluent",
+      "tier": "community"
+    },
+    {
+      "kind": "confluent_cloud",
+      "tier": "community"
+    },
+    {
+      "kind": "confluent_kafka",
       "tier": "community"
     },
     {
@@ -99,6 +143,14 @@
     {
       "kind": "datalayers",
       "tier": "enterprise"
+    },
+    {
+      "kind": "ddb",
+      "tier": "community"
+    },
+    {
+      "kind": "delta_lake",
+      "tier": "community"
     },
     {
       "kind": "disk_log",
@@ -137,11 +189,19 @@
       "tier": "community"
     },
     {
+      "kind": "gbq",
+      "tier": "community"
+    },
+    {
       "kind": "gcp",
       "tier": "community"
     },
     {
       "kind": "gcp_iot",
+      "tier": "community"
+    },
+    {
+      "kind": "gcp_iot_core",
       "tier": "community"
     },
     {
@@ -154,6 +214,10 @@
     },
     {
       "kind": "gcp_pubsub_producer",
+      "tier": "community"
+    },
+    {
+      "kind": "google_alloydb",
       "tier": "community"
     },
     {
@@ -181,6 +245,10 @@
       "tier": "community"
     },
     {
+      "kind": "iothub",
+      "tier": "community"
+    },
+    {
       "kind": "kafka",
       "tier": "community"
     },
@@ -194,6 +262,18 @@
     },
     {
       "kind": "kinesis",
+      "tier": "community"
+    },
+    {
+      "kind": "logger",
+      "tier": "community"
+    },
+    {
+      "kind": "mariadb",
+      "tier": "community"
+    },
+    {
+      "kind": "minio",
       "tier": "community"
     },
     {
@@ -221,11 +301,19 @@
       "tier": "community"
     },
     {
+      "kind": "oci",
+      "tier": "community"
+    },
+    {
       "kind": "oci_streaming",
       "tier": "community"
     },
     {
       "kind": "opc_ua",
+      "tier": "community"
+    },
+    {
+      "kind": "opcua",
       "tier": "community"
     },
     {
@@ -245,6 +333,10 @@
       "tier": "community"
     },
     {
+      "kind": "ots",
+      "tier": "community"
+    },
+    {
       "kind": "pgsql",
       "tier": "community"
     },
@@ -253,11 +345,19 @@
       "tier": "community"
     },
     {
+      "kind": "postgresql",
+      "tier": "community"
+    },
+    {
       "kind": "pubsub",
       "tier": "community"
     },
     {
       "kind": "pulsar",
+      "tier": "community"
+    },
+    {
+      "kind": "rabbit",
       "tier": "community"
     },
     {
@@ -270,6 +370,10 @@
     },
     {
       "kind": "redshift",
+      "tier": "community"
+    },
+    {
+      "kind": "rest",
       "tier": "community"
     },
     {
@@ -293,11 +397,23 @@
       "tier": "community"
     },
     {
+      "kind": "snowflake_aggregated",
+      "tier": "community"
+    },
+    {
       "kind": "snowflake_streaming",
       "tier": "community"
     },
     {
+      "kind": "sparkplug",
+      "tier": "community"
+    },
+    {
       "kind": "sparkplug_b",
+      "tier": "community"
+    },
+    {
+      "kind": "spb",
       "tier": "community"
     },
     {

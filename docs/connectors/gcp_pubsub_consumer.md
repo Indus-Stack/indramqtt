@@ -7,9 +7,9 @@ sidebar:
 
 # GCP Pub/Sub consumer
 
-The `gcp_pubsub_consumer` name is the documented Google Cloud Pub/Sub ingress source. It is not a sink. The source store keeps its registration and its enable flag, but the name is absent from the ready source list. The v5 connectors route also accepts the name and maps it to the `gcp_pubsub` sink runtime.
+The `gcp_pubsub_consumer` name is the documented Google Cloud Pub/Sub ingress source. It is not a sink. This build has no Pub/Sub pull loop, so create and update refuse the source name. The v5 connectors route also accepts the name and maps it to the `gcp_pubsub` sink runtime.
 
-Use it when a tool sends the documented source name. You get a stored source row with the project and the topic parameters. This build has no Pub/Sub pull loop, so the broker does not read messages from a subscription.
+Use it only when a tool sends the documented source name. The broker refuses the source name and stores nothing. This build has no Pub/Sub pull loop, so the broker does not read messages from a subscription.
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
 
 ## Settings
 
-Register the source with `POST /api/v5/sources`.
+`POST /api/v5/sources` refuses the source name.
 
 | Setting | Required | Meaning |
 |---|---|---|
@@ -40,7 +40,7 @@ Register the source with `POST /api/v5/sources`.
 | `parameters` | no | Object of source parameters. Default empty. |
 | `resource_opts` | no | Object of resource options. Default empty. |
 
-The source catalogue documents `parameters.project_id` and `parameters.topic`. The source store validates the type and keeps `parameters` unchanged. It does not validate the two parameter names. The store holds at most 512 sources.
+The source catalogue documents `parameters.project_id` and `parameters.topic`. Create and update refuse the type because this build has no ingress runtime. Nothing is stored. The store holds at most 512 sources.
 
 The v5 connectors route runs the `gcp_pubsub` runtime. It reads `project_id` or `project` (default `test-project`) and `topic_id` or `topic` (default `test-topic`). It reads `endpoint` or `url`. It reads `timeout_ms` or `timeout`. It fixes `auth` to none, `ordering_key_template` to none, and `attributes` to empty. It fixes `batch_size` to 1, `batch_bytes` to 1048576, and `linger_ms` to 10. It fixes `max_retries` to 3, `initial_backoff_ms` to 100, and `max_backoff_ms` to 2000. It registers the name and the aliases `gcp_pubsub:name` and `pubsub:name`.
 
@@ -63,11 +63,11 @@ Example:
 ```
 
 > [!NOTE]
-> The docs run registers this source and creates the connector name. The source stores no message path. The default build refuses the connector route with 400 and names the `gcp_pubsub` feature. A full build returns 201. The sink send path needs a Pub/Sub service. See the record in [Verification failures](../_verification/failures.md).
+> The docs run refuses the source name and creates the connector name. The source stores no message path. The default build refuses the connector route with 400 and names the `gcp_pubsub` feature. A full build returns 201. The sink send path needs a Pub/Sub service. See the record in [Verification failures](../_verification/failures.md).
 
 ## Check that it works
 
-Register the source and create the connector name. The source answers 201. The connector route answers 201 or 400. Both answers print `ok`.
+Register the source and create the connector name. The source answers 400. The connector route answers 201 or 400. Both answers print `ok`.
 
 ```toml test
 [node]
@@ -113,9 +113,8 @@ s1, b1 = call("POST", "/api/v5/sources",
                "type": "gcp_pubsub_consumer",
                "parameters": {"project_id": "my-iot-project",
                               "topic": "telemetry-events"}})
-assert s1 == 201, (s1, b1)
-assert b1["type"] == "gcp_pubsub_consumer", b1
-assert b1["enable"] is True, b1
+assert s1 == 400, (s1, b1)
+assert "ingress runtime" in json.dumps(b1).lower(), b1
 
 s2, b2 = call("POST", "/api/v5/connectors",
               {"name": "gcp-pubsub-consumer-2",
@@ -139,8 +138,8 @@ ok
 ## Limits
 
 - The source id must not be empty and must not exceed 256 bytes. A duplicate id is refused. A full store refuses the create at 512 entries.
-- The source store validates only the type. It stores `parameters` and `resource_opts` as objects and rejects a non-object value.
-- The source name is absent from `GET /api/v5/source_types`. This build has no Pub/Sub pull loop, so the source reads no subscription.
+- The source store refuses the type because it has no ingress runtime. It stores nothing.
+- The source name is absent from `GET /api/v5/source_types`, and create refuses it. This build has no Pub/Sub pull loop.
 - The v1 connectors route refuses `gcp_pubsub_consumer`. It accepts only `gcp_pubsub`, `gcp`, and `pubsub`.
 - The v5 connectors route maps the name to the `gcp_pubsub` runtime. It fixes one message per batch and a 1 MiB byte limit. It sets no ordering key, attributes, or auth.
 - The `gcp_pubsub` runtime refuses a `project_id` or `topic_id` outside 3 to 255 lower case, digits, or hyphen.

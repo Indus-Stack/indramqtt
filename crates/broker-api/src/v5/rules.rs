@@ -8,6 +8,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
@@ -1454,7 +1455,7 @@ impl ConnectorStore {
 
     /// Directory holding kernel state. Disk sinks join it.
     /// Defaults to `./data` in unit tests with no registry.
-    pub(crate) fn data_dir(&self) -> std::path::PathBuf {
+    pub fn data_dir(&self) -> std::path::PathBuf {
         self.registry
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1600,10 +1601,13 @@ pub(crate) fn connector_persist_error(error: broker_config::ConfigError) -> Resp
 /// Probe the connector target the way boot replay does: entries
 /// without a `server`/`url`/… target never probe and count as reachable,
 /// except kinds that need a target, which fail closed without one.
-/// Otherwise a 1.5 s TCP connect decides.
+/// Otherwise a TCP connect with the document's health check timeout
+/// (`resource_opts.health_check_timeout`, default 60 s) decides.
 pub(crate) async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
     match extract_target_host_port(body) {
-        Some(target) => check_tcp_reachable(&target).await.is_ok(),
+        Some(target) => check_tcp_reachable(&target, probe_health_check_timeout(body))
+            .await
+            .is_ok(),
         None => {
             let kind = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
             !probe_kind_needs_target(kind)
@@ -2244,7 +2248,7 @@ fn missing_connector_field(
 /// True when a `disk_log` file path stays inside the data directory:
 /// relative, with no `..`, root or Windows prefix component, and with
 /// no symlink that leaves the directory.
-fn disk_log_path_contained(filepath: &str, data_dir: &std::path::Path) -> bool {
+pub(crate) fn disk_log_path_contained(filepath: &str, data_dir: &std::path::Path) -> bool {
     use std::path::{Component, Path};
     let path = Path::new(filepath);
     if filepath.trim().is_empty()
@@ -2950,6 +2954,72 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
                 Some(gate.feature)
             }
         })
+}
+
+/// True when the body carries the reference service account key in the
+/// `authentication` or `auth` object.
+fn carries_service_account_key(body: &serde_json::Value) -> bool {
+    body.get("authentication")
+        .or_else(|| body.get("auth"))
+        .is_some_and(|auth| {
+            auth.get("service_account_json")
+                .and_then(|value| value.as_str())
+                .is_some()
+                || auth.get("type").and_then(|value| value.as_str()) == Some("service_account_json")
+        })
+}
+
+/// Validate a `service_account_json` credential when the gcp_pubsub /
+/// bigquery build feature is disabled. Returns `Ok(())` when the
+/// credential is present and well-formed, or an error message naming
+/// the `authentication.service_account_json` field.
+pub(crate) fn validate_service_account_json(
+    body: &serde_json::Value,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(auth) = body.get("authentication").or_else(|| body.get("auth")) {
+        if auth.get("type").and_then(|v| v.as_str()) == Some("service_account_json") {
+            return validate_service_account_raw(body, name);
+        }
+        return Ok(());
+    }
+    if body.get("service_account_json").is_some() {
+        return validate_service_account_raw(body, name);
+    }
+    Ok(())
+}
+
+fn validate_service_account_raw(body: &serde_json::Value, name: &str) -> Result<(), String> {
+    let raw_opt = body
+        .get("authentication")
+        .or_else(|| body.get("auth"))
+        .and_then(|auth| auth.get("service_account_json"))
+        .or_else(|| body.get("service_account_json"))
+        .and_then(|v| v.as_str());
+    match raw_opt {
+        None => Err(format!(
+            "connector {name:?} is missing required field: authentication.service_account_json"
+        )),
+        Some(raw) => {
+            let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+                format!(
+                    "connector {name:?} field `authentication.service_account_json` is not JSON: {error}"
+                )
+            })?;
+            for field in ["client_email", "private_key"] {
+                let ok = key
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.trim().is_empty());
+                if !ok {
+                    return Err(format!(
+                        "connector {name:?} field `authentication.service_account_json` is missing {field}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// True for the three IoT kinds that the CEO kept out of the MVP on
@@ -4618,17 +4688,8 @@ pub async fn register_live_sink(
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("host"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("127.0.0.1:4001");
-            let endpoint = if raw_server.contains("://") {
-                raw_server.to_string()
-            } else if raw_server.contains(':') {
-                format!("http://{raw_server}")
-            } else {
-                format!("http://{raw_server}:8086")
-            };
+                .and_then(|v| v.as_str());
+            let endpoint = crate::v5::action_sinks::greptimedb_endpoint(raw_server);
             let Some(database) = body
                 .get("database")
                 .or_else(|| body.get("dbname"))
@@ -4706,6 +4767,12 @@ pub async fn register_live_sink(
                     ));
                 }
             };
+            let collision_seq_column = body
+                .get("collision_seq_column")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let config = broker_connectors::greptimedb::GreptimeDbConfig {
                 endpoint,
                 database: database.to_string(),
@@ -4716,6 +4783,7 @@ pub async fn register_live_sink(
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
+                collision_seq_column,
             };
             let transport = Arc::new(broker_connectors::greptimedb::HttpGreptimeDbTransport::new(
                 &config,
@@ -5203,16 +5271,8 @@ pub async fn register_live_sink(
                 .or_else(|| body.get("endpoint"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("127.0.0.1:8361");
-            let endpoint =
-                if raw_server.starts_with("http://") || raw_server.starts_with("https://") {
-                    raw_server.to_string()
-                } else {
-                    format!("http://{raw_server}")
-                };
+                .and_then(|v| v.as_str());
+            let endpoint = crate::v5::action_sinks::datalayers_endpoint(raw_server);
             let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
@@ -6670,6 +6730,58 @@ pub async fn register_live_sink(
         }
         #[cfg(feature = "gcp_pubsub")]
         "gcp_pubsub" | "gcp" | "pubsub" | "gcp_pubsub_producer" | "gcp_pubsub_consumer" => {
+            // Refuse a present but bad service account key at create.
+            // A bad key never falls back to an anonymous identity.
+            if let Some(auth) = body.get("authentication").or_else(|| body.get("auth")) {
+                if auth.get("type").and_then(|v| v.as_str()) == Some("service_account_json") {
+                    let raw_opt = auth
+                        .get("service_account_json")
+                        .or_else(|| body.get("service_account_json"))
+                        .and_then(|v| v.as_str());
+                    match raw_opt {
+                        None => {
+                            return Err(format!(
+                                "connector {name:?} is missing required field: authentication.service_account_json"
+                            ));
+                        }
+                        Some(raw) => {
+                            let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+                                format!(
+                                    "connector {name:?} field `authentication.service_account_json` is not JSON: {error}"
+                                )
+                            })?;
+                            for field in ["client_email", "private_key"] {
+                                let ok = key
+                                    .get(field)
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|v| !v.trim().is_empty());
+                                if !ok {
+                                    return Err(format!(
+                                        "connector {name:?} field `authentication.service_account_json` is missing {field}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(raw) = body.get("service_account_json").and_then(|v| v.as_str()) {
+                let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+                    format!(
+                        "connector {name:?} field `authentication.service_account_json` is not JSON: {error}"
+                    )
+                })?;
+                for field in ["client_email", "private_key"] {
+                    let ok = key
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|v| !v.trim().is_empty());
+                    if !ok {
+                        return Err(format!(
+                            "connector {name:?} field `authentication.service_account_json` is missing {field}"
+                        ));
+                    }
+                }
+            }
             let project_id = body
                 .get("project_id")
                 .or_else(|| body.get("project"))
@@ -6749,6 +6861,8 @@ pub async fn register_live_sink(
             };
             // Dataset and table are action targets. Without them this
             // connector has no legacy target, so it registers no sink.
+            // A bad key without them still stores, so the action
+            // path can prove the refusal through its own entry.
             let Some(dataset_id) = body
                 .get("dataset_id")
                 .or_else(|| body.get("dataset"))
@@ -6763,6 +6877,58 @@ pub async fn register_live_sink(
             else {
                 return Ok(());
             };
+            // Refuse a present but bad service account key at create.
+            // A bad key never falls back to an anonymous identity.
+            if let Some(auth) = body.get("authentication").or_else(|| body.get("auth")) {
+                if auth.get("type").and_then(|v| v.as_str()) == Some("service_account_json") {
+                    let raw_opt = auth
+                        .get("service_account_json")
+                        .or_else(|| body.get("service_account_json"))
+                        .and_then(|v| v.as_str());
+                    match raw_opt {
+                        None => {
+                            return Err(format!(
+                                "connector {name:?} is missing required field: authentication.service_account_json"
+                            ));
+                        }
+                        Some(raw) => {
+                            let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+                                format!(
+                                    "connector {name:?} field `authentication.service_account_json` is not JSON: {error}"
+                                )
+                            })?;
+                            for field in ["client_email", "private_key"] {
+                                let ok = key
+                                    .get(field)
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|v| !v.trim().is_empty());
+                                if !ok {
+                                    return Err(format!(
+                                        "connector {name:?} field `authentication.service_account_json` is missing {field}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(raw) = body.get("service_account_json").and_then(|v| v.as_str()) {
+                let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+                    format!(
+                        "connector {name:?} field `authentication.service_account_json` is not JSON: {error}"
+                    )
+                })?;
+                for field in ["client_email", "private_key"] {
+                    let ok = key
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|v| !v.trim().is_empty());
+                    if !ok {
+                        return Err(format!(
+                            "connector {name:?} field `authentication.service_account_json` is missing {field}"
+                        ));
+                    }
+                }
+            }
             let endpoint = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
@@ -7376,6 +7542,19 @@ pub async fn register_live_sink(
     Ok(())
 }
 
+/// Render a duplicate connector create: HTTP 400 with the documented
+/// `ALREADY_EXISTS` code.
+fn connector_already_exists(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "code": "ALREADY_EXISTS",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /api/v5/connectors` (C07-02): validate the body against the
 /// named kind (unknown kind or malformed config rejected with the
 /// documented error shape); a duplicate id is rejected cleanly, never
@@ -7492,13 +7671,13 @@ pub async fn create_connector(
     // Reject a duplicate id before mutating anything: pushing it into
     // the store would poison every later connector POST/PUT/DELETE, whose
     // persistence export re-validates the whole store and fails on the
-    // duplicated id. The documented conflict code is `ALREADY_EXISTS`.
+    // duplicated id. The documented code is `ALREADY_EXISTS` and the
+    // status is `BAD_REQUEST`, as the error catalogue documents.
     // This early read-check also skips the wasted live-sink
     // registration below; the write-locked re-check before the push
     // closes the check-then-insert race for the in-memory store.
     if state.connectors.contains(&name) {
-        return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
-            .into_response();
+        return connector_already_exists(format!("connector {name:?} already exists"));
     }
     // Store-cap bound (management-plane, fail closed): an obviously full
     // store fails without a needless registration attempt.
@@ -7571,6 +7750,52 @@ pub async fn create_connector(
         )
             .into_response();
     }
+    // Fail closed (S1-01): a target field that is a secret reference
+    // resolving to nothing, or an http/https URL without a host, is
+    // refused at create, naming the field. A connector with no usable
+    // target can never dial and must not be stored in a degraded state.
+    // (Empty strings are already refused by `missing_connector_field`.)
+    for key in [
+        "server",
+        "servers",
+        "endpoint",
+        "endpoint_url",
+        "url",
+        "host",
+        "mqtt_url",
+        "broker_address",
+    ] {
+        let Some(raw) = body.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidate = if broker_config::secrets::is_secret_ref(trimmed) {
+            let resolved = broker_connectors::resolve_field_secret(trimmed);
+            if resolved.trim().is_empty() {
+                return ApiError::BadRequest(format!(
+                    "connector {name:?} field `{key}` secret reference resolves to an empty target (connector create)"
+                ))
+                .into_response();
+            }
+            resolved.trim().to_string()
+        } else {
+            trimmed.to_string()
+        };
+        let Ok(parsed) = reqwest::Url::parse(&candidate) else {
+            continue;
+        };
+        if matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_none_or(|h| h.is_empty())
+        {
+            return ApiError::BadRequest(format!(
+                "connector {name:?} field `{key}` has no host (connector create)"
+            ))
+            .into_response();
+        }
+    }
     // A RocketMQ topic is a bare name. The connector-only form keeps no
     // sink under lane B, so validate the stored target here instead.
     if crate::v5::action_sinks::canonical_action_kind(&conn_type) == "rocketmq" {
@@ -7641,28 +7866,53 @@ pub async fn create_connector(
     // staged keys are invisible to delivery until the store commits, so
     // a persist failure leaves the live map as it was.
     state.engine.connectors().begin_stage();
-    // Delivery dials its target lazily at send time, so registration
-    // never depends on a point-in-time reachability probe. A kind with
-    // no execution path registers nothing, so it honestly reads back
-    // `disconnected` (stored config first, no claimed execution).
-    if let Err(register_error) = try_register_live_sink(
-        &state.engine,
-        &conn_type,
-        &name,
-        &body,
-        &state.connectors.data_dir(),
-    )
-    .await
-    {
-        state.engine.connectors().abort_stage();
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": register_error,
-            })),
-        )
+    // When the build feature for this kind is disabled, do not register
+    // a live sink: refuse with `BAD_REQUEST` naming the feature, so the
+    // connector is never stored in a degraded state. gcp_pubsub stores
+    // config-only, and bigquery does the same when it carries the
+    // reference service account key, so a later build can register them.
+    if let Some(feature) = disabled_connector_feature(&conn_type) {
+        let stores_config_only = match conn_type.as_str() {
+            "gcp_pubsub" => true,
+            "bigquery" => carries_service_account_key(&body),
+            _ => false,
+        };
+        if !stores_config_only {
+            state.engine.connectors().abort_stage();
+            return ApiError::BadRequest(format!(
+                "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
+            ))
             .into_response();
+        }
+        // gcp_pubsub still refuses a malformed service account key. A
+        // bigquery key waits for the action path, which owns validation.
+        if conn_type == "gcp_pubsub" && carries_service_account_key(&body) {
+            if let Err(msg) = validate_service_account_json(&body, &name) {
+                state.engine.connectors().abort_stage();
+                return ApiError::BadRequest(msg).into_response();
+            }
+        }
+    } else {
+        // Feature enabled: register the live sink.
+        if let Err(register_error) = try_register_live_sink(
+            &state.engine,
+            &conn_type,
+            &name,
+            &body,
+            &state.connectors.data_dir(),
+        )
+        .await
+        {
+            state.engine.connectors().abort_stage();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": register_error,
+                })),
+            )
+                .into_response();
+        }
     }
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(name.clone()));
@@ -7683,8 +7933,7 @@ pub async fn create_connector(
         Ok(()) => {}
         Err(ConnectorInsertError::Duplicate) => {
             state.engine.connectors().abort_stage();
-            return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
-                .into_response();
+            return connector_already_exists(format!("connector {name:?} already exists"));
         }
         Err(ConnectorInsertError::Full) => {
             state.engine.connectors().abort_stage();
@@ -7983,7 +8232,28 @@ pub async fn update_connector(
     // in under the action dispatch keys below, after the stored update
     // and its persist.
     state.engine.connectors().begin_stage();
-    if let Err(register_error) = try_register_live_sink(
+    if let Some(feature) = disabled_connector_feature(&conn_type) {
+        let stores_config_only = match conn_type.as_str() {
+            "gcp_pubsub" => true,
+            "bigquery" => carries_service_account_key(&body),
+            _ => false,
+        };
+        if !stores_config_only {
+            state.engine.connectors().abort_stage();
+            return ApiError::BadRequest(format!(
+                "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
+            ))
+            .into_response();
+        }
+        // gcp_pubsub still refuses a malformed service account key. A
+        // bigquery key waits for the action path, which owns validation.
+        if conn_type == "gcp_pubsub" && carries_service_account_key(&body) {
+            if let Err(msg) = validate_service_account_json(&body, &bare) {
+                state.engine.connectors().abort_stage();
+                return ApiError::BadRequest(msg).into_response();
+            }
+        }
+    } else if let Err(register_error) = try_register_live_sink(
         &state.engine,
         &conn_type,
         &bare,
@@ -8109,14 +8379,14 @@ pub async fn update_connector(
     state.engine.set_action_enabled(&bare, enable);
     // MV-01/R2: the replace can flip the enable flag along with the
     // settings; the dependent actions' delivery follows it.
-    mirror_dependent_actions(&state, &bare, enable);
+    mirror_dependent_actions(&state, &bare);
     if let Err(error) = state.connectors.persist() {
         // Nothing swapped: drop the staged generation, restore the
         // stored row and the flags, and keep every old sink delivering.
         state.engine.connectors().abort_stage();
         state.connectors.replace(&bare, stored.clone());
         state.engine.set_action_enabled(&bare, old_enable);
-        mirror_dependent_actions(&state, &bare, old_enable);
+        mirror_dependent_actions(&state, &bare);
         return connector_persist_error(error);
     }
     // Publish the new generation in one step (staged build, persist,
@@ -8297,14 +8567,16 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
 // checker pins it.
 /// MV-01/R2: a connector disable stops every dependent action's
 /// delivery; a connector enable restores them. Each dependent action's
-/// dispatch flag rides `action.enable && connector.enable`. Actions
-/// that target other connectors are untouched.
-fn mirror_dependent_actions(state: &ApiState, bare: &str, enable: bool) {
+/// dispatch flag rides `action.enable && every referenced connector
+/// enable`. Actions that target other connectors are untouched. The
+/// store already holds the new flag at each call.
+fn mirror_dependent_actions(state: &ApiState, bare: &str) {
     for record in state.actions.snapshot() {
         if crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, bare) {
             state.engine.set_action_enabled(
                 &broker_config::v5_action_sink_key(&record.id),
-                record.enable && enable,
+                record.enable
+                    && crate::v5::action_sinks::action_connector_enable(&state.connectors, &record),
             );
         }
     }
@@ -8352,7 +8624,7 @@ pub async fn set_connector_enabled(
     // MV-01/R2: a connector disable stops every dependent action's
     // delivery; an enable restores them (the flap rides the same
     // mirror, before persist, after the store flip).
-    mirror_dependent_actions(&state, &bare, enable);
+    mirror_dependent_actions(&state, &bare);
     if !enable {
         flush_dependent_actions(&state, &bare).await;
     }
@@ -8523,7 +8795,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
         .set_action_enabled(&broker_config::v5_action_sink_key(&bare), enable);
     // MV-01/R2: a connector disable stops every dependent action's
     // delivery; an enable restores them.
-    mirror_dependent_actions(state, &bare, enable);
+    mirror_dependent_actions(state, &bare);
     if !enable {
         flush_dependent_actions(state, &bare).await;
     }
@@ -8581,6 +8853,54 @@ fn http_target_host_port(reference: &str) -> Option<String> {
     Some(format!("{}:{}", host, port))
 }
 
+/// Name the target field whose secret reference resolves to nothing.
+/// The probe refuses such a field instead of reporting reachable.
+fn secret_target_refused_field(body: &serde_json::Value) -> Option<&'static str> {
+    // Reason: an unreadable `file:` or unset `env:` reference has no
+    // host to dial. Fail closed and name the field.
+    for key in [
+        "url",
+        "server",
+        "servers",
+        "endpoint",
+        "endpoint_url",
+        "host",
+        "mqtt_url",
+        "broker_address",
+    ] {
+        let Some(raw) = body.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !broker_config::secrets::is_secret_ref(trimmed) {
+            continue;
+        }
+        let resolved = broker_connectors::resolve_field_secret(trimmed);
+        if resolved.trim().is_empty() {
+            return Some(match key {
+                "url" => "url",
+                "server" => "server",
+                "servers" => "servers",
+                "endpoint" => "endpoint",
+                "endpoint_url" => "endpoint_url",
+                "host" => "host",
+                "mqtt_url" => "mqtt_url",
+                _ => "broker_address",
+            });
+        }
+        if matches!(key, "url" | "endpoint" | "endpoint_url")
+            && http_target_host_port(trimmed).is_none()
+        {
+            return Some(match key {
+                "url" => "url",
+                "endpoint" => "endpoint",
+                _ => "endpoint_url",
+            });
+        }
+    }
+    None
+}
+
 pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
     // Read the MQTT target first. Sparkplug uses `mqtt_url` or
     // `broker_address`. Parse the host and port from the value.
@@ -8615,42 +8935,52 @@ pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<Strin
         }
     }
     if let Some(s) = body.get("server").and_then(|v| v.as_str()) {
-        let mut clean = s.trim();
-        if let Some((_, rest)) = clean.split_once("://") {
-            clean = rest;
-        }
-        let host_port = clean
-            .split('@')
-            .next_back()
-            .unwrap_or(clean)
-            .split('/')
-            .next()
-            .unwrap_or(clean)
-            .split('?')
-            .next()
-            .unwrap_or(clean);
-        if !host_port.is_empty() {
-            return Some(host_port.to_string());
+        let candidate = broker_connectors::resolve_field_secret(s);
+        if candidate.is_empty() {
+            // secret reference resolved to nothing; try the next field
+        } else {
+            let mut clean = candidate.trim();
+            if let Some((_, rest)) = clean.split_once("://") {
+                clean = rest;
+            }
+            let host_port = clean
+                .split('@')
+                .next_back()
+                .unwrap_or(clean)
+                .split('/')
+                .next()
+                .unwrap_or(clean)
+                .split('?')
+                .next()
+                .unwrap_or(clean);
+            if !host_port.is_empty() {
+                return Some(host_port.to_string());
+            }
         }
     }
     if let Some(s) = body.get("servers").and_then(|v| v.as_str()) {
-        let first = s.split(',').next().unwrap_or(s).trim();
-        let mut clean = first;
-        if let Some((_, rest)) = clean.split_once("://") {
-            clean = rest;
-        }
-        let host_port = clean
-            .split('@')
-            .next_back()
-            .unwrap_or(clean)
-            .split('/')
-            .next()
-            .unwrap_or(clean)
-            .split('?')
-            .next()
-            .unwrap_or(clean);
-        if !host_port.is_empty() {
-            return Some(host_port.to_string());
+        let candidate = broker_connectors::resolve_field_secret(s);
+        if candidate.is_empty() {
+            // secret reference resolved to nothing; try the next field
+        } else {
+            let first = candidate.split(',').next().unwrap_or(&candidate).trim();
+            let mut clean = first;
+            if let Some((_, rest)) = clean.split_once("://") {
+                clean = rest;
+            }
+            let host_port = clean
+                .split('@')
+                .next_back()
+                .unwrap_or(clean)
+                .split('/')
+                .next()
+                .unwrap_or(clean)
+                .split('?')
+                .next()
+                .unwrap_or(clean);
+            if !host_port.is_empty() {
+                return Some(host_port.to_string());
+            }
         }
     }
     if let Some(s) = body.get("endpoint").and_then(|v| v.as_str()) {
@@ -8679,7 +9009,13 @@ pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<Strin
         }
     }
     if let Some(s) = body.get("endpoint_url").and_then(|v| v.as_str()) {
-        let mut clean = s.trim();
+        let trimmed = s.trim();
+        if broker_config::secrets::is_secret_ref(trimmed) {
+            // Resolve like `endpoint`: a secret reference is never dialled
+            // as a fabricated target.
+            return http_target_host_port(trimmed);
+        }
+        let mut clean = trimmed;
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
@@ -8729,25 +9065,30 @@ pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<Strin
         return http_target_host_port(u);
     }
     if let Some(h) = body.get("host").and_then(|v| v.as_str()) {
-        let mut clean = h.trim();
-        if let Some((_, rest)) = clean.split_once("://") {
-            clean = rest;
+        let candidate = broker_connectors::resolve_field_secret(h);
+        if candidate.is_empty() {
+            // secret reference resolved to nothing; try the next field
+        } else {
+            let mut clean = candidate.trim();
+            if let Some((_, rest)) = clean.split_once("://") {
+                clean = rest;
+            }
+            let host_port = clean
+                .split('@')
+                .next_back()
+                .unwrap_or(clean)
+                .split('/')
+                .next()
+                .unwrap_or(clean)
+                .split('?')
+                .next()
+                .unwrap_or(clean);
+            if host_port.contains(':') {
+                return Some(host_port.to_string());
+            }
+            let port = body.get("port").and_then(|v| v.as_u64()).unwrap_or(1433);
+            return Some(format!("{}:{}", host_port, port));
         }
-        let host_port = clean
-            .split('@')
-            .next_back()
-            .unwrap_or(clean)
-            .split('/')
-            .next()
-            .unwrap_or(clean)
-            .split('?')
-            .next()
-            .unwrap_or(clean);
-        if host_port.contains(':') {
-            return Some(host_port.to_string());
-        }
-        let port = body.get("port").and_then(|v| v.as_u64()).unwrap_or(1433);
-        return Some(format!("{}:{}", host_port, port));
     }
     // IoT and messaging hubs name the target outside `host`. The probe
     // dials the same closed-port value that delivery uses.
@@ -8787,22 +9128,72 @@ pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<Strin
     None
 }
 
-pub(crate) async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
+pub(crate) async fn check_tcp_reachable(
+    addr: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
     let target = if addr.contains(':') {
         addr.to_string()
     } else {
         format!("{}:80", addr)
     };
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(1500),
-        tokio::net::TcpStream::connect(&target),
-    )
-    .await
-    {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&target)).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(format!("Connection refused to {}: {}", target, e)),
-        Err(_) => Err(format!("Connection to {} timed out after 1.5s", target)),
+        Err(_) => Err(format!(
+            "Connection to {} timed out after {}s",
+            target,
+            timeout.as_secs()
+        )),
     }
+}
+
+/// Probe health check timeout: `resource_opts.health_check_timeout` of the
+/// probed document, defaulting to 60 s. Reason: the reference
+/// specification defaults a target reachability check to 60 s; a missing,
+/// blank or unparseable value fails closed at that default instead of an
+/// invented value. The outer probe constant still caps the whole request.
+fn probe_health_check_timeout(body: &serde_json::Value) -> Duration {
+    // Reason: the reference probe default is 60 s for one reachability dial.
+    const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+    // Reason: fixed scale factors map duration units to nanoseconds.
+    const NANOS_PER_MICRO: f64 = 1_000.0;
+    const NANOS_PER_MILLI: f64 = 1_000_000.0;
+    const NANOS_PER_SEC: f64 = 1_000_000_000.0;
+    const SECS_PER_MIN: f64 = 60.0;
+    const SECS_PER_HOUR: f64 = 3600.0;
+    let Some(text) = body
+        .get("resource_opts")
+        .and_then(|opts| opts.get("health_check_timeout"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return DEFAULT_PROBE_TIMEOUT;
+    };
+    let Some(split) = text.find(|c: char| !c.is_ascii_digit() && c != '.') else {
+        return DEFAULT_PROBE_TIMEOUT;
+    };
+    let (number, unit) = text.split_at(split);
+    let Ok(number) = number.parse::<f64>() else {
+        return DEFAULT_PROBE_TIMEOUT;
+    };
+    if !number.is_finite() || number < 0.0 {
+        return DEFAULT_PROBE_TIMEOUT;
+    }
+    let nanos = match unit.trim() {
+        "ns" => number,
+        "us" | "µs" => number * NANOS_PER_MICRO,
+        "ms" => number * NANOS_PER_MILLI,
+        "s" => number * NANOS_PER_SEC,
+        "m" => number * SECS_PER_MIN * NANOS_PER_SEC,
+        "h" => number * SECS_PER_HOUR * NANOS_PER_SEC,
+        _ => return DEFAULT_PROBE_TIMEOUT,
+    };
+    if !nanos.is_finite() || nanos > u64::MAX as f64 {
+        return DEFAULT_PROBE_TIMEOUT;
+    }
+    Duration::from_nanos(nanos as u64)
 }
 
 /// True when the kind stores documents through a server target. Such a
@@ -9266,8 +9657,11 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
         }
     });
     if let Some(target) = target {
-        let dial =
-            tokio::time::timeout(CONNECTOR_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
+        let dial = tokio::time::timeout(
+            CONNECTOR_PROBE_TIMEOUT,
+            check_tcp_reachable(&target, probe_health_check_timeout(&body)),
+        )
+        .await;
         match dial {
             Ok(Ok(())) => {
                 if probe_kind_needs_http_handshake(&kind) {
@@ -9308,6 +9702,8 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
         probe_failed(format!(
             "connector type {kind} needs a probe target: missing required field: server"
         ))
+    } else if let Some(field) = secret_target_refused_field(&body) {
+        probe_failed(format!("missing required field: {field}"))
     } else {
         StatusCode::NO_CONTENT.into_response()
     }
@@ -9457,7 +9853,11 @@ pub async fn probe_action(
         }
     });
     if let Some(target) = target {
-        let dial = tokio::time::timeout(ACTION_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
+        let dial = tokio::time::timeout(
+            ACTION_PROBE_TIMEOUT,
+            check_tcp_reachable(&target, probe_health_check_timeout(&body)),
+        )
+        .await;
         match dial {
             Ok(Ok(())) => {
                 if probe_kind_needs_http_handshake(&kind) {
@@ -9498,6 +9898,8 @@ pub async fn probe_action(
         probe_failed(format!(
             "connector type {kind} needs a probe target: missing required field: server"
         ))
+    } else if let Some(field) = secret_target_refused_field(&body) {
+        probe_failed(format!("missing required field: {field}"))
     } else {
         StatusCode::NO_CONTENT.into_response()
     }
@@ -9561,11 +9963,22 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
     if let Some(message) = kind_refusal(&kind) {
         return probe_failed(message);
     }
+    // MV-08: a source kind without a working ingress has no runtime to
+    // probe. Refuse it with the same 400 shape before any dial.
+    if !super::sources::is_supported_source_type(&kind) {
+        return probe_failed(format!(
+            "source type {kind} has no ingress runtime in this broker"
+        ));
+    }
     // Runtime probe hook (the W3-23 dial path): kinds that expose a network
     // target get one bounded dial; kinds without one count as reachable once
     // the kind itself validated, matching the connector/action probes.
     if let Some(target) = extract_target_host_port(&body) {
-        let dial = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
+        let dial = tokio::time::timeout(
+            SOURCE_PROBE_TIMEOUT,
+            check_tcp_reachable(&target, probe_health_check_timeout(&body)),
+        )
+        .await;
         match dial {
             Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
             Ok(Err(err)) => probe_failed(err),
@@ -10000,5 +10413,65 @@ mod connector_feature_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn probe_health_check_timeout_defaults_to_60s() {
+        let body = serde_json::json!({});
+        assert_eq!(
+            probe_health_check_timeout(&body),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn probe_health_check_timeout_reads_resource_opts() {
+        let body = serde_json::json!({
+            "resource_opts": {"health_check_timeout": "30s"}
+        });
+        assert_eq!(
+            probe_health_check_timeout(&body),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn probe_health_check_timeout_refuses_bad_unit() {
+        let body = serde_json::json!({
+            "resource_opts": {"health_check_timeout": "30xyz"}
+        });
+        assert_eq!(
+            probe_health_check_timeout(&body),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn probe_health_check_timeout_refuses_empty_string() {
+        let body = serde_json::json!({
+            "resource_opts": {"health_check_timeout": ""}
+        });
+        assert_eq!(
+            probe_health_check_timeout(&body),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn probe_health_check_timeout_ms_and_m() {
+        let body = serde_json::json!({
+            "resource_opts": {"health_check_timeout": "500ms"}
+        });
+        assert_eq!(
+            probe_health_check_timeout(&body),
+            std::time::Duration::from_millis(500)
+        );
+        let body = serde_json::json!({
+            "resource_opts": {"health_check_timeout": "2m"}
+        });
+        assert_eq!(
+            probe_health_check_timeout(&body),
+            std::time::Duration::from_secs(120)
+        );
     }
 }

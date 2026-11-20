@@ -49,6 +49,9 @@ ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability. It comes through serde_yaml in the OPC UA client library (async-opcua-core, its configuration-file loader, which IndraMQTT never calls) and on a test-only path of broker-auth. Remove when the OPC UA library makes YAML optional." },
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1: fixed in 0.39.0, which no released sqlx version accepts; the rule-engine dependency pins sqlx 0.8. Known debt: remove sqlx's sqlite feature if no production path uses it, or upgrade, before the 1.0 release." },
     { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro, build time only, no code at run time. Comes through the rule-engine dependency." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained (all versions affected, patched = []). Direct dependency of broker-api and broker-rules, plus rekuiper and third-party connector drivers; migrate direct and rekuiper usage to jiff or time." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained (all versions affected, patched = []). Transitive via vendored rekuiper-sql; remove once rekuiper migrates to jiff or time." },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build: unmaintained (all versions affected, patched = []). Build-time transitive via chrono-tz in vendored rekuiper-sql; remove with chrono-tz." },
 ]
 
 [bans]

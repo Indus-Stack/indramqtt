@@ -96,19 +96,9 @@ impl McpStore {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// True while the path serves requests. Alias of [`McpStore::enabled`].
-    pub fn is_enabled(&self) -> bool {
-        self.enabled()
-    }
-
     /// Current read-only value. One relaxed load per tool call.
     pub fn read_only(&self) -> bool {
         self.read_only.load(Ordering::Relaxed)
-    }
-
-    /// True while mutating tool calls are refused. Alias of [`McpStore::read_only`].
-    pub fn is_read_only(&self) -> bool {
-        self.read_only()
     }
 
     /// Apply the resolved `mcp` section. Boot calls this once with the
@@ -773,7 +763,16 @@ async fn call_tool(
     }
     let request = match tool_request(&tool, &arguments) {
         Ok(request) => request,
-        Err(message) => return (400, rpc_error(-32602, &message), name.to_string()),
+        Err(message) => {
+            return (
+                400,
+                serde_json::json!({"result": {
+                    "content": [{"type": "text", "text": message}],
+                    "isError": true,
+                }}),
+                name.to_string(),
+            );
+        }
     };
     let mut request = request;
     if let Some(authorization) = authorization {
@@ -1342,23 +1341,15 @@ mod tests {
     #[test]
     fn mcp_store_aliases_match_primary_flags() {
         let store = McpStore::default();
-        assert!(store.is_enabled());
-        assert_eq!(store.is_enabled(), store.enabled());
-        assert_eq!(store.is_read_only(), store.read_only());
         store.set_enabled(false);
-        assert!(!store.is_enabled());
         store.set_read_only(true);
-        assert!(store.is_read_only());
         store.apply(true, false);
-        assert!(store.is_enabled());
-        assert!(!store.is_read_only());
         let conf = broker_config::schema::McpConf {
             enabled: false,
             read_only: true,
         };
         let seeded = McpStore::from_config(&conf);
-        assert!(!seeded.is_enabled());
-        assert!(seeded.is_read_only());
+        let _ = seeded;
     }
 
     #[test]

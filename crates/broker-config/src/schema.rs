@@ -4082,9 +4082,31 @@ pub fn settings_reference_markdown() -> String {
         }
     }
     for (index, group) in groups.iter().enumerate() {
-        out.push_str(&format!(
-            "    G{index}[\"{group}\"] -- \"set\" --> Kernel[\"kernel\"]\n"
-        ));
+        // Each edge names one real setting and one real component.
+        // Reason: the reference page needs an overview that the code supports.
+        let (setting, target, verb) = match *group {
+            "listeners" => ("listeners.tcp.bind", Some("ListenerStore"), "serve"),
+            "session + quotas" => ("session.max_packet_size", Some("SessionManager"), "hold"),
+            "rules + delayed" => (
+                "rules_engine.window_channel_depth",
+                Some("RuleEngine"),
+                "apply",
+            ),
+            "auth + user stores" => ("auth.enabled", Some("ApiState"), "guard"),
+            _ => ("node.id", None, "set"),
+        };
+        if let Some(component) = target {
+            out.push_str(&format!(
+                "    G{index}[\"{group}\"] -- \"set {setting}\" --> {component}[\"{component}\"]\n"
+            ));
+            out.push_str(&format!(
+                "    {component} -- \"{verb}\" --> Kernel[\"kernel\"]\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "    G{index}[\"{group}\"] -- \"set {setting}\" --> Kernel[\"kernel\"]\n"
+            ));
+        }
     }
     out.push_str("```\n\n");
     for (section, fields) in schema_sections() {

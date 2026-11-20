@@ -1,6 +1,6 @@
 {
   "action": "Connect one TLS client without a certificate and one with a valid certificate.",
-  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem\"\nfail_if_no_peer_cert = true\n",
+  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\ncert_file = \"${TLS_DIR}/server-cert.pem\"\nkey_file = \"${TLS_DIR}/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"${TLS_DIR}/ca-cert.pem\"\nfail_if_no_peer_cert = true\n",
   "item": "listeners.tls.fail_if_no_peer_cert",
   "kind": "setting",
   "output": "no-cert-refused",

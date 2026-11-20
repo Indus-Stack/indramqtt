@@ -63,6 +63,10 @@ pub struct Subscription {
     pub retain_as_published: bool,
     pub retain_handling: u8,
     pub subscription_id: u32,
+    /// Monotonic `SessionId` owning this subscription copy (`0` when unbound
+    /// or constructed by legacy/test callers). Checked at delivery so an
+    /// already-snapshotted match never delivers to a replacement session.
+    pub session_id: u64,
 }
 
 impl Subscription {
@@ -78,6 +82,7 @@ impl Subscription {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         }
     }
 
@@ -98,6 +103,7 @@ impl Subscription {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         }
     }
 
@@ -1208,6 +1214,47 @@ impl Router {
         }
         self.root.store(Arc::new(next));
         true
+    }
+
+    /// Subscribe atomically with an admission check/commit closure run under
+    /// `trie_write` after capacity is verified and before the trie is mutated.
+    /// Returns `Ok(false)` if the router is full (without running `admit`),
+    /// `Err(e)` if `admit` fails (without mutating the router), or `Ok(true)`
+    /// once both `admit` and trie insertion succeed.
+    pub fn try_subscribe_with<E>(
+        &self,
+        filter: &TopicFilter,
+        sub: Subscription,
+        admit: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        if sub.tenant.as_ref() != DEFAULT_TENANT_ID {
+            self.has_non_default.store(true, Ordering::Relaxed);
+        }
+        let _guard = self.trie_write.lock();
+        let current = self.root.load_full();
+        if !Self::terminal_contains(
+            &current,
+            filter,
+            sub.client_id.as_ref(),
+            sub.tenant.as_ref(),
+        ) && self.subscription_count.load(Ordering::Relaxed) >= MAX_SUBSCRIPTIONS
+        {
+            return Ok(false);
+        }
+        admit()?;
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        let root_owned = (*current).clone();
+        let (next, added) = Self::insert_owned(root_owned, &levels, 0, sub);
+        if added {
+            self.subscription_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.root.store(Arc::new(next));
+        Ok(true)
+    }
+
+    #[doc(hidden)]
+    pub fn set_subscription_count_for_test(&self, count: usize) {
+        self.subscription_count.store(count, Ordering::Relaxed);
     }
 
     /// Insert helper with path copying on a shallow-cloned root. Only the

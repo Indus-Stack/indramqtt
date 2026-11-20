@@ -226,6 +226,51 @@ def wait_health(api, proc, log_path, timeout=30):
     raise RuntimeError("broker never answered /healthz")
 
 
+def generate_ephemeral_tls_pki(tls_dir: Path):
+    """Generate a temporary CA, server, client-a (CN=k1-05-a), and wrong-client PKI."""
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    for ca_prefix, subj in [("ca", "/CN=indra-k1-05-ca"), ("wrong-ca", "/CN=indra-wrong-ca")]:
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                "-subj", subj,
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                "-keyout", str(tls_dir / f"{ca_prefix}-key.pem"),
+                "-out", str(tls_dir / f"{ca_prefix}-cert.pem"),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    for name, subj, ext, ca_prefix in [
+        ("server", "/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n", "ca"),
+        ("client-a", "/CN=k1-05-a", "extendedKeyUsage=clientAuth\n", "ca"),
+        ("wrong-client", "/CN=wrong-client", "extendedKeyUsage=clientAuth\n", "wrong-ca"),
+    ]:
+        csr = tls_dir / f"{name}.csr"
+        extf = tls_dir / f"{name}.ext"
+        extf.write_text(ext, encoding="utf-8")
+        subprocess.run(
+            [
+                "openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", subj,
+                "-keyout", str(tls_dir / f"{name}-key.pem"), "-out", str(csr),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl", "x509", "-req", "-in", str(csr),
+                "-CA", str(tls_dir / f"{ca_prefix}-cert.pem"),
+                "-CAkey", str(tls_dir / f"{ca_prefix}-key.pem"),
+                "-CAcreateserial", "-out", str(tls_dir / f"{name}-cert.pem"),
+                "-days", "1", "-extfile", str(extf),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+
 def substitute(text, values):
     """Replace each placeholder in one example text."""
     for key, value in values.items():
@@ -247,8 +292,12 @@ def verify_setting(ex):
         cfg = work / "cfg"
         (cfg / "conf.d").mkdir(parents=True)
         mqtt, api, coap, brokerlink = config_ports(4)
+        tls_dir = work / "tls"
+        if "${TLS_DIR}" in ex["config"] or "TLS_DIR" in ex["script"]:
+            generate_ephemeral_tls_pki(tls_dir)
         values = {
             "WORK_DIR": work,
+            "TLS_DIR": tls_dir,
             "MQTT_PORT": mqtt,
             "API_PORT": api,
             "COAP_PORT": coap,
@@ -291,6 +340,7 @@ def verify_setting(ex):
                     "BROKERLINK_PORT": str(brokerlink),
                     "API_KEY": CONFIG_KEY,
                     "WORK_DIR": str(work),
+                    "TLS_DIR": str(tls_dir),
                     "CONFIG_DIR": str(cfg),
                     "DATA_DIR": str(work / "data"),
                 }

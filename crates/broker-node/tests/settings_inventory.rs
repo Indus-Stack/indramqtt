@@ -1,7 +1,8 @@
 //! Entry proof for the temporary accepted-settings inventory.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,7 @@ fn az01_settings_through_the_real_broker() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::process::Command::new("python3")
         .arg(root.join("tests/settings_inventory/entry.py"))
-        .arg(env!("CARGO_BIN_EXE_indramqtt"))
+        .arg(stable_kernel_binary())
         .env(
             "AZ01_RABBITMQ_COMPILED",
             if cfg!(feature = "rabbitmq") { "1" } else { "0" },
@@ -313,8 +314,40 @@ async fn ldap_file_pool_and_timeouts_reach_live_authenticator() {
     let _ = std::fs::remove_file(&log_path);
 }
 
-// Locates the kernel binary under test.
-fn kernel_binary() -> std::path::PathBuf {
+// Returns a stable copy of the kernel binary under test.
+// Reason: the gate host can remove target artifacts while a test runs.
+// Source: CE-01.gates.log lines 40-51.
+fn stable_kernel_binary() -> &'static Path {
+    static STABLE: OnceLock<std::path::PathBuf> = OnceLock::new();
+    STABLE.get_or_init(|| {
+        let source = built_kernel_binary();
+        let tag = format!(
+            "indramqtt-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(tag);
+        std::fs::create_dir_all(&dir).expect("stable binary temp dir");
+        let dest = dir.join("indramqtt");
+        std::fs::copy(&source, &dest).expect("copy kernel binary to temp dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&dest)
+                .expect("copied kernel metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&dest, permissions).expect("set copied kernel permissions");
+        }
+        dest
+    })
+}
+
+// Locates the kernel binary that cargo built for this test.
+fn built_kernel_binary() -> std::path::PathBuf {
     if let Some(built) = option_env!("CARGO_BIN_EXE_indramqtt") {
         return std::path::PathBuf::from(built);
     }
@@ -328,6 +361,11 @@ fn kernel_binary() -> std::path::PathBuf {
         }
     }
     panic!("kernel binary not found: build the workspace first");
+}
+
+// Locates the kernel binary under test.
+fn kernel_binary() -> std::path::PathBuf {
+    stable_kernel_binary().to_path_buf()
 }
 
 // Takes one free loopback port.

@@ -14,7 +14,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// Iterations for PBKDF2-HMAC-SHA-256 (`SCRAM-SHA-256` default).
@@ -55,6 +55,28 @@ fn is_strong_password(password: &str) -> bool {
 /// exists anywhere on this path.
 /// Management-plane only: publish and deliver never touch this map.
 pub const MAX_ADMIN_USERS: usize = 1024;
+
+/// Recover the guard from a poisoned lock and log one warning.
+///
+/// A panic in another thread while it holds the lock poisons it. The auth
+/// stores hold plain values, so the guard still yields data. Recovery keeps
+/// the management API answering instead of panicking.
+pub(crate) trait RecoverGuard<T> {
+    /// Unwrap the guard, recovering the inner value from a poison.
+    fn recover(self, lock_name: &str) -> T;
+}
+
+impl<T> RecoverGuard<T> for Result<T, PoisonError<T>> {
+    fn recover(self, lock_name: &str) -> T {
+        self.unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                lock = lock_name,
+                "auth lock was poisoned; recovering the guard"
+            );
+            PoisonError::into_inner(poisoned)
+        })
+    }
+}
 
 /// Consecutive failed MFA code verifications before the per-user
 /// cool-down trips: 5 attempts. Reason: five tries cover a mistyped code
@@ -210,6 +232,7 @@ impl std::error::Error for MfaVerifyError {}
 
 /// Management API users with SCRAM-SHA-256 credentials.
 pub struct AdminUsers {
+    /// Recover: the map holds plain records, so a poisoned guard still reads.
     users: RwLock<HashMap<String, AdminUser>>,
     process_secret: [u8; 32],
     /// Kernel config registry receiving every mutation (`None` in unit
@@ -217,13 +240,16 @@ pub struct AdminUsers {
     registry: Option<Arc<ConfigRegistry>>,
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
+    /// Recover: the guard carries no data and only serialises disk saves.
     save_lock: Mutex<()>,
     /// Consecutive-failure counters plus cool-down deadlines for MFA
     /// verify, one entry per known user at most (memory-only).
     /// Management-plane only: publish and deliver never touch this map.
+    /// Recover: counters are plain values and the map stays bounded.
     mfa_attempts: Mutex<HashMap<String, MfaAttempt>>,
     /// Failed password logins for each known user. The same bound and
     /// the same cool-down as the MFA attempts.
+    /// Recover: counters are plain values and the map stays bounded.
     login_attempts: Mutex<HashMap<String, MfaAttempt>>,
 }
 
@@ -245,7 +271,7 @@ impl AdminUsers {
         store
             .users
             .write()
-            .unwrap()
+            .recover("admin users")
             .insert("admin".to_string(), default_admin_user());
         store
     }
@@ -268,7 +294,7 @@ impl AdminUsers {
             store
                 .users
                 .write()
-                .unwrap()
+                .recover("admin users")
                 .insert("admin".to_string(), default_admin_user());
             return store;
         }
@@ -323,7 +349,7 @@ impl AdminUsers {
             store
                 .users
                 .write()
-                .unwrap()
+                .recover("admin users")
                 .insert(user.username.clone(), user);
         }
         store
@@ -350,18 +376,20 @@ impl AdminUsers {
         conf.validate()
             .map_err(|err| AdminUserError::Persist(err.to_string()))?;
         let fresh = Self::from_snapshot(conf);
-        let fresh_users = fresh.users.into_inner().unwrap();
+        let fresh_users = fresh.users.into_inner().map_err(|_| {
+            AdminUserError::Persist("admin user store lock is poisoned".to_string())
+        })?;
         // Remove the MFA attempt counters of the users that the new
         // snapshot does not contain.
         self.mfa_attempts
             .lock()
-            .unwrap()
+            .recover("admin mfa attempts")
             .retain(|name, _| fresh_users.contains_key(name));
         self.login_attempts
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recover("admin login attempts")
             .retain(|name, _| fresh_users.contains_key(name));
-        let mut users = self.users.write().unwrap();
+        let mut users = self.users.write().recover("admin users");
         *users = fresh_users;
         Ok(())
     }
@@ -370,7 +398,7 @@ impl AdminUsers {
     /// username so the persisted file is deterministic. MFA enrolment
     /// rides the same root so it survives a kernel restart byte-identically.
     fn export_conf(&self) -> AdminUsersConf {
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         let base64 = base64::engine::general_purpose::STANDARD;
         let mut entries: Vec<broker_config::AdminUser> = users
             .values()
@@ -407,7 +435,7 @@ impl AdminUsers {
         let Some(registry) = self.registry.as_ref() else {
             return Ok(());
         };
-        let _guard = self.save_lock.lock().unwrap();
+        let _guard = self.save_lock.lock().recover("admin save");
         let conf = self.export_conf();
         registry
             .commit_admin_users(conf)
@@ -444,7 +472,7 @@ impl AdminUsers {
             return Err(AdminUserError::WeakPassword);
         }
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             if users.contains_key(username) {
                 return Err(AdminUserError::AlreadyExists);
             }
@@ -482,7 +510,7 @@ impl AdminUsers {
 
     pub fn delete(&self, username: &str) -> Result<(), AdminUserError> {
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let user = users.get(username).ok_or(AdminUserError::NotFound)?;
             if user.role == AdminRole::Administrator
                 && users
@@ -495,13 +523,16 @@ impl AdminUsers {
             }
             users.remove(username);
         }
-        self.mfa_attempts.lock().unwrap().remove(username);
+        self.mfa_attempts
+            .lock()
+            .recover("admin mfa attempts")
+            .remove(username);
         self.persist()
     }
 
     pub fn set_role(&self, username: &str, role: AdminRole) -> Result<(), AdminUserError> {
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let current = users.get(username).ok_or(AdminUserError::NotFound)?;
             if current.role == AdminRole::Administrator
                 && role == AdminRole::Viewer
@@ -522,7 +553,7 @@ impl AdminUsers {
 
     pub fn set_description(&self, username: &str, description: &str) -> Result<(), AdminUserError> {
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let user = users.get_mut(username).ok_or(AdminUserError::NotFound)?;
             user.description = description.to_string();
         }
@@ -554,7 +585,7 @@ impl AdminUsers {
         scopes: UserScopesUpdate,
     ) -> Result<(), AdminUserError> {
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             if !users.contains_key(username) {
                 return Err(AdminUserError::NotFound);
             }
@@ -599,7 +630,7 @@ impl AdminUsers {
         // Read the current verifier under a short read lock.
         // Derive outside the lock so a slow hash never blocks readers.
         let (salt, iterations, stored_key) = {
-            let users = self.users.read().unwrap();
+            let users = self.users.read().recover("admin users");
             let user = users.get(username).ok_or(AdminUserError::NotFound)?;
             (user.salt.clone(), user.iterations, user.stored_key)
         };
@@ -613,7 +644,7 @@ impl AdminUsers {
         rand::rng().fill_bytes(&mut new_salt);
         let (new_stored, new_server) = derive_keys(new_password.as_bytes(), &new_salt, ITERATIONS);
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let user = users.get_mut(username).ok_or(AdminUserError::NotFound)?;
             user.salt = new_salt.to_vec();
             user.iterations = ITERATIONS;
@@ -629,10 +660,7 @@ impl AdminUsers {
     /// entry is kept for a name that is not a user, thus the map stays in
     /// [`MAX_ADMIN_USERS`] entries.
     pub fn login_locked(&self, username: &str) -> bool {
-        let mut attempts = self
-            .login_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut attempts = self.login_attempts.lock().recover("admin login attempts");
         let now = Instant::now();
         match attempts
             .get(username)
@@ -656,15 +684,12 @@ impl AdminUsers {
         let known = self
             .users
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recover("admin users")
             .contains_key(username);
         if !known {
             return;
         }
-        let mut attempts = self
-            .login_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut attempts = self.login_attempts.lock().recover("admin login attempts");
         let entry = attempts.entry(username.to_string()).or_insert(MfaAttempt {
             consecutive_failures: 0,
             locked_until: None,
@@ -680,14 +705,14 @@ impl AdminUsers {
     pub fn clear_login_failures(&self, username: &str) {
         self.login_attempts
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recover("admin login attempts")
             .remove(username);
     }
 
     /// Constant-time check of `password` against the stored `StoredKey`.
     pub fn verify_password(&self, username: &str, password: &str) -> bool {
         let found: Option<(Vec<u8>, u32, [u8; 32])> = {
-            let users = self.users.read().unwrap();
+            let users = self.users.read().recover("admin users");
             users
                 .get(username)
                 .map(|user| (user.salt.clone(), user.iterations, user.stored_key))
@@ -715,7 +740,7 @@ impl AdminUsers {
     /// Stored salt + iterations, or a deterministic fake salt for unknown
     /// users so names cannot be enumerated.
     pub fn scram_params(&self, username: &str) -> (Vec<u8>, u32) {
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         if let Some(user) = users.get(username) {
             return (user.salt.clone(), user.iterations);
         }
@@ -733,7 +758,7 @@ impl AdminUsers {
         if client_proof.len() != 32 {
             return None;
         }
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         let user = users.get(username)?;
         let client_signature = hmac_sha256(&user.stored_key, auth_message.as_bytes());
         let mut client_key = [0u8; 32];
@@ -748,7 +773,7 @@ impl AdminUsers {
     }
 
     pub fn get(&self, username: &str) -> Option<AdminUserView> {
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         users.get(username).map(|u| AdminUserView {
             username: u.username.clone(),
             role: u.role,
@@ -759,7 +784,7 @@ impl AdminUsers {
     }
 
     pub fn list(&self) -> Vec<AdminUserView> {
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         let mut out: Vec<AdminUserView> = users
             .values()
             .map(|u| AdminUserView {
@@ -786,7 +811,7 @@ impl AdminUsers {
         description: &str,
     ) {
         let (stored_key, server_key) = derive_keys(password.as_bytes(), salt, iterations);
-        self.users.write().unwrap().insert(
+        self.users.write().recover("admin users").insert(
             username.to_string(),
             AdminUser {
                 username: username.to_string(),
@@ -809,7 +834,7 @@ impl AdminUsers {
     /// Management-plane only: one short read lock; publish and deliver
     /// never touch this map.
     pub fn mfa_status(&self, username: &str) -> Option<MfaStatus> {
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         users.get(username).map(|user| MfaStatus {
             enabled: user.mfa_enabled,
             pending: !user.mfa_secret.is_empty() && !user.mfa_enabled,
@@ -836,7 +861,7 @@ impl AdminUsers {
     // until the checker pins it.
     pub fn mfa_setup(&self, username: &str) -> Result<Vec<u8>, AdminUserError> {
         let secret = {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let user = users.get(username).ok_or(AdminUserError::NotFound)?;
             if user.mfa_enabled {
                 return Err(AdminUserError::AlreadyExists);
@@ -853,7 +878,7 @@ impl AdminUsers {
             secret
         };
         if let Err(error) = self.persist() {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             if let Some(user) = users.get_mut(username) {
                 user.mfa_secret.clear();
                 user.mfa_enabled = false;
@@ -877,7 +902,7 @@ impl AdminUsers {
     /// it once.
     pub fn mfa_admin_enrol(&self, username: &str) -> Result<Vec<u8>, AdminUserError> {
         let (secret, previous) = {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let user = users.get(username).ok_or(AdminUserError::NotFound)?;
             let previous = (
                 user.mfa_secret.clone(),
@@ -892,9 +917,12 @@ impl AdminUsers {
             }
             (secret, previous)
         };
-        self.mfa_attempts.lock().unwrap().remove(username);
+        self.mfa_attempts
+            .lock()
+            .recover("admin mfa attempts")
+            .remove(username);
         if let Err(error) = self.persist() {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             if let Some(user) = users.get_mut(username) {
                 user.mfa_secret = previous.0;
                 user.mfa_enabled = previous.1;
@@ -923,7 +951,7 @@ impl AdminUsers {
     // other dashboard miss paths) until the checker pins it.
     pub fn mfa_disable(&self, username: &str) -> Result<(), AdminUserError> {
         let previous = {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             let user = users.get(username).ok_or(AdminUserError::NotFound)?;
             if user.mfa_secret.is_empty() && !user.mfa_enabled {
                 return Err(AdminUserError::NotFound);
@@ -940,9 +968,12 @@ impl AdminUsers {
             }
             previous
         };
-        self.mfa_attempts.lock().unwrap().remove(username);
+        self.mfa_attempts
+            .lock()
+            .recover("admin mfa attempts")
+            .remove(username);
         if let Err(error) = self.persist() {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             if let Some(user) = users.get_mut(username) {
                 user.mfa_secret = previous.0;
                 user.mfa_enabled = previous.1;
@@ -978,12 +1009,12 @@ impl AdminUsers {
         unix_secs: u64,
     ) -> Result<bool, MfaVerifyError> {
         let (secret, last_step) = {
-            let users = self.users.read().unwrap();
+            let users = self.users.read().recover("admin users");
             let user = users.get(username).ok_or(MfaVerifyError::NotFound)?;
             (user.mfa_secret.clone(), user.mfa_last_step)
         };
         {
-            let mut attempts = self.mfa_attempts.lock().unwrap();
+            let mut attempts = self.mfa_attempts.lock().recover("admin mfa attempts");
             // Entries only exist for known users (unknown names fail
             // before recording anything), so the map stays within
             // MAX_ADMIN_USERS without further eviction.
@@ -1011,7 +1042,7 @@ impl AdminUsers {
             return Err(MfaVerifyError::Replayed);
         }
         {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             // Re-check under the write lock: a concurrent verify may have
             // consumed this counter first (single-use must hold).
             let user = users.get(username).ok_or(MfaVerifyError::NotFound)?;
@@ -1026,7 +1057,7 @@ impl AdminUsers {
             }
         }
         if let Err(error) = self.persist_mfa() {
-            let mut users = self.users.write().unwrap();
+            let mut users = self.users.write().recover("admin users");
             if let Some(user) = users.get_mut(username) {
                 user.mfa_last_step = last_step;
                 if last_step.is_none() {
@@ -1035,7 +1066,10 @@ impl AdminUsers {
             }
             return Err(MfaVerifyError::Persist(error));
         }
-        self.mfa_attempts.lock().unwrap().remove(username);
+        self.mfa_attempts
+            .lock()
+            .recover("admin mfa attempts")
+            .remove(username);
         Ok(true)
     }
 
@@ -1043,7 +1077,7 @@ impl AdminUsers {
     /// [`MFA_VERIFY_MAX_ATTEMPTS`] consecutive failures. Only called for
     /// known users, so the map stays within [`MAX_ADMIN_USERS`].
     fn record_mfa_failure(&self, username: &str) {
-        let mut attempts = self.mfa_attempts.lock().unwrap();
+        let mut attempts = self.mfa_attempts.lock().recover("admin mfa attempts");
         let entry = attempts.entry(username.to_string()).or_insert(MfaAttempt {
             consecutive_failures: 0,
             locked_until: None,
@@ -1061,7 +1095,7 @@ impl AdminUsers {
         let Some(registry) = self.registry.as_ref() else {
             return Ok(());
         };
-        let _guard = self.save_lock.lock().unwrap();
+        let _guard = self.save_lock.lock().recover("admin save");
         let conf = self.export_conf();
         registry
             .commit_admin_users(conf)
@@ -1072,11 +1106,21 @@ impl AdminUsers {
         Ok(())
     }
 
+    /// Poison the user map lock on purpose from the calling thread.
+    ///
+    /// Tests call this from a thread that they join; the panic poisons the
+    /// lock and the thread ends. Test only.
+    #[cfg(test)]
+    pub(crate) fn poison_user_store_for_test(&self) {
+        let _guard = self.users.write().expect("admin user store lock");
+        panic!("poison the admin user store lock");
+    }
+
     /// Raw enrolment secret for tests only (handler tests read it back
     /// from the setup response instead).
     #[cfg(test)]
     pub(crate) fn mfa_secret_for_test(&self, username: &str) -> Option<Vec<u8>> {
-        let users = self.users.read().unwrap();
+        let users = self.users.read().recover("admin users");
         users.get(username).map(|user| user.mfa_secret.clone())
     }
 }

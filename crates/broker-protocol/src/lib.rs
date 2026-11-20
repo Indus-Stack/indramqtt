@@ -107,7 +107,7 @@ impl TopicFilter {
                     "'#' wildcard must be the final level".to_string(),
                 ));
             }
-            if pos > 0 && &filter[pos - 1..pos] != "/" {
+            if pos > 0 && filter.as_bytes()[pos - 1] != b'/' {
                 return Err(ProtocolError::InvalidTopic(
                     "'#' wildcard must be prefixed with '/'".to_string(),
                 ));
@@ -192,5 +192,15 @@ mod tests {
         assert!(f2.matches(&t1));
         assert!(!f3.matches(&t1));
         assert!(f4.matches(&t1));
+    }
+}
+
+#[cfg(test)]
+mod utf8_filter_tests {
+    use super::TopicFilter;
+    #[test]
+    fn topic_filter_rejects_multibyte_utf8_before_hash_without_panicking() {
+        assert!(TopicFilter::new("sensors/é#").is_err());
+        assert!(TopicFilter::new("a/🔥#").is_err());
     }
 }
