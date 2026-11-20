@@ -1,6 +1,6 @@
 # IndraMQTT Architecture Specification
 
-**IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is a distributed MQTT messaging and streaming platform for cloud deployments and industrial edge systems.
+**IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is a single-node Rust MQTT broker with embedded streaming SQL for cloud deployments and industrial edge systems.
 
 This document describes the internal design of IndraMQTT. It describes concurrency models, data flows and layer decoupling.
 
@@ -39,21 +39,21 @@ graph TB
         SQL[Embedded rekuiper Streaming SQL Engine]
         CONNECTORS[Unified Connectors: Kafka, PG, Redis, S3, ES, Webhook]
         REST[Axum REST API & Web Dashboard :18083]
-    end
-
-    subgraph Enterprise[Layer 2: Distributed Clustering]
-        QUIC[QUIC Multiplexed Data Plane]
-        SWIM[SWIM Gossip Failure Detection]
-        RAFT[Raft Metadata Consensus]
-        WINDOWS[Stateful rekuiper Window Operators]
-        INDUSTRIAL[Industrial Protocols: Sparkplug B, OPC-UA]
+        SQL --> WINDOWS[Stateful rekuiper windows]
     end
 
     Clients --> Core
-    Core --> Enterprise
 ```
 
 ---
+
+### Cluster design and implementation status
+
+The [cluster crate](crates/broker-cluster) implements SWIM membership and an in-process routing plane. The distributed design calls for Raft metadata and QUIC forwarding. The current broker runs on one node. Startup validation rejects settings that request clustering before listeners bind. Multi-node operation and qualification are tracked in the [roadmap](ROADMAP.md).
+
+### Repository layout
+
+The [broker node](crates/broker-node) starts the process and provides the operator CLI. The [workspace crates](crates) implement the protocol, router, sessions, storage, authentication, SQL, connectors, and management API. Deployment examples live in [deploy](deploy), end-to-end tests in [tests](tests), and configuration schemas in [schemas](schemas).
 
 ## 2. Core Architectural Invariants
 
@@ -116,7 +116,7 @@ graph LR
     DISPATCH --> CONNECTORS[Outbound Sinks: Kafka, S3, ES, Webhook, DB]
 ```
 
-* **Stateless Rules (Community Tier)**:
+* **Stateless Rules**:
   - 185 scalar functions (trigonometry, math, bitwise, string, datetime, conditionals; catalog length asserted by `test_function_catalog_has_185_entries` in `crates/broker-rules/src/lib.rs`).
   - Evaluated inline on the ingress thread with zero task spawns and zero network loopback at **~4.77M ± 0.10M events/sec** in the in-process single-threaded microbenchmark `bench_sql_ingress_throughput` in `crates/broker-node/benches/broker_throughput.rs` (hardware-dependent; re-run locally; JSON parsing plus `WHERE`/`SELECT` with `Block` backpressure and 100 percent sink delivery); not end-to-end network throughput.
 * **Stateful Window Operators**:
@@ -146,7 +146,7 @@ pub trait Sink: Send + Sync {
 
 * **Micro-Batching & Backoff**: Standardized using shared `BatchQueue` and `BackoffState` helpers.
 * **Zero External Dependencies in Tests**: All unit and integration tests execute against in-memory mock transports (`MemoryKafkaTransport`, `MockS3Transport`, `MockHttpTransport`, `MemoryDiskLogWriter`, etc.).
-* **Capability & Qualification**: See `crates/broker-connectors/CAPABILITY.md` for what each sink actually speaks and what it was tested against; no sink in this tree has been qualified against a real vendor server.
+* The [connector capability table](crates/broker-connectors/CAPABILITY.md) records each sink’s transport, offline test coverage, and any opt-in service tests.
 
 ---
 

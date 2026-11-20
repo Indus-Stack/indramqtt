@@ -1,13 +1,13 @@
 ---
 title: "IndraMQTT"
-description: "The complete MQTT platform in one small binary."
+description: "A single-node Rust MQTT broker with embedded streaming SQL."
 sidebar:
   order: 1
 ---
 
 # IndraMQTT
 
-IndraMQTT is the complete MQTT platform in one small binary: broker, SQL rules, data connectors and multi-tenancy in a single process.
+IndraMQTT runs an MQTT broker, SQL rules, data connectors, and tenant isolation in one Rust process. The current pre-1.0 broker supports single-node evaluation.
 
 It serves IoT fleets, industrial edge systems and cloud deployments. One process holds the client sockets and does the broker work. There is no second process to install or monitor.
 
@@ -22,12 +22,12 @@ flowchart LR
     Session -- "match" --> Engine["rule engine"]
     Engine -- "send" --> Conn["connectors"]
     API -- "read" --> Session
-    Engine -. "plan" .-> MCP["MCP bridge roadmap"]
+    Client -- "POST /mcp" --> API
 ```
 
-The MCP bridge is deferred. This release exposes no MCP endpoint. Details live in `ROADMAP.md`.
+The [MCP management endpoint](./mcp.md) exposes operator tools on the management listener.
 
-Protocol gateways, message schema validations, OpenTelemetry export and cluster links are deferred. Each list or config read answers an empty or disabled state. Each write refuses with 400. Nothing is stored.
+SSO login is deferred. Protocol gateways, message schema validations, OpenTelemetry export and cluster links are also deferred. Each list or config read answers an empty or disabled state. Each write refuses with 400. Nothing is stored.
 
 ## Before you start
 

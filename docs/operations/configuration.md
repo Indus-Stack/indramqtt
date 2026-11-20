@@ -79,7 +79,7 @@ Section names follow the schema. Use `[node]`, `[listeners.tcp]`,
 INDRA_LISTENERS__TCP__BIND=0.0.0.0:1883
 INDRA_SESSION__MAX_QOS0_BACKLOG=1000
 INDRA_AUTH__ALLOW_ANONYMOUS=false
-INDRA_CLUSTER__SEED_NODES=host1:19883,host2:19883
+INDRA_LOGGING__LEVEL=debug
 ```
 
 Values are typed by the schema: booleans take `true`/`false`, integers

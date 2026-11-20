@@ -118,13 +118,16 @@ Highest sustained load, 180 s run. Latency is the median at that load.
 | 10,000 connections, time | 13.6 s | 13.6 s | 240 s, 161 clients not connected |
 | 10,000 connections, memory | 283 MiB | 720 MiB | 638 MiB |
 | Memory for each connection | 21 KiB | 41 KiB | 66 KiB |
+| Memory with no clients | 75.5 MiB | 321.9 MiB | 1.5 MiB |
+
+The idle-memory row comes from `idle_mem_mib` in the [MQTT 5 connection records](results/mqtt5-three-brokers.jsonl). The IndraMQTT image included the idle edge process described in section 4.
 
 ## 7. Where IndraMQTT is behind
 
 - **Fan-in with MQTT 5:** rumqttd holds 80,000 msg/s and IndraMQTT
   holds 40,000 msg/s.
-- **Memory with no clients:** rumqttd uses 1.6 MiB and IndraMQTT uses
-  76 MiB.
+- **Memory with no clients in the MQTT 5 run:** rumqttd used 1.5 MiB and
+  IndraMQTT used 75.5 MiB. Section 5 lists the MQTT 3.1.1 measurements.
 - **Memory for each connection with MQTT 3.1.1:** EMQX uses 18 KiB and
   IndraMQTT uses 21 KiB.
 - **Many subscribers of one topic:** 25,000 subscribers of one topic
