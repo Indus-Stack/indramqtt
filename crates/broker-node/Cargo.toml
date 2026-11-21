@@ -42,6 +42,10 @@ name = "listener_conformance"
 path = "tests/listener_conformance.rs"
 
 [[test]]
+name = "conformance"
+path = "tests/conformance/main.rs"
+
+[[test]]
 name = "reconnect_storm"
 path = "tests/reconnect_storm.rs"
 
