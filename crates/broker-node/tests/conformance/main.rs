@@ -5,3 +5,4 @@
 
 mod support;
 mod ta_000;
+mod ta_003;
