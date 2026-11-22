@@ -12,3 +12,4 @@ mod ta_006;
 mod ta_007;
 mod ta_008;
 mod ta_009;
+mod ta_010;
