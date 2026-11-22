@@ -3,6 +3,9 @@
     "crates/broker-api/src/lib.rs",
     "crates/broker-api/src/mcp/catalog.rs",
     "crates/broker-api/src/mcp/mod.rs",
+    "crates/broker-api/src/tests/mcp.rs",
+    "crates/broker-api/src/tests/support.rs",
+    "crates/broker-api/src/tests/users.rs",
     "crates/broker-api/src/v5/api_keys.rs"
   ],
   "note": "Tree has no MCP endpoint.",
