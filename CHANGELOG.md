@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased] - Sprint 20
 
 ### Security
+- **url 2.5.8 → 2.5.9**: fixes advisory RUSTSEC-2026-0592, stack overflow in `Url::origin()` on nested `blob:` URLs.
 - **libz-sys 1.1.31 → 1.1.33**: fixes advisory RUSTSEC-2026-0544, where gz_vacate() has a heap buffer overflow.
 - **libz-sys 1.1.29 → 1.1.31**: fixes advisory RUSTSEC-2026-0418, where the build script leaked the build environment.
 - **aws-smithy-http 0.64.0 → 0.64.3, aws-smithy-runtime 1.15.0 → 1.16.2, aws-smithy-types 1.8.0 → 1.9.1, aws-smithy-async 1.3.0 → 1.3.1**: removes the unmaintained `pin-utils` dependency and fixes advisory RUSTSEC-2026-0441.
