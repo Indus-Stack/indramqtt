@@ -373,3 +373,61 @@ not_built = { file = "crates/broker-api/src/lib.rs", line = 2395, reason = "live
 
 [items."iotdb.tls"]
 not_built = { file = "crates/broker-connectors-enterprise/src/iotdb.rs", line = 137, reason = "the sink config has no TLS field" }
+
+# mssql
+[items."mssql.host"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.port"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.database"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.table_template"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.auth"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.auth.SqlPassword"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.auth.Integrated"]
+test = "mssql_auth_variants_through_broker"
+
+[items."mssql.auth.ActiveDirectoryPassword"]
+test = "mssql_auth_variants_through_broker"
+
+[items."mssql.query_mode"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.query_mode.InsertJson"]
+test = "mssql_end_to_end_through_broker"
+
+[items."mssql.query_mode.CustomUpsert"]
+test = "mssql_custom_upsert_through_broker"
+
+[items."mssql.trust_server_certificate"]
+test = "mssql_trust_server_certificate_through_broker"
+
+[items."mssql.batch_size"]
+test = "mssql_batch_size_through_broker"
+
+[items."mssql.batch_bytes"]
+test = "mssql_batch_bytes_through_broker"
+
+[items."mssql.linger_ms"]
+test = "mssql_linger_through_broker"
+
+[items."mssql.max_retries"]
+test = "mssql_retry_through_outage"
+
+[items."mssql.initial_backoff_ms"]
+test = "mssql_retry_through_outage"
+
+[items."mssql.max_backoff_ms"]
+test = "mssql_retry_through_outage"
+
+[items."mssql.timeout_ms"]
+test = "mssql_timeout_through_broker"

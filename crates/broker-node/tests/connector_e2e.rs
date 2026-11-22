@@ -22,5 +22,7 @@ mod kafka_e2e;
 mod mn10_e2e;
 #[path = "connector_e2e/mqtt_bridge_e2e.rs"]
 mod mqtt_bridge_e2e;
+#[path = "connector_e2e/mssql_e2e.rs"]
+mod mssql_e2e;
 #[path = "connector_e2e/mysql_e2e.rs"]
 mod mysql_e2e;
