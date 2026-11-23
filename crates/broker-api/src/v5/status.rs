@@ -41,9 +41,7 @@ pub struct StatusQuery {
     format: Option<String>,
 }
 
-/// `GET /api/v5/status`: node status read. It needs no token, as the
-/// reference API documents. `GET /status` is the same answer for load
-/// balancers.
+/// Node status read.
 ///
 /// Single node, management-plane only: one relaxed atomic load serves
 /// request, no delivery locks, no new buffering.

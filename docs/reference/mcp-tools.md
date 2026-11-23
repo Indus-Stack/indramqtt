@@ -60,7 +60,7 @@ The catalogue holds 370 tools: 368 routed tools plus `list_toolsets` and `subscr
 
 - Toolset: `status`
 - Route: `GET /api/v5/status`
-- Description: `GET /api/v5/status`: node status read. It needs no token, as the (GET /api/v5/status)
+- Description: Node status read. (GET /api/v5/status)
 
 **inputSchema**
 ```json
@@ -148,7 +148,7 @@ The catalogue holds 370 tools: 368 routed tools plus `list_toolsets` and `subscr
 
 - Toolset: `status`
 - Route: `GET /status`
-- Description: `GET /api/v5/status`: node status read. It needs no token, as the (GET /status)
+- Description: Node status read. (GET /status)
 
 **inputSchema**
 ```json
