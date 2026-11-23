@@ -23,7 +23,7 @@ path = "tests/docs_dx01.rs"
 
 [[test]]
 name = "e2e_integration"
-path = "../../tests/e2e_integration.rs"
+path = "../../tests/e2e_integration/main.rs"
 
 [[test]]
 name = "mc04_messaging_tools"

@@ -919,7 +919,7 @@ async fn default_administrator_keeps_bearer_management_routes() {
 /// MV-05: a limited administrator keeps tenant checks and can write a
 /// tenant limit. The MQTT refusal is proved by
 /// `mv05_tenant_session_limit_refuses_second_mqtt_session` in
-/// `tests/e2e_integration.rs`.
+/// `tests/e2e_integration/`.
 #[tokio::test]
 async fn dashboard_user_scopes_keep_tenant_checks() {
     let (server, _state) = TestServer::start().await;

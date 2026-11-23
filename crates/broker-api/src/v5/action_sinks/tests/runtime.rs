@@ -565,7 +565,7 @@ async fn runtime_holds_the_inflight_window_across_worker_chunks() {
 async fn runtime_counts_matched_success_and_failed_for_one_action() {
     // Direct unit test for the counter math. The broker-path proof is
     // `ro01_action_runtime_applies_options_through_publish_and_restart`
-    // in `tests/e2e_integration.rs`, which drives the same counters
+    // in `tests/e2e_integration/`, which drives the same counters
     // through a real publish.
     let inner = Arc::new(BatchSink {
         fail: true,
@@ -589,7 +589,7 @@ async fn runtime_counts_matched_success_and_failed_for_one_action() {
 async fn two_actions_keep_separate_counters() {
     // Direct unit test for per-action separation. The broker-path proof
     // is `mv01_pgsql_action_delivers_engine_rows_to_connector_settings`
-    // in `tests/e2e_integration.rs`, which separates two actions through
+    // in `tests/e2e_integration/`, which separates two actions through
     // a real publish.
     let good = Arc::new(BatchSink::default());
     let bad = Arc::new(BatchSink {

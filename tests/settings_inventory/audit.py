@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[2]
-ENTRY_PREFIXES = ("tests/settings_inventory/entry.py", "tests/e2e_integration.rs")
+ENTRY_PREFIXES = ("tests/settings_inventory/entry.py", "tests/e2e_integration/")
 NO_EFFECT = (
     "state.connectors.connectors[type=console].config",
     "state.connectors.connectors[type=test].config",
