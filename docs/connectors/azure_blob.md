@@ -135,6 +135,12 @@ ok
 - The connector runs behind the rule engine bounded queue. A slow endpoint sheds load; it never stalls publishers.
 - The tier is enterprise. The kind needs the `azure_blob` feature build.
 
+## Other names
+
+This connector is also known as `azure-blob`, `azure_blob_storage`, `azureblob`, and `azblob`. Old links to `/connectors/azure-blob/` and `/connectors/azure_blob_storage/` redirect here.
+
+The v1 route accepts `azure_blob`. The v5 route accepts both `azure_blob` and `azure_blob_storage`. On v1 actions, the flat parameters `account_key`, `container`, `blob`, and `content` are supported.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

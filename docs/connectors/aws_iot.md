@@ -149,6 +149,19 @@ ok
 - The connector runs behind the rule engine bounded queue. A slow cloud endpoint sheds load; it never stalls publishers.
 - The tier is enterprise. The kind needs the `aws_iot` feature build.
 
+## Other names
+
+This connector is also known as `aws-iot` and `aws_iot_core`. The documented kind is `aws_iot`. The alias `aws-iot` redirects to this page.
+
+### QoS mapping
+
+- Ingress QoS 0 stays 0 on egress.
+- Ingress QoS 1 stays 1 on egress.
+- Ingress QoS 2 downgrades to 1 on egress.
+- QoS 0 is fire-and-forget with no PUBACK.
+- QoS 1 waits for PUBACK.
+- A dead server counts one failed forward for QoS 1.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

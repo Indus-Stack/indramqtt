@@ -252,6 +252,12 @@ ok
 - A failed summary count stops the batch with a failure.
 - A dead server backs off and retries. The bounded queue sheds past its bound.
 
+## Other names
+
+This connector is also known as `opents`. The alias `opents` redirects to this page.
+
+The v1 route requires `opentsdb`. The v5 route accepts both `opentsdb` and `opents`.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

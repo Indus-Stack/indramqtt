@@ -150,3 +150,9 @@ body:not(:has(mobile-starlight-toc)) .main-frame,
 html:not(:has(mobile-starlight-toc)) .main-frame {
   padding-top: var(--sl-nav-height) !important;
 }
+
+/* Ensure closed sidebar details hide their contents */
+details:not([open]) > :not(summary) {
+  display: none !important;
+}
+

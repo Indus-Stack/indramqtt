@@ -33,6 +33,7 @@ describe('single page title test', () => {
     const failures = [];
     for (const file of htmlFiles) {
       const content = readFileSync(file, 'utf8');
+      if (content.includes('http-equiv="refresh"')) continue;
       const h1Matches = content.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi) || [];
       if (h1Matches.length !== 1) {
         failures.push({

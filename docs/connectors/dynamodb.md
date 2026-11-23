@@ -62,6 +62,12 @@ Example action:
 - A missing access key or secret is refused. The connector does not invent credentials.
 - A failed batch counts one failed forward on the action.
 
+## Other names
+
+This connector is also known as `dynamo` and `ddb`. The alias `dynamo` redirects to this page.
+
+The broker accepts `dynamo` on both v1 and v5 routes and stores the connector under the DynamoDB runtime.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

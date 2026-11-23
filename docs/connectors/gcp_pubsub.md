@@ -142,6 +142,12 @@ ok
 - Throttles retry in place up to `max_retries`. Terminal codes fail fast and keep the buffer.
 - One flush runs at a time. The batch is bounded by `batch_size` and `batch_bytes`.
 
+## Other names
+
+This connector is also known as `gcp-pubsub`, `gcp_pubsub_producer`, `gcp_pubsub_consumer`, `gcp`, and `pubsub`. Old links to `/connectors/gcp-pubsub/`, `/connectors/gcp_pubsub_producer/`, and `/connectors/gcp_pubsub_consumer/` redirect here.
+
+The `gcp_pubsub_producer` name serves egress actions. The `gcp_pubsub_consumer` name serves ingress sources. Both names map to this runtime.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

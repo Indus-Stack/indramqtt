@@ -250,6 +250,12 @@ delivered
 - The production path uses the maintained HTTP client and maintained RSA code. The loopback test uses the same transport.
 - The tier is enterprise. The kind ships in the default build.
 
+## Other names
+
+This connector is also known as `oci-streaming` and `oci`. The alias `oci-streaming` redirects to this page.
+
+This kind is pending under ticket SB-11. The broker refuses create and update with `400 BAD_REQUEST`.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

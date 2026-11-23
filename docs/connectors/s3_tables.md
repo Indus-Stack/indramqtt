@@ -113,6 +113,12 @@ refused
 - A stored record from an earlier version is kept and reads `disconnected`.
 - No feature build enables this path.
 
+## Other names
+
+This connector is also known as `s3tables` and `iceberg`. The alias `s3tables` redirects to this page.
+
+This connector was removed under decision MV-04. New connectors of type `s3_tables`, `s3tables`, or `iceberg` are refused with `400`.
+
 ## Next steps
 
 - Send rows with [Amazon S3](./s3.md).

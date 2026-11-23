@@ -207,9 +207,15 @@ connected
 - The production path uses the maintained PostgreSQL driver with bound parameters.
 - The tier is community. The kind ships in the default build.
 
+## Other names
+
+This connector is also known as `postgres` and `postgresql`. Old links to `/connectors/postgres/` redirect here.
+
+The v1 route accepts `postgres` and `postgresql`. It requires a SQL template with parameter markers `$1` (topic), `$2` (QoS), and `$3` (payload). The v5 route accepts `pgsql` and `postgres`.
+
 ## Next steps
 
-- Read the full sink settings in [PostgreSQL](./postgres.md).
+- Read the full sink settings in [PostgreSQL](#other-names).
 - Feed the connector from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
 

@@ -126,6 +126,12 @@ timescaledb
 - The connector runs behind the rule engine bounded queue. A slow server sheds load; it never stalls publishers.
 - The tier is community. The kind ships in the default build.
 
+## Other names
+
+This connector is also known as `timescale`. The alias `timescale` redirects to this page.
+
+The v1 route accepts `timescaledb` and `timescale`. The kind is pending under ticket SB-27 on v5 routes.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

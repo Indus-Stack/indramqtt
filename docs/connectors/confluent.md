@@ -136,6 +136,12 @@ ok
 - OAuth is not supported. The driver always uses SASL with the API pair.
 - Producer buffer tuning belongs to `resource_opts`. A present value is refused.
 
+## Other names
+
+This connector is also known as `confluent_producer`, `confluent_kafka`, and `confluent_cloud`. Old links to `/connectors/confluent_producer/` redirect here.
+
+The v5 route accepts `confluent_producer` as an alias for the producer action. The v1 route requires `confluent`. The send path uses the `confluent` runtime.
+
 ## Next steps
 
 - Feed the action from a rule in [Actions](../rules/actions.md).
@@ -315,7 +321,7 @@ ok
 
 ### Next steps
 
-- Use the documented producer name on [Confluent Producer](./confluent_producer.md).
+- Use the documented producer name on [Confluent Producer](#other-names).
 - Feed the connector from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
 

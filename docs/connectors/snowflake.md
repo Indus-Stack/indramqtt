@@ -56,6 +56,12 @@ Example action:
 - The reference `pipe` becomes the streaming channel name. This mapping is marked for a later parity check.
 - A failed row batch counts one failed forward on the action.
 
+## Other names
+
+This connector is also known as `snowflake_streaming` and `snowflake_aggregated`. Old links to `/connectors/snowflake_streaming/` redirect here.
+
+The v5 actions route lists `snowflake_streaming` as a valid action type. Action create requires connector reference, pipe, database, and schema.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).
