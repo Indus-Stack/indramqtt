@@ -1,8 +1,6 @@
 //! Session replay, v5 receive-maximum credit and deferred retained delivery.
 
 use super::*;
-use crate::link_harness::handle_connection;
-use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn unbound_conn_cannot_replay_or_consume_durable_offline_queue() {

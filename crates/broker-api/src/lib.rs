@@ -124,6 +124,9 @@ pub struct ApiState {
     /// clone at most one message, so they never block delivery.
     /// Bounded by `broker_storage::MAX_RETAINED_MESSAGES`.
     pub retained: Arc<dyn broker_storage::RetainedStore>,
+    /// Coordinates retained writes + fan-out against concurrent `SUBSCRIBE`
+    /// retained-snapshot + route installation (shared with the kernel).
+    pub retained_subscribe_gate: Arc<tokio::sync::RwLock<()>>,
     /// Slow-subscription recorder for `GET/DELETE /api/v5/slow_subscriptions`
     /// (W1-30): bounded ranked table of slow deliveries. Management-plane
     /// only; never touched on the per-message path.
@@ -652,6 +655,7 @@ impl ApiState {
             readiness: Arc::new(NodeReadiness::new()),
             retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
             retained: Arc::new(broker_storage::MemoryStore::new()),
+            retained_subscribe_gate: Arc::new(tokio::sync::RwLock::new(())),
             slow_subs: Arc::new(crate::v5::slow_subscriptions::SlowSubsStore::new()),
             slow_subs_settings: Arc::new(
                 crate::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
@@ -766,6 +770,7 @@ impl ApiState {
             readiness: Arc::new(NodeReadiness::new()),
             retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
             retained: Arc::new(broker_storage::MemoryStore::new()),
+            retained_subscribe_gate: Arc::new(tokio::sync::RwLock::new(())),
             slow_subs: Arc::new(crate::v5::slow_subscriptions::SlowSubsStore::new()),
             slow_subs_settings: Arc::new(
                 crate::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
