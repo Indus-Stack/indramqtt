@@ -7875,6 +7875,8 @@ pub async fn create_connector(
         let stores_config_only = match conn_type.as_str() {
             "gcp_pubsub" => true,
             "bigquery" => carries_service_account_key(&body),
+            "mongodb" if conn_type_early == "mongo" => true,
+            "elasticsearch" if conn_type_early == "es" => true,
             _ => false,
         };
         if !stores_config_only {
@@ -8236,6 +8238,8 @@ pub async fn update_connector(
         let stores_config_only = match conn_type.as_str() {
             "gcp_pubsub" => true,
             "bigquery" => carries_service_account_key(&body),
+            "mongodb" if stored_type == "mongo" => true,
+            "elasticsearch" if stored_type == "es" => true,
             _ => false,
         };
         if !stores_config_only {

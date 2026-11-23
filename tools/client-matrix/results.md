@@ -2,9 +2,9 @@
 
 Two libraries ran the full checklist: Paho Python and Node `mqtt`.
 Both use the real client package over a client socket. The Rust
-`rumqttc` project is written but not built in this run; the gates
-build it. The Rust `paho-mqtt` crate and the mosquitto tools are not
-installable here.
+`rumqttc` project is written but not built in this run; no automated
+gate builds or runs the project. The Rust `paho-mqtt` crate and the
+mosquitto tools are not installable here.
 
 ## Environment
 
@@ -22,10 +22,10 @@ Try each library in order. Report what each attempt gives.
 | Library | Attempt | Outcome |
 |---|---|---|
 | Paho Python client | `pip install --target` outside the tree. | Installed. `paho-mqtt 2.1.0` ran the full checklist on TCP, TLS and WebSocket. |
-| Rust `rumqttc` | Crate `rumqttc-0.25.1` is in the registry cache. | Project written under `rust_rumqttc/`. The loop cannot run cargo, so this run did not build it. `not verified` for every Rust row. The gates build and run it. |
+| Rust `rumqttc` | Crate `rumqttc-0.25.1` is in the registry cache. | Project written under `rust_rumqttc/`. The loop cannot run cargo, so this run did not build it. `not verified` for every Rust row. No automated gate builds or runs the project. |
 | Rust `paho-mqtt` | Needs the Eclipse Paho C library and system header changes. | Not installable: the task forbids root changes to the system. Each check reports `not-supported` with that reason. |
 | `mosquitto_pub`, `mosquitto_sub` | `command -v` for both. | Both are missing. Each check reports `not-supported: tools missing`. |
-| Node `mqtt` package | `npm install` outside the tree (`mqtt@5.16.1`). | Installed. `node_mqtt/` ran the full checklist on TCP and WebSocket. |
+| Node `mqtt` package | `npm install` outside the tree (`mqtt@5.16.1`). | Installed. `node_mqtt/` ran the full checklist on TCP, TLS and WebSocket. |
 
 No library is vendored into the tree. Packages live outside the tree
 and resolve at run time.
@@ -36,21 +36,21 @@ and resolve at run time.
 `fail` gives the observed error. `not-supported` names the reason.
 `not verified` means this run did not execute it.
 
-| Check | Python TCP | Python TLS | Python WS | Node TCP | Node WS | Rust rumqttc | Rust paho-mqtt | mosquitto |
-|---|---|---|---|---|---|---|---|---|
-| v311-connect | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| v5-connect | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| qos0 | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| qos1 | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| qos2 | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| retained | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| will | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| session-resume | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| shared | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| payload-1mib | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| auth | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| keepalive | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
-| restart | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| Check | Python TCP | Python TLS | Python WS | Node TCP | Node TLS | Node WS | Rust rumqttc | Rust paho-mqtt | mosquitto |
+|---|---|---|---|---|---|---|---|---|---|
+| v311-connect | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| v5-connect | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| qos0 | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| qos1 | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| qos2 | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| retained | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| will | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| session-resume | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| shared | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| payload-1mib | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| auth | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| keepalive | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
+| restart | pass | pass | pass | pass | pass | pass | not verified | not-supported: C library | not-supported: tools missing |
 
 Evidence lines are in the run output of `run_all.sh`
 (`results-lines.txt`). Example lines from the run:

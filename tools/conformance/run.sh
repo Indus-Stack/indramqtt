@@ -302,9 +302,9 @@ ANALYSIS = {
         "test_session_expiry": "The broker is wrong. MQTT 5.0 \u00a73.1.2.11.2 "
             "requires the Session Expiry Interval and its DISCONNECT override. "
             "The session-present flag was wrong. Class: medium.",
-        "test_subscribe_failure": "The broker differs. The suite expects 0x80; "
-            "the broker sent 0x87. Both are legal in version 5, but the "
-            "interoperability target uses 0x80. Send 0x80. Class: small.",
+        "test_subscribe_failure": "The suite expects 0x80. The broker answers "
+            "0x87 Not Authorized. Both are legal under MQTT 5.0 section 3.9.3. "
+            "The broker sends the more exact code by choice.",
         "test_subscribe_identifiers": "The broker differs. MQTT 5.0 \u00a73.8.4 "
             "permits one copy per matching subscription; the suite expects one "
             "copy with every Subscription Identifier. The broker sent two "

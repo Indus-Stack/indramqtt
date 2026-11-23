@@ -164,6 +164,7 @@ run_one "paho_python-tcp" bash "$HERE/paho_python/run.sh" tcp
 run_one "paho_python-tls" bash "$HERE/paho_python/run.sh" tls
 run_one "paho_python-ws"  bash "$HERE/paho_python/run.sh" ws
 run_one "node_mqtt-tcp"    bash "$HERE/node_mqtt/run.sh" tcp
+run_one "node_mqtt-tls"    bash "$HERE/node_mqtt/run.sh" tls
 run_one "node_mqtt-ws"     bash "$HERE/node_mqtt/run.sh" ws
 run_one "rust_rumqttc-tcp" bash "$HERE/rust_rumqttc/run.sh" tcp
 run_one "rust_paho_mqtt-tcp" bash "$HERE/rust_paho_mqtt/run.sh" tcp

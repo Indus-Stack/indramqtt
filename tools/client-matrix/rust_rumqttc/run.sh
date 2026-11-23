@@ -9,7 +9,7 @@
 #
 # The loop agents cannot run cargo. The runner uses a prebuilt binary
 # when one exists. Set MATRIX_ALLOW_CARGO=1 to let cargo build and run
-# the project; the gates set the shared target directory for that build.
+# the project; no automated gate builds or runs the project.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 TRANSPORT=${1:-tcp}
@@ -44,7 +44,7 @@ if [ "${MATRIX_ALLOW_CARGO:-0}" = "1" ]; then
   exec cargo run --quiet --manifest-path "$HERE/Cargo.toml" -- "$TRANSPORT"
 fi
 
-echo "rust binary is not built; the gates build this project with cargo"
+echo "rust binary is not built; no automated gate builds or runs the project"
 for check in v311-connect v5-connect qos0 qos1 qos2 retained will \
     session-resume shared payload-1mib auth keepalive restart; do
   echo "RESULT $check not-verified rust binary is not built in this run"

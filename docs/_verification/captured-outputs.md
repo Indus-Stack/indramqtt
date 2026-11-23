@@ -238,7 +238,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/cli.md` | 2348 | `OK` |
 | `reference/configuration.md` | 3404 | `OK` |
 | `reference/configuration.md` | 3420 | `OK` |
-| `reference/index.md` | 42 | `OK` |
+| `reference/index.md` | 43 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |
 | `reference/sources.md` | 70 | `status=connected` |

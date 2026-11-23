@@ -1266,3 +1266,63 @@ async fn mv01_webhook_action_sink_survives_restart() {
     assert_eq!(body.as_slice(), &br#"{"r":2}"#[..]);
     kernel.finish().await;
 }
+
+/// Creating connectors with aliases `mongo` and `es` returns 201 Created
+/// and stores their canonical types `mongodb` and `elasticsearch`.
+#[tokio::test]
+async fn mn14_connector_aliases_mongo_and_es() {
+    let kernel = spawn_kernel("").await;
+
+    // Sending POST /api/v5/connectors with type `mongo` returns 201 and stores `mongodb`.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn14-mongo",
+            "type": "mongo",
+            "server": "127.0.0.1:9",
+            "database": "telemetry",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "mongo connector create: {body}");
+    assert_eq!(body["type"], "mongodb", "stored type: {body}");
+
+    let (status, get_body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mn14-mongo",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "mongo connector get: {get_body}");
+    assert_eq!(get_body["type"], "mongodb", "stored type: {get_body}");
+
+    // Sending POST /api/v5/connectors with type `es` returns 201 and stores `elasticsearch`.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mn14-es",
+            "type": "es",
+            "server": "127.0.0.1:9",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "es connector create: {body}");
+    assert_eq!(body["type"], "elasticsearch", "stored type: {body}");
+
+    let (status, get_body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mn14-es",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "es connector get: {get_body}");
+    assert_eq!(get_body["type"], "elasticsearch", "stored type: {get_body}");
+
+    kernel.finish().await;
+}
