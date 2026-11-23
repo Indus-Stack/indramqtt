@@ -61,8 +61,9 @@ If you set `RUST_LOG`, it overrides `logging.level`. `RUST_LOG` is a
 developer filter (`RUST_LOG=broker_router=trace`). The compose file
 does not set it.
 
-The `GET /api/v1/config/explain` endpoint shows the layer that set a
-value. The endpoint needs a token. A request without a token gets 401.
+### Get an admin token
+
+Use the following commands in the same shell as the README example. They require curl and Python 3. On first login, replace both occurrences of `<choose-a-password>` with your new admin password. If you already changed it, run only the last login command with your current password.
 
 ```bash
 # Log in as the first-boot default admin, rotate the password (a
@@ -79,8 +80,13 @@ TOKEN=$(curl -sf -X POST http://localhost:18083/api/v5/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"<choose-a-password>"}' \
   | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+```
 
-# The explain endpoint names the winning layer for the setting.
+### Check the effective setting
+
+Use the token to see which layer set the log level.
+
+```bash
 curl -sf -H "Authorization: Bearer $TOKEN" \
   'http://localhost:18083/api/v1/config/explain?key=logging.level'
 # -> {"key":"logging.level","value":"\"debug\"",

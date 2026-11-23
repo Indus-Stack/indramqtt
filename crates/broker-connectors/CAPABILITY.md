@@ -1,11 +1,6 @@
 # Connector capability table (B1-05)
 
-One row per sink module in `crates/broker-connectors/src` plus the
-enterprise sinks in `crates/broker-connectors-enterprise/src` (every file
-except each crate's `lib.rs`). Each row was derived from the module source
-and its `#[cfg(test)]` tests. No row claims a live-server run: every test
-in these crates passes offline with `cargo test -p broker-connectors`
-and `cargo test -p broker-connectors-enterprise`.
+The table covers 46 distinct sink names across the two connector crates. Source-only connectors, shared helpers, and test modules for a sink listed elsewhere are outside this count.
 
 Method:
 
@@ -15,62 +10,17 @@ Method:
 - `Tested against` is what the proving test actually runs against:
   `mock transport` (in-memory `Mock*`/`Memory*`), or `loopback fake`
   (an in-process `TcpListener` on `127.0.0.1:0` or ephemeral `axum`
-  server scripted for one exchange). Neither is the vendor's real
-  server.
+  server scripted for one exchange). Some rows also name an opt-in
+  qualification test that needs a live service and credentials. Those
+  tests run separately from the default offline suite.
 - `Proving test` names one test by path. Community paths are
   `crates/broker-connectors/src/<module>.rs`; enterprise paths are
   `crates/broker-connectors-enterprise/src/<module>.rs`.
 
-Dependency note: the two connector manifests
-(`crates/broker-connectors/Cargo.toml` for community sinks,
-`crates/broker-connectors-enterprise/Cargo.toml` for enterprise sinks)
-pull in the
-maintained vendor drivers `clickhouse 0.15` for the clickhouse sink only
-(`DriverClickHouseTransport` with driver-owned HTTP pool, Basic auth
-and `RowBinaryWithNamesAndTypes` inserts),
-`tokio-postgres 0.7` +
-`tokio-postgres-rustls` for the cockroachdb sink only
-(`PgDriverCockroachDbTransport` with `rustls` system roots),
-`aws-sdk-dynamodb 1` for the dynamodb sink only
-(`SdkDynamoDbTransport` with driver-owned SigV4),
-`aws-sdk-kinesis 1` for the kinesis sink only
-(`SdkKinesisTransport` with driver-owned SigV4),
-`aws-sdk-redshiftdata 1` for the redshift sink only
-(`SdkRedshiftTransport` with driver-owned SigV4 plus
-`DescribeStatement` polling to FINISHED),
-`elasticsearch 8` (+ `http 1` for per-request headers) for the
-elasticsearch sink only (`DriverElasticsearchTransport` sending the
-sink-rendered bulk NDJSON through the official client),
-`couchbase 1` for the couchbase sink only
-(`DriverCouchbaseTransport` with upsert/insert/replace plus
-scope/collection management),
- `google-cloud-pubsub 1` (+ `google-cloud-gax 1` for status-code mapping
- in tests) for the gcp_pubsub sink only (`SdkGcpPubSubTransport`
- publishing base64 data with ordering keys and attributes through the
- official gRPC `Publisher`), and
- `mongodb 3` for the mongodb sink only (`DriverMongoDbTransport`
- bulk insert with acknowledged write concern plus collection routing
- through the official client), and
- `rdkafka 0.39` (SASL_SSL + SASL) plus `schema-registry-client 0.4`
-for the confluent sink only (`RdkafkaConfluentTransport` with the
-system OpenSSL roots, `RegistrySchemaClient` for Avro/JSON subjects;
-`apache-avro 0.15` proves Avro framing in dev-tests); `rdkafka 0.39`
- for the kafka sink (`RdkafkaKafkaTransport`, plaintext + acks +
- idempotence where configured; `FutureProducer` delivery futures); no other
- sink uses a maintained vendor driver (`mysql_async`,
- `redis`, other cloud SDKs remain absent). Every other TCP sink is
-hand-written over `tokio::net::TcpStream`; the AWS IoT and Azure IoT
-sinks upgrade that socket with `tokio-rustls`/`rustls` (platform roots
-plus a configured CA bundle); every cloud sink is otherwise
-hand-written over `reqwest`. The `dev-dependencies` are `axum` for
-the loopback fakes and `apache-avro` for the confluent Avro vectors.
-
-Counts: 47 sink modules (15 community + 32 enterprise). 19 speak a
-native wire protocol over TCP
-(alloydb, aws_iot, azure_iot, cassandra, cockroachdb, confluent, couchbase,
-gcp_iot, kafka, mongodb, mqtt_bridge, mssql, mysql, opc_ua, postgres,
-pulsar, rabbitmq, redis, timescaledb). 0 have been run against a real
-vendor server in-tree. 47 have only mock or loopback-fake coverage.
+For driver versions and Cargo features, see the manifests for
+[`broker-connectors`](Cargo.toml) and
+[`broker-connectors-enterprise`](../broker-connectors-enterprise/Cargo.toml).
+The row for each sink describes which driver or protocol implementation it uses.
 
 | Sink | Speaks | Tested against | Proving test |
 |------|--------|----------------|--------------|

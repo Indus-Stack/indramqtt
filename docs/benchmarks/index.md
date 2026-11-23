@@ -31,7 +31,7 @@ The rates are single-threaded and in memory. They change with the hardware. They
 
 ## Broker comparison
 
-The README compares brokers at 1 CPU and 1 GB. It states the method, the limits and the raw data. Read it before you quote a number. The method, the tool, and the raw results live in `benchmark/`. See [Sizing](../operations/sizing.md) for the sustained rows.
+The [November 14 four-CPU measurements](../../benchmark/2026-11-14.md) cover MQTT 5 throughput and idle-client memory for IndraMQTT and EMQX, plus a repeated MQTT 3.1.1 SQL republish test. The [October 5 one-CPU comparison](../../benchmark/README.md) includes EMQX and rumqttd, its harness, and raw load-step results.
 
 ## Microbenchmarks
 
