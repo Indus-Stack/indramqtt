@@ -35,6 +35,12 @@ def port():
         return sock.getsockname()[1]
 
 
+def held_port():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    return sock, sock.getsockname()[1]
+
+
 def word(value):
     raw = value.encode() if isinstance(value, str) else value
     return struct.pack("!H", len(raw)) + raw
@@ -1480,9 +1486,7 @@ class InventoryEntry(unittest.TestCase):
     def test_created_listener_is_only_a_transient_record(self):
         b = self.boot()
         fixture = ROOT / "crates/broker-node/tests/k1_05"
-        ports = set()
-        while len(ports) < 4:
-            ports.add(port())
+        held = [held_port() for _ in range(4)]
         tcp_defaults = {"backlog": 8, "active_n": 10, "buffer": "4KB", "high_watermark": "1MB",
                         "keepalive": "none", "nodelay": True, "nolinger": False, "reuseaddr": True,
                         "send_timeout": "15s", "send_timeout_close": True}
@@ -1499,7 +1503,7 @@ class InventoryEntry(unittest.TestCase):
                               "proxy_address_header": "", "proxy_port_header": "",
                               "supported_subprotocols": "mqtt, mqtt-v3, mqtt-v3.1.1, mqtt-v5", "validate_utf8": True}
         identifiers = []
-        for kind, bind_port in zip(["tcp", "ssl", "ws", "wss"], ports):
+        for kind, (held_sock, bind_port) in zip(["tcp", "ssl", "ws", "wss"], held):
             with self.subTest(kind=kind):
                 name = "inventory" + kind
                 identifier = kind + ":" + name
@@ -1523,6 +1527,7 @@ class InventoryEntry(unittest.TestCase):
                     self.assert_fields_kept(created["ssl_options"], config["ssl_options"])
                 with self.assertRaises(ConnectionRefusedError):
                     socket.create_connection(("127.0.0.1", bind_port), timeout=2)
+                held_sock.close()
                 path = "/api/v5/listeners/" + identifier
                 self.assertEqual(b.http("POST", path + "/start", {})[0], 400)
                 self.assertEqual(b.http("PUT", path, {**config, "max_connections": 0})[0], 400)
@@ -2482,7 +2487,7 @@ class InventoryEntry(unittest.TestCase):
     # // AZ-01 inventory: current behaviour; owner MV-14
     def test_deprecated_edge_settings_warn_without_starting_edge_socket(self):
         b = self.broker
-        edge_port = port()
+        edge_sock, edge_port = held_port()
         b.configure()
         path = b.cfg / "indra.toml"
         config = path.read_text().replace('id="az-01-entry"', 'id="az-01-entry"\nbrokerlink_bind="127.0.0.1:' + str(edge_port) + '"')
@@ -2494,6 +2499,7 @@ class InventoryEntry(unittest.TestCase):
         b.start()
         with self.assertRaises(OSError):
             socket.create_connection(("127.0.0.1", edge_port), timeout=1)
+        edge_sock.close()
         _, ack = b.connect("deprecated-native")
         self.assertEqual(ack, "0000")
         b.stop()
@@ -4718,7 +4724,8 @@ class InventoryEntry(unittest.TestCase):
         b = self.broker
         b.configure()
         fixture = ROOT / "crates/broker-node/tests/k1_05"
-        tls_port = port()
+        tls_sock, tls_port = held_port()
+        b.reserved.append(tls_sock)
         config_path = b.cfg / "indra.toml"
         base = config_path.read_text()
 
@@ -4769,6 +4776,9 @@ class InventoryEntry(unittest.TestCase):
             sock.sendall(b"\xc0\x00")
             self.assertEqual(packet(sock), (0xd0, b""))
             b.stop()
+            hold = socket.socket()
+            hold.bind(("127.0.0.1", tls_port))
+            b.reserved.append(hold)
         # Both policies come from the file in separate broker processes.
         # This covers certificate TLS, not PSK or a database qualification.
 
