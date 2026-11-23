@@ -83,15 +83,15 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/gcp_pubsub.md` | 99 | `ok` |
 | `connectors/gcp_pubsub_consumer.md` | 89 | `ok` |
 | `connectors/gcp_pubsub_producer.md` | 85 | `ok` |
-| `connectors/greptimedb.md` | 45 | `ok` |
-| `connectors/greptimedb.md` | 74 | `ok` |
-| `connectors/greptimedb.md` | 103 | `ok` |
-| `connectors/greptimedb.md` | 132 | `ok` |
-| `connectors/greptimedb.md` | 162 | `ok` |
-| `connectors/greptimedb.md` | 192 | `ok` |
-| `connectors/greptimedb.md` | 226 | `ok` |
-| `connectors/greptimedb.md` | 292 | `ok` |
-| `connectors/greptimedb.md` | 415 | `greptimedb` |
+| `connectors/greptimedb.md` | 46 | `ok` |
+| `connectors/greptimedb.md` | 75 | `ok` |
+| `connectors/greptimedb.md` | 104 | `ok` |
+| `connectors/greptimedb.md` | 133 | `ok` |
+| `connectors/greptimedb.md` | 163 | `ok` |
+| `connectors/greptimedb.md` | 193 | `ok` |
+| `connectors/greptimedb.md` | 227 | `ok` |
+| `connectors/greptimedb.md` | 293 | `ok` |
+| `connectors/greptimedb.md` | 416 | `greptimedb` |
 | `connectors/http.md` | 93 | `delivered` |
 | `connectors/http.md` | 192 | `http` |
 | `connectors/index.md` | 173 | `ok` |
@@ -120,7 +120,10 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/mysql.md` | 82 | `mysql` |
 | `connectors/oci-streaming.md` | 94 | `ok` |
 | `connectors/oci_streaming.md` | 107 | `delivered` |
-| `connectors/opc-ua.md` | 72 | `ok` |
+| `connectors/opc-ua.md` | 64 | `opc.tcp://127.0.0.1:4840` |
+| `connectors/opc-ua.md` | 112 | `ns=1;i=1001` |
+| `connectors/opc-ua.md` | 175 | `2500` |
+| `connectors/opc-ua.md` | 232 | `ok` |
 | `connectors/opc_ua.md` | 97 | `ok` |
 | `connectors/opents.md` | 91 | `delivered` |
 | `connectors/opentsdb.md` | 43 | `ok` |
@@ -149,7 +152,10 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/s3tables.md` | 69 | `refused` |
 | `connectors/snowflake.md` | 85 | `ok` |
 | `connectors/snowflake.md` | 227 | `delivered` |
-| `connectors/sparkplug-b.md` | 71 | `ok` |
+| `connectors/sparkplug-b.md` | 63 | `mqtt://127.0.0.1:1883` |
+| `connectors/sparkplug-b.md` | 111 | `spb-client-1` |
+| `connectors/sparkplug-b.md` | 160 | `spBv1.0/plant1` |
+| `connectors/sparkplug-b.md` | 231 | `ok` |
 | `connectors/sparkplug_b.md` | 84 | `sparkplug_b` |
 | `connectors/sqlserver.md` | 102 | `mssql` |
 | `connectors/tablestore.md` | 92 | `ok` |
@@ -190,7 +196,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `getting-started/install.md` | 66 | `indramqtt 0.1.0` |
 | `getting-started/install.md` | 74 | `indra 0.1.0` |
 | `index.md` | 56 | `OK` |
-| `mcp.md` | 2229 | `401` |
+| `mcp.md` | 3513 | `401` |
 | `migration.md` | 94 | `OK` |
 | `multi-tenancy/index.md` | 100 | `isolated` |
 | `multi-tenancy/quotas.md` | 102 | `ok` |
@@ -235,7 +241,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/index.md` | 42 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |
-| `reference/sources.md` | 62 | `status=connected` |
+| `reference/sources.md` | 70 | `status=connected` |
 | `rules/actions.md` | 64 | `delivered` |
 | `rules/actions.md` | 258 | `matched=2 success=2 reset=0` |
 | `rules/functions.md` | 506 | `ok` |
@@ -265,4 +271,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 249 blocks. Each output matches its page.
+The run captured 255 blocks. Each output matches its page.
