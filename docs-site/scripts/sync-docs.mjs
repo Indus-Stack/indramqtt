@@ -24,6 +24,62 @@ function removeInternal(folder) {
   }
 }
 
+// Remove the first Markdown heading line when its text matches the front matter title.
+function stripDuplicateTitle(content) {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fmMatch) return content;
+  const titleMatch = fmMatch[1].match(/^title:\s*(.*)$/m);
+  if (!titleMatch) return content;
+  const title = titleMatch[1].trim().replace(/^["']|["']$/g, '');
+  const prefix = content.slice(0, fmMatch[0].length);
+  const rest = content.slice(fmMatch[0].length);
+
+  const lines = rest.split(/\r?\n/);
+  let removed = false;
+  const outLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!removed && /^#\s+/.test(line)) {
+      const heading = line.replace(/^#\s+/, '').trim();
+      const norm = (s) =>
+        s
+          .toLowerCase()
+          .replace(/^indramqtt\s+/, '')
+          .replace(/\s+layers$/, '')
+          .replace(/["']/g, '')
+          .trim();
+      if (
+        heading === title ||
+        norm(heading) === norm(title) ||
+        heading.toLowerCase().includes(title.toLowerCase())
+      ) {
+        removed = true;
+        if (i + 1 < lines.length && lines[i + 1].trim() === '') {
+          i++;
+        }
+        continue;
+      }
+    }
+    outLines.push(line);
+  }
+  return prefix + outLines.join('\n');
+}
+
+function processMarkdownFiles(folder) {
+  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+    const path = join(folder, entry.name);
+    if (entry.isDirectory()) {
+      processMarkdownFiles(path);
+    } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      const content = readFileSync(path, 'utf8');
+      const updated = stripDuplicateTitle(content);
+      if (updated !== content) {
+        writeFileSync(path, updated, 'utf8');
+      }
+    }
+  }
+}
+
 function publishFailures() {
   const page = join(source, FAILURES_SOURCE);
   if (!existsSync(page)) {
@@ -39,11 +95,13 @@ function publishFailures() {
   ].join('\n');
   const out = join(target, `${FAILURES_ROUTE}.md`);
   mkdirSync(dirname(out), { recursive: true });
-  writeFileSync(out, frontMatter + readFileSync(page, 'utf8'));
+  const raw = frontMatter + readFileSync(page, 'utf8');
+  writeFileSync(out, stripDuplicateTitle(raw), 'utf8');
 }
 
 rmSync(target, { recursive: true, force: true });
 mkdirSync(dirname(target), { recursive: true });
 cpSync(source, target, { recursive: true });
 removeInternal(target);
+processMarkdownFiles(target);
 publishFailures();

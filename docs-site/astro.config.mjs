@@ -38,6 +38,17 @@ export default defineConfig({
     starlight({
       title: 'IndraMQTT',
       description: 'The complete MQTT platform in one small binary.',
+      logo: {
+        src: './src/assets/mark.svg',
+        replacesTitle: false,
+      },
+      social: {
+        github: 'https://github.com/ankur-paan/indramqtt',
+      },
+      editLink: {
+        baseUrl: 'https://github.com/ankur-paan/indramqtt/edit/main/docs/',
+      },
+      customCss: ['./src/styles/theme.css'],
       components: {
         Head: './src/components/overrides/Head.astro',
       },
