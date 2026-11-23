@@ -1059,7 +1059,7 @@ async fn mv03c_sparkplug_b_delivers_updates_through_the_broker() {
             task_conns_accept.lock().expect("fake lock").push(handle);
         }
     });
-    let (mut server, state1) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+    let (server, state1) = TestServer::start_with_registry(Arc::clone(&registry)).await;
     let token = server.login_as_admin().await;
     let mqtt_url = format!("mqtt://127.0.0.1:{port}");
     let (status, _) = server
@@ -1240,8 +1240,7 @@ async fn mv03c_sparkplug_b_delivers_updates_through_the_broker() {
     assert!(failed >= 1, "a dead MQTT target counts one failed forward");
     // Stop the old server and its connector pump before the rebind,
     // so the restarted broker is the only client on the port.
-    server.task.abort();
-    let _ = (&mut server.task).await;
+    drop(server);
     drop(state1);
     drop(registry);
     let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
@@ -1262,45 +1261,67 @@ async fn mv03c_sparkplug_b_delivers_updates_through_the_broker() {
         .await
         .expect("rebind sparkplug fake");
     let task_received = std::sync::Arc::clone(&received);
+    let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_connect_count = std::sync::Arc::clone(&connect_count);
+    let restarted_conns: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let restarted_conns_accept = std::sync::Arc::clone(&restarted_conns);
     let task = tokio::spawn(async move {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
-        let Some((kind, rest)) = read_packet(&mut stream).await else {
-            return;
-        };
-        assert_eq!(kind & 0xF0, 0x10, "first packet is CONNECT");
-        let _ = stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await;
-        let _ = rest;
         loop {
-            let Some((kind, rest)) = read_packet(&mut stream).await else {
-                return;
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
             };
-            match kind & 0xF0 {
-                0x30 => {
-                    if rest.len() < 2 {
-                        return;
-                    }
-                    let topic_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
-                    if rest.len() < 2 + topic_len + 2 {
-                        return;
-                    }
-                    let topic = String::from_utf8_lossy(&rest[2..2 + topic_len]).to_string();
-                    let packet_id = [rest[2 + topic_len], rest[3 + topic_len]];
-                    let payload = rest[4 + topic_len..].to_vec();
-                    task_received
-                        .lock()
-                        .expect("fake lock")
-                        .push((topic, payload));
-                    let _ = stream
-                        .write_all(&[0x40, 0x02, packet_id[0], packet_id[1]])
-                        .await;
+            let task_received = std::sync::Arc::clone(&task_received);
+            let task_connect_count = std::sync::Arc::clone(&task_connect_count);
+            let handle = tokio::spawn(async move {
+                let Some((kind, rest)) = read_packet(&mut stream).await else {
+                    return;
+                };
+                if kind & 0xF0 == 0x10 {
+                    task_connect_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                0xC0 => {
-                    let _ = stream.write_all(&[0xD0, 0x00]).await;
+                assert_eq!(kind & 0xF0, 0x10, "first packet is CONNECT");
+                assert!(
+                    rest.windows(9).any(|w| w == b"mv03c-spb"),
+                    "the CONNECT carries the client id"
+                );
+                let _ = stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await;
+                loop {
+                    let Some((kind, rest)) = read_packet(&mut stream).await else {
+                        return;
+                    };
+                    match kind & 0xF0 {
+                        0x30 => {
+                            if rest.len() < 2 {
+                                return;
+                            }
+                            let topic_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                            if rest.len() < 2 + topic_len + 2 {
+                                return;
+                            }
+                            let topic =
+                                String::from_utf8_lossy(&rest[2..2 + topic_len]).to_string();
+                            let packet_id = [rest[2 + topic_len], rest[3 + topic_len]];
+                            let payload = rest[4 + topic_len..].to_vec();
+                            task_received
+                                .lock()
+                                .expect("fake lock")
+                                .push((topic, payload));
+                            let _ = stream
+                                .write_all(&[0x40, 0x02, packet_id[0], packet_id[1]])
+                                .await;
+                        }
+                        0xC0 => {
+                            let _ = stream.write_all(&[0xD0, 0x00]).await;
+                        }
+                        _ => return,
+                    }
                 }
-                _ => return,
-            }
+            });
+            restarted_conns_accept
+                .lock()
+                .expect("fake lock")
+                .push(handle);
         }
     });
     mv03c_publish_mqtt(
@@ -1323,7 +1344,18 @@ async fn mv03c_sparkplug_b_delivers_updates_through_the_broker() {
     // Metrics are memory-only, so the restarted broker starts at
     // zero and this first delivery reads one success.
     mv02b_wait_success(&server, &token, "mv03c-spb-act", 1).await;
+    // Five pump intervals of 100 ms to confirm no second connection arrives.
+    const PUMP_SETTLE_MS: u64 = 500;
+    tokio::time::sleep(std::time::Duration::from_millis(PUMP_SETTLE_MS)).await;
+    assert_eq!(
+        connect_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the restarted broker connects after the restart"
+    );
     task.abort();
+    for handle in restarted_conns.lock().expect("fake lock").drain(..) {
+        handle.abort();
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
