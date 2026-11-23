@@ -1,6 +1,6 @@
 ---
-title: Rule functions: message context
-description: Verified entries for the message context accessors.
+title: "Rule functions: message context"
+description: "Verified entries for the message context accessors."
 sidebar:
   order: 45
 ---

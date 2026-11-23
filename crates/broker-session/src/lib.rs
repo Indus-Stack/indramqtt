@@ -127,6 +127,18 @@ pub struct Session {
     /// an fsync. One mutex per session, detached-buffer path only; live
     /// deliveries to connected sessions never touch it or a file.
     offline_persist: std::sync::Mutex<()>,
+    /// Serializes offline/inflight replay per session so an overlapping
+    /// reconnect on the same session waits for any in-progress drain/restore.
+    replay_lock: parking_lot::Mutex<()>,
+    /// Retransmissions deferred by Receive Maximum on the current connection,
+    /// drained ahead of fresh `offline_queue` entries as ACKs arrive.
+    pending_replays: RwLock<VecDeque<PendingReplay>>,
+    /// Retained PUBLISH matches deferred during `SUBSCRIBE` on the current
+    /// connection, drained after `pending_replays` and before `offline_queue`.
+    pending_retained: RwLock<PendingRetainedQueue>,
+    /// Serializes MQTT 5 connection-scoped send-window checks and tracking
+    /// reservations across live delivery and replay.
+    send_quota_lock: parking_lot::Mutex<()>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
     /// resends oldest-first with DUP set. Bounded per session by the
@@ -617,6 +629,59 @@ pub struct Qos2InboundEntry {
 /// waiting for PUBCOMP (payload dropped, packet id retained for dedup).
 /// Replay reuses the packet id in order; PUBLISH replays carry DUP set
 /// while PUBREL replays carry the fixed PUBREL flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReplayKind {
+    Qos1,
+    Qos2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingReplay {
+    packet_id: u16,
+    kind: PendingReplayKind,
+}
+
+/// One deferred retransmission item popped from the connection's pending
+/// replay queue when send-window capacity opens.
+#[derive(Debug, Clone)]
+pub enum PendingReplayItem {
+    Qos1 {
+        entry: InflightMessage,
+        is_spill: bool,
+    },
+    Qos2(Qos2OutboundEntry),
+}
+
+/// One retained PUBLISH match deferred because the connection's MQTT 5 Receive
+/// Maximum (or tracking capacity) was exhausted during `SUBSCRIBE`. Stored
+/// per-connection in memory so it never mutates or evicts the durable offline
+/// queue and preserves the subscription identifier until sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferRetainedOutcome {
+    Admitted,
+    QuotaExceeded,
+    Superseded,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingRetained {
+    pub topic: Topic,
+    pub qos: QoS,
+    pub payload: Bytes,
+    pub sub_id: u32,
+}
+
+/// Hard upper bound on deferred per-connection retained payload bytes so a
+/// client with a full send window cannot exhaust broker memory via repeated
+/// SUBSCRIBEs.
+const MAX_PENDING_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct PendingRetainedQueue {
+    items: VecDeque<PendingRetained>,
+    bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Qos2OutboundEntry {
     pub packet_id: u16,
@@ -754,6 +819,10 @@ impl Session {
             offline_queue: RwLock::new(VecDeque::new()),
             offline_store: RwLock::new(None),
             offline_persist: std::sync::Mutex::new(()),
+            replay_lock: parking_lot::Mutex::new(()),
+            pending_replays: RwLock::new(VecDeque::new()),
+            pending_retained: RwLock::new(PendingRetainedQueue::default()),
+            send_quota_lock: parking_lot::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
             spill_count: AtomicUsize::new(0),
@@ -808,9 +877,21 @@ impl Session {
     /// superuser flag together so the publish path reads one atomic.
     /// Off the hot path (bind only).
     pub fn set_verified_identity(&self, verified: Option<String>, is_superuser: bool) {
+        if !self.drops_state_at_disconnect() {
+            let store = self.offline_store.read().clone();
+            if let Some(store) = store {
+                let tenant = self.tenant_id.read().clone();
+                let _ = store.set_owner_in_tenant(&tenant, &self.client_id, verified.as_deref());
+            }
+        }
         *self.verified_username.write() = verified;
         self.verified_is_superuser
             .store(is_superuser, Ordering::Relaxed);
+    }
+
+    /// Verified MQTT principal bound to this session, if authenticated.
+    pub fn verified_username(&self) -> Option<String> {
+        self.verified_username.read().clone()
     }
 
     /// Negotiated protocol level for this session (X1-02): 4 or 5.
@@ -1786,7 +1867,7 @@ impl Session {
         let drained: Vec<QueuedMessage> = self.offline_queue.write().drain(..).collect();
         if !drained.is_empty() {
             let tenant = self.offline_tenant();
-            store.remove_in_tenant(&tenant, &self.client_id);
+            store.remove_queue_in_tenant(&tenant, &self.client_id);
         }
         drained
     }
@@ -1800,6 +1881,363 @@ impl Session {
     /// the persist mutex for the drain so the drain pairs with the
     /// confirm's rewrite under the same serialization as concurrent
     /// buffers; no file I/O happens here.
+    /// Serialize offline/inflight replay per session so an overlapping
+    /// reconnect on the same session cannot observe an empty queue while an
+    /// older connection is still routing or restoring unrouted entries.
+    pub fn lock_replay(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.replay_lock.lock()
+    }
+
+    /// Total unacknowledged QoS 1 + QoS 2 PUBLISH packets currently in-flight
+    /// on the active connection (excluding retransmissions still deferred in
+    /// `pending_replays` for this connection).
+    pub fn unacked_on_conn_len(&self) -> usize {
+        let total_unacked = self
+            .inflight_total_len()
+            .saturating_add(self.qos2_outbound_len());
+        let deferred = self.pending_replays.read().len();
+        total_unacked.saturating_sub(deferred)
+    }
+
+    /// True when this session has either deferred retransmissions or queued
+    /// offline messages waiting for send-window capacity.
+    pub fn has_pending_replay_or_offline(&self) -> bool {
+        !self.pending_replays.read().is_empty()
+            || !self.pending_retained.read().items.is_empty()
+            || !self.offline_queue.read().is_empty()
+    }
+
+    pub fn pending_retained_len(&self) -> usize {
+        self.pending_retained.read().items.len()
+    }
+
+    /// True when `pending_retained` can admit `additional_msgs` /
+    /// `additional_bytes` without exceeding `max_msgs` or
+    /// `MAX_PENDING_RETAINED_BYTES`.
+    pub fn pending_retained_can_fit(
+        &self,
+        max_msgs: usize,
+        additional_msgs: usize,
+        additional_bytes: usize,
+    ) -> bool {
+        if additional_msgs == 0 {
+            return true;
+        }
+        let _quota = self.send_quota_lock.lock();
+        let max_msgs = max_msgs.max(1);
+        let queue = self.pending_retained.read();
+        queue.items.len().saturating_add(additional_msgs) <= max_msgs
+            && queue.bytes.saturating_add(additional_bytes) <= MAX_PENDING_RETAINED_BYTES
+    }
+
+    /// Enqueue deferred retained matches for the current connection only,
+    /// serialized with `send_quota_lock` and bounded by both
+    /// `offline_queue_limit()` and `MAX_PENDING_RETAINED_BYTES`. Returns
+    /// `Some(dropped)` when `expected_conn_id` owns the session (`dropped` is
+    /// the count rejected once full), or `None` if superseded.
+    pub fn defer_retained_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        max_msgs: usize,
+        items: Vec<PendingRetained>,
+    ) -> Option<usize> {
+        if items.is_empty() {
+            return Some(0);
+        }
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return None;
+        }
+        let max_msgs = max_msgs.max(1);
+        let mut queue = self.pending_retained.write();
+        let mut dropped = 0usize;
+        for item in items {
+            let item_bytes = item.topic.as_str().len().saturating_add(item.payload.len());
+            let fits_msgs = queue.items.len() < max_msgs;
+            let fits_bytes = queue.bytes.saturating_add(item_bytes) <= MAX_PENDING_RETAINED_BYTES;
+            if fits_msgs && fits_bytes {
+                queue.bytes = queue.bytes.saturating_add(item_bytes);
+                queue.items.push_back(item);
+            } else {
+                dropped += 1;
+            }
+        }
+        Some(dropped)
+    }
+
+    /// Atomically admit all `items` into `pending_retained` for
+    /// `expected_conn_id` or admit none when capacity would be exceeded.
+    pub fn try_defer_retained_all_or_none_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        max_msgs: usize,
+        items: Vec<PendingRetained>,
+    ) -> DeferRetainedOutcome {
+        if items.is_empty() {
+            return DeferRetainedOutcome::Admitted;
+        }
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return DeferRetainedOutcome::Superseded;
+        }
+        let max_msgs = max_msgs.max(1);
+        let extra_bytes: usize = items
+            .iter()
+            .map(|i| i.topic.as_str().len().saturating_add(i.payload.len()))
+            .fold(0usize, |acc, b| acc.saturating_add(b));
+        let mut queue = self.pending_retained.write();
+        if queue.items.len().saturating_add(items.len()) > max_msgs
+            || queue.bytes.saturating_add(extra_bytes) > MAX_PENDING_RETAINED_BYTES
+        {
+            return DeferRetainedOutcome::QuotaExceeded;
+        }
+        queue.bytes = queue.bytes.saturating_add(extra_bytes);
+        queue.items.extend(items);
+        DeferRetainedOutcome::Admitted
+    }
+
+    pub fn pop_next_pending_retained(&self) -> Option<PendingRetained> {
+        let mut queue = self.pending_retained.write();
+        let item = queue.items.pop_front()?;
+        let item_bytes = item.topic.as_str().len().saturating_add(item.payload.len());
+        queue.bytes = queue.bytes.saturating_sub(item_bytes);
+        Some(item)
+    }
+
+    pub fn push_front_pending_retained(&self, item: PendingRetained) {
+        let mut queue = self.pending_retained.write();
+        let item_bytes = item.topic.as_str().len().saturating_add(item.payload.len());
+        queue.bytes = queue.bytes.saturating_add(item_bytes);
+        queue.items.push_front(item);
+    }
+
+    /// Seed `pending_replays` at the start of a connection's replay from the
+    /// session's unacked QoS 1 (window + spill) and QoS 2 PUBLISH state, and
+    /// return any QoS 2 entries already awaiting PUBCOMP (which only need
+    /// PUBREL and do not consume Receive Maximum).
+    pub fn seed_pending_replays(&self) -> Vec<Qos2OutboundEntry> {
+        let mut pending = VecDeque::new();
+        for m in self.inflight.read().iter() {
+            pending.push_back(PendingReplay {
+                packet_id: m.packet_id,
+                kind: PendingReplayKind::Qos1,
+            });
+        }
+        if self.has_spill() {
+            for m in self.inflight_spill.read().iter() {
+                pending.push_back(PendingReplay {
+                    packet_id: m.packet_id,
+                    kind: PendingReplayKind::Qos1,
+                });
+            }
+        }
+        let mut pubrels = Vec::new();
+        for m in self.qos2_outbound.read().iter() {
+            if m.rec_received {
+                pubrels.push(m.clone());
+            } else {
+                pending.push_back(PendingReplay {
+                    packet_id: m.packet_id,
+                    kind: PendingReplayKind::Qos2,
+                });
+            }
+        }
+        *self.pending_replays.write() = pending;
+        pubrels
+    }
+
+    /// Pop the next still-unacked deferred retransmission item for this
+    /// connection, atomically respecting the MQTT 5 Receive Maximum send
+    /// window when `protocol_version() == 5`.
+    pub fn pop_next_pending_replay_paced(&self) -> Option<PendingReplayItem> {
+        let _quota = self.send_quota_lock.lock();
+        let v5_cap = (self.protocol_version() == 5)
+            .then(|| usize::from(self.client_receive_maximum().max(1)));
+        loop {
+            if v5_cap.is_some_and(|cap| self.unacked_on_conn_len() >= cap) {
+                return None;
+            }
+            let next = self.pending_replays.write().pop_front()?;
+            match next.kind {
+                PendingReplayKind::Qos1 => {
+                    if let Some(entry) = self
+                        .inflight
+                        .read()
+                        .iter()
+                        .find(|m| m.packet_id == next.packet_id)
+                        .cloned()
+                    {
+                        return Some(PendingReplayItem::Qos1 {
+                            entry,
+                            is_spill: false,
+                        });
+                    }
+                    if let Some(entry) = self
+                        .inflight_spill
+                        .read()
+                        .iter()
+                        .find(|m| m.packet_id == next.packet_id)
+                        .cloned()
+                    {
+                        return Some(PendingReplayItem::Qos1 {
+                            entry,
+                            is_spill: true,
+                        });
+                    }
+                }
+                PendingReplayKind::Qos2 => {
+                    if let Some(entry) = self
+                        .qos2_outbound
+                        .read()
+                        .iter()
+                        .find(|m| m.packet_id == next.packet_id && !m.rec_received)
+                        .cloned()
+                    {
+                        return Some(PendingReplayItem::Qos2(entry));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-queue a popped pending retransmission at the front if routing to the
+    /// mailbox failed.
+    pub fn push_front_pending_replay(&self, item: &PendingReplayItem) {
+        let entry = match item {
+            PendingReplayItem::Qos1 { entry, .. } => PendingReplay {
+                packet_id: entry.packet_id,
+                kind: PendingReplayKind::Qos1,
+            },
+            PendingReplayItem::Qos2(entry) => PendingReplay {
+                packet_id: entry.packet_id,
+                kind: PendingReplayKind::Qos2,
+            },
+        };
+        self.pending_replays.write().push_front(entry);
+    }
+
+    /// Atomically check the MQTT 5 Receive Maximum send window (for v5
+    /// sessions) and allocate/track one QoS 1 downlink. Returns `None` when
+    /// the v5 Receive Maximum window is full.
+    pub fn try_alloc_qos1_downlink_v5_checked(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+        enqueued_at: Instant,
+    ) -> Option<(u16, InflightTrackOutcome)> {
+        self.try_alloc_qos1_downlink_v5_checked_for_conn(
+            None,
+            topic,
+            qos,
+            retain,
+            payload,
+            enqueued_at,
+        )
+    }
+
+    /// Connection-bound variant of [`Session::try_alloc_qos1_downlink_v5_checked`]:
+    /// atomically verifies `expected_conn_id` (when `Some`) under `send_quota_lock`
+    /// so a superseded connection cannot consume the replacement's send credit.
+    pub fn try_alloc_qos1_downlink_v5_checked_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        topic: Topic,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+        enqueued_at: Instant,
+    ) -> Option<(u16, InflightTrackOutcome)> {
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return None;
+        }
+        if self.protocol_version() != 5 {
+            return Some(self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at));
+        }
+        let cap = usize::from(self.client_receive_maximum().max(1));
+        if self.unacked_on_conn_len() >= cap {
+            return None;
+        }
+        let (pid, outcome) = self.alloc_qos1_downlink(topic, qos, retain, payload, enqueued_at);
+        if outcome == InflightTrackOutcome::Dropped {
+            return None;
+        }
+        Some((pid, outcome))
+    }
+
+    /// Atomically check the MQTT 5 Receive Maximum send window (for v5
+    /// sessions) and reserve one QoS 1 replay entry. Returns `None` when the
+    /// v5 Receive Maximum window is full.
+    pub fn try_reserve_replay_qos1(
+        &self,
+        message: InflightMessage,
+    ) -> Option<InflightTrackOutcome> {
+        if self.protocol_version() != 5 {
+            return Some(self.track_inflight_or_spill(message));
+        }
+        let _quota = self.send_quota_lock.lock();
+        let cap = usize::from(self.client_receive_maximum().max(1));
+        if self.unacked_on_conn_len() >= cap {
+            return None;
+        }
+        Some(self.track_inflight_or_spill(message))
+    }
+
+    /// Atomically check the MQTT 5 Receive Maximum send window (for v5
+    /// sessions) and allocate/track one QoS 2 outbound entry. Returns `None`
+    /// when the v5 Receive Maximum window is full; otherwise `Some((pid, tracked))`.
+    pub fn try_alloc_qos2_outbound_v5_checked(
+        &self,
+        topic: Topic,
+        retain: bool,
+        payload: Bytes,
+    ) -> Option<(u16, bool)> {
+        self.try_alloc_qos2_outbound_v5_checked_for_conn(None, topic, retain, payload)
+    }
+
+    /// Connection-bound variant of [`Session::try_alloc_qos2_outbound_v5_checked`].
+    pub fn try_alloc_qos2_outbound_v5_checked_for_conn(
+        &self,
+        expected_conn_id: Option<u64>,
+        topic: Topic,
+        retain: bool,
+        payload: Bytes,
+    ) -> Option<(u16, bool)> {
+        let _quota = self.send_quota_lock.lock();
+        if expected_conn_id.is_some_and(|cid| *self.conn_id.read() != Some(cid)) {
+            return None;
+        }
+        if self.protocol_version() != 5 {
+            let pid = self.next_packet_id();
+            let tracked = self.track_qos2_outbound(Qos2OutboundEntry {
+                packet_id: pid,
+                topic,
+                retain,
+                payload,
+                rec_received: false,
+            });
+            return Some((pid, tracked));
+        }
+        let cap = usize::from(self.client_receive_maximum().max(1));
+        if self.unacked_on_conn_len() >= cap {
+            return None;
+        }
+        let pid = self.next_packet_id();
+        let tracked = self.track_qos2_outbound(Qos2OutboundEntry {
+            packet_id: pid,
+            topic,
+            retain,
+            payload,
+            rec_received: false,
+        });
+        if !tracked {
+            return None;
+        }
+        Some((pid, true))
+    }
+
     pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {
         if self.offline_store.read().is_some() {
             let _persist = self
@@ -1972,6 +2410,9 @@ pub struct SessionManager {
     /// the full session key so two tenants sharing a client id never
     /// resolve to each other's session.
     conn_index: RwLock<HashMap<u64, SessionKey>>,
+    /// Serializes control-plane route installs (`SUBSCRIBE`) with stale-route
+    /// sweeps so cleanup never deletes a newly accepted subscription.
+    route_guard: parking_lot::Mutex<()>,
     /// Live connection count per `(tenant, username)` (INDRA-127 quotas,
     /// MT-03), grouped `tenant -> username -> count` so the connect path
     /// resolves via borrowed `&str` with no per-connect allocation (only
@@ -2059,6 +2500,19 @@ impl Default for SessionManager {
     }
 }
 
+/// Per-CONNECT metadata committed atomically with session resolution and
+/// `conn_id` binding.
+pub struct ConnectBindMeta {
+    pub conn_id: u64,
+    pub username: Option<String>,
+    pub verified_username: Option<String>,
+    pub is_superuser: bool,
+    pub peerhost: Option<String>,
+    pub keepalive_secs: u16,
+    pub client_alias_max: u16,
+    pub will: Option<StoredWill>,
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self::new_with_all_limits(
@@ -2093,6 +2547,7 @@ impl SessionManager {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             conn_index: RwLock::new(HashMap::new()),
+            route_guard: parking_lot::Mutex::new(()),
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
             connected_count: AtomicU64::new(0),
@@ -2193,6 +2648,8 @@ impl SessionManager {
             self.apply_qos1_limits(&session);
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(Some(store.clone()));
+            let owner = store.owner_in_tenant(&tenant, &client_id);
+            session.set_verified_identity(owner, false);
             *session.connected.write() = false;
             let dropped = session.push_restored_with_limit(messages, self.max_offline_queue());
             stats.capped_dropped += dropped;
@@ -2398,6 +2855,38 @@ impl SessionManager {
     /// pair, never the other tenant's session). Borrowed two-level
     /// lookup takes no allocation, so the deliver path pays no new
     /// allocation per subscriber per publish.
+    /// Commit `confirm_offline_consumed` only if `session` is still the active
+    /// generation for its `(tenant, client_id)` key, serialized under
+    /// `self.sessions.read()` so a concurrent replacement's durable queue file
+    /// can never be rewritten or deleted by an older replay.
+    pub fn confirm_offline_consumed_if_current(
+        &self,
+        session: &Arc<Session>,
+        expected_conn_id: Option<u64>,
+        unrouted: Vec<QueuedMessage>,
+    ) {
+        let tenant = session.offline_tenant();
+        let map = self.sessions.read();
+        let Some(cur) = map
+            .get(&tenant)
+            .and_then(|inner| inner.get(&session.client_id))
+        else {
+            return;
+        };
+        if cur.id != session.id {
+            return;
+        }
+        // If another connection already took over this same session, never
+        // delete/consume on disk for an empty batch, but do restore any
+        // unrouted/deferred messages back to the still-current session.
+        if expected_conn_id.is_some_and(|cid| *cur.conn_id.read() != Some(cid))
+            && unrouted.is_empty()
+        {
+            return;
+        }
+        session.confirm_offline_consumed(unrouted);
+    }
+
     pub fn get_in_tenant(&self, tenant: &str, client_id: &str) -> Option<Arc<Session>> {
         self.sessions.read().get(tenant)?.get(client_id).cloned()
     }
@@ -2408,7 +2897,7 @@ impl SessionManager {
     /// `conn_id` writes (paths outside the indexed bind hook) still
     /// resolve exactly as before.
     pub fn client_id_for_conn(&self, conn_id: u64) -> Option<String> {
-        if let Some(owner) = self.conn_index.read().get(&conn_id).cloned() {
+        if let Some(owner) = self.key_for_conn(conn_id) {
             return Some(owner.client_id);
         }
         self.sessions.read().iter().find_map(|(_, inner)| {
@@ -2420,22 +2909,23 @@ impl SessionManager {
     }
 
     /// Full session key owning a live edge connection, if bound (MT-03).
-    /// Tenant-correct where [`SessionManager::client_id_for_conn`] plus a
-    /// bare `get` would land in the default tenant: connection ids are
-    /// unique per edge connection, so the index identifies exactly one
-    /// `(tenant, client id)` pair.
+    /// Verifies the resolved session still owns `conn_id` so a stale
+    /// `conn_index` entry can never resolve to a replacement session.
     pub fn key_for_conn(&self, conn_id: u64) -> Option<SessionKey> {
-        self.conn_index.read().get(&conn_id).cloned()
+        let index = self.conn_index.read();
+        let owner = index.get(&conn_id)?;
+        let sessions = self.sessions.read();
+        let owns = sessions
+            .get(owner.tenant.as_str())?
+            .get(owner.client_id.as_str())
+            .is_some_and(|session| *session.conn_id.read() == Some(conn_id));
+        owns.then(|| owner.clone())
     }
 
     /// Session owning a live edge connection, if bound (MT-03). Resolves
-    /// through the `conn_id -> session key` index, so a connection in a
-    /// non-default tenant yields its own session, never the
-    /// default-tenant namesake. `None` when the connection is unbound or
-    /// its session is gone. Borrowed two-level lookup clones only the
-    /// `Arc` (no `String` allocation), so the publish path pays no new
-    /// allocation per publish; the two short reads are never held across
-    /// dispatch, routing, or I/O.
+    /// through the `conn_id -> session key` index and verifies the resolved
+    /// session still owns `conn_id`, preventing stale index entries from
+    /// resolving to a replacement owner's session.
     pub fn session_for_conn(&self, conn_id: u64) -> Option<Arc<Session>> {
         let index = self.conn_index.read();
         let owner = index.get(&conn_id)?;
@@ -2443,6 +2933,7 @@ impl SessionManager {
         sessions
             .get(owner.tenant.as_str())?
             .get(owner.client_id.as_str())
+            .filter(|session| *session.conn_id.read() == Some(conn_id))
             .cloned()
     }
 
@@ -2799,6 +3290,38 @@ impl SessionManager {
     // MT-03: tenant plus full subscription options kept flat so callers
     // take no new allocation; allowed like the existing handlers.
     #[allow(clippy::too_many_arguments)]
+    /// Mirror a granted subscription only if `(tenant, client_id)` still
+    /// resolves to `expected_session_id` (when `Some`), preventing a stale
+    /// `SUBSCRIBE` from mutating a replacement session.
+    pub fn add_subscription_if_session_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        expected_session_id: Option<SessionId>,
+        filter: TopicFilter,
+        qos: QoS,
+        no_local: u8,
+        rap: u8,
+        rh: u8,
+    ) {
+        let map = self.sessions.read();
+        if let Some(session) = map.get(tenant).and_then(|inner| inner.get(client_id)) {
+            if expected_session_id.is_some_and(|id| session.id != id) {
+                return;
+            }
+            if session.conn_id.read().is_none() && session.ended_at_ms.read().is_some() {
+                return;
+            }
+        } else {
+            return;
+        }
+        drop(map);
+        self.add_subscription_with_options_in_tenant(
+            tenant, client_id, filter, qos, no_local, rap, rh,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn add_subscription_with_options_in_tenant(
         &self,
         tenant: &str,
@@ -2879,6 +3402,7 @@ impl SessionManager {
                 store.remove_in_tenant(tenant, client_id);
             }
         }
+        let _route_guard = clean_start.then(|| self.route_guard.lock());
         let mut map = self.sessions.write();
 
         if clean_start {
@@ -2998,43 +3522,254 @@ impl SessionManager {
         receive_max: u16,
         max_packet: u32,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
-        // Cap the CONNECT expiry at the configured maximum.
-        // Zero cap means the operator opts into no cap.
+        let (session, present, swept, _) = self.get_or_create_v5_with_discard_in_tenant(
+            tenant,
+            client_id,
+            clean_start,
+            None,
+            version,
+            expiry,
+            receive_max,
+            max_packet,
+        );
+        (session, present, swept)
+    }
+
+    /// Resolve a v4/v5 CONNECT atomically under one session-map write lock.
+    /// When `expected_owner` is `Some(want)` and the existing session's
+    /// verified owner differs, the prior session, its durable files, and its
+    /// `conn_index` binding are discarded while preserving the replacement
+    /// session's own `clean_start` persistence policy.
+    /// Returns `(session, present, swept_filters, superseded_conn_id)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_or_create_v5_with_discard_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+        expected_owner: Option<Option<&str>>,
+        version: u8,
+        expiry: u32,
+        receive_max: u16,
+        max_packet: u32,
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
+        self.connect_bind_v5_in_tenant(
+            tenant,
+            client_id,
+            clean_start,
+            expected_owner,
+            version,
+            expiry,
+            receive_max,
+            max_packet,
+            None,
+        )
+    }
+
+    /// Per-CONNECT metadata committed atomically with session resolution and
+    /// `conn_id` binding so concurrent CONNECTs cannot stamp identity onto
+    /// another connection's session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_bind_v5_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+        expected_owner: Option<Option<&str>>,
+        version: u8,
+        expiry: u32,
+        receive_max: u16,
+        max_packet: u32,
+        bind_meta: Option<ConnectBindMeta>,
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
         let expiry = self.cap_session_expiry(expiry);
-        if clean_start {
-            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, true);
-            debug_assert!(!present);
-            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-            return (session, false, Vec::new());
-        }
+        let store = self.offline_store.read().clone();
+        let key = SessionKey::new(tenant, client_id);
         let now = now_ms();
-        let expired = self
-            .get_in_tenant(tenant, client_id)
-            .map(|existing| existing.session_expired(now))
-            .unwrap_or(false);
-        if expired {
-            // Drop the elapsed session first so the replacement starts
-            // clean: snapshot its router filters, remove the object
-            // plus its durable queue file, then create fresh
-            // (present=false).
-            let swept = self.subscription_filters_in_tenant(tenant, client_id);
-            if let Some(store) = self.offline_store.read().clone() {
+        let new_conn_id = bind_meta.as_ref().map(|m| m.conn_id);
+
+        let apply_meta = move |session: &Arc<Session>| {
+            if let Some(ConnectBindMeta {
+                conn_id,
+                username,
+                verified_username,
+                is_superuser,
+                peerhost,
+                keepalive_secs,
+                client_alias_max,
+                mut will,
+            }) = bind_meta
+            {
+                *session.conn_id.write() = Some(conn_id);
+                *session.connected_at_ms.write() = Some(now);
+                *session.keepalive_secs.write() = keepalive_secs;
+                session.clear_aliases();
+                session.set_inbound_alias_max(self.max_topic_alias());
+                session.set_outbound_alias_max(client_alias_max);
+                if let Some(ref mut w) = will {
+                    w.tenant = tenant.to_string();
+                }
+                session.set_last_will(will);
+                if let Some(u) = username {
+                    *session.username.write() = Some(u);
+                }
+                if let Some(p) = peerhost {
+                    *session.peerhost.write() = Some(p);
+                }
+                session.set_verified_identity(verified_username, is_superuser);
+            }
+        };
+
+        let _route_guard = self.route_guard.lock();
+        let mut map = self.sessions.write();
+        let existing = map
+            .get(tenant)
+            .and_then(|inner| inner.get(client_id))
+            .cloned();
+        let owner_mismatch = existing.as_ref().is_some_and(|s| {
+            expected_owner.is_some_and(|want| s.verified_username().as_deref() != want)
+        });
+        let expired = existing.as_ref().is_some_and(|s| s.session_expired(now));
+        let should_discard = clean_start || owner_mismatch || expired;
+
+        if should_discard {
+            let stale_conn = existing.as_ref().and_then(|s| *s.conn_id.read());
+            let stale_connected = existing
+                .as_ref()
+                .map(|s| *s.connected.read())
+                .unwrap_or(false);
+            let swept: Vec<TopicFilter> = existing
+                .as_ref()
+                .map(|s| s.subscriptions.read().keys().cloned().collect())
+                .unwrap_or_default();
+            if let Some(old) = &existing {
+                *old.conn_id.write() = None;
+                *old.connected.write() = false;
+            }
+            if let Some(store) = store.as_ref() {
                 store.remove_in_tenant(tenant, client_id);
             }
-            {
-                let mut map = self.sessions.write();
-                if let Some(inner) = map.get_mut(tenant) {
-                    inner.remove(client_id);
+            let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
+            let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            session.set_tenant_id(tenant.to_string());
+            self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(store);
+            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            apply_meta(&session);
+            map.entry(tenant.to_string())
+                .or_default()
+                .insert(client_id.to_string(), session.clone());
+            Self::enforce_session_cap_locked(&mut map, tenant);
+            Self::enforce_tenant_cap_locked(&mut map, tenant);
+            drop(map);
+
+            if !stale_connected {
+                self.connected_count.fetch_add(1, Ordering::SeqCst);
+            }
+            let mut index = self.conn_index.write();
+            if let Some(stale) = stale_conn {
+                if index
+                    .get(&stale)
+                    .map(|owner| owner == &key)
+                    .unwrap_or(false)
+                {
+                    index.remove(&stale);
                 }
             }
-            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
-            debug_assert!(!present);
+            if let Some(conn_id) = new_conn_id {
+                if *session.conn_id.read() == Some(conn_id) {
+                    index.insert(conn_id, key);
+                }
+            }
+            (session, false, swept, stale_conn)
+        } else if let Some(existing) = existing {
+            let was_connected = *existing.connected.read();
+            let prev_conn = *existing.conn_id.read();
+            if !was_connected {
+                *existing.connected.write() = true;
+                *existing.connected_at_ms.write() = Some(now);
+                *existing.ended_at_ms.write() = None;
+                self.connected_count.fetch_add(1, Ordering::SeqCst);
+            }
+            existing.set_offline_store(store);
+            existing.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            apply_meta(&existing);
+            drop(map);
+            let mut index = self.conn_index.write();
+            if let Some(prev) = prev_conn {
+                if new_conn_id != Some(prev)
+                    && index.get(&prev).map(|owner| owner == &key).unwrap_or(false)
+                {
+                    index.remove(&prev);
+                }
+            }
+            if let Some(conn_id) = new_conn_id {
+                if *existing.conn_id.read() == Some(conn_id) {
+                    index.insert(conn_id, key);
+                }
+            }
+            (
+                existing,
+                true,
+                Vec::new(),
+                prev_conn.filter(|p| new_conn_id != Some(*p)),
+            )
+        } else {
+            let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
+            let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            session.set_tenant_id(tenant.to_string());
+            self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(store);
             session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-            return (session, false, swept);
+            apply_meta(&session);
+            map.entry(tenant.to_string())
+                .or_default()
+                .insert(client_id.to_string(), session.clone());
+            Self::enforce_session_cap_locked(&mut map, tenant);
+            Self::enforce_tenant_cap_locked(&mut map, tenant);
+            drop(map);
+            self.connected_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(conn_id) = new_conn_id {
+                if *session.conn_id.read() == Some(conn_id) {
+                    self.conn_index.write().insert(conn_id, key);
+                }
+            }
+            (session, false, Vec::new(), None)
         }
-        let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
-        session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
-        (session, present, Vec::new())
+    }
+
+    /// Unsubscribe only filters not currently owned by any active replacement
+    /// session for `(tenant, client_id)`.
+    /// Acquire the control-plane route guard so `SUBSCRIBE` router + session
+    /// mirror updates serialize with stale-route cleanup.
+    pub fn lock_route_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.route_guard.lock()
+    }
+
+    pub fn sweep_unsubscribed_filters_in_tenant<F>(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        filters: &[TopicFilter],
+        mut unsubscribe: F,
+    ) where
+        F: FnMut(&TopicFilter),
+    {
+        if filters.is_empty() {
+            return;
+        }
+        let _route_guard = self.route_guard.lock();
+        let map = self.sessions.read();
+        let current = map.get(tenant).and_then(|inner| inner.get(client_id));
+        let subs = current.map(|s| s.subscriptions.read());
+        for filter in filters {
+            if subs.as_ref().is_some_and(|m| m.contains_key(filter)) {
+                continue;
+            }
+            unsubscribe(filter);
+        }
     }
 
     /// Reap detached expired v5 sessions in `tenant`, scanning at most
@@ -3051,7 +3786,7 @@ impl SessionManager {
         max_scan: usize,
     ) -> Vec<(String, Vec<TopicFilter>)> {
         let now = now_ms();
-        let victims: Vec<(String, Vec<TopicFilter>)> = {
+        let candidates: Vec<(String, SessionId)> = {
             let map = self.sessions.read();
             let Some(inner) = map.get(tenant) else {
                 return Vec::new();
@@ -3062,25 +3797,32 @@ impl SessionManager {
                 .filter(|(_, session)| {
                     session.protocol_version() == 5 && session.session_expired(now)
                 })
-                .map(|(client_id, session)| {
-                    (
-                        client_id.clone(),
-                        session.subscriptions.read().keys().cloned().collect(),
-                    )
-                })
+                .map(|(client_id, session)| (client_id.clone(), session.id))
                 .collect()
         };
-        if victims.is_empty() {
-            return victims;
+        if candidates.is_empty() {
+            return Vec::new();
         }
         let store = self.offline_store.read().clone();
+        let mut removed = Vec::with_capacity(candidates.len());
         {
             let mut map = self.sessions.write();
             if let Some(inner) = map.get_mut(tenant) {
-                for (client_id, _) in &victims {
-                    inner.remove(client_id);
-                    if let Some(store) = store.as_ref() {
-                        store.remove_in_tenant(tenant, client_id);
+                for (client_id, victim_id) in candidates {
+                    let still_expired = inner.get(&client_id).is_some_and(|session| {
+                        session.id == victim_id
+                            && session.protocol_version() == 5
+                            && session.session_expired(now)
+                    });
+                    if still_expired {
+                        if let Some(session) = inner.remove(&client_id) {
+                            let filters: Vec<TopicFilter> =
+                                session.subscriptions.read().keys().cloned().collect();
+                            if let Some(store) = store.as_ref() {
+                                store.remove_in_tenant(tenant, &client_id);
+                            }
+                            removed.push((client_id, filters));
+                        }
                     }
                 }
                 if inner.is_empty() {
@@ -3088,7 +3830,7 @@ impl SessionManager {
                 }
             }
         }
-        victims
+        removed
     }
 
     /// Constant-time live-session count for the management count endpoint.
@@ -3185,7 +3927,12 @@ impl SessionManager {
     ) -> Vec<TopicFilter> {
         // Detach path only (never publish/deliver): owned keys are fine.
         let key = SessionKey::new(tenant, client_id);
-        let (username_to_release, swept, did_detach): (Option<String>, Vec<TopicFilter>, bool) = {
+        let (username_to_release, swept, did_detach, drop_session_id): (
+            Option<String>,
+            Vec<TopicFilter>,
+            bool,
+            Option<SessionId>,
+        ) = {
             let map = self.sessions.read();
             match map.get(tenant).and_then(|inner| inner.get(client_id)) {
                 Some(session) => {
@@ -3223,14 +3970,39 @@ impl SessionManager {
                         // past [`ENDED_SESSION_TTL_SECS`], so ended
                         // tenants' entries go away instead of accumulating.
                         *session.ended_at_ms.write() = Some(now_ms());
-                        (session.username.read().clone(), swept, was_connected)
+                        (
+                            session.username.read().clone(),
+                            swept,
+                            was_connected,
+                            if drop_state { Some(session.id) } else { None },
+                        )
                     } else {
-                        (None, Vec::new(), false)
+                        (None, Vec::new(), false, None)
                     }
                 }
-                None => (None, Vec::new(), false),
+                None => (None, Vec::new(), false, None),
             }
         };
+        if let Some(detached_id) = drop_session_id {
+            let store = self.offline_store.read().clone();
+            if let Some(store) = store {
+                // Serialize disk cleanup with replacement under the session-map
+                // write lock: if a reconnect already installed a new session for
+                // this key, leave its persisted state untouched.
+                let map = self.sessions.write();
+                let same_detached = map
+                    .get(tenant)
+                    .and_then(|inner| inner.get(client_id))
+                    .is_some_and(|current| {
+                        current.id == detached_id
+                            && current.conn_id.read().is_none()
+                            && current.drops_state_at_disconnect()
+                    });
+                if same_detached {
+                    store.remove_in_tenant(tenant, client_id);
+                }
+            }
+        }
         if did_detach {
             // Verified owner detach of a live session: one fewer connected
             // session. Racing teardowns (wrong conn_id, unknown client)
@@ -3323,10 +4095,27 @@ impl SessionManager {
         if victims.is_empty() {
             return;
         }
+        let store = self.offline_store.read().clone();
         let mut map = self.sessions.write();
         if let Some(inner) = map.get_mut(tenant) {
             for victim in victims {
-                inner.remove(&victim);
+                let still_reapable = inner.get(&victim).is_some_and(|session| {
+                    if !is_ended_stateless(session) {
+                        return false;
+                    }
+                    let ended_ago = session
+                        .ended_at_ms
+                        .read()
+                        .map(|ended_at| now.saturating_sub(ended_at))
+                        .unwrap_or(0);
+                    ended_ago >= ttl_ms
+                });
+                if still_reapable {
+                    inner.remove(&victim);
+                    if let Some(store) = store.as_ref() {
+                        store.remove_in_tenant(tenant, &victim);
+                    }
+                }
             }
             if inner.is_empty() {
                 map.remove(tenant);
@@ -5068,5 +5857,412 @@ mod tests {
         manager.unbind_connection_in_tenant("tenant-a", "dup", 701);
         assert!(manager.active_client_ids_in_tenant("tenant-a").is_empty());
         assert_eq!(manager.active_client_ids_in_tenant("tenant-b"), vec!["dup"]);
+    }
+
+    #[test]
+    fn clean_authenticated_session_does_not_leave_owner_file() {
+        let dir = unique_offline_dir("clean-owner");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (clean_v4, _) = manager.get_or_create("clean-v4", true);
+        *clean_v4.conn_id.write() = Some(1);
+        clean_v4.set_verified_identity(Some("alice".to_string()), false);
+        assert!(store
+            .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "clean-v4")
+            .is_none());
+        manager.unbind_connection("clean-v4", 1);
+        assert!(store
+            .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "clean-v4")
+            .is_none());
+
+        let (durable_v5, _, _) = manager.get_or_create_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "durable-then-zero",
+            true,
+            5,
+            60,
+            16,
+            0,
+        );
+        *durable_v5.conn_id.write() = Some(2);
+        durable_v5.set_verified_identity(Some("alice".to_string()), false);
+        assert_eq!(
+            store
+                .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "durable-then-zero")
+                .as_deref(),
+            Some("alice")
+        );
+        durable_v5.set_session_expiry(0);
+        manager.unbind_connection("durable-then-zero", 2);
+        assert!(store
+            .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "durable-then-zero")
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn principal_mismatch_discard_preserves_v4_persistent_session() {
+        let dir = unique_offline_dir("mismatch-v4");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (old_sess, _, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "shared-v4",
+            false,
+            Some(Some("alice")),
+            4,
+            0,
+            65535,
+            0,
+        );
+        manager.bind_session(&old_sess, 100);
+        old_sess.set_verified_identity(Some("alice".to_string()), false);
+        manager.add_subscription(
+            "shared-v4",
+            TopicFilter::new("alice/topic").unwrap(),
+            QoS::AtLeastOnce,
+        );
+        assert_eq!(manager.connected_count(), 1);
+        assert!(manager.key_for_conn(100).is_some());
+
+        // Bob connects with Clean Session=false (clean_start=false) and expected_owner=Some(Some("bob")).
+        let (new_sess, present, swept_old, stale_conn) = manager
+            .get_or_create_v5_with_discard_in_tenant(
+                tenant::DEFAULT_TENANT_ID,
+                "shared-v4",
+                false,
+                Some(Some("bob")),
+                4,
+                0,
+                65535,
+                0,
+            );
+        assert_eq!(stale_conn, Some(100));
+        assert!(manager.key_for_conn(100).is_none());
+        assert_eq!(manager.connected_count(), 1);
+        assert_eq!(swept_old.len(), 1);
+        manager.bind_session(&new_sess, 200);
+        assert!(manager.key_for_conn(200).is_some());
+        assert!(!present);
+        assert!(!new_sess.clean_start);
+        assert!(!new_sess.drops_state_at_disconnect());
+        assert!(new_sess.subscriptions.read().is_empty());
+
+        *new_sess.conn_id.write() = Some(10);
+        new_sess.set_verified_identity(Some("bob".to_string()), false);
+        manager.add_subscription(
+            "shared-v4",
+            TopicFilter::new("bob/topic").unwrap(),
+            QoS::AtLeastOnce,
+        );
+        let swept = manager.unbind_connection("shared-v4", 10);
+        assert!(swept.is_empty());
+        assert_eq!(new_sess.subscriptions.read().len(), 1);
+        assert_eq!(
+            store
+                .owner_in_tenant(tenant::DEFAULT_TENANT_ID, "shared-v4")
+                .as_deref(),
+            Some("bob")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_expired_bounded_returns_only_removed_sessions() {
+        let manager = SessionManager::new();
+        let (s1, _, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "exp-1",
+            false,
+            None,
+            5,
+            1,
+            16,
+            0,
+        );
+        manager.add_subscription("exp-1", TopicFilter::new("a/1").unwrap(), QoS::AtLeastOnce);
+        *s1.connected.write() = false;
+        *s1.ended_at_ms.write() = Some(0);
+
+        let (s2, _, _, _) = manager.get_or_create_v5_with_discard_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "exp-1",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+        );
+        assert_ne!(s1.id, s2.id);
+        let removed = manager.prune_expired_bounded(tenant::DEFAULT_TENANT_ID, 10);
+        assert!(removed.is_empty());
+        assert!(manager
+            .get_in_tenant(tenant::DEFAULT_TENANT_ID, "exp-1")
+            .is_some());
+    }
+
+    #[test]
+    fn session_for_conn_rejects_stale_conn_index_entry() {
+        let manager = SessionManager::new();
+        let (s1, _, _, _) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "race-cid",
+            false,
+            Some(Some("alice")),
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 100,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let (s2, _, _, stale_conn) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "race-cid",
+            false,
+            Some(Some("bob")),
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 200,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: true,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert_ne!(s1.id, s2.id);
+        assert_eq!(stale_conn, Some(100));
+
+        // Even if conn_index still contained 100 -> race-cid during a window,
+        // session_for_conn and key_for_conn must reject it because s2 owns 200.
+        manager
+            .conn_index
+            .write()
+            .insert(100, SessionKey::new(tenant::DEFAULT_TENANT_ID, "race-cid"));
+        assert!(manager.session_for_conn(100).is_none());
+        assert!(manager.key_for_conn(100).is_none());
+        assert_eq!(manager.session_for_conn(200).unwrap().id, s2.id);
+    }
+
+    #[test]
+    fn confirm_offline_consumed_if_current_skips_replaced_session() {
+        let dir = unique_offline_dir("confirm-gen");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (s1, _, _, _) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "gen-cid",
+            false,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 10,
+                username: Some("alice".to_string()),
+                verified_username: Some("alice".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        let (s2, _, _, _) = manager.connect_bind_v5_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            "gen-cid",
+            true,
+            None,
+            5,
+            60,
+            16,
+            0,
+            Some(ConnectBindMeta {
+                conn_id: 20,
+                username: Some("bob".to_string()),
+                verified_username: Some("bob".to_string()),
+                is_superuser: false,
+                peerhost: None,
+                keepalive_secs: 60,
+                client_alias_max: 0,
+                will: None,
+            }),
+        );
+        assert_ne!(s1.id, s2.id);
+        s2.push_offline(QueuedMessage {
+            topic: Topic::new("t/1").unwrap(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"bob-msg"),
+            publish_at_ms: None,
+        });
+        assert_eq!(
+            store
+                .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
+                .0
+                .len(),
+            1
+        );
+
+        manager.confirm_offline_consumed_if_current(&s1, Some(10), Vec::new());
+        // Same-session reconnect (same SessionId, new conn_id 30) must block
+        // empty confirmation for old conn 20, while restoring any unrouted
+        // batch back to the still-current session.
+        *s2.conn_id.write() = Some(30);
+        manager.confirm_offline_consumed_if_current(&s2, Some(20), Vec::new());
+        assert_eq!(
+            store
+                .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
+                .0
+                .len(),
+            1
+        );
+
+        let drained = s2.take_offline_retained();
+        assert_eq!(drained.len(), 1);
+        manager.confirm_offline_consumed_if_current(&s2, Some(20), drained);
+        assert_eq!(s2.offline_len(), 1);
+        assert_eq!(
+            store
+                .load_in_tenant(tenant::DEFAULT_TENANT_ID, "gen-cid")
+                .0
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_replay_resolves_spill_promoted_packet_and_shares_v5_credit() {
+        let session = Session::new(SessionId(1), "spill-promo".to_string(), false);
+        session.set_protocol_version(5);
+        session.set_client_receive_maximum(1);
+        session.set_max_inflight(1);
+        session.set_max_spill(1);
+
+        let topic = Topic::new("t/1").unwrap();
+        assert_eq!(
+            session.track_inflight_or_spill(InflightMessage {
+                packet_id: 1,
+                topic: topic.clone(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"a"),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            }),
+            InflightTrackOutcome::Tracked
+        );
+        assert_eq!(
+            session.track_inflight_or_spill(InflightMessage {
+                packet_id: 2,
+                topic: topic.clone(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"b"),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            }),
+            InflightTrackOutcome::Spilled
+        );
+
+        assert!(session.seed_pending_replays().is_empty());
+        // ACK packet 1 so packet 2 is promoted from inflight_spill -> inflight.
+        assert!(session.ack_inflight(1));
+        assert_eq!(session.inflight_len(), 1);
+        assert!(!session.has_spill());
+
+        // Packet 2 must still resolve from inflight even though it was seeded while spilled.
+        match session.pop_next_pending_replay_paced() {
+            Some(PendingReplayItem::Qos1 { entry, is_spill }) => {
+                assert_eq!(entry.packet_id, 2);
+                assert!(!is_spill);
+            }
+            other => panic!("expected promoted Qos1 entry, got {other:?}"),
+        }
+        // Now the single v5 send credit is used; both live and replay reservations fail.
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"c"),
+                Instant::now(),
+            )
+            .is_none());
+        assert!(session
+            .try_reserve_replay_qos1(InflightMessage {
+                packet_id: 3,
+                topic,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from_static(b"c"),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn v5_checked_alloc_refuses_when_tracking_capacity_exhausted() {
+        let session = Session::new(SessionId(2), "v5-cap-exhaust".to_string(), false);
+        session.set_protocol_version(5);
+        session.set_client_receive_maximum(3);
+        session.set_max_inflight(1);
+        session.set_max_spill(1);
+
+        let topic = Topic::new("t/cap").unwrap();
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"1"),
+                Instant::now(),
+            )
+            .is_some());
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"2"),
+                Instant::now(),
+            )
+            .is_some());
+        // Tracking capacity (1 window + 1 spill = 2) is now full even though
+        // Receive Maximum is 3: must refuse rather than send untracked.
+        assert!(session
+            .try_alloc_qos1_downlink_v5_checked(
+                topic,
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"3"),
+                Instant::now(),
+            )
+            .is_none());
+        assert_eq!(session.unacked_on_conn_len(), 2);
     }
 }

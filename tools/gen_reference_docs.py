@@ -1422,8 +1422,8 @@ def config_page(fields: list) -> str:
         next_steps(
             [
                 "[Command line reference](cli.md): the flags that set the same values.",
-                "[Configuration](../../operations/configuration.md): the layers behind the file.",
-                "[First start](../../getting-started/first-start.md): boot the broker.",
+                "[Configuration](../operations/configuration.md): the layers behind the file.",
+                "[First start](../getting-started/first-start.md): boot the broker.",
             ]
         )
     )

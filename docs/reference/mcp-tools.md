@@ -7052,7 +7052,7 @@ _No live example captured: this operation requires a path-segment value or a req
 
 **Output**
 ```
-UNAUTHORIZED: 
+UNAUTHORIZED:
 ```
 
 ### `get_api_v5_sso`

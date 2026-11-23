@@ -377,14 +377,29 @@ pub mod test_certs {
 mod tests {
     use super::*;
 
-    // Shared loopback TLS material, generated once with openssl and
-    // never deployed. The files live with the enterprise crate's tests.
-    const TEST_CA_PEM: &str =
-        include_str!("../../broker-connectors-enterprise/testdata/ca-cert.pem");
-    const TEST_SERVER_CERT_PEM: &str =
-        include_str!("../../broker-connectors-enterprise/testdata/server-cert.pem");
-    const TEST_SERVER_KEY_PEM: &str =
-        include_str!("../../broker-connectors-enterprise/testdata/server-key.pem");
+    fn test_pki() -> &'static (String, String, String) {
+        static PKI: std::sync::OnceLock<(String, String, String)> = std::sync::OnceLock::new();
+        PKI.get_or_init(|| {
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "indramqtt-test-ca");
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+            let srv_key = rcgen::KeyPair::generate().unwrap();
+            let mut srv_params =
+                rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            srv_params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::LOCALHOST,
+                )));
+            let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+            (ca_cert.pem(), srv_cert.pem(), srv_key.serialize_pem())
+        })
+    }
 
     #[test]
     fn test_parse_host_port_defaults_and_errors() {
@@ -442,9 +457,8 @@ mod tests {
         use tokio::net::TcpListener;
         use tokio_rustls::TlsAcceptor;
 
-        let server_config =
-            test_certs::server_config(TEST_SERVER_CERT_PEM, TEST_SERVER_KEY_PEM, None)
-                .expect("test server config");
+        let server_config = test_certs::server_config(&test_pki().1, &test_pki().2, None)
+            .expect("test server config");
         let acceptor = TlsAcceptor::from(server_config);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -465,7 +479,7 @@ mod tests {
         });
 
         // Accepted: the test CA rides on top of the bundled roots.
-        let roots = root_store_with(Some(TEST_CA_PEM)).expect("root store");
+        let roots = root_store_with(Some(&test_pki().0)).expect("root store");
         let config = client_config(roots, None, &[]).expect("client config");
         let mut stream = tls_dial(
             "127.0.0.1",

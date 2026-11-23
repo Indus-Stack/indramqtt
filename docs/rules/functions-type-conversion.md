@@ -1,6 +1,6 @@
 ---
-title: Rule functions: type conversion
-description: Verified entries for the type conversion functions.
+title: "Rule functions: type conversion"
+description: "Verified entries for the type conversion functions."
 sidebar:
   order: 48
 ---

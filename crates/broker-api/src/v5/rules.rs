@@ -1455,7 +1455,7 @@ impl ConnectorStore {
 
     /// Directory holding kernel state. Disk sinks join it.
     /// Defaults to `./data` in unit tests with no registry.
-    pub(crate) fn data_dir(&self) -> std::path::PathBuf {
+    pub fn data_dir(&self) -> std::path::PathBuf {
         self.registry
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -4767,6 +4767,12 @@ pub async fn register_live_sink(
                     ));
                 }
             };
+            let collision_seq_column = body
+                .get("collision_seq_column")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let config = broker_connectors::greptimedb::GreptimeDbConfig {
                 endpoint,
                 database: database.to_string(),
@@ -4777,6 +4783,7 @@ pub async fn register_live_sink(
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
+                collision_seq_column,
             };
             let transport = Arc::new(broker_connectors::greptimedb::HttpGreptimeDbTransport::new(
                 &config,

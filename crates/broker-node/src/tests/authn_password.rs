@@ -62,6 +62,151 @@ async fn bind_auth_accepts_anonymous_when_no_users() {
 }
 
 #[tokio::test]
+async fn bind_auth_rejects_username_without_backend_when_allow_anonymous_is_false() {
+    let mut shared = test_shared();
+    shared.allow_anonymous = false;
+
+    let frame = bind_frame(
+        840,
+        1,
+        encode_bind_meta_creds("dev-user-no-backend", true, 60, "alice", b"secret"),
+    );
+    let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+    let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+    assert_eq!(
+        rc, 0x87,
+        "CONNECT with username and no backend must fail closed when allow_anonymous=false"
+    );
+    assert!(!present);
+    assert!(shared.sessions.get("dev-user-no-backend").is_none());
+}
+
+#[tokio::test]
+async fn bind_resume_with_different_principal_drops_cached_authz_and_subscriptions() {
+    let shared = test_shared();
+    shared.auth.add_user("super", b"p1").unwrap();
+    shared.auth.add_user("bob", b"p2").unwrap();
+
+    let frame1 = bind_frame(
+        841,
+        1,
+        encode_bind_meta_creds("shared-cid", false, 60, "super", b"p1"),
+    );
+    let reply1 = apply_bind(&frame1, &shared).await.expect("bind1 replies");
+    let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
+    assert_eq!(rc1, 0);
+
+    let sess1 = shared.sessions.get("shared-cid").unwrap();
+    sess1.record_authz_decision("publish", "secret/topic", 1, false, true);
+    let filter = broker_protocol::TopicFilter::new("secret/#").unwrap();
+    shared
+        .sessions
+        .add_subscription("shared-cid", filter, QoS::AtLeastOnce);
+    shared.sessions.unbind_connection("shared-cid", 841);
+
+    let frame2 = bind_frame(
+        842,
+        1,
+        encode_bind_meta_creds("shared-cid", false, 60, "bob", b"p2"),
+    );
+    let reply2 = apply_bind(&frame2, &shared).await.expect("bind2 replies");
+    let (_, present2, rc2) = decode_session_binding_meta(&reply2.metadata);
+    assert_eq!(rc2, 0);
+    assert!(
+        !present2,
+        "resuming another principal's session must not report session_present"
+    );
+
+    let sess2 = shared.sessions.get("shared-cid").unwrap();
+    assert_eq!(sess2.verified_username().as_deref(), Some("bob"));
+    assert!(
+        sess2.authz_cache_snapshot().is_empty(),
+        "new principal must not inherit prior principal's authz_cache"
+    );
+    assert!(
+        shared
+            .sessions
+            .subscription_filters("shared-cid")
+            .is_empty(),
+        "new principal must not inherit prior principal's subscriptions"
+    );
+}
+
+#[tokio::test]
+async fn durable_authenticated_session_preserves_offline_queue_across_restart() {
+    let dir = std::env::temp_dir().join(format!("indra-owner-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+    {
+        let shared = test_shared();
+        shared.sessions.set_offline_store(store.clone());
+        shared.auth.add_user("alice", b"p1").unwrap();
+
+        let frame1 = bind_frame(
+            850,
+            1,
+            encode_bind_meta_creds("durable-cid", false, 60, "alice", b"p1"),
+        );
+        let reply1 = apply_bind(&frame1, &shared).await.expect("bind1 replies");
+        let (_, _, rc1) = decode_session_binding_meta(&reply1.metadata);
+        assert_eq!(rc1, 0);
+
+        // Simulate normal CONNECT replay drain before disconnecting.
+        let _ = shared.sessions.get("durable-cid").unwrap().drain_offline();
+        shared.sessions.unbind_connection("durable-cid", 850);
+        let sess = shared.sessions.get("durable-cid").unwrap();
+        let topic = broker_protocol::Topic::new("offline/t").unwrap();
+        sess.push_offline(broker_session::QueuedMessage {
+            topic,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Bytes::from_static(b"msg1"),
+            publish_at_ms: None,
+        });
+        assert_eq!(sess.offline_len(), 1);
+    }
+
+    // Simulate broker restart: new SessionManager restores from the same OfflineQueueStore.
+    let shared2 = test_shared();
+    shared2.auth.add_user("alice", b"p1").unwrap();
+    shared2.sessions.set_offline_store(store.clone());
+    let stats = shared2.sessions.restore_offline_queues();
+    assert_eq!(stats.messages, 1);
+    assert_eq!(
+        store.owner_in_tenant("default", "durable-cid").as_deref(),
+        Some("alice"),
+        "owner file missing"
+    );
+    assert_eq!(
+        shared2
+            .sessions
+            .get("durable-cid")
+            .unwrap()
+            .verified_username()
+            .as_deref(),
+        Some("alice"),
+        "restored session missing verified_username"
+    );
+
+    let frame2 = bind_frame(
+        851,
+        1,
+        encode_bind_meta_creds("durable-cid", false, 60, "alice", b"p1"),
+    );
+    let reply2 = apply_bind(&frame2, &shared2).await.expect("bind2 replies");
+    let (_, present2, rc2) = decode_session_binding_meta(&reply2.metadata);
+    assert_eq!(rc2, 0);
+    assert!(
+        present2,
+        "same authenticated owner must resume durable session after restart"
+    );
+    let sess2 = shared2.sessions.get("durable-cid").unwrap();
+    assert_eq!(sess2.offline_len(), 1, "offline queue must survive restart");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn bind_auth_rejects_anonymous_when_allow_flag_is_false() {
     // Fail closed: the flag refuses an anonymous CONNECT while the
     // user store is empty.

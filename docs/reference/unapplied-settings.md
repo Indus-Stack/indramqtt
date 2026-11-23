@@ -1,3 +1,8 @@
+---
+title: "Stored setting audit"
+description: "Stored settings, the code that reads them, and their current behaviour."
+---
+
 # Stored setting audit
 
 This page lists the stored settings that this audit covers. Use it when a setting is accepted but its effect is not clear. Each row gives the runtime reader, the current behavior, the risk, the credential exposure and one owner ticket. This audit does not fix any defect.

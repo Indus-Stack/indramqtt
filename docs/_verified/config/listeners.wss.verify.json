@@ -1,6 +1,6 @@
 {
   "action": "Upgrade one secure WebSocket client without a certificate and one with a valid certificate, then send MQTT CONNECT on each.",
-  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"/work/tree/crates/broker-node/tests/k1_05/ca-cert.pem\"\n",
+  "config": "[listeners.wss]\nenabled = true\nbind = \"127.0.0.1:28884\"\ncert_file = \"${TLS_DIR}/server-cert.pem\"\nkey_file = \"${TLS_DIR}/server-key.pem\"\nverify = \"verify_peer\"\ncacertfile = \"${TLS_DIR}/ca-cert.pem\"\n",
   "item": "listeners.wss.verify",
   "kind": "setting",
   "output": "verify-peer-optional-ok",

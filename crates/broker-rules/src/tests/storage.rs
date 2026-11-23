@@ -734,6 +734,7 @@ async fn test_into_fans_out_to_databases_and_timeseries_sinks() {
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms: None,
+                collision_seq_column: None,
             },
             greptimedb_transport.clone(),
         )

@@ -20,7 +20,7 @@ This document provides the full empirical methodology, test harness specificatio
 
 ## 2. Internal Microbenchmark Methodology & Results
 
-All microbenchmarks run via `cargo test --release --bench broker_throughput -- --nocapture` using compiler dead-code elimination guards (`std::hint::black_box`) and multi-sample variance reporting. Figures are hardware-dependent and carry no machine citation for that reason; the reproducible claim is the methodology and the end-to-end suite in `benchmark_suite/benchmark_results_v5.json` (whose `environment` block states the CPU, memory, OS and network for those runs).
+All microbenchmarks run via `cargo test --release --bench broker_throughput -- --nocapture` using compiler dead-code elimination guards (`std::hint::black_box`) and multi-sample variance reporting. Figures are hardware-dependent and carry no machine citation for that reason; the reproducible claim is the methodology and the end-to-end suite in `benchmark/results/benchmark_results_v5.json` (whose `environment` block states the CPU, memory, OS and network for those runs).
 
 ### 1. Router Matching (`bench_router_match_throughput`)
 - **What It Measures**: Single-threaded in-process Radix Trie lookup (`router.matches(topic)`).
@@ -68,7 +68,7 @@ To complement our function-level microbenchmarks with rigorous, defensible end-t
 * **Target Workload**:
   - Full TCP socket listener (`:1883`) of the kernel.
   - Real MQTT packet parsing (3.1, 3.1.1 and 5), QoS 0 and QoS 1 framing, and network socket fan-out.
-* **No throughput target is claimed**: the suite reports what it measures. Measured end-to-end rates, with delivery percentages, latencies, hardware class (`environment` block: CPU model, core count, memory, OS) and load shapes, live in `benchmark_suite/benchmark_results_v5.json`. No single-core loopback target is stated because no such local measurement is committed in-tree.
+* **No throughput target is claimed**: the suite reports what it measures. Measured end-to-end rates, with delivery percentages, latencies, hardware class (`environment` block: CPU model, core count, memory, OS) and load shapes, live in `benchmark/results/benchmark_results_v5.json`. No single-core loopback target is stated because no such local measurement is committed in-tree.
 
 ---
 

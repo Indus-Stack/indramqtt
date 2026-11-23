@@ -21,6 +21,7 @@ fn webhook_test_subscriber(shared: &Shared, client_id: &str, conn_id: u64, filte
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
 }

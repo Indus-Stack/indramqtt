@@ -19,6 +19,7 @@ mod delivery;
 mod licensing;
 mod observability;
 mod protocol;
+mod replay;
 mod retained;
 mod rewrite;
 mod rules;

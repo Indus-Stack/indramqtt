@@ -1,6 +1,6 @@
 {
   "action": "Connect one TLS client to the configured bind, then read `GET /api/v5/listeners/ssl:default`.",
-  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\ncert_file = \"/work/tree/crates/broker-node/tests/k1_05/server-cert.pem\"\nkey_file = \"/work/tree/crates/broker-node/tests/k1_05/server-key.pem\"\n",
+  "config": "[listeners.tls]\nenabled = true\nbind = \"127.0.0.1:28883\"\ncert_file = \"${TLS_DIR}/server-cert.pem\"\nkey_file = \"${TLS_DIR}/server-key.pem\"\n",
   "item": "listeners.tls.bind",
   "kind": "setting",
   "output": "bind=127.0.0.1:28883",

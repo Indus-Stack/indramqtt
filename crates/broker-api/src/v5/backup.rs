@@ -689,7 +689,10 @@ fn merge_admin_users(value: &Value, previous: &AdminUsersConf) -> Result<AdminUs
 /// or the membership of the dashboard users. Description, password-change
 /// flag and MFA state do not raise rights, so they do not need a full
 /// administrator.
-fn admin_user_rights_change(candidate: &AdminUsersConf, previous: &AdminUsersConf) -> bool {
+pub(crate) fn admin_user_rights_change(
+    candidate: &AdminUsersConf,
+    previous: &AdminUsersConf,
+) -> bool {
     if candidate.users.len() != previous.users.len() {
         return true;
     }
@@ -707,7 +710,15 @@ fn admin_user_rights_change(candidate: &AdminUsersConf, previous: &AdminUsersCon
             .iter()
             .find(|entry| entry.username == user.username)
         {
-            Some(entry) => entry.role != user.role || entry.scopes != user.scopes,
+            Some(entry) => {
+                entry.role != user.role
+                    || entry.scopes != user.scopes
+                    || entry.password_hash != user.password_hash
+                    || entry.must_change_password != user.must_change_password
+                    || entry.mfa_secret != user.mfa_secret
+                    || entry.mfa_enabled != user.mfa_enabled
+                    || entry.mfa_last_step != user.mfa_last_step
+            }
             None => true,
         }
     })
@@ -1260,10 +1271,20 @@ async fn rollback(
     previous: &FullSnapshot,
     previous_bans: &[BanEntry],
     previous_retained: &[broker_storage::StoredMessage],
+    committed_roots: &[ConfigRoot],
+    expected_admin_after_commit: Option<&AdminUsersConf>,
 ) {
-    let _ = state
-        .config
-        .commit(ConfigRoot::AdminUsers(previous.admin_users.clone()));
+    let owns_admin = expected_admin_after_commit
+        .is_some_and(|expected| &state.config.snapshot().admin_users == expected);
+    if owns_admin
+        && committed_roots
+            .iter()
+            .any(|r| matches!(r, ConfigRoot::AdminUsers(_)))
+    {
+        let _ = state
+            .config
+            .commit(ConfigRoot::AdminUsers(previous.admin_users.clone()));
+    }
     let _ = state
         .config
         .commit(ConfigRoot::MqttUsers(previous.mqtt_users.clone()));
@@ -1288,7 +1309,13 @@ async fn rollback(
     let _ = state.config.save();
     let _ = state.auth.seed_from_registry(&state.config);
     let _ = state.engine.seed_from_registry(&state.config);
-    let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
+    if owns_admin
+        && committed_roots
+            .iter()
+            .any(|r| matches!(r, ConfigRoot::AdminUsers(_)))
+    {
+        let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
+    }
     state.authn_node_cache.seed_from_registry(&state.config);
     state.authn_settings.seed_from_registry(&state.config);
     state.authz_node_cache.seed_from_registry(&state.config);
@@ -1325,8 +1352,11 @@ async fn rollback(
 
 // Commit every pending root, then reseed each live owner from the
 // registry. A refused reseed restores every part already applied.
-async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<(), ApiError> {
-    let previous = state.config.snapshot();
+async fn apply_materialized(
+    state: &ApiState,
+    pending: &Materialized,
+    authorized_admin_users: Option<&AdminUsersConf>,
+) -> Result<(), ApiError> {
     let previous_bans = state.bans.list_live();
     // Snapshot retained rows before any apply. A list failure stops
     // the import with no state moved.
@@ -1360,11 +1390,26 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
             }
         }
     }
+    // Re-read the config snapshot after async retained-store reads so a
+    // concurrent admin change cannot be overwritten silently.
+    let current_snapshot = state.config.snapshot();
+    if let Some(expected) = authorized_admin_users {
+        if &current_snapshot.admin_users != expected {
+            return Err(ApiError::BadRequest(
+                "dashboard users changed concurrently during import".to_string(),
+            ));
+        }
+    }
+    let previous = current_snapshot;
     // Registry commits. Each commit validates again; the parts were
     // validated above, so a failure here is an internal error.
     let mut commits: Vec<ConfigRoot> = Vec::new();
+    let mut committed_admin: Option<&AdminUsersConf> = None;
     if let Some(conf) = &pending.admin_users {
-        commits.push(ConfigRoot::AdminUsers(conf.clone()));
+        if conf != &previous.admin_users {
+            commits.push(ConfigRoot::AdminUsers(conf.clone()));
+            committed_admin = Some(conf);
+        }
     }
     if let Some(conf) = &pending.mqtt_users {
         commits.push(ConfigRoot::MqttUsers(conf.clone()));
@@ -1389,14 +1434,30 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
     }
     for root in &commits {
         if let Err(error) = state.config.commit(root.clone()) {
-            rollback(state, &previous, &previous_bans, &previous_retained).await;
+            rollback(
+                state,
+                &previous,
+                &previous_bans,
+                &previous_retained,
+                &commits,
+                committed_admin,
+            )
+            .await;
             return Err(ApiError::InternalError(format!(
                 "config commit failed: {error}"
             )));
         }
     }
     if let Err(error) = state.config.save() {
-        rollback(state, &previous, &previous_bans, &previous_retained).await;
+        rollback(
+            state,
+            &previous,
+            &previous_bans,
+            &previous_retained,
+            &commits,
+            committed_admin,
+        )
+        .await;
         return Err(ApiError::InternalError(format!(
             "config persist failed: {error}"
         )));
@@ -1405,7 +1466,15 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
     // kernel boot. A refusal restores every part already applied.
     if pending.mqtt_users.is_some() {
         if let Err(error) = state.auth.seed_from_registry(&state.config) {
-            rollback(state, &previous, &previous_bans, &previous_retained).await;
+            rollback(
+                state,
+                &previous,
+                &previous_bans,
+                &previous_retained,
+                &commits,
+                committed_admin,
+            )
+            .await;
             return Err(ApiError::InternalError(format!(
                 "mqtt_users backend refused: {error}"
             )));
@@ -1413,18 +1482,34 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
     }
     if pending.rules.is_some() {
         if let Err(error) = state.engine.seed_from_registry(&state.config) {
-            rollback(state, &previous, &previous_bans, &previous_retained).await;
+            rollback(
+                state,
+                &previous,
+                &previous_bans,
+                &previous_retained,
+                &commits,
+                committed_admin,
+            )
+            .await;
             return Err(ApiError::InternalError(format!(
                 "rules backend refused: {error}"
             )));
         }
     }
-    if pending.admin_users.is_some() {
+    if committed_admin.is_some() {
         if let Err(error) = state
             .admin_users
             .apply_snapshot_conf(&state.config.snapshot().admin_users)
         {
-            rollback(state, &previous, &previous_bans, &previous_retained).await;
+            rollback(
+                state,
+                &previous,
+                &previous_bans,
+                &previous_retained,
+                &commits,
+                committed_admin,
+            )
+            .await;
             return Err(ApiError::InternalError(format!(
                 "admin_users backend refused: {error}"
             )));
@@ -1464,7 +1549,15 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
             .map_err(|error| ApiError::InternalError(format!("retained list failed: {error}")))?;
         for msg in &current {
             if let Err(error) = state.retained.clear_retained(&msg.topic).await {
-                rollback(state, &previous, &previous_bans, &previous_retained).await;
+                rollback(
+                    state,
+                    &previous,
+                    &previous_bans,
+                    &previous_retained,
+                    &commits,
+                    committed_admin,
+                )
+                .await;
                 return Err(ApiError::InternalError(format!(
                     "retained clear failed: {error}"
                 )));
@@ -1476,7 +1569,15 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
                 .set_retained(row.topic.clone(), row.qos, row.payload.clone())
                 .await
             {
-                rollback(state, &previous, &previous_bans, &previous_retained).await;
+                rollback(
+                    state,
+                    &previous,
+                    &previous_bans,
+                    &previous_retained,
+                    &commits,
+                    committed_admin,
+                )
+                .await;
                 return Err(ApiError::InternalError(format!(
                     "retained apply failed: {error}"
                 )));
@@ -1567,7 +1668,7 @@ pub async fn import_data(
                 .into_response();
         }
     };
-    if let Some(candidate) = &pending.admin_users {
+    let authorized_admin_users = if let Some(candidate) = &pending.admin_users {
         let previous = state.config.snapshot();
         let is_full_admin = full_admin.is_some_and(|flag| flag.0 .0);
         if !is_full_admin && admin_user_rights_change(candidate, &previous.admin_users) {
@@ -1577,8 +1678,11 @@ pub async fn import_data(
             )
             .into_response();
         }
-    }
-    match apply_materialized(&state, &pending).await {
+        Some(previous.admin_users.clone())
+    } else {
+        None
+    };
+    match apply_materialized(&state, &pending, authorized_admin_users.as_ref()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
@@ -1699,5 +1803,80 @@ mod tests {
         assert!(parse_retained(&json!([{"topic": "rt/conf/retained", "qos": 1}])).is_err());
         assert!(parse_retained(&json!([{"topic": "#", "qos": 0, "payload": payload}])).is_err());
         assert!(parse_retained(&json!("not-a-list")).is_err());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_concurrent_admin_change_and_skips_unchanged_admin_root() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("indra-backup-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = Arc::new(broker_config::ConfigRegistry::load_for_boot(&dir).unwrap());
+        let (edge_tx, _edge_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState::new(
+            Arc::new(broker_rules::RuleEngine::new(
+                16,
+                broker_rules::BackpressurePolicy::DropOldest,
+            )),
+            Arc::new(broker_session::SessionManager::new()),
+            Arc::new(broker_router::Router::new()),
+            Arc::new(broker_observability::Metrics::new()),
+            Arc::new(broker_auth::MemoryAuth::new()),
+            Arc::new(crate::ConnTable::default()),
+            Arc::clone(&registry),
+            "node-1".to_string(),
+            edge_tx,
+        );
+        let initial_admin = state.config.snapshot().admin_users.clone();
+
+        let mut pending = Materialized::default();
+        let mut modified_admin = initial_admin.clone();
+        modified_admin.users.push(broker_config::AdminUser {
+            username: "imported".to_string(),
+            password_hash: "$2b$12$000000000000000000000u0000000000000000000000000000000"
+                .to_string(),
+            role: "viewer".to_string(),
+            description: String::new(),
+            must_change_password: false,
+            scopes: None,
+            mfa_enabled: false,
+            mfa_secret: String::new(),
+            mfa_last_step: None,
+        });
+        pending.admin_users = Some(modified_admin);
+
+        // Simulate a concurrent admin-user commit after authorization snapshot.
+        let mut concurrent_admin = initial_admin.clone();
+        concurrent_admin.users.push(broker_config::AdminUser {
+            username: "concurrent".to_string(),
+            password_hash: "$2b$12$000000000000000000000u0000000000000000000000000000000"
+                .to_string(),
+            role: "viewer".to_string(),
+            description: String::new(),
+            must_change_password: false,
+            scopes: None,
+            mfa_enabled: false,
+            mfa_secret: String::new(),
+            mfa_last_step: None,
+        });
+        state
+            .config
+            .commit(ConfigRoot::AdminUsers(concurrent_admin))
+            .unwrap();
+
+        let err = apply_materialized(&state, &pending, Some(&initial_admin))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+        assert!(
+            state
+                .config
+                .snapshot()
+                .admin_users
+                .users
+                .iter()
+                .any(|u| u.username == "concurrent"),
+            "concurrent admin update must survive rejected import"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -101,15 +101,22 @@ fn is_cql_identifier(value: &str) -> bool {
 /// `INSERT INTO`, `UPDATE`, `DELETE FROM`, and `TABLE` patterns. If the
 /// keyspace already appears in the CQL text, the text is returned as-is.
 fn qualify_cql_with_keyspace(cql: &str, keyspace: &str) -> String {
-    // Match keywords without regard to case. The driver accepts
-    // lower-case and upper-case CQL verbs.
-    let upper = cql.to_uppercase();
+    // ASCII-only uppercasing preserves byte offsets with `cql` even when
+    // string literals contain multi-byte UTF-8 characters (e.g. `ß`).
+    let upper = cql.to_ascii_uppercase();
     let mut result = cql.to_string();
-    for keyword in ["INTO ", "FROM ", "UPDATE ", "TABLE "] {
+    for keyword in ["INTO", "FROM", "UPDATE", "TABLE"] {
         let Some(pos) = upper.find(keyword) else {
             continue;
         };
         let after = pos + keyword.len();
+        if !upper[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_whitespace())
+        {
+            continue;
+        }
         let start = result[after..]
             .find(|c: char| !c.is_whitespace())
             .map_or(after, |i| after + i);
@@ -2030,6 +2037,15 @@ mod tests {
         assert_eq!(
             qualify_cql_with_keyspace("INSERT INTO schema.events VALUES (?, ?)", "telemetry"),
             "INSERT INTO schema.events VALUES (?, ?)"
+        );
+        // Non-ASCII UTF-8 string literals and tab/newline separators must not panic.
+        assert_eq!(
+            qualify_cql_with_keyspace("INSERT INTO events VALUES ('ß', ?)", "telemetry"),
+            "INSERT INTO telemetry.events VALUES ('ß', ?)"
+        );
+        assert_eq!(
+            qualify_cql_with_keyspace("INSERT INTO\tevents VALUES (?)", "telemetry"),
+            "INSERT INTO\ttelemetry.events VALUES (?)"
         );
     }
 

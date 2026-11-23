@@ -243,7 +243,7 @@ impl InfluxDbSink {
                         };
                         let should_flush = {
                             let queue = inner.buffer.lock();
-                            !queue.is_empty() && queue.is_stale() && queue.len() < MAX_BUFFERED_ROWS
+                            !queue.is_empty() && queue.is_stale()
                         };
                         if should_flush {
                             let _ = inner.flush().await;

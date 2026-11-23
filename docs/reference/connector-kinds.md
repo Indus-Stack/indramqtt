@@ -1,3 +1,8 @@
+---
+title: "Connector, action and source kinds"
+description: "Every connector, action and source kind, and whether this build serves it."
+---
+
 # Connector, action and source kinds
 
 Generated from the KC-00 capability map (`broker_config::capability`).

@@ -101,6 +101,7 @@ elasticsearch = ["dep:elasticsearch"]
 rabbitmq = ["dep:lapin"]
 
 [dev-dependencies]
+rcgen = { workspace = true }
 axum = { workspace = true }
 apache-avro = { version = "0.15" }
 broker-connectors-enterprise = { workspace = true, features = ["kinesis"] }

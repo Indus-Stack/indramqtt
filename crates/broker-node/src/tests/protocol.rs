@@ -1222,11 +1222,11 @@ async fn subscribe_v5_no_local_suppresses_self_only() {
             encode_subscribe_meta_v5(1, client, &[("nl/topic", opts, 0)]),
         );
         apply_subscribe(&frame, &shared).await.0.expect("subscribe");
-        let (session, _) = shared.sessions.get_or_create(client, true);
+        let (session, _) = shared.sessions.get_or_create(client, false);
         *session.conn_id.write() = Some(conn);
     }
     // Publish from the no-local client through the broker path.
-    let (pub_session, _) = shared.sessions.get_or_create("nl-self", true);
+    let (pub_session, _) = shared.sessions.get_or_create("nl-self", false);
     *pub_session.conn_id.write() = Some(31);
     shared.sessions.bind_session(&pub_session, 31);
     let (meta, payload) = encode_publish_meta("nl/topic", 0, 0, false, b"x");

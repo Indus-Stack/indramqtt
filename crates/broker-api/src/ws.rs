@@ -705,9 +705,20 @@ async fn handle_packet(
             let verified_is_superuser = verified_username
                 .as_deref()
                 .is_some_and(|name| state.auth.is_superuser(name));
+            let principal_mismatch = !conn.clean_start
+                && state
+                    .sessions
+                    .get(&conn.client_id)
+                    .is_some_and(|existing| existing.verified_username() != verified_username);
+            if conn.clean_start || principal_mismatch {
+                let stale = state.sessions.subscription_filters(&conn.client_id);
+                for filter in &stale {
+                    state.router.unsubscribe(filter, &conn.client_id);
+                }
+            }
             let (stored, present) = state
                 .sessions
-                .get_or_create(&conn.client_id, conn.clean_start);
+                .get_or_create(&conn.client_id, conn.clean_start || principal_mismatch);
             *stored.conn_id.write() = Some(conn_id);
             *stored.keepalive_secs.write() = conn.keepalive_secs;
             *stored.username.write() = conn.username.clone();
@@ -823,6 +834,7 @@ async fn handle_subscribe(
                             retain_as_published: false,
                             retain_handling: 0,
                             subscription_id: 0,
+                            session_id: 0,
                         },
                     );
                     if !stored {
@@ -941,6 +953,9 @@ async fn handle_publish(
         ) else {
             continue;
         };
+        if sub.session_id != 0 && target.id.0 != sub.session_id {
+            continue;
+        }
         if !*target.connected.read() {
             continue;
         }

@@ -791,6 +791,7 @@ async fn slow_shed_records_through_broker() {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
     let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -921,6 +922,7 @@ async fn slow_qos0_backlog_records_slow_not_prompt() {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
     let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -948,6 +950,7 @@ async fn slow_qos0_backlog_records_slow_not_prompt() {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
     let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -1067,6 +1070,7 @@ async fn slow_qos1_ack_delay_records_under_defaults() {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
     let (slow_tx, _slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -1091,6 +1095,7 @@ async fn slow_qos1_ack_delay_records_under_defaults() {
             retain_as_published: false,
             retain_handling: 0,
             subscription_id: 0,
+            session_id: 0,
         },
     );
     let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();

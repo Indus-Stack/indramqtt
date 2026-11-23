@@ -4837,6 +4837,32 @@ impl ConfigRegistry {
     }
 }
 
+/// Parse a human-readable duration string such as `250ms`, `15s`, or `1h`.
+pub fn parse_duration_str(text: &str) -> std::result::Result<std::time::Duration, &'static str> {
+    let text = text.trim().to_ascii_lowercase();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .ok_or("missing duration unit")?;
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().map_err(|_| "invalid duration number")?;
+    if !number.is_finite() || number < 0.0 {
+        return Err("duration must be finite and non-negative");
+    }
+    let nanos = match unit.trim() {
+        "ns" => number,
+        "us" | "µs" => number * 1_000.0,
+        "ms" => number * 1_000_000.0,
+        "s" => number * 1_000_000_000.0,
+        "m" => number * 60.0 * 1_000_000_000.0,
+        "h" => number * 3600.0 * 1_000_000_000.0,
+        _ => return Err("unsupported duration unit"),
+    };
+    if nanos > u64::MAX as f64 {
+        return Err("duration overflows u64 nanoseconds");
+    }
+    Ok(std::time::Duration::from_nanos(nanos as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

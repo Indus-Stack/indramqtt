@@ -26,13 +26,10 @@ command -v python3 >/dev/null || { echo "FAIL: python3 is not in PATH"; exit 2; 
 # TLS tests, so the probe uses the same chain as the gates.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TREE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-CERT="$TREE_DIR/crates/broker-node/tests/k1_05/server-cert.pem"
-KEY="$TREE_DIR/crates/broker-node/tests/k1_05/server-key.pem"
-for cert in "$CERT" "$KEY"; do
-    [ -f "$cert" ] || { echo "FAIL: test certificate $cert is missing"; exit 2; }
-done
-
 ROOT=$(mktemp -d)
+bash "$TREE_DIR/tools/gen_test_pki.sh" "$ROOT/pki"
+CERT="$ROOT/pki/server-cert.pem"
+KEY="$ROOT/pki/server-key.pem"
 KERNEL_PID=
 failures=0
 

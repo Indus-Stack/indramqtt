@@ -985,3 +985,51 @@ async fn rq04_other_tenant_event_reaches_no_rule() {
     let data = rq04_collect_outputs(&shared, 1031, &mut rx_sub, "data/tenant");
     assert_eq!(data.len(), 1, "only default data delivers: {data:?}");
 }
+
+#[tokio::test]
+async fn subscribe_router_full_0x97_does_not_leave_deferred_retained() {
+    let shared = test_shared();
+    shared
+        .router
+        .set_subscription_count_for_test(broker_router::MAX_SUBSCRIPTIONS);
+
+    // Store two retained QoS 1 messages under sensors/#.
+    for suffix in ["a", "b"] {
+        shared
+            .retained
+            .set_retained_in_tenant(
+                Topic::new(format!("sensors/{suffix}")).unwrap(),
+                QoS::AtLeastOnce,
+                Bytes::from_static(b"1"),
+                broker_storage::DEFAULT_TENANT_ID,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Bind a v5 client with Receive Maximum 1 so the second retained match
+    // would be deferred if the subscription succeeded.
+    let _rx = rq04_mailbox(&shared, 4001);
+    rq04_bind(&shared, 4001, 1, "sub-full").await;
+    let session = shared.sessions.get("sub-full").expect("bound session");
+    session.set_protocol_version(5);
+    session.set_client_receive_maximum(1);
+    let sub_frame = subscribe_frame(
+        4001,
+        2,
+        encode_subscribe_meta(77, "sub-full", &[("sensors/#", 1)]),
+    );
+    let (suback, _) = apply_subscribe(&sub_frame, &shared).await;
+    let suback = suback.expect("SUBACK must be returned");
+    assert!(
+        suback.metadata.ends_with(&[V5_SUBACK_QUOTA_EXCEEDED])
+            || suback.metadata.ends_with(&[V5_SUBACK_UNSPECIFIED]),
+        "expected quota/unspecified rejection in SUBACK, got {:?}",
+        suback.metadata
+    );
+    assert_eq!(
+        session.pending_retained_len(),
+        0,
+        "rejected 0x97 subscribe must not leave orphaned deferred retained entries"
+    );
+}

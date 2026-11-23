@@ -307,7 +307,7 @@ def connector_records():
             config_name = config_type_for(text, structs)
             if not config_name:
                 continue
-            source = str(path.relative_to(ROOT))
+            source = path.relative_to(ROOT).as_posix()
             items = build_items(kind, config_name, structs, enums, text)
             records.append({
                 "kind": kind,

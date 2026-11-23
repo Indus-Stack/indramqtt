@@ -207,6 +207,8 @@ kinesis = ["dep:aws-sdk-kinesis"]
 opc_ua = []
 
 [dev-dependencies]
+rcgen = { workspace = true }
+rsa = "0.9"
 axum = { workspace = true }
 apache-avro = { version = "0.15" }
 broker-rules = { workspace = true }

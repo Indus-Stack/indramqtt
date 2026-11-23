@@ -263,34 +263,29 @@ fn source_resource_duration(
             "source {id:?} field `resource_opts.{key}` must be a duration string"
         ));
     };
-    let text = text.trim().to_ascii_lowercase();
-    let split = text
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .ok_or_else(|| source_resource_duration_error(id, key, value))?;
-    let (number, unit) = text.split_at(split);
-    let number: f64 = number
-        .parse()
-        .map_err(|_| source_resource_duration_error(id, key, value))?;
-    if !number.is_finite() || number < 0.0 {
-        return Err(source_resource_duration_error(id, key, value));
-    }
-    let nanos = match unit.trim() {
-        "ns" => number,
-        "us" | "µs" => number * 1_000.0,
-        "ms" => number * 1_000_000.0,
-        "s" => number * 1_000_000_000.0,
-        "m" => number * 60.0 * 1_000_000_000.0,
-        "h" => number * 3600.0 * 1_000_000_000.0,
-        _ => return Err(source_resource_duration_error(id, key, value)),
-    };
-    if nanos > u64::MAX as f64 {
-        return Err(source_resource_duration_error(id, key, value));
-    }
-    Ok(Duration::from_nanos(nanos as u64))
+    broker_config::parse_duration_str(text)
+        .map_err(|_| source_resource_duration_error(id, key, value))
 }
 
 fn source_resource_duration_error(id: &str, key: &str, value: &serde_json::Value) -> String {
     format!("source {id:?} field `resource_opts.{key}` value {value} is not a valid duration")
+}
+
+/// Validate MQTT wildcard placement (`+` must occupy an entire level, `#` only at the end).
+fn is_valid_mqtt_wildcards(filter: &str) -> bool {
+    if filter.is_empty() {
+        return false;
+    }
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (idx, level) in levels.iter().enumerate() {
+        if level.contains('#') && (*level != "#" || idx + 1 != levels.len()) {
+            return false;
+        }
+        if level.contains('+') && *level != "+" {
+            return false;
+        }
+    }
+    true
 }
 
 /// Split a create or replace body into envelope fields plus extras.
@@ -386,12 +381,25 @@ fn split_source_body(
     if connector.trim().is_empty() {
         return Err("missing required field: connector".to_string());
     }
-    let has_topic = parameters
+    let topic = parameters
         .get("topic")
         .and_then(|value| value.as_str())
-        .is_some_and(|topic| !topic.trim().is_empty());
-    if !has_topic {
-        return Err("missing required field: parameters.topic".to_string());
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty())
+        .ok_or_else(|| "missing required field: parameters.topic".to_string())?;
+    broker_protocol::TopicFilter::new(topic)
+        .map_err(|err| format!("invalid source topic filter {topic:?}: {err}"))?;
+    // Reject partial-level wildcards such as `sensors/temp+` that the wire driver rejects.
+    if !is_valid_mqtt_wildcards(topic) {
+        return Err(format!("invalid source topic filter {topic:?}"));
+    }
+    if let Some(qos_val) = parameters.get("qos") {
+        let qos = qos_val
+            .as_u64()
+            .ok_or_else(|| "field `parameters.qos` must be an integer".to_string())?;
+        if qos > 2 {
+            return Err("field `parameters.qos` must be 0, 1 or 2".to_string());
+        }
     }
     let mut extras = serde_json::Map::new();
     for (key, value) in obj {
@@ -1534,6 +1542,43 @@ mod tests {
         assert!(
             split_source_body(&serde_json::json!({"name": "x", "type": "nope"}), None).is_err()
         );
+    }
+
+    #[test]
+    fn split_body_refuses_invalid_topic_filter_and_qos() {
+        let bad_topic = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "sensors/temp+"},
+            }),
+            None,
+        )
+        .unwrap_err();
+        let _ = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "sensors/é#"},
+            }),
+            None,
+        )
+        .expect_err("invalid MQTT topic filter is refused");
+        assert!(bad_topic.contains("topic filter"), "{bad_topic}");
+
+        let bad_qos = split_source_body(
+            &serde_json::json!({
+                "type": "mqtt",
+                "name": "in",
+                "connector": "mqtt:up",
+                "parameters": {"topic": "events/#", "qos": 3},
+            }),
+            None,
+        )
+        .expect_err("out-of-range qos is refused");
+        assert!(bad_qos.contains("parameters.qos"), "{bad_qos}");
     }
 
     #[test]

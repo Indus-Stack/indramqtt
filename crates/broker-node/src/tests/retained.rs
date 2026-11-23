@@ -93,6 +93,7 @@ async fn kernel_ingress_enforces_retainer_limits_like_mgmt() {
     let mut api_state = broker_api::ApiState::standalone(engine);
     api_state.retainer_config = shared.retainer_config.clone();
     api_state.retained = shared.retained.clone();
+    api_state.retained_subscribe_gate = shared.retained_subscribe_gate.clone();
     api_state.stats = shared.stats.clone();
     let body = bytes::Bytes::from(
         serde_json::to_vec(&serde_json::json!({

@@ -1,6 +1,6 @@
 ---
-title: Rule actions B: elasticsearch to opentsdb
-description: Verified entries for each rule action from elasticsearch to opentsdb.
+title: "Rule actions B: elasticsearch to opentsdb"
+description: "Verified entries for each rule action from elasticsearch to opentsdb."
 sidebar:
   order: 55
 ---

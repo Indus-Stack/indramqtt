@@ -108,7 +108,7 @@ def call(method, path, body=None):
 call("DELETE", "/api/v5/actions/adb-sink-1")
 call("DELETE", "/api/v5/connectors/adb-conn-1")
 conn = call("POST", "/api/v5/connectors", {"name": "adb-conn-1", "type": "alloydb",
-    "server": "127.0.0.1:5432", "database": "db", "username": "u"})
+    "server": "127.0.0.1:15432", "database": "db", "username": "u"})
 assert conn["type"] == "alloydb", conn
 act = call("POST", "/api/v5/actions", {"name": "adb-sink-1", "type": "alloydb",
     "connector": "adb-conn-1",
