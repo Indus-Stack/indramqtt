@@ -2112,6 +2112,7 @@ fn bind_request(
             .unwrap_or(0),
         user_properties: props.map(|p| p.user_properties.into_iter().collect()),
         listener: listener.to_string(),
+        enhanced_auth_verified: false,
     }
 }
 
@@ -2780,6 +2781,7 @@ async fn drain_inbound(
                         let (_connect, mut request) =
                             // INVARIANT: pending_connect was populated when the exchange started.
                             conn.pending_connect.take().expect("pending connect");
+                        request.enhanced_auth_verified = true;
                         if request.username.is_none() {
                             request.username = Some(scram_username);
                         }

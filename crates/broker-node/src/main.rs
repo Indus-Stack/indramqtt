@@ -2245,6 +2245,8 @@ async fn apply_bind_request_inner(
                         server_max_pkt,
                     ));
                 }
+            } else if req.enhanced_auth_verified {
+                verified_connect_username = req.username.clone();
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
                 // CONNECT without a Kerberos token fails closed.
@@ -2436,7 +2438,7 @@ async fn apply_bind_request_inner(
             } else if via_local || via_ldap || via_db || via_webhook {
                 req.username.clone()
             } else {
-                None
+                verified_connect_username
             };
         }
     }
@@ -2962,6 +2964,9 @@ struct BindRequest {
     /// Listener name the connection arrived on (`""` means default).
     /// The edge reports it. The kernel native path sets it.
     listener: String,
+    /// True only when native enhanced authentication (SCRAM-SHA-256)
+    /// verified the client proof for this CONNECT.
+    enhanced_auth_verified: bool,
 }
 
 /// Longest accepted listener name in a bind.
@@ -3055,6 +3060,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             max_packet_size: v5.max_packet_size,
             user_properties: Some(v5.user_properties),
             listener: identity.listener,
+            enhanced_auth_verified: false,
         });
     }
     // Preferred: exact legacy parse (no alias section).
@@ -3077,6 +3083,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             max_packet_size: 0,
             user_properties: None,
             listener: identity.listener,
+            enhanced_auth_verified: false,
         });
     }
     // Otherwise the last two bytes may be the alias section: the prefix
@@ -3105,6 +3112,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
                 max_packet_size: 0,
                 user_properties: None,
                 listener: identity.listener,
+                enhanced_auth_verified: false,
             });
         }
     }
@@ -3179,6 +3187,7 @@ fn decode_flagged_bind(
         max_packet_size,
         user_properties,
         listener: identity.listener,
+        enhanced_auth_verified: false,
     })
 }
 

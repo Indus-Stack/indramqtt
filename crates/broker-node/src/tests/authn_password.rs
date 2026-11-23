@@ -82,6 +82,56 @@ async fn bind_auth_rejects_username_without_backend_when_allow_anonymous_is_fals
 }
 
 #[tokio::test]
+async fn bind_auth_accepts_enhanced_auth_verified_without_backend_when_allow_anonymous_is_false() {
+    let mut shared = test_shared();
+    shared.allow_anonymous = false;
+
+    let mut req = BindRequest {
+        client_id: "dev-user-enhanced".to_string(),
+        clean_start: true,
+        keepalive_secs: 60,
+        username: Some("alice".to_string()),
+        password: None,
+        peerhost: None,
+        client_alias_max: 0,
+        will: None,
+        cert_cn: None,
+        cert_subject: None,
+        cert_sans: Vec::new(),
+        protocol_version: 5,
+        session_expiry: 0,
+        receive_maximum: u16::MAX,
+        max_packet_size: 0,
+        user_properties: None,
+        listener: String::new(),
+        enhanced_auth_verified: true,
+    };
+
+    let frame = bind_frame(841, 1, Bytes::new());
+    let reply = apply_bind_request(&frame, Ok(req.clone()), true, &shared)
+        .await
+        .expect("bind replies");
+    let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+    assert_eq!(
+        rc, 0,
+        "CONNECT with enhanced_auth_verified=true and username must bind with rc 0"
+    );
+    assert!(shared.sessions.get("dev-user-enhanced").is_some());
+
+    req.enhanced_auth_verified = false;
+    let frame_fail = bind_frame(842, 1, Bytes::new());
+    let reply_fail = apply_bind_request(&frame_fail, Ok(req), true, &shared)
+        .await
+        .expect("bind replies");
+    let (_, present_fail, rc_fail) = decode_session_binding_meta(&reply_fail.metadata);
+    assert_eq!(
+        rc_fail, 0x87,
+        "same request with enhanced_auth_verified=false must still get 0x87"
+    );
+    assert!(!present_fail);
+}
+
+#[tokio::test]
 async fn bind_resume_with_different_principal_drops_cached_authz_and_subscriptions() {
     let shared = test_shared();
     shared.auth.add_user("super", b"p1").unwrap();
