@@ -195,7 +195,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `getting-started/first-user.md` | 82 | `ok<br>denied` |
 | `getting-started/install.md` | 66 | `indramqtt 0.1.0` |
 | `getting-started/install.md` | 74 | `indra 0.1.0` |
-| `index.md` | 56 | `OK` |
+| `index.md` | 67 | `OK` |
 | `mcp.md` | 3513 | `401` |
 | `migration.md` | 94 | `OK` |
 | `multi-tenancy/index.md` | 100 | `isolated` |

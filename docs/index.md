@@ -1,6 +1,17 @@
 ---
 title: "IndraMQTT"
-description: "A single-node Rust MQTT broker with embedded streaming SQL."
+description: "The complete MQTT platform in one small binary."
+template: splash
+hero:
+  title: "IndraMQTT"
+  tagline: "The complete MQTT platform in one small binary."
+  actions:
+    - text: "Get started"
+      link: /getting-started/
+      variant: primary
+    - text: "Connectors"
+      link: /connectors/
+      variant: secondary
 sidebar:
   order: 1
 ---

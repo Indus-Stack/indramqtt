@@ -1,0 +1,32 @@
+---
+import Default from '@astrojs/starlight/components/MarkdownContent.astro';
+import HomeSections from '../HomeSections.astro';
+import ConnectorCatalogue from '../ConnectorCatalogue.astro';
+
+const pathname = Astro.url.pathname.replace(/\/$/, '') || '/';
+const slug = (Astro.props as any).slug ?? (Astro.props as any).entry?.slug;
+const isHome = pathname === '/' || slug === '' || slug === 'index';
+const isConnectors = pathname === '/connectors' || slug === 'connectors' || slug === 'connectors/index';
+---
+
+{
+  isHome ? (
+    <>
+      <HomeSections />
+      <Default {...Astro.props}>
+        <slot />
+      </Default>
+    </>
+  ) : isConnectors ? (
+    <>
+      <ConnectorCatalogue />
+      <Default {...Astro.props}>
+        <slot />
+      </Default>
+    </>
+  ) : (
+    <Default {...Astro.props}>
+      <slot />
+    </Default>
+  )
+}

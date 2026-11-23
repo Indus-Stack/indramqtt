@@ -99,9 +99,142 @@ function publishFailures() {
   writeFileSync(out, stripDuplicateTitle(raw), 'utf8');
 }
 
+const CATEGORY_NAMES = {
+  'relational': 'Relational databases',
+  'time-series': 'Time-series databases',
+  'document-store': 'Document stores',
+  'object-store': 'Storage and analytics',
+  'message-broker': 'Message brokers',
+  'cloud-messaging': 'Cloud messaging',
+  'cloud-iot': 'Cloud IoT',
+  'device': 'Industrial devices',
+  'http': 'HTTP',
+  'local': 'Local',
+};
+
+function mapState(rawState) {
+  const trimmed = rawState.trim();
+  if (trimmed === 'ready') return 'Ready';
+  if (trimmed.startsWith('pending')) return 'Pending';
+  if (trimmed.startsWith('refused')) return 'Not in this build';
+  if (trimmed === 'test-only') return 'test-only';
+  throw new Error(`Unknown state: ${trimmed}`);
+}
+
+function generateConnectorsJson() {
+  const kindsFile = join(source, 'reference', 'connector-kinds.md');
+  if (!existsSync(kindsFile)) {
+    throw new Error(`${kindsFile} is missing.`);
+  }
+
+  const kindsContent = readFileSync(kindsFile, 'utf8');
+  const lines = kindsContent.split(/\r?\n/);
+  const tableRows = lines.filter(
+    (l) => l.startsWith('|') && !l.includes('---') && !l.includes('kind | aliases')
+  );
+
+  const kinds = [];
+  for (const row of tableRows) {
+    const cols = row.split('|').map((c) => c.trim()).slice(1, -1);
+    if (cols.length < 5) continue;
+    const [kind, aliasesStr, family, _owner, rawState] = cols;
+    const aliases = aliasesStr
+      ? aliasesStr.split(',').map((a) => a.trim()).filter(Boolean)
+      : [];
+    kinds.push({
+      kind,
+      aliases,
+      family,
+      category: CATEGORY_NAMES[family] || family,
+      state: mapState(rawState),
+      rawState: rawState.trim(),
+    });
+  }
+
+  const connectorsDir = join(source, 'connectors');
+  const connectorFiles = readdirSync(connectorsDir).filter(
+    (f) => f.endsWith('.md') && f !== 'index.md'
+  );
+
+  for (const file of connectorFiles) {
+    const stem = file.replace(/\.md$/, '');
+    const normStem = stem.replace(/-/g, '_');
+    const matchingKinds = kinds.filter(
+      (k) => k.kind === normStem || k.aliases.includes(normStem)
+    );
+    if (matchingKinds.length === 0) {
+      throw new Error(`Connector page ${file} does not match any kind in connector-kinds.md`);
+    }
+  }
+
+  const items = [];
+  for (const k of kinds) {
+    const matchingFiles = connectorFiles.filter((f) => {
+      const stem = f.replace(/\.md$/, '');
+      const normStem = stem.replace(/-/g, '_');
+      return normStem === k.kind || k.aliases.includes(normStem);
+    });
+    if (matchingFiles.length === 0) {
+      throw new Error(`Kind ${k.kind} has no matching page in docs/connectors`);
+    }
+
+    if (k.state === 'test-only' || k.rawState === 'test-only') {
+      continue;
+    }
+
+    let chosenFile;
+    const exactMatch = matchingFiles.find((f) => f.replace(/\.md$/, '') === k.kind);
+    if (exactMatch) {
+      chosenFile = exactMatch;
+    } else {
+      let maxLines = -1;
+      for (const f of matchingFiles) {
+        const content = readFileSync(join(connectorsDir, f), 'utf8');
+        const lineCount = content.split(/\r?\n/).length;
+        if (lineCount > maxLines) {
+          maxLines = lineCount;
+          chosenFile = f;
+        }
+      }
+    }
+
+    const pageContent = readFileSync(join(connectorsDir, chosenFile), 'utf8');
+    const fmMatch = pageContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (!fmMatch) {
+      throw new Error(`Connector page ${chosenFile} is missing front matter`);
+    }
+    const titleMatch = fmMatch[1].match(/^title:\s*(.*)$/m);
+    const descMatch = fmMatch[1].match(/^description:\s*(.*)$/m);
+    if (!titleMatch || !descMatch) {
+      throw new Error(`Connector page ${chosenFile} is missing title or description in front matter`);
+    }
+    const title = titleMatch[1].trim().replace(/^["']|["']$/g, '');
+    const description = descMatch[1].trim().replace(/^["']|["']$/g, '');
+    const page = chosenFile.replace(/\.md$/, '');
+
+    items.push({
+      kind: k.kind,
+      aliases: k.aliases,
+      category: k.category,
+      state: k.state,
+      title,
+      description,
+      page,
+    });
+  }
+
+  items.sort((a, b) => a.title.localeCompare(b.title));
+
+  const dataDir = join(site, 'src', 'data');
+  mkdirSync(dataDir, { recursive: true });
+  const outFile = join(dataDir, 'connectors.json');
+  writeFileSync(outFile, JSON.stringify(items, null, 2) + '\n', 'utf8');
+}
+
 rmSync(target, { recursive: true, force: true });
 mkdirSync(dirname(target), { recursive: true });
 cpSync(source, target, { recursive: true });
 removeInternal(target);
 processMarkdownFiles(target);
 publishFailures();
+generateConnectorsJson();

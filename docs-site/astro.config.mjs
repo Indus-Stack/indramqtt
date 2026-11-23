@@ -53,6 +53,7 @@ export default defineConfig({
         Head: './src/components/overrides/Head.astro',
         PageFrame: './src/components/overrides/PageFrame.astro',
         PageSidebar: './src/components/overrides/PageSidebar.astro',
+        MarkdownContent: './src/components/overrides/MarkdownContent.astro',
       },
       sidebar: [
         {

@@ -1,0 +1,181 @@
+---
+import { Card, CardGrid, Code } from '@astrojs/starlight/components';
+import homeFlowSvg from '../content/docs/assets/home-flow.svg?raw';
+
+const installCommand = `git clone https://github.com/ankur-paan/indramqtt.git && cd indramqtt
+docker compose up -d`;
+---
+
+<div class="home-sections not-content">
+  <div class="home-install-box">
+    <Code code={installCommand} lang="sh" />
+  </div>
+
+  <div class="home-cards">
+    <CardGrid>
+      <a href="/getting-started/" class="home-card-link">
+        <Card title="Get started" icon="rocket">
+          Install the broker, start it, send your first message and open the console.
+        </Card>
+      </a>
+      <a href="/rules/" class="home-card-link">
+        <Card title="Rules (SQL)" icon="open-book">
+          Filter, transform and enrich MQTT messages with embedded streaming SQL.
+        </Card>
+      </a>
+      <a href="/connectors/" class="home-card-link">
+        <Card title="Connectors" icon="puzzle">
+          Stream data to databases, queues, data lakes and cloud services.
+        </Card>
+      </a>
+      <a href="/operations/" class="home-card-link">
+        <Card title="Operate" icon="setting">
+          Deploy, configure, monitor, scale and troubleshoot IndraMQTT in production.
+        </Card>
+      </a>
+    </CardGrid>
+  </div>
+
+  <div class="home-diagram-section">
+    <h2 class="home-section-title">What it does</h2>
+    <div class="home-diagram" set:html={homeFlowSvg} />
+  </div>
+
+  <div class="home-tasks-section">
+    <h2 class="home-section-title">Popular tasks</h2>
+    <ul class="home-tasks-list">
+      <li>
+        <a href="/getting-started/first-publish/">
+          <span class="task-arrow">&rarr;</span>
+          <span>Publish a first message</span>
+        </a>
+      </li>
+      <li>
+        <a href="/getting-started/first-user/">
+          <span class="task-arrow">&rarr;</span>
+          <span>Create a first user</span>
+        </a>
+      </li>
+      <li>
+        <a href="/rules/sql/">
+          <span class="task-arrow">&rarr;</span>
+          <span>Write a rule with SQL</span>
+        </a>
+      </li>
+      <li>
+        <a href="/connectors/kafka/">
+          <span class="task-arrow">&rarr;</span>
+          <span>Connect Apache Kafka</span>
+        </a>
+      </li>
+      <li>
+        <a href="/security/tls/">
+          <span class="task-arrow">&rarr;</span>
+          <span>Enable TLS encryption</span>
+        </a>
+      </li>
+      <li>
+        <a href="/operations/deployment/">
+          <span class="task-arrow">&rarr;</span>
+          <span>Deploy with Docker</span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div>
+
+<style>
+  .home-sections {
+    margin-top: 1.5rem;
+    margin-bottom: 3rem;
+  }
+  .home-install-box {
+    margin: 1.5rem 0 2.5rem 0;
+  }
+  .home-install-box :global(.expressive-code) {
+    margin: 0 auto;
+  }
+  .home-cards {
+    margin: 2.5rem 0;
+  }
+  .home-card-link {
+    text-decoration: none;
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    transition: transform 0.15s ease;
+  }
+  .home-card-link:hover {
+    transform: translateY(-2px);
+  }
+  .home-card-link:hover :global(.card) {
+    border-color: var(--sl-color-accent);
+  }
+  .home-card-link :global(.card) {
+    height: 100%;
+    transition: border-color 0.15s ease;
+    border-radius: 0.5rem;
+  }
+  .home-card-link :global(.title) {
+    color: var(--sl-color-white);
+  }
+  .home-card-link :global(.body) {
+    color: var(--sl-color-gray-3);
+  }
+  .home-diagram-section {
+    margin: 3.5rem 0;
+  }
+  .home-section-title {
+    font-size: var(--sl-text-h2, 1.75rem);
+    font-weight: 600;
+    color: var(--sl-color-white);
+    margin-bottom: 1.5rem;
+    text-align: left;
+  }
+  .home-diagram {
+    width: 100%;
+    max-width: 860px;
+    margin: 0 auto;
+    overflow-x: auto;
+  }
+  .home-tasks-section {
+    margin: 3rem 0 2rem 0;
+  }
+  .home-tasks-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 1rem;
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .home-tasks-list li {
+    margin: 0;
+    padding: 0;
+  }
+  .home-tasks-list a {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.875rem 1.25rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.5rem;
+    background-color: var(--sl-color-black);
+    color: var(--sl-color-text);
+    text-decoration: none;
+    font-size: 0.95rem;
+    font-weight: 500;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+  .home-tasks-list a:hover {
+    border-color: var(--sl-color-accent);
+    transform: translateY(-1px);
+    color: var(--sl-color-text-accent);
+  }
+  .task-arrow {
+    color: var(--sl-color-accent);
+    font-weight: 700;
+    font-size: 1.1rem;
+  }
+</style>
