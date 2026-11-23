@@ -48,9 +48,11 @@ export default defineConfig({
       editLink: {
         baseUrl: 'https://github.com/ankur-paan/indramqtt/edit/main/docs/',
       },
-      customCss: ['./src/styles/theme.css'],
+      customCss: ['./src/styles/theme.css', './src/styles/panels.css'],
       components: {
         Head: './src/components/overrides/Head.astro',
+        PageFrame: './src/components/overrides/PageFrame.astro',
+        PageSidebar: './src/components/overrides/PageSidebar.astro',
       },
       sidebar: [
         {

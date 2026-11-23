@@ -1,0 +1,18 @@
+---
+import Default from '@astrojs/starlight/components/PageSidebar.astro';
+import type { Props } from '@astrojs/starlight/props';
+
+const { headings = [] } = Astro.props;
+const tocCount = headings.filter((h) => h.depth === 2 || h.depth === 3).length;
+const hasToc = tocCount >= 3;
+---
+
+{
+  hasToc && (
+    <div id="starlight__toc">
+      <Default {...Astro.props}>
+        <slot />
+      </Default>
+    </div>
+  )
+}
