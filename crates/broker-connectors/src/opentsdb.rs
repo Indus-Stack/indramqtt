@@ -695,6 +695,26 @@ impl OpenTsdbSink {
         })
     }
 
+    #[cfg(test)]
+    pub fn new_with_linger(
+        config: OpenTsdbConfig,
+        transport: Arc<dyn OpenTsdbTransport>,
+        linger: Duration,
+    ) -> Result<Self> {
+        config.validate()?;
+        // Reason: ~1 KiB per HTTP/telnet flush amortises request
+        // overhead while keeping each flush well under a MiB; `None`
+        // maps to the same finite default, never unlimited.
+        let batch_size = config.batch_size.unwrap_or(1000).max(1);
+        Ok(Self {
+            config,
+            transport,
+            queue: Mutex::new(BatchQueue::new(batch_size, linger)),
+            backoff: Mutex::new(BackoffState::default()),
+            sent: AtomicU64::new(0),
+        })
+    }
+
     pub fn config(&self) -> &OpenTsdbConfig {
         &self.config
     }
@@ -1143,7 +1163,8 @@ mod tests {
         let mut cfg = sample_http_config();
         cfg.batch_size = Some(10);
         let transport = Arc::new(MockOpenTsdbTransport::with_transient_failures(1));
-        let sink = OpenTsdbSink::new(cfg, transport.clone()).expect("valid sink");
+        let sink = OpenTsdbSink::new_with_linger(cfg, transport.clone(), Duration::from_secs(60))
+            .expect("valid sink");
 
         let topic = Topic::new("sensors/temp").unwrap();
         let payload1 = Bytes::from_static(br#"{"host": "edge-10", "temperature": 75.0}"#);
