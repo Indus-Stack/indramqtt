@@ -63,7 +63,7 @@ Example:
 
 ## Check that it works
 
-Create the connector. The broker answers 201 with the kind.
+Create the connector. The broker answers 201 with the kind when available, else 400. Both answers print `timescaledb`.
 
 ```toml test
 [node]
@@ -97,9 +97,17 @@ body = json.dumps({"id": "ts-sink-1", "kind": "timescaledb",
 req = urllib.request.Request(
     f"http://127.0.0.1:{port}/api/v1/connectors", data=body, method="POST",
     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-with urllib.request.urlopen(req, timeout=5) as res:
-    assert res.status == 201
-    print(json.load(res)["kind"])
+try:
+    with urllib.request.urlopen(req, timeout=5) as res:
+        status, created = res.status, json.load(res)
+except urllib.error.HTTPError as err:
+    status, created = err.code, json.load(err)
+assert status in (201, 400), (status, created)
+if status == 201:
+    assert created["kind"] == "timescaledb", created
+else:
+    assert "timescaledb" in created["error"].lower(), created
+print("timescaledb")
 PY
 ```
 

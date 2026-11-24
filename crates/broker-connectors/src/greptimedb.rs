@@ -1186,9 +1186,10 @@ mod tests {
         ];
 
         let sql = build_greptime_sql_insert("metrics", &records).expect("valid sql");
-        assert!(sql.starts_with("INSERT INTO metrics (ts, dev_id, temp) VALUES "));
-        assert!(sql.contains("(1700000000, 'dev-1', 23.4)"));
-        assert!(sql.contains("(1700000005, 'dev-2', 25.1)"));
+        assert_eq!(
+            sql,
+            "INSERT INTO metrics (ts, dev_id, temp) VALUES (1700000000, 'dev-1', 23.4), (1700000005, 'dev-2', 25.1)"
+        );
     }
 
     #[test]
@@ -1204,9 +1205,10 @@ mod tests {
         }];
 
         let lines = build_influx_line_protocol(&records);
-        assert!(lines.starts_with(
+        assert_eq!(
+            lines,
             "device_telemetry status=\"OK\",count=10i,pressure=101.3 1700000000000000000\n"
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2273,7 +2275,7 @@ mod tests {
         let transport = Arc::new(MockGreptimeDbTransport::default());
         let sink = GreptimeDbSink::new(config, transport.clone()).unwrap();
 
-        let payload = Bytes::from_static(br#"{"_seq":999,"temp":21}"#);
+        let payload = Bytes::from_static(br#"{"_seq":999999,"temp":21}"#);
         sink.send(
             &Topic::new("sensors/a").unwrap(),
             &payload,
@@ -2292,7 +2294,7 @@ mod tests {
         let sent = transport.captured_sqls.lock().clone();
         assert_eq!(sent.len(), 1);
         assert!(
-            !sent[0].contains("999"),
+            !sent[0].contains("999999"),
             "payload _seq must not leak: {}",
             sent[0]
         );

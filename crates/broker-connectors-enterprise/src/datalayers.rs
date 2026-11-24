@@ -1358,9 +1358,9 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         let line = bodies[0].trim();
-        assert!(
-            line.starts_with("a\\nb\\rc\\,d\\ e,"),
-            "escaped table on the wire: {line}"
+        assert_eq!(
+            line,
+            "a\\nb\\rc\\,d\\ e,line=A1 pressure=9.5 1726000000000000"
         );
         server.abort();
     }
@@ -1420,19 +1420,7 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         let line = bodies[0].trim();
-        assert!(
-            line.starts_with("machinery,"),
-            "line must carry the table: {line}"
-        );
-        assert!(line.contains("line=A1"), "line must carry the tag: {line}");
-        assert!(
-            line.contains("pressure=9.5"),
-            "line must carry the field: {line}"
-        );
-        assert!(
-            line.ends_with(" 1726000000000000"),
-            "line must carry microsecond time: {line}"
-        );
+        assert_eq!(line, "machinery,line=A1 pressure=9.5 1726000000000000");
         server.abort();
     }
 
@@ -1481,19 +1469,7 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         let line = bodies[0].trim();
-        assert!(
-            line.starts_with("machinery,"),
-            "line must carry the table: {line}"
-        );
-        assert!(line.contains("line=A1"), "line must carry the tag: {line}");
-        assert!(
-            line.contains("pressure=9.5"),
-            "line must carry the field: {line}"
-        );
-        assert!(
-            line.ends_with(" 1726000000000000"),
-            "line must carry microsecond time: {line}"
-        );
+        assert_eq!(line, "machinery,line=A1 pressure=9.5 1726000000000000");
         server.abort();
     }
 

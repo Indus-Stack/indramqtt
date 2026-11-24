@@ -360,8 +360,8 @@ async fn mv02b_connector_level_settings_apply_and_refuse() {
     token["token"] = serde_json::json!("tok");
     let sink = build_tdengine_sink(&rec, &token).expect("a token builds");
     assert_eq!(sink.kind(), "tdengine");
-    // GreptimeDB: the connector precision and format apply; an
-    // unknown connector value refuses.
+    // GreptimeDB: the build reads the connector precision and format; an
+    // unknown connector value refuses the build.
     let grec = mv02b_record("act", "greptimedb", "greptimedb:up", serde_json::json!({}));
     let error = build_greptimedb_sink(
         &grec,
@@ -370,7 +370,8 @@ async fn mv02b_connector_level_settings_apply_and_refuse() {
     )
     .err()
     .expect("an unknown connector precision refuses");
-    assert!(error.contains("precision"), "{error}");
+    assert!(error.contains("connector setting `precision`"), "{error}");
+    assert!(!error.contains("parameters.precision"), "{error}");
     let sink = build_greptimedb_sink(
         &grec,
         &serde_json::json!({"server": "127.0.0.1:4001", "database": "db",
@@ -378,8 +379,8 @@ async fn mv02b_connector_level_settings_apply_and_refuse() {
     )
     .expect("a connector precision and format builds");
     assert_eq!(sink.kind(), "greptimedb");
-    // Timestream: the connector precision applies; an unknown
-    // connector value refuses.
+    // Timestream: the build reads the connector precision and format; an
+    // unknown connector value refuses the build.
     let trec = mv02b_record("act", "timestream", "timestream:up", serde_json::json!({}));
     let error = build_timestream_sink(
         &trec,
@@ -389,7 +390,8 @@ async fn mv02b_connector_level_settings_apply_and_refuse() {
     )
     .err()
     .expect("an unknown connector precision refuses");
-    assert!(error.contains("precision"), "{error}");
+    assert!(error.contains("connector setting `precision`"), "{error}");
+    assert!(!error.contains("parameters.precision"), "{error}");
     let sink = build_timestream_sink(
         &trec,
         &serde_json::json!({"database": "db", "table": "m", "region": "r",

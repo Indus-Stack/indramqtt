@@ -1326,3 +1326,39 @@ async fn mn14_connector_aliases_mongo_and_es() {
 
     kernel.finish().await;
 }
+
+/// Refuse pending connector kinds on v1 with HTTP 400.
+#[tokio::test]
+async fn mn06_v1_pending_kind_is_refused() {
+    let kernel = spawn_kernel("").await;
+
+    for (id, kind, canonical) in [
+        ("mn06-iot", "aws_iot", "aws_iot"),
+        ("mn06-azure-iot", "azure_iot", "azure_iot"),
+        ("mn06-oci", "oci_streaming", "oci_streaming"),
+        ("mn06-cass", "cassandra", "cassandra"),
+        ("mn06-ts", "timescaledb", "timescaledb"),
+        ("mn06-ts-alias", "timescale", "timescaledb"),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v1/connectors",
+            serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "config": {},
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "kind {kind} refused with 400: {body}");
+        let expected = format!("connector type {canonical} is not available in this broker");
+        let error_msg = body["error"].as_str().unwrap_or("");
+        assert!(
+            error_msg.contains(&expected),
+            "error for {kind} must contain '{expected}', got: {body}"
+        );
+    }
+
+    kernel.finish().await;
+}

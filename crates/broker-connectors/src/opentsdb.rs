@@ -985,8 +985,13 @@ mod tests {
 
         let lines = transport.captured_telnet.lock();
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("put plant.press_1 "));
-        assert!(lines[0].contains(" 120.4 machine=press_1\n"));
+        let parts: Vec<&str> = lines[0].split(' ').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0], "put");
+        assert_eq!(parts[1], "plant.press_1");
+        assert!(parts[2].parse::<u64>().is_ok());
+        assert_eq!(parts[3], "120.4");
+        assert_eq!(parts[4], "machine=press_1\n");
         assert_eq!(sink.sent_count(), 1);
     }
 

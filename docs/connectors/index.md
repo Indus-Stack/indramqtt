@@ -151,7 +151,7 @@ curl -X POST http://127.0.0.1:18083/api/v5/connectors/hook-1/stop \
 
 ## Check that it works
 
-Ask the broker for its action type names. The list holds the documented action kinds that are ready in this build.
+Ask the broker for its action type names. The list holds the 38 action type names that the check below asserts. It holds none of `aws_iot`, `azure_iot`, `oci_streaming` and `cassandra`.
 
 ```toml test
 [node]

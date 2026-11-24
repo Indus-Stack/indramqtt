@@ -294,8 +294,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-    assert_eq!(status, 201);
-    assert_eq!(created["kind"], json!("timescaledb"));
+    assert_eq!(status, 400);
+    assert_eq!(
+        created["error"],
+        json!("connector type timescaledb is not available in this broker")
+    );
 
     // Webhook sink: validated without sending any request.
     let (status, created) = server
@@ -579,19 +582,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-    if cfg!(feature = "cassandra") {
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("cassandra"));
-    } else {
-        assert_eq!(status, 400);
-        assert!(
-            created["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("cassandra"),
-            "disabled cassandra must name the feature, got: {created}"
-        );
-    }
+    assert_eq!(status, 400);
+    assert_eq!(
+        created["error"],
+        json!("connector type cassandra is not available in this broker")
+    );
 
     // Couchbase sink: validated without opening any socket.
     // X1-10: gated behind Cargo feature `couchbase`.
@@ -892,8 +887,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-    assert_eq!(status, 201);
-    assert_eq!(created["kind"], json!("oci_streaming"));
+    assert_eq!(status, 400);
+    assert_eq!(
+        created["error"],
+        json!("connector type oci_streaming is not available in this broker")
+    );
 
     // AWS IoT Core sink: mTLS-only build, validated without opening any socket.
     // SigV4/WebSocket is intentionally not built (no licence-compliant
@@ -933,16 +931,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             &token,
         )
         .await;
-    if cfg!(feature = "aws_iot") {
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("aws_iot"));
-    } else {
-        assert_eq!(status, 400);
-        assert!(
-            created["error"].as_str().unwrap_or("").contains("aws_iot"),
-            "disabled aws_iot must name the feature, got: {created}"
-        );
-    }
+    assert_eq!(status, 400);
+    assert_eq!(
+        created["error"],
+        json!("connector type aws_iot is not available in this broker")
+    );
 
     // Azure IoT Hub sink: validated without opening any socket.
     // X1-09: gated behind Cargo feature `azure_iot`.
@@ -966,19 +959,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             &token,
         )
         .await;
-    if cfg!(feature = "azure_iot") {
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("azure_iot"));
-    } else {
-        assert_eq!(status, 400);
-        assert!(
-            created["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("azure_iot"),
-            "disabled azure_iot must name the feature, got: {created}"
-        );
-    }
+    assert_eq!(status, 400);
+    assert_eq!(
+        created["error"],
+        json!("connector type azure_iot is not available in this broker")
+    );
 
     // GCP IoT Core sink: validated without opening any socket.
     // X1-09: gated behind Cargo feature `gcp_iot`.
@@ -1274,7 +1259,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             "iotdb-1",
             "mssql-1",
             "mysql-sink-1",
-            "oci-1",
             "opcua-1",
             "opentsdb-1",
             "oracle-1",
@@ -1288,7 +1272,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             "spb-1",
             "tdengine-1",
             "timestream-1",
-            "ts-sink-1",
         ] {
             assert!(ids.contains(always), "connector {always} must be listed");
         }
@@ -1297,8 +1280,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             ("azure-1", cfg!(feature = "azure_eventhubs")),
             ("dynamodb-1", cfg!(feature = "dynamodb")),
             ("bigquery-1", cfg!(feature = "bigquery")),
-            ("aws-iot-1", cfg!(feature = "aws_iot")),
-            ("azure-iot-1", cfg!(feature = "azure_iot")),
             ("gcp-iot-1", cfg!(feature = "gcp_iot")),
             ("azblob-1", cfg!(feature = "azure_blob")),
             ("kafka-sink-1", cfg!(feature = "kafka")),
@@ -1307,20 +1288,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             ("es-sink-1", cfg!(feature = "elasticsearch")),
             ("gcp-1", cfg!(feature = "gcp_pubsub")),
             ("mongo-1", cfg!(feature = "mongodb")),
-            ("cassandra-1", cfg!(feature = "cassandra")),
             ("couchbase-1", cfg!(feature = "couchbase")),
             ("confluent-1", cfg!(feature = "confluent")),
             ("kinesis-1", cfg!(feature = "kinesis")),
         ] {
             assert_eq!(ids.contains(id), enabled, "gated connector {id} presence");
         }
-        let expected = 29
+        let expected = 27
             + (cfg!(feature = "s3") as usize)
             + (cfg!(feature = "azure_eventhubs") as usize)
             + (cfg!(feature = "dynamodb") as usize)
             + (cfg!(feature = "bigquery") as usize)
-            + (cfg!(feature = "aws_iot") as usize)
-            + (cfg!(feature = "azure_iot") as usize)
             + (cfg!(feature = "gcp_iot") as usize)
             + (cfg!(feature = "azure_blob") as usize)
             + (cfg!(feature = "kafka") as usize)
@@ -1329,7 +1307,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             + (cfg!(feature = "elasticsearch") as usize)
             + (cfg!(feature = "gcp_pubsub") as usize)
             + (cfg!(feature = "mongodb") as usize)
-            + (cfg!(feature = "cassandra") as usize)
             + (cfg!(feature = "couchbase") as usize)
             + (cfg!(feature = "confluent") as usize)
             + (cfg!(feature = "kinesis") as usize);
@@ -1541,13 +1518,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     assert_eq!(status, 200);
     // X1-09/X1-10: count follows the enabled gated features (29 always
     // plus each gated kind when its feature is on).
-    let expected = 29
+    let expected = 27
         + (cfg!(feature = "s3") as usize)
         + (cfg!(feature = "azure_eventhubs") as usize)
         + (cfg!(feature = "dynamodb") as usize)
         + (cfg!(feature = "bigquery") as usize)
-        + (cfg!(feature = "aws_iot") as usize)
-        + (cfg!(feature = "azure_iot") as usize)
         + (cfg!(feature = "gcp_iot") as usize)
         + (cfg!(feature = "azure_blob") as usize)
         + (cfg!(feature = "kafka") as usize)
@@ -1556,7 +1531,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         + (cfg!(feature = "elasticsearch") as usize)
         + (cfg!(feature = "gcp_pubsub") as usize)
         + (cfg!(feature = "mongodb") as usize)
-        + (cfg!(feature = "cassandra") as usize)
         + (cfg!(feature = "couchbase") as usize)
         + (cfg!(feature = "confluent") as usize)
         + (cfg!(feature = "kinesis") as usize);

@@ -4027,18 +4027,24 @@ pub(crate) fn build_greptimedb_sink(
         &["table", "table_template"],
         "table",
     )?;
-    let precision = match param_string(record, "precision")
-        .or_else(|| first_string(connector_doc, &["precision"]).map(|value| value.into_owned()))
-        .unwrap_or_else(|| "ms".to_string())
-        .as_str()
-    {
+    let param_prec = param_string(record, "precision");
+    let raw_prec = param_prec
+        .clone()
+        .or_else(|| first_string(connector_doc, &["precision"]).map(|v| v.into_owned()))
+        .unwrap_or_else(|| "ms".to_string());
+    let precision = match raw_prec.as_str() {
         "ns" => GreptimePrecision::Nanosecond,
         "us" => GreptimePrecision::Microsecond,
         "ms" => GreptimePrecision::Millisecond,
         "s" => GreptimePrecision::Second,
         other => {
+            let target = if param_prec.is_some() {
+                "field `parameters.precision`"
+            } else {
+                "connector setting `precision`"
+            };
             return Err(format!(
-                "action {:?} field `parameters.precision` must be one of s, ms, us, ns: {other:?}",
+                "action {:?} {target} must be one of s, ms, us, ns: {other:?}",
                 record.id
             ));
         }
@@ -4837,17 +4843,23 @@ pub(crate) fn build_timestream_sink(
         first_string(connector_doc, &["measure", "measure_name_template"])
             .map(|value| value.into_owned())
     });
-    let time_unit = match param_string(record, "precision")
-        .or_else(|| first_string(connector_doc, &["precision"]).map(|value| value.into_owned()))
-        .unwrap_or_else(|| "ms".to_string())
-        .as_str()
-    {
+    let param_prec = param_string(record, "precision");
+    let raw_prec = param_prec
+        .clone()
+        .or_else(|| first_string(connector_doc, &["precision"]).map(|v| v.into_owned()))
+        .unwrap_or_else(|| "ms".to_string());
+    let time_unit = match raw_prec.as_str() {
         "ms" => TimestreamTimeUnit::Milliseconds,
         "us" => TimestreamTimeUnit::Microseconds,
         "ns" => TimestreamTimeUnit::Nanoseconds,
         other => {
+            let target = if param_prec.is_some() {
+                "field `parameters.precision`"
+            } else {
+                "connector setting `precision`"
+            };
             return Err(format!(
-                "action {:?} field `parameters.precision` must be one of ms, us, ns: the driver has no second resolution ({other:?})",
+                "action {:?} {target} must be one of ms, us, ns: the driver has no second resolution ({other:?})",
                 record.id
             ));
         }

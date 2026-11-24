@@ -1682,6 +1682,9 @@ async fn create_connector(
     if let Some(message) = removed_connector_refusal(&kind) {
         return bad_request(message);
     }
+    if let Some(message) = broker_config::capability::kind_refusal_message(&kind) {
+        return bad_request(message);
+    }
     // MV-01: `action:` names the reserved dispatch-key space of the v5
     // action-owned sinks. A v1 connector with that prefix would collide
     // with it, so it is refused here before the sink is built.

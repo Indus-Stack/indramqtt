@@ -2,10 +2,10 @@
 //!
 //! One row per canonical connector, action and source kind, with every
 //! alias, the owning ticket, the required Cargo feature, the accepted
-//! capabilities (connector create, action create, source create, probe,
-//! SQL `INTO`) and the readiness state. The API, the schema listings,
-//! the file loader, boot replay and the documents read this table; there
-//! is no second kind list.
+//! capabilities (connector create, action create, source create) and
+//! the readiness state. The API, the schema listings, the file loader,
+//! boot replay and the documents read this table; there is no second kind
+//! list.
 //!
 //! A kind whose state is not `ready` must be refused at create, update
 //! and probe with `connector type <kind> is not available in this
@@ -71,10 +71,6 @@ pub struct KindRow {
     pub action: bool,
     /// Accepted as a source create kind.
     pub source: bool,
-    /// Exposed through the connector/action probe endpoints.
-    pub probe: bool,
-    /// Usable as an inline SQL `INTO connector("id")` target.
-    pub sql_into: bool,
     /// Cargo feature that compiles the runtime in, when gated.
     pub feature: Option<&'static str>,
     /// Present in the default build.
@@ -95,8 +91,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -112,8 +106,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("aws_iot"),
         default_build: false,
         full_build: true,
@@ -127,8 +119,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("azure_blob"),
         default_build: false,
         full_build: true,
@@ -147,8 +137,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("azure_eventhubs"),
         default_build: false,
         full_build: true,
@@ -162,8 +150,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("azure_iot"),
         default_build: false,
         full_build: true,
@@ -177,8 +163,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("bigquery"),
         default_build: false,
         full_build: true,
@@ -195,8 +179,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("cassandra"),
         default_build: false,
         full_build: true,
@@ -210,8 +192,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("clickhouse"),
         default_build: false,
         full_build: true,
@@ -225,8 +205,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -240,8 +218,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("confluent"),
         default_build: false,
         full_build: true,
@@ -255,8 +231,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -270,8 +244,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("couchbase"),
         default_build: false,
         full_build: true,
@@ -285,8 +257,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: false,
         action: false,
         source: false,
-        probe: false,
-        sql_into: false,
         feature: None,
         default_build: true,
         full_build: true,
@@ -300,8 +270,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -315,8 +283,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -330,8 +296,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -345,8 +309,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("dynamodb"),
         default_build: false,
         full_build: true,
@@ -360,8 +322,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("elasticsearch"),
         default_build: false,
         full_build: true,
@@ -379,8 +339,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: false,
         action: false,
         source: false,
-        probe: false,
-        sql_into: false,
         feature: Some("gcp_iot"),
         default_build: false,
         full_build: true,
@@ -399,8 +357,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: false,
-        probe: true,
-        sql_into: true,
         feature: Some("gcp_pubsub"),
         default_build: false,
         full_build: true,
@@ -414,8 +370,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -429,8 +383,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -444,8 +396,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -459,8 +409,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -474,8 +422,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("kafka"),
         default_build: false,
         full_build: true,
@@ -489,8 +435,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("kinesis"),
         default_build: false,
         full_build: true,
@@ -504,8 +448,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("mongodb"),
         default_build: false,
         full_build: true,
@@ -519,8 +461,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -534,8 +474,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -549,8 +487,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -564,8 +500,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -579,8 +513,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -594,8 +526,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -609,8 +539,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -624,8 +552,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -639,8 +565,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -654,8 +578,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("rabbitmq"),
         default_build: false,
         full_build: true,
@@ -669,8 +591,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -684,8 +604,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -699,8 +617,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -714,8 +630,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: Some("s3"),
         default_build: false,
         full_build: true,
@@ -729,8 +643,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -744,8 +656,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -759,8 +669,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -774,8 +682,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -789,8 +695,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: false,
         source: false,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -802,13 +706,11 @@ pub static KIND_ROWS: &[KindRow] = &[
         name: "timescaledb",
         aliases: &["timescale"],
         family: "time-series",
-        owner: "SB-27",
-        state: KindState::Pending("SB-27"),
+        owner: "CE2-22",
+        state: KindState::Pending("CE2-22"),
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -822,8 +724,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -837,8 +737,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: true,
         action: true,
         source: true,
-        probe: true,
-        sql_into: true,
         feature: None,
         default_build: true,
         full_build: true,
@@ -852,8 +750,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: false,
         action: false,
         source: false,
-        probe: false,
-        sql_into: false,
         feature: None,
         default_build: true,
         full_build: true,
@@ -867,8 +763,6 @@ pub static KIND_ROWS: &[KindRow] = &[
         connector: false,
         action: false,
         source: false,
-        probe: false,
-        sql_into: false,
         feature: None,
         default_build: true,
         full_build: true,
@@ -1000,6 +894,29 @@ pub fn kind_feature(name: &str) -> Option<&'static str> {
     kind_row(name).and_then(|row| row.feature)
 }
 
+/// True when the kind is pending an implementation ticket.
+#[must_use]
+pub fn is_kind_pending(name: &str) -> bool {
+    matches!(
+        kind_row(name).map(|row| row.state),
+        Some(KindState::Pending(_))
+    )
+}
+
+/// Refusal message for a pending kind on the v1 route.
+#[must_use]
+pub fn kind_refusal_message(name: &str) -> Option<String> {
+    let row = kind_row(name)?;
+    if is_kind_pending(row.name) {
+        Some(format!(
+            "connector type {} is not available in this broker",
+            row.name
+        ))
+    } else {
+        None
+    }
+}
+
 /// Render `docs/reference/connector-kinds.md` from the map, so the
 /// document is generated rather than hand-maintained.
 #[must_use]
@@ -1040,11 +957,11 @@ pub fn render_markdown() -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| kind | aliases | family | owner | state | connector | action | source | probe | SQL INTO | feature |"
+        "| kind | aliases | family | owner | state | connector | action | source | feature |"
     );
     let _ = writeln!(
         out,
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     for row in KIND_ROWS {
         let state = match row.state {
@@ -1056,7 +973,7 @@ pub fn render_markdown() -> String {
         let yes = |v: bool| if v { "yes" } else { "no" };
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.name,
             row.aliases.join(", "),
             row.family,
@@ -1065,8 +982,6 @@ pub fn render_markdown() -> String {
             yes(row.connector),
             yes(row.action),
             yes(row.source),
-            yes(row.probe),
-            yes(row.sql_into),
             row.feature.unwrap_or("-"),
         );
     }
@@ -1283,8 +1198,6 @@ mod tests {
                 assert!(!row.connector, "{} connector", row.name);
                 assert!(!row.action, "{} action", row.name);
                 assert!(!row.source, "{} source", row.name);
-                assert!(!row.probe, "{} probe", row.name);
-                assert!(!row.sql_into, "{} SQL INTO", row.name);
             }
         }
     }

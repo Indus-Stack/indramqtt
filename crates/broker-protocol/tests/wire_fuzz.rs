@@ -14,8 +14,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Budget when `FUZZ_SECONDS` is unset. The ticket fixes the normal run.
 const DEFAULT_FUZZ_SECONDS: u64 = 20;
-/// Largest random packet in bytes. Small packets reach every decoder
-/// branch without long loops in the test process.
+/// Largest random packet in bytes. Small packets keep one run short.
+/// The packets are random bytes. No check shows that they reach every decoder branch.
 const MAX_PACKET: usize = 512;
 /// Corpus files larger than this are not replayed. Reason: a corpus
 /// file is one failing input; a huge file is a write bug, not a case.
