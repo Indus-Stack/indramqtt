@@ -100,18 +100,66 @@ fn tr_015_handler_scopes() {
     );
 }
 
-/// Prove that key management paths accept bearer tokens only.
+/// Prove that API keys cannot manage API keys.
 ///
-/// The collection path needs a login token. Single key paths need
-/// an administrator role without an explicit scope list.
-#[test]
-fn tr_015_handler_scopes_login_only() {
-    assert_eq!(access_for_path("/api/v5/api_key"), PathAccess::BearerOnly);
+/// An API key request to `/api/v5/api_key` fails with 403 login-only.
+/// A scoped API key request to `/api/v5/api_key/some-key` fails with 403 forbidden.
+#[tokio::test]
+async fn tr_015_handler_scopes_login_only() {
+    let (base_url, _state) = start_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build client");
+    let admin_token = login_admin(&client, &base_url).await;
+
+    let create_res = client
+        .post(format!("{base_url}/api/v5/api_key"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "name": "tr015-scoped-key",
+            "role": "viewer",
+            "scopes": ["connections", "publish"]
+        }))
+        .send()
+        .await
+        .expect("mint api key");
+    assert_eq!(create_res.status(), StatusCode::OK);
+    let key_body: serde_json::Value = create_res.json().await.expect("key json");
+    let key_id = key_body["api_key"].as_str().expect("api_key");
+    let secret = key_body["api_secret"].as_str().expect("api_secret");
+
+    let login_only_res = client
+        .post(format!("{base_url}/api/v5/api_key"))
+        .basic_auth(key_id, Some(secret))
+        .json(&json!({
+            "name": "tr015-nested-key",
+            "role": "viewer"
+        }))
+        .send()
+        .await
+        .expect("call api_key collection with key");
+    assert_eq!(login_only_res.status(), StatusCode::FORBIDDEN);
+    let login_only_body: serde_json::Value = login_only_res.json().await.expect("login_only json");
+    assert_eq!(login_only_body["code"], "FORBIDDEN");
     assert_eq!(
-        access_for_path("/api/v5/api_key/some-key"),
-        PathAccess::RoleOnly
+        login_only_body["message"],
+        "this operation needs the token of a user who logged in"
     );
-    assert_eq!(access_for_path("/api/v5/users"), PathAccess::BearerOnly);
+
+    let role_only_res = client
+        .get(format!("{base_url}/api/v5/api_key/some-key"))
+        .basic_auth(key_id, Some(secret))
+        .send()
+        .await
+        .expect("call single api_key with scoped key");
+    assert_eq!(role_only_res.status(), StatusCode::FORBIDDEN);
+    let role_only_body: serde_json::Value = role_only_res.json().await.expect("role_only json");
+    assert_eq!(role_only_body["code"], "FORBIDDEN");
+    assert_eq!(
+        role_only_body["message"],
+        "this API key does not have the right to call this path"
+    );
 }
 
 /// Prove that public paths declare no scope.

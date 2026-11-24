@@ -146,6 +146,7 @@ async fn ap09_stats_and_metrics_read_true_broker_values() {
     // The exposition carries the same true counters as text.
     let exposition = broker_api::v5::prometheus::get_prometheus_stats(
         State(api_state),
+        axum::http::HeaderMap::new(),
         axum::extract::Query(broker_api::v5::prometheus::PrometheusQuery::default()),
     )
     .await;
@@ -379,6 +380,7 @@ async fn ap09_rule_and_transform_counters_move_through_real_fire() {
     // Exposition carries the same true counters as text.
     let exposition = broker_api::v5::prometheus::get_prometheus_stats(
         State(api_state),
+        axum::http::HeaderMap::new(),
         axum::extract::Query(broker_api::v5::prometheus::PrometheusQuery::default()),
     )
     .await;

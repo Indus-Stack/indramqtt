@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -519,12 +519,33 @@ fn exposition_response(state: &ApiState) -> Response {
         .into_response()
 }
 
+/// Validate that the Accept header does not request JSON format.
+fn validate_prometheus_accept(headers: &HeaderMap) -> Option<Response> {
+    if let Some(accept) = headers.get(axum::http::header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            if accept_str.contains("application/json") {
+                return Some(
+                    crate::errors::ApiError::BadRequest(
+                        "unsupported accept header: application/json".to_string(),
+                    )
+                    .into_response(),
+                );
+            }
+        }
+    }
+    None
+}
+
 /// `GET /prometheus/stats`: text exposition of the node counters and
 /// gauges. Always 200 with `text/plain`. Management-plane only.
 pub async fn get_prometheus_stats(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(_query): Query<PrometheusQuery>,
 ) -> Response {
+    if let Some(rejection) = validate_prometheus_accept(&headers) {
+        return rejection;
+    }
     exposition_response(&state)
 }
 
@@ -533,8 +554,12 @@ pub async fn get_prometheus_stats(
 /// values; the route exists so the documented scrape target answers.
 pub async fn get_prometheus_auth(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(_query): Query<PrometheusQuery>,
 ) -> Response {
+    if let Some(rejection) = validate_prometheus_accept(&headers) {
+        return rejection;
+    }
     exposition_response(&state)
 }
 
@@ -783,7 +808,8 @@ mod tests {
             crate::v5::clients::publish_message(axum::extract::State(state.clone()), body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let (status, content_type, text) =
-            read_text(get_prometheus_stats(State(state.clone()), query()).await).await;
+            read_text(get_prometheus_stats(State(state.clone()), HeaderMap::new(), query()).await)
+                .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             content_type.starts_with("text/plain"),
@@ -801,7 +827,8 @@ mod tests {
         state.stats.set_connections(2);
         state.stats.set_retained(1);
         let (status, content_type, text) =
-            read_text(get_prometheus_stats(State(state.clone()), query()).await).await;
+            read_text(get_prometheus_stats(State(state.clone()), HeaderMap::new(), query()).await)
+                .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             content_type.starts_with("text/plain"),
@@ -813,7 +840,7 @@ mod tests {
         assert!(text.contains("indramqtt_retained_count 1\n"));
         // Every area route serves the same true counters.
         for route in [
-            get_prometheus_auth(State(state.clone()), query()).await,
+            get_prometheus_auth(State(state.clone()), HeaderMap::new(), query()).await,
             get_prometheus_data_integration(State(state.clone()), query()).await,
             get_prometheus_message_transformation(State(state.clone()), query()).await,
             get_prometheus_namespaced_stats(State(state.clone()), query()).await,

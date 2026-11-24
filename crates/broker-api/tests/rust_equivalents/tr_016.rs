@@ -351,6 +351,100 @@ async fn tr_016_prometheus_auth_api() {
     assert!(text.contains("indramqtt_"));
 }
 
+/// Prove that Prometheus stats metric requests reject application/json.
+///
+/// Query stats metrics with Accept application/json and assert HTTP 400.
+/// Query stats metrics with Accept text/plain and assert HTTP 200 text exposition.
+#[tokio::test]
+async fn tr_016_prometheus_stats_accept_header() {
+    let (base_url, _state) = start_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build client");
+    let admin_token = login_admin(&client, &base_url).await;
+
+    let bad_res = client
+        .get(format!("{base_url}/api/v5/prometheus/stats"))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("get prometheus stats json");
+    assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+    let bad_body: serde_json::Value = bad_res.json().await.expect("bad json");
+    assert_eq!(bad_body["code"], "BAD_REQUEST");
+    assert_eq!(
+        bad_body["message"],
+        "unsupported accept header: application/json"
+    );
+
+    let ok_res = client
+        .get(format!("{base_url}/api/v5/prometheus/stats"))
+        .header(reqwest::header::ACCEPT, "text/plain")
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("get prometheus stats text");
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    let content_type = ok_res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .expect("content type header")
+        .to_str()
+        .expect("content type string");
+    assert_eq!(content_type, "text/plain; version=0.0.4");
+    let text = ok_res.text().await.expect("text body");
+    assert!(text.contains("indramqtt_"));
+}
+
+/// Prove that Prometheus auth metric requests reject application/json.
+///
+/// Query auth metrics with Accept application/json and assert HTTP 400.
+/// Query auth metrics with Accept text/plain and assert HTTP 200 text exposition.
+#[tokio::test]
+async fn tr_016_prometheus_auth_accept_header() {
+    let (base_url, _state) = start_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build client");
+    let admin_token = login_admin(&client, &base_url).await;
+
+    let bad_res = client
+        .get(format!("{base_url}/api/v5/prometheus/auth"))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("get prometheus auth json");
+    assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+    let bad_body: serde_json::Value = bad_res.json().await.expect("bad json");
+    assert_eq!(bad_body["code"], "BAD_REQUEST");
+    assert_eq!(
+        bad_body["message"],
+        "unsupported accept header: application/json"
+    );
+
+    let ok_res = client
+        .get(format!("{base_url}/api/v5/prometheus/auth"))
+        .header(reqwest::header::ACCEPT, "text/plain")
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("get prometheus auth text");
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    let content_type = ok_res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .expect("content type header")
+        .to_str()
+        .expect("content type string");
+    assert_eq!(content_type, "text/plain; version=0.0.4");
+    let text = ok_res.text().await.expect("text body");
+    assert!(text.contains("indramqtt_"));
+}
+
 /// Prove that aggregated Prometheus auth metrics return HTTP 200.
 ///
 /// Query the endpoint with the aggregation parameter.
