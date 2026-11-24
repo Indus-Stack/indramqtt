@@ -223,7 +223,20 @@ function generateConnectorsJson() {
     });
   }
 
-  items.sort((a, b) => a.title.localeCompare(b.title));
+  const STATE_ORDER = {
+    'Ready': 0,
+    'Pending': 1,
+    'Not in this build': 2,
+  };
+
+  items.sort((a, b) => {
+    const orderA = STATE_ORDER[a.state] ?? 99;
+    const orderB = STATE_ORDER[b.state] ?? 99;
+    if (orderA !== orderB) {
+      return orderA - orderB;
+    }
+    return a.title.localeCompare(b.title);
+  });
 
   const dataDir = join(site, 'src', 'data');
   mkdirSync(dataDir, { recursive: true });

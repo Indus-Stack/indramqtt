@@ -75,5 +75,80 @@ describe('collapsible sidebars and page panel tests', () => {
       html.includes('aria-controls="starlight__sidebar"'),
       'Sidebar toggle button must have aria-controls="starlight__sidebar"'
     );
+
+    // Verify configuration page has no h3 entry in its page panel (DS-05, item 3)
+    const tocMatch = html.match(/<starlight-toc\b[^>]*>([\s\S]*?)<\/starlight-toc>/);
+    assert.ok(tocMatch, 'configuration page must have <starlight-toc>');
+    const tocHtml = tocMatch[1];
+
+    // Read markdown to check h2 and h3 headings
+    const repoRoot = path.resolve('..');
+    const configMd = readFileSync(
+      path.join(repoRoot, 'docs', 'reference', 'configuration.md'),
+      'utf8'
+    );
+    const mdLines = configMd.split('\n');
+    const h2Slugs = [];
+    const h3Slugs = [];
+    for (const line of mdLines) {
+      if (/^##\s+/.test(line)) {
+        const text = line.replace(/^##\s+/, '').trim();
+        const slug = text.toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-');
+        h2Slugs.push(slug);
+      } else if (/^###\s+/.test(line)) {
+        const text = line.replace(/^###\s+/, '').trim();
+        const slug = text.toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-');
+        h3Slugs.push(slug);
+      }
+    }
+
+    assert.ok(h2Slugs.length > 0, 'configuration must have h2 headings');
+    assert.ok(h3Slugs.length > 0, 'configuration must have h3 headings');
+
+    // Page panel must list h2 headings but not h3 headings
+    assert.ok(
+      h2Slugs.some((slug) => tocHtml.includes(`href="#${slug}"`)),
+      'configuration page panel must list h2 headings'
+    );
+    for (const slug of h3Slugs) {
+      assert.ok(
+        !tocHtml.includes(`href="#${slug}"`),
+        `configuration page panel must not include h3 heading #${slug}`
+      );
+    }
+  });
+
+  it('verifies /getting-started/install/ keeps all its panel entries (DS-05, item 3)', () => {
+    const distDir = path.resolve('dist');
+    const filePath = path.join(distDir, 'getting-started', 'install', 'index.html');
+    assert.ok(existsSync(filePath), 'getting-started/install/index.html must exist in dist');
+
+    const html = readFileSync(filePath, 'utf8');
+    const tocMatch = html.match(/<starlight-toc\b[^>]*>([\s\S]*?)<\/starlight-toc>/);
+    assert.ok(tocMatch, 'install page must have <starlight-toc>');
+    const tocHtml = tocMatch[1];
+
+    const repoRoot = path.resolve('..');
+    const installMd = readFileSync(
+      path.join(repoRoot, 'docs', 'getting-started', 'install.md'),
+      'utf8'
+    );
+    const mdLines = installMd.split('\n');
+    const headings = [];
+    for (const line of mdLines) {
+      if (/^##\s+/.test(line)) {
+        const text = line.replace(/^##\s+/, '').trim();
+        const slug = text.toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-');
+        headings.push(slug);
+      }
+    }
+
+    assert.ok(headings.length > 0, 'install must have headings');
+    for (const slug of headings) {
+      assert.ok(
+        tocHtml.includes(`href="#${slug}"`),
+        `install page panel must retain heading #${slug}`
+      );
+    }
   });
 });

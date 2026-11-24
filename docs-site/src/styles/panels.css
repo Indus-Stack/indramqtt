@@ -10,9 +10,17 @@
   pointer-events: none;
   z-index: calc(var(--sl-z-index-navbar, 10) + 5);
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: center;
   padding: 0 0.75rem;
+}
+
+/* Sidebar header inside left sidebar (DS-05) */
+.indra-sidebar-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 0.25rem 0.5rem 0.5rem;
 }
 
 /* Button styles and focus ring */
@@ -62,13 +70,34 @@
     display: inline-flex;
   }
 
-  :global([data-has-sidebar]) .header .title-wrapper {
-    margin-inline-start: 2rem;
+  /* When sidebar is closed: move header content right by width of button */
+  html[data-has-sidebar][data-sidebar='closed'] .header .title-wrapper {
+    margin-inline-start: 2.5rem;
   }
 
   html[data-sidebar='closed'] #starlight__sidebar,
   html[data-sidebar='closed'] .sidebar-pane {
+    visibility: hidden !important;
+    border: none !important;
+    width: 0 !important;
+    background: transparent !important;
+  }
+
+  html[data-sidebar='closed'] .sidebar-content > :not(.indra-sidebar-header) {
     display: none !important;
+  }
+
+  html[data-sidebar='closed'] .indra-sidebar-header {
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  html[data-sidebar='closed'] .indra-toggle-sidebar {
+    visibility: visible !important;
+    position: fixed;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: calc(var(--sl-z-index-navbar, 10) + 5);
   }
 
   html[data-sidebar='closed'] {

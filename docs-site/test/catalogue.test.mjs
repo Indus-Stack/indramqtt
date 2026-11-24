@@ -42,12 +42,26 @@ describe('connector catalogue tests', () => {
       assert.ok(existsSync(pageFile), `Page file ${pageFile} must exist for kind ${item.kind}`);
     }
 
-    // Verify sorted by title
+    // Verify sorted by state (Ready, Pending, Not in this build) then title (DS-05, item 4)
+    const STATE_ORDER = {
+      'Ready': 0,
+      'Pending': 1,
+      'Not in this build': 2,
+    };
+
     for (let i = 0; i < data.length - 1; i++) {
+      const orderA = STATE_ORDER[data[i].state] ?? 99;
+      const orderB = STATE_ORDER[data[i + 1].state] ?? 99;
       assert.ok(
-        data[i].title.localeCompare(data[i + 1].title) <= 0,
-        `connectors must be sorted by title: "${data[i].title}" vs "${data[i + 1].title}"`
+        orderA <= orderB,
+        `connectors must be ordered by state (Ready, Pending, Not in this build): "${data[i].title}" (${data[i].state}) vs "${data[i + 1].title}" (${data[i + 1].state})`
       );
+      if (orderA === orderB) {
+        assert.ok(
+          data[i].title.localeCompare(data[i + 1].title) <= 0,
+          `connectors in state "${data[i].state}" must be sorted by title: "${data[i].title}" vs "${data[i + 1].title}"`
+        );
+      }
     }
   });
 });

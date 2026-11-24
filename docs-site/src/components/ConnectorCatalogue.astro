@@ -44,7 +44,7 @@ const categories = ['All', ...new Set(connectors.map((c) => c.category))];
       connectors.map((c) => (
         <a
           href={`/connectors/${c.page}/`}
-          class="connector-card"
+          class={`connector-card ${c.state === 'Not in this build' ? 'muted' : ''}`.trim()}
           data-kind={c.kind.toLowerCase()}
           data-title={c.title.toLowerCase()}
           data-aliases={c.aliases.join(' ').toLowerCase()}

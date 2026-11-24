@@ -194,3 +194,43 @@ pre.mermaid svg,
     justify-content: space-between;
   }
 }
+
+/* Sub-group labels in left sidebar (DS-05, item 2) */
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) details details summary .large,
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) ul:not(.top-level) summary .large {
+  font-weight: 500 !important;
+  font-size: 0.9375rem !important;
+}
+
+/* Muted connector cards for 'Not in this build' (DS-05, item 4) */
+.connector-card.muted .card-inner {
+  background-color: var(--sl-color-gray-7) !important;
+  border-color: var(--sl-color-hairline-shade) !important;
+}
+
+.connector-card.muted .card-title {
+  color: var(--sl-color-gray-3) !important;
+}
+
+.connector-card.muted .card-description {
+  color: var(--sl-color-gray-3) !important;
+}
+
+.connector-card.muted:hover .card-inner {
+  border-color: var(--sl-color-gray-5) !important;
+}
+
+/* Home hero spacing (DS-05, item 5: at most 48 px space between hero buttons and install box) */
+@media (min-width: 50rem) {
+  .hero {
+    padding-block-end: 0.5rem !important;
+  }
+}
+
+.home-sections {
+  margin-top: 0 !important;
+}
+
+.home-install-box {
+  margin-top: 1rem !important;
+}
