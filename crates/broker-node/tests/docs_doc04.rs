@@ -256,7 +256,7 @@ fn actions_page_covers_action_kinds() {
 fn top_ten_connector_pages_exist() {
     for (file, kind) in [
         ("connectors/kafka.md", "kafka"),
-        ("connectors/postgres.md", "postgres"),
+        ("connectors/pgsql.md", "postgres"),
         ("connectors/mysql.md", "mysql"),
         ("connectors/mongodb.md", "mongodb"),
         ("connectors/redis.md", "redis"),
