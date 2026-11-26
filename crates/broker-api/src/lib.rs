@@ -384,6 +384,10 @@ pub struct ApiState {
     /// tool drains. Idle publishes pay one atomic load; feeds take one
     /// short lock and clone only for matching slots.
     pub collectors: Arc<crate::mcp::CollectRegistry>,
+    /// True when the API listener itself terminates TLS (`https`).
+    pub api_https: bool,
+    /// True when a trusted reverse proxy terminates TLS and forwards `X-Forwarded-Proto`.
+    pub trust_proxy_proto: bool,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -693,6 +697,8 @@ impl ApiState {
             namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             mcp: Arc::new(crate::mcp::McpStore::new()),
             collectors: Arc::new(crate::mcp::CollectRegistry::new()),
+            api_https: false,
+            trust_proxy_proto: false,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         };
         state.raise_unavailable_stored_kinds();
@@ -806,6 +812,8 @@ impl ApiState {
             namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             mcp: Arc::new(crate::mcp::McpStore::new()),
             collectors: Arc::new(crate::mcp::CollectRegistry::new()),
+            api_https: false,
+            trust_proxy_proto: false,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }

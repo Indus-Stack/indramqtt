@@ -305,7 +305,7 @@ fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, QoS, bool)> {
 // WebSocket handler.
 // ---------------------------------------------------------------------------
 
-fn normalize_host_port_from_origin(origin: &str) -> Option<(String, u16)> {
+fn normalize_origin(origin: &str) -> Option<(&'static str, String, u16)> {
     let s = origin.trim();
     let (scheme, rest) = if let Some(stripped) = s.strip_prefix("http://") {
         ("http", stripped)
@@ -313,7 +313,14 @@ fn normalize_host_port_from_origin(origin: &str) -> Option<(String, u16)> {
         ("https", s.strip_prefix("https://")?)
     };
     let host_port = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    parse_host_port(host_port, scheme)
+    let (host, port) = parse_host_port(host_port, scheme)?;
+    Some((scheme, host, port))
+}
+
+#[cfg(test)]
+fn normalize_host_port_from_origin(origin: &str) -> Option<(String, u16)> {
+    let (_, host, port) = normalize_origin(origin)?;
+    Some((host, port))
 }
 
 fn parse_host_port(host_port: &str, scheme: &str) -> Option<(String, u16)> {
@@ -371,23 +378,24 @@ fn normalize_host_port_from_host(host_hdr: &str) -> Option<(String, Option<u16>)
     Some((s.to_ascii_lowercase(), None))
 }
 
-fn origin_matches_host(origin_str: &str, host_str: &str) -> bool {
-    let Some((orig_host, orig_port)) = normalize_host_port_from_origin(origin_str) else {
+fn origin_matches_host(origin_str: &str, host_str: &str, expected_scheme: &str) -> bool {
+    let Some((orig_scheme, orig_host, orig_port)) = normalize_origin(origin_str) else {
         return false;
     };
+    if orig_scheme != expected_scheme {
+        return false;
+    }
     let Some((req_host, req_port)) = normalize_host_port_from_host(host_str) else {
         return false;
     };
     if orig_host != req_host {
         return false;
     }
-    match req_port {
-        Some(p) => orig_port == p,
-        None => orig_port == 80 || orig_port == 443,
-    }
+    let expected_port = req_port.unwrap_or(if expected_scheme == "https" { 443 } else { 80 });
+    orig_port == expected_port
 }
 
-fn validate_ws_origin(headers: &axum::http::HeaderMap) -> bool {
+fn validate_ws_origin(headers: &axum::http::HeaderMap, expected_scheme: &str) -> bool {
     let origin_value = headers.get(axum::http::header::ORIGIN);
     let origin_str = match origin_value {
         Some(val) => match val.to_str() {
@@ -402,19 +410,42 @@ fn validate_ws_origin(headers: &axum::http::HeaderMap) -> bool {
     else {
         return false;
     };
-    origin_matches_host(origin_str, host_hdr)
+    origin_matches_host(origin_str, host_hdr, expected_scheme)
 }
 
 /// Upgrade `GET /ws/mqtt` to an MQTT-over-WebSocket session.
 pub async fn ws_mqtt_handler(
     ws: WebSocketUpgrade,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
     State(state): State<ApiState>,
 ) -> Response {
-    if !validate_ws_origin(&headers) {
+    let expected_scheme = if state.api_https {
+        "https"
+    } else if let Some(s) = uri.scheme_str() {
+        if s.eq_ignore_ascii_case("https") {
+            "https"
+        } else {
+            "http"
+        }
+    } else if state.trust_proxy_proto {
+        match headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or("").trim())
+        {
+            Some(s) if s.eq_ignore_ascii_case("https") => "https",
+            _ => "http",
+        }
+    } else {
+        "http"
+    };
+    if !validate_ws_origin(&headers, expected_scheme) {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(|socket| handle_socket(state, socket))
+    ws.max_message_size(MAX_PACKET_BYTES)
+        .max_frame_size(MAX_PACKET_BYTES)
+        .on_upgrade(|socket| handle_socket(state, socket))
 }
 
 struct WsSession {
@@ -449,13 +480,21 @@ async fn handle_socket(state: ApiState, mut socket: WebSocket) {
                 } else {
                     (state.sessions.max_packet_size() as usize).min(MAX_PACKET_BYTES)
                 };
-                if carry.len().saturating_add(bytes.len()) > max_buf {
+                if drive_ws_binary_frame(
+                    &state,
+                    &mut socket,
+                    &mut session,
+                    conn_id,
+                    &tx,
+                    &waker,
+                    &mut carry,
+                    &bytes,
+                    max_buf,
+                )
+                .await
+                .is_err()
+                {
                     break;
-                }
-                carry.extend_from_slice(&bytes);
-                match drive_packets(&state, &mut socket, &mut session, conn_id, &tx, &waker, &mut carry).await {
-                    Ok(()) => {}
-                    Err(()) => break,
                 }
                 if session.is_none() && carry.is_empty() {
                     // CONNECT rejected and answered: fall through to close.
@@ -532,6 +571,80 @@ async fn handle_socket(state: ApiState, mut socket: WebSocket) {
     }
 
     teardown_ws_session(&state, &session, conn_id, &tx).await;
+}
+
+/// Process one WebSocket binary frame without copying an entire large frame
+/// into `carry`. Coalesced complete MQTT packets are dispatched directly from
+/// `&bytes`; only an incomplete packet spanning frames uses `carry` (bounded by
+/// `max_buf`).
+#[allow(clippy::too_many_arguments)]
+async fn drive_ws_binary_frame(
+    state: &ApiState,
+    socket: &mut WebSocket,
+    session: &mut Option<WsSession>,
+    conn_id: u64,
+    tx: &mpsc::UnboundedSender<BrokerFrame>,
+    waker: &std::sync::Arc<tokio::sync::Notify>,
+    carry: &mut Vec<u8>,
+    bytes: &[u8],
+    max_buf: usize,
+) -> Result<(), ()> {
+    let mut rest = bytes;
+    if !carry.is_empty() {
+        let room = max_buf.saturating_sub(carry.len());
+        let take = rest.len().min(room);
+        carry.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
+        drive_packets(state, socket, session, conn_id, tx, waker, carry).await?;
+        if !carry.is_empty() {
+            // Incomplete packet still in carry; if any bytes remain uncopied,
+            // the single packet exceeded max_buf.
+            if !rest.is_empty() || carry.len() > max_buf {
+                return Err(());
+            }
+            return Ok(());
+        }
+    }
+    while !rest.is_empty() {
+        let flags = rest[0] & 0x0F;
+        let packet_type = rest[0] >> 4;
+        let (remaining, header_len) = match decode_remaining_length(&rest[1..]) {
+            DecodeRemainingLength::Complete(rem, hlen) => (rem, hlen),
+            DecodeRemainingLength::Incomplete => {
+                if rest.len() > max_buf {
+                    return Err(());
+                }
+                carry.extend_from_slice(rest);
+                return Ok(());
+            }
+            DecodeRemainingLength::Malformed => return Err(()),
+        };
+        let total = 1 + header_len + remaining;
+        if total > max_buf {
+            return Err(());
+        }
+        if rest.len() < total {
+            carry.extend_from_slice(rest);
+            return Ok(());
+        }
+        let payload = &rest[1 + header_len..total];
+        rest = &rest[total..];
+        handle_packet(
+            state,
+            socket,
+            session,
+            conn_id,
+            tx,
+            waker,
+            WsPacket {
+                packet_type,
+                flags,
+                payload,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Drain complete MQTT packets from the carry buffer. `Err(())` means a
@@ -1224,25 +1337,71 @@ mod tests {
             Some(("[::1]".to_string(), Some(8083)))
         );
 
-        // Matching Host
+        // Matching Host and scheme
         assert!(origin_matches_host(
             "http://localhost:18083",
-            "localhost:18083"
+            "localhost:18083",
+            "http"
         ));
         assert!(origin_matches_host(
             "http://127.0.0.1:8083",
-            "127.0.0.1:8083"
+            "127.0.0.1:8083",
+            "http"
         ));
-        assert!(origin_matches_host("http://example.com", "example.com"));
-        assert!(origin_matches_host("https://example.com", "example.com"));
+        assert!(origin_matches_host(
+            "http://example.com",
+            "example.com",
+            "http"
+        ));
+        assert!(!origin_matches_host(
+            "https://example.com",
+            "example.com",
+            "http"
+        ));
+        assert!(origin_matches_host(
+            "https://example.com",
+            "example.com",
+            "https"
+        ));
+        assert!(!origin_matches_host(
+            "http://example.com",
+            "example.com",
+            "https"
+        ));
         assert!(!origin_matches_host(
             "http://attacker.com:18083",
-            "localhost:18083"
+            "localhost:18083",
+            "http"
         ));
         assert!(!origin_matches_host(
             "http://localhost:18083",
-            "localhost:18084"
+            "localhost:18084",
+            "http"
         ));
-        assert!(!origin_matches_host("http://localhost:8080", "localhost"));
+        assert!(!origin_matches_host(
+            "http://localhost:8080",
+            "localhost",
+            "http"
+        ));
+    }
+
+    #[test]
+    fn test_https_and_proxy_origin_scheme_derivation() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "example.com".parse().unwrap());
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://example.com".parse().unwrap(),
+        );
+        assert!(validate_ws_origin(&headers, "https"));
+        assert!(!validate_ws_origin(&headers, "http"));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://example.com".parse().unwrap(),
+        );
+        assert!(!validate_ws_origin(&headers, "https"));
+        assert!(validate_ws_origin(&headers, "http"));
     }
 }

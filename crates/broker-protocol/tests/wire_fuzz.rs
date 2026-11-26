@@ -626,6 +626,7 @@ fn connack_encoder_fuzz_stays_correct() {
             },
             reason_string: if rng.below(1) == 1 { Some("ok") } else { None },
             user_properties: &users,
+            ..ConnackProperties::default()
         };
         let mut out = Vec::new();
         wire::encode_connack_v5(rng.below(1) == 1, rng.byte(), &props, &mut out);

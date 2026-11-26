@@ -784,6 +784,8 @@ pub struct ConnackProperties<'a> {
     pub topic_alias_maximum: Option<u16>,
     pub assigned_client_id: Option<&'a str>,
     pub reason_string: Option<&'a str>,
+    pub auth_method: Option<&'a str>,
+    pub auth_data: Option<&'a [u8]>,
     pub user_properties: &'a [(String, String)],
 }
 
@@ -818,6 +820,14 @@ pub fn encode_connack_v5(
     if let Some(v) = props.reason_string {
         section.push(prop::REASON_STRING as u8);
         put_binary(v.as_bytes(), &mut section);
+    }
+    if let Some(v) = props.auth_method {
+        section.push(prop::AUTH_METHOD as u8);
+        put_binary(v.as_bytes(), &mut section);
+    }
+    if let Some(v) = props.auth_data {
+        section.push(prop::AUTH_DATA as u8);
+        put_binary(v, &mut section);
     }
     for (key, value) in props.user_properties {
         section.push(prop::USER_PROPERTY as u8);
@@ -1576,6 +1586,7 @@ mod tests {
                 assigned_client_id: Some("auto-9"),
                 reason_string: Some("ok"),
                 user_properties: &users,
+                ..ConnackProperties::default()
             },
             &mut out,
         );

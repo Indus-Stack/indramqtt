@@ -306,6 +306,28 @@ pub fn connect5_full(
     packet
 }
 
+pub fn connect5_auth_with_username(
+    client_id: &str,
+    method: &str,
+    auth_data: &[u8],
+    username: &str,
+) -> Vec<u8> {
+    let mut props = Vec::new();
+    props.extend_from_slice(&auth_method_prop(method));
+    props.push(22);
+    props.extend_from_slice(&binary(auth_data));
+    let mut rest = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x82];
+    rest.extend_from_slice(&60u16.to_be_bytes());
+    rest.extend_from_slice(&varint(props.len() as u32));
+    rest.extend_from_slice(&props);
+    rest.extend_from_slice(&mqtt_str(client_id));
+    rest.extend_from_slice(&mqtt_str(username));
+    let mut packet = vec![0x10];
+    packet.extend_from_slice(&rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
 pub fn connect5_with_credentials(
     client_id: &str,
     clean_start: bool,
@@ -403,6 +425,8 @@ pub fn parse_auth(body: &[u8]) -> (u8, Option<String>, Option<Vec<u8>>) {
                 data = Some(body[index..index + len].to_vec());
                 index += len;
             }
+            17 | 39 => index += 4,
+            33 | 34 => index += 2,
             _ => panic!("unexpected AUTH property {id}"),
         }
     }
@@ -572,13 +596,6 @@ pub async fn connect_scram_ok(
         &auth_packet(0x18, Some("SCRAM-SHA-256"), Some(client_final.as_bytes())),
     )
     .await;
-    let (head, body) = recv(&mut sock).await;
-    assert_eq!(head & 0xF0, 0xF0, "server sends AUTH success");
-    let (reason, _method, data) = parse_auth(&body);
-    assert_eq!(reason, 0x00, "SCRAM initial auth succeeds");
-    let server_final = String::from_utf8(data.expect("server-final data")).expect("UTF-8");
-    assert!(server_final.starts_with("v="));
-
     let (c_head, c_body) = recv(&mut sock).await;
     assert_eq!(c_head & 0xF0, 0x20, "server sends CONNACK");
     assert_eq!(
@@ -586,6 +603,14 @@ pub async fn connect_scram_ok(
         0x00,
         "CONNACK success"
     );
+    let (_reason, method, data) = parse_auth(&c_body[1..]);
+    assert_eq!(
+        method.as_deref(),
+        Some("SCRAM-SHA-256"),
+        "CONNACK carries negotiated Authentication Method"
+    );
+    let server_final = String::from_utf8(data.expect("CONNACK server-final data")).expect("UTF-8");
+    assert!(server_final.starts_with("v="));
     sock
 }
 

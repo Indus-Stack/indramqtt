@@ -105,6 +105,7 @@ async fn bind_auth_accepts_enhanced_auth_verified_without_backend_when_allow_ano
         user_properties: None,
         listener: String::new(),
         enhanced_auth_verified: true,
+        pending_acls: None,
     };
 
     let frame = bind_frame(841, 1, Bytes::new());
@@ -1009,6 +1010,50 @@ async fn kerberos_bind_through_broker_connect() {
     let reply = apply_bind(&frame, &shared).await.expect("bind replies");
     let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
     assert_eq!(rc, 0, "valid SPNEGO ticket must be accepted");
+
+    // Successful Kerberos takeover of krb-device-1 (single verification, no replay self-reject).
+    let takeover_token = mint("alice@EXAMPLE.COM", now - 60, now + 3600, now, 23);
+    let takeover_frame = bind_frame(
+        93,
+        1,
+        encode_bind_meta_creds("krb-device-1", true, 60, "alice", &takeover_token),
+    );
+    let takeover_reply = apply_bind(&takeover_frame, &shared)
+        .await
+        .expect("takeover replies");
+    let (_, _, takeover_rc) = decode_session_binding_meta(&takeover_reply.metadata);
+    assert_eq!(takeover_rc, 0, "valid Kerberos takeover must succeed");
+    assert_eq!(
+        *shared
+            .sessions
+            .get("krb-device-1")
+            .expect("session exists")
+            .conn_id
+            .read(),
+        Some(93)
+    );
+
+    // Refused replacement (replayed Kerberos ticket) must leave incumbent (conn 93) connected.
+    let bad_takeover_frame = bind_frame(
+        94,
+        1,
+        encode_bind_meta_creds("krb-device-1", true, 60, "alice", &takeover_token),
+    );
+    let bad_takeover_reply = apply_bind(&bad_takeover_frame, &shared)
+        .await
+        .expect("refused takeover replies");
+    let (_, _, bad_rc) = decode_session_binding_meta(&bad_takeover_reply.metadata);
+    assert_ne!(bad_rc, 0, "replayed Kerberos takeover must be refused");
+    assert_eq!(
+        *shared
+            .sessions
+            .get("krb-device-1")
+            .expect("incumbent remains")
+            .conn_id
+            .read(),
+        Some(93),
+        "refused replacement must leave incumbent connected"
+    );
 
     // Local users keep working with Kerberos enabled.
     let frame = bind_frame(

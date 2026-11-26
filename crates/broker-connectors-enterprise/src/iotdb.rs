@@ -812,23 +812,30 @@ impl Sink for IotDbSink {
     /// Write the whole batch as one tablet per device. The rows are
     /// checked first, so a bad row leaves nothing half buffered.
     async fn send_batch(&self, items: &[SinkBatchItem]) -> Result<()> {
-        let mut built = Vec::with_capacity(items.len());
-        let mut previous = i64::MIN;
         for item in items {
             if item.topic.as_str().is_empty() {
                 return Err(ConnectorError::Dispatch(
                     "iotdb row requires a non-empty topic".to_string(),
                 ));
             }
+        }
+        let start_millis = if items.is_empty() {
+            0
+        } else {
+            let mut buffer = self.buffer.lock();
+            let start = now_millis().max(buffer.last_millis.saturating_add(1));
+            buffer.last_millis = start.saturating_add((items.len() - 1) as i64);
+            start
+        };
+        let mut built = Vec::with_capacity(items.len());
+        for (idx, item) in items.iter().enumerate() {
             // Rows of one device need distinct times, or the server
             // overwrites the earlier row.
-            let millis = now_millis().max(previous.saturating_add(1));
-            previous = millis;
+            let millis = start_millis.saturating_add(idx as i64);
             built.push(self.build_row(&item.topic, &item.payload, item.qos, millis)?);
         }
         {
             let mut buffer = self.buffer.lock();
-            buffer.last_millis = buffer.last_millis.max(previous);
             for (row, bytes) in built {
                 buffer.queue.push(row);
                 buffer.bytes = buffer.bytes.saturating_add(bytes);

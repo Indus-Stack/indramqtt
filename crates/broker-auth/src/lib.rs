@@ -183,7 +183,7 @@ impl AclRule {
             .unwrap_or(false)
     }
 
-    fn topic_matches(&self, topic: &Topic) -> bool {
+    pub fn topic_matches(&self, topic: &Topic) -> bool {
         TopicFilter::new(self.topic_pattern.as_str())
             .map(|filter| filter.matches(topic))
             .unwrap_or(false)
@@ -211,7 +211,7 @@ impl AclRule {
     /// Whether this rule decides one subscribe request. An allow rule
     /// decides when the rule covers the request. A deny rule decides when
     /// the rule overlaps the request. The first deciding rule wins.
-    fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
+    pub fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
         if self.allow {
             self.filter_covered(filter)
         } else {

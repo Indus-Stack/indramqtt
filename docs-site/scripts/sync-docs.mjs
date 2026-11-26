@@ -65,14 +65,22 @@ function stripDuplicateTitle(content) {
   return prefix + outLines.join('\n');
 }
 
-function processMarkdownFiles(folder) {
+function injectEditUrl(content, relPath) {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fmMatch || /^editUrl:/m.test(fmMatch[1])) return content;
+  const editUrl = `https://github.com/ankur-paan/indramqtt/edit/main/docs/${relPath.replace(/\\/g, '/')}`;
+  return content.replace(/^---\r?\n/, `---\neditUrl: ${editUrl}\n`);
+}
+
+function processMarkdownFiles(folder, root = folder) {
   for (const entry of readdirSync(folder, { withFileTypes: true })) {
     const path = join(folder, entry.name);
     if (entry.isDirectory()) {
-      processMarkdownFiles(path);
+      processMarkdownFiles(path, root);
     } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      const rel = path.slice(root.length + 1);
       const content = readFileSync(path, 'utf8');
-      const updated = stripDuplicateTitle(content);
+      const updated = injectEditUrl(stripDuplicateTitle(content), rel);
       if (updated !== content) {
         writeFileSync(path, updated, 'utf8');
       }

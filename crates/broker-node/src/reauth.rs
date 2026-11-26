@@ -157,6 +157,7 @@ pub async fn handle(
                 auth.properties.auth_data.as_deref(),
                 true,
             )
+            .await
         }
         _ => Outcome::Reject {
             reason: RC_BAD_AUTH_METHOD,
@@ -223,7 +224,30 @@ async fn jwt(
                     };
                 }
             }
-            if finish_success(shared, conn_id, client_id, tenant, verified.acls).is_err() {
+            let Some(session) = shared.sessions.session_for_conn(conn_id) else {
+                return Outcome::Reject {
+                    reason: RC_NOT_AUTHORIZED,
+                };
+            };
+            let expected_gen = session.bind_generation();
+            let owner = session.verified_username.read().clone();
+            let incoming_sub = (!verified.subject.is_empty()).then_some(verified.subject.as_str());
+            if owner.as_deref() != incoming_sub {
+                return Outcome::Reject {
+                    reason: RC_NOT_AUTHORIZED,
+                };
+            }
+            if finish_success(
+                shared,
+                conn_id,
+                expected_gen,
+                client_id,
+                tenant,
+                verified.acls,
+            )
+            .await
+            .is_err()
+            {
                 return Outcome::Reject {
                     reason: RC_NOT_AUTHORIZED,
                 };
@@ -297,7 +321,7 @@ pub fn begin_scram(
     }
 }
 
-pub fn finish_scram(
+pub async fn finish_scram(
     shared: &Shared,
     conn_id: u64,
     client_id: &str,
@@ -349,12 +373,38 @@ pub fn finish_scram(
         .scram_verify(&state.username, &auth_message, &proof)
     {
         Some(signature) => {
-            if is_reauth
-                && finish_success(shared, conn_id, client_id, &state.tenant, Vec::new()).is_err()
-            {
-                return Outcome::Reject {
-                    reason: RC_NOT_AUTHORIZED,
+            if is_reauth {
+                let Some(session) = shared.sessions.session_for_conn(conn_id) else {
+                    return Outcome::Reject {
+                        reason: RC_NOT_AUTHORIZED,
+                    };
                 };
+                let expected_gen = session.bind_generation();
+                let owner = session
+                    .verified_username
+                    .read()
+                    .clone()
+                    .or_else(|| session.username.read().clone());
+                if owner.as_deref() != Some(state.username.as_str()) {
+                    return Outcome::Reject {
+                        reason: RC_NOT_AUTHORIZED,
+                    };
+                }
+                if finish_success(
+                    shared,
+                    conn_id,
+                    expected_gen,
+                    client_id,
+                    &state.tenant,
+                    Vec::new(),
+                )
+                .await
+                .is_err()
+                {
+                    return Outcome::Reject {
+                        reason: RC_NOT_AUTHORIZED,
+                    };
+                }
             }
             Outcome::Success {
                 method: Some(SCRAM_METHOD.to_string()),
@@ -374,20 +424,43 @@ pub fn finish_scram(
     }
 }
 
-pub fn finish_success(
+pub fn to_session_acls(
+    acls: Vec<broker_auth::AclRule>,
+) -> Option<Vec<broker_session::CredentialAclRule>> {
+    if acls.is_empty() {
+        return None;
+    }
+    Some(
+        acls.into_iter()
+            .map(|r| broker_session::CredentialAclRule {
+                topic_pattern: r.topic_pattern,
+                action: match r.action {
+                    broker_auth::AclAction::Publish => 0,
+                    broker_auth::AclAction::Subscribe => 1,
+                    broker_auth::AclAction::All => 2,
+                },
+                allow: r.allow,
+            })
+            .collect(),
+    )
+}
+
+pub async fn finish_success(
     shared: &Shared,
     conn_id: u64,
-    client_id: &str,
+    expected_gen: u64,
+    _client_id: &str,
     tenant: &str,
     acls: Vec<broker_auth::AclRule>,
 ) -> Result<(), ()> {
-    if let Some(session) = shared.sessions.session_for_conn(conn_id) {
-        session.clear_authz_cache();
+    let Some(session) = shared.sessions.session_for_conn(conn_id) else {
+        return Err(());
+    };
+    if !session.set_credential_acls_for_conn(conn_id, expected_gen, to_session_acls(acls)) {
+        return Err(());
     }
-    shared
-        .auth
-        .apply_reauth_acl(tenant, client_id, acls)
-        .map_err(|_| ())
+    crate::prune_revoked_subscriptions(shared, &session, tenant).await;
+    Ok(())
 }
 
 pub fn parameter(message: &str, name: &str) -> Option<String> {

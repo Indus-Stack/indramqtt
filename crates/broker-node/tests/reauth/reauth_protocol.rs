@@ -1,5 +1,4 @@
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 
 use crate::reauth_harness::*;
 
@@ -255,12 +254,7 @@ async fn will_published_on_abort_not_on_success() {
         parse_publish_payload(w_head, &w_body),
         b"will-plain-takeover-payload"
     );
-    let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(STEP, plain_takeover_sock.read(&mut byte))
-        .await
-        .expect("close in time")
-        .expect("close read");
-    assert_eq!(read, 0, "replaced socket is closed on plain takeover");
+    expect_disconnect(&mut plain_takeover_sock, 0x8E).await;
 
     kernel.finish().await;
 }

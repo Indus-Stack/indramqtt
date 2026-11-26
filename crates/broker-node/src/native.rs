@@ -1661,6 +1661,8 @@ where
 /// connection. [`handle_inbound_frame_with`] sends its replies through
 /// the transport trait. This type encodes each reply at once and keeps
 /// the bytes until the connection task writes them.
+type PendingConnackAuth = Option<(Option<String>, Option<Vec<u8>>)>;
+
 struct NativeSink {
     out: parking_lot::Mutex<Vec<u8>>,
     /// Negotiated protocol level (4 until CONNECT is decoded).
@@ -1669,6 +1671,8 @@ struct NativeSink {
     close: AtomicBool,
     /// Set when the kernel accepted the bind.
     accepted: AtomicBool,
+    /// Pending initial enhanced-auth method/data to embed in v5 CONNACK.
+    pending_connack_auth: parking_lot::Mutex<PendingConnackAuth>,
 }
 
 impl NativeSink {
@@ -1678,6 +1682,7 @@ impl NativeSink {
             level: AtomicU8::new(4),
             close: AtomicBool::new(false),
             accepted: AtomicBool::new(false),
+            pending_connack_auth: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1688,7 +1693,53 @@ impl NativeSink {
     fn encode(&self, frame: &BrokerFrame) {
         let level = self.level();
         let mut out = self.out.lock();
-        match encode_frame(frame, level, &mut out) {
+        let effect = match frame.header.opcode {
+            OpCode::SessionBinding => {
+                let Some((_session_id, present, reason, alias_max, v5)) =
+                    decode_session_binding_full(&frame.metadata)
+                else {
+                    *self.pending_connack_auth.lock() = None;
+                    self.close.store(true, Ordering::Relaxed);
+                    return;
+                };
+                let connack_auth = if reason == 0 && level == 5 {
+                    self.pending_connack_auth.lock().take()
+                } else {
+                    *self.pending_connack_auth.lock() = None;
+                    None
+                };
+                if level == 5 {
+                    let empty: Vec<(String, String)> = Vec::new();
+                    let mut props = ConnackProperties {
+                        topic_alias_maximum: (alias_max >= 1).then_some(alias_max),
+                        user_properties: &empty,
+                        auth_method: connack_auth.as_ref().and_then(|(m, _)| m.as_deref()),
+                        auth_data: connack_auth.as_ref().and_then(|(_, d)| d.as_deref()),
+                        ..ConnackProperties::default()
+                    };
+                    if let Some(v5) = v5.as_ref() {
+                        props.session_expiry =
+                            (v5.granted_expiry >= 1).then_some(v5.granted_expiry);
+                        props.receive_maximum =
+                            (v5.server_recv_max >= 1).then_some(v5.server_recv_max);
+                        props.maximum_packet_size =
+                            (v5.server_max_pkt >= 1).then_some(v5.server_max_pkt);
+                        props.reason_string = (!v5.reason.is_empty()).then_some(v5.reason.as_str());
+                        props.user_properties = &v5.user_properties;
+                    }
+                    wire::encode_connack_v5(present, reason, &props, &mut out);
+                } else {
+                    wire::encode_connack(present, connack_return_code(reason), &mut out);
+                }
+                if reason == 0 {
+                    FrameEffect::Accepted
+                } else {
+                    FrameEffect::Close
+                }
+            }
+            _ => encode_frame(frame, level, &mut out),
+        };
+        match effect {
             FrameEffect::None => {}
             FrameEffect::Accepted => self.accepted.store(true, Ordering::Relaxed),
             FrameEffect::Close => self.close.store(true, Ordering::Relaxed),
@@ -2113,6 +2164,7 @@ fn bind_request(
         user_properties: props.map(|p| p.user_properties.into_iter().collect()),
         listener: listener.to_string(),
         enhanced_auth_verified: false,
+        pending_acls: None,
     }
 }
 
@@ -2228,175 +2280,6 @@ fn request_tenant(shared: &Shared, request: &BindRequest) -> String {
         user_properties: request.user_properties.clone(),
     };
     shared.tenant_registry.assign(&ctx)
-}
-
-/// Checks admission rules before takeover and bind.
-fn is_admission_allowed(shared: &Shared, tenant: &str, req: &BindRequest) -> bool {
-    if shared.bans.is_banned_in_tenant(
-        tenant,
-        &req.client_id,
-        req.username.as_deref(),
-        req.peerhost.as_deref(),
-    ) {
-        return false;
-    }
-    if super::client_cert_required(shared, &req.listener) && !super::has_client_cert(req) {
-        return false;
-    }
-    true
-}
-
-/// Checks credentials and admission rules for plain CONNECT before takeover.
-async fn is_plain_connect_authenticated(shared: &Shared, tenant: &str, req: &BindRequest) -> bool {
-    if !is_admission_allowed(shared, tenant, req) {
-        return false;
-    }
-    if !shared.authn_chain.built_in_available() {
-        return false;
-    }
-    let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
-    let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
-    let db_configured = shared.db_auth.as_ref().is_some_and(|d| d.is_configured());
-
-    if req.username.is_none() {
-        if shared.auth.user_count() > 0
-            || shared.ldap.is_some()
-            || kerberos_enabled
-            || jwks_enabled
-            || db_configured
-            || shared.webhook.is_some()
-            || !shared.allow_anonymous
-        {
-            return false;
-        }
-        return true;
-    }
-    let password = req.password.as_deref();
-    let chain_entries = shared.authn_chain.snapshot();
-    if !chain_entries.is_empty() {
-        return super::decide_chain_auth(
-            shared,
-            &chain_entries,
-            tenant,
-            &req.client_id,
-            req.username.as_deref(),
-            password,
-        )
-        .await
-        .is_ok();
-    }
-    if shared.auth.user_count() > 0 {
-        let local_ok = shared
-            .auth
-            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
-            .await
-            .is_ok();
-        if local_ok {
-            return true;
-        }
-        if req
-            .username
-            .as_deref()
-            .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u))
-        {
-            return false;
-        }
-    }
-    if jwks_enabled && password.is_some_and(broker_auth::JwksAuthenticator::looks_like_jwt) {
-        return super::verify_jwks_connect(shared, tenant, &req.client_id, password)
-            .await
-            .is_ok();
-    }
-    if kerberos_enabled {
-        let looks_kerberos =
-            password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
-        if looks_kerberos {
-            let Some(token) = password else {
-                return false;
-            };
-            let Some(kerberos) = shared.kerberos.as_ref() else {
-                return false;
-            };
-            return kerberos
-                .verify_token_in_tenant(tenant, &req.client_id, token)
-                .is_ok();
-        }
-        return false;
-    }
-    if let Some(ldap) = shared.ldap.as_ref() {
-        return ldap
-            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
-            .await
-            .is_ok();
-    }
-    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-        return db
-            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
-            .await
-            .is_ok();
-    }
-    if let Some(webhook) = shared.webhook.as_ref() {
-        return webhook
-            .authenticate_in_tenant(tenant, &req.client_id, req.username.as_deref(), password)
-            .await
-            .is_ok();
-    }
-    if jwks_enabled {
-        return false;
-    }
-    shared.auth.user_count() == 0
-}
-
-/// Disconnects the previous connection before the new connection binds.
-/// When the previous connection registered a last will, the broker publishes it.
-async fn handle_takeover_pre_bind(
-    shared: &Shared,
-    tx: &tokio::sync::mpsc::UnboundedSender<BrokerFrame>,
-    tenant: &str,
-    client_id: &str,
-    new_conn_id: u64,
-) {
-    let Some(session) = shared.sessions.get_in_tenant(tenant, client_id) else {
-        return;
-    };
-    let old_conn_id = match *session.conn_id.read() {
-        Some(id) if id != new_conn_id => id,
-        _ => return,
-    };
-    let id = client_id.as_bytes();
-    let mut meta = Vec::with_capacity(2 + id.len());
-    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    meta.extend_from_slice(id);
-    if let Ok(close_frame) = BrokerFrame::new(
-        OpCode::ConnClose,
-        old_conn_id,
-        0,
-        Bytes::new(),
-        Bytes::new(),
-    ) {
-        let _ = shared.conns.order_close(old_conn_id, close_frame);
-    }
-    if let Ok(frame) = BrokerFrame::new(
-        OpCode::DisconnectIn,
-        old_conn_id,
-        0,
-        Bytes::from(meta),
-        Bytes::new(),
-    ) {
-        let dummy_sink = NativeSink::new();
-        let dummy_waker = Arc::new(tokio::sync::Notify::new());
-        let mut dummy_bound = Vec::new();
-        let _ = handle_inbound_frame_with(
-            frame,
-            shared,
-            tx,
-            &dummy_sink,
-            &mut dummy_bound,
-            &dummy_waker,
-            None,
-        )
-        .await;
-    }
 }
 
 /// Owns the kernel state of one connection. When the task ends without
@@ -2758,6 +2641,22 @@ async fn drain_inbound(
                 };
                 let reauth::State::Scram(state) = pending.state;
                 let scram_username = state.username.clone();
+                let (_connect, mut request) =
+                    // INVARIANT: pending_connect was populated when the exchange started.
+                    conn.pending_connect.take().expect("pending connect");
+                if request
+                    .username
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != scram_username)
+                {
+                    wire::encode_connack_v5(
+                        false,
+                        reauth::RC_NOT_AUTHORIZED,
+                        &ConnackProperties::default(),
+                        &mut sink.out.lock(),
+                    );
+                    return Ok(Some(Stop::Clean));
+                }
                 let outcome = reauth::finish_scram(
                     shared,
                     conn.conn_id,
@@ -2765,44 +2664,21 @@ async fn drain_inbound(
                     state,
                     auth.properties.auth_data.as_deref(),
                     false,
-                );
+                )
+                .await;
                 match outcome {
                     reauth::Outcome::Success {
                         method,
                         data,
                         expires_at,
                     } => {
-                        wire::encode_auth(
-                            reauth::RC_SUCCESS,
-                            method.as_deref(),
-                            data.as_deref(),
-                            &mut sink.out.lock(),
-                        );
-                        let (_connect, mut request) =
-                            // INVARIANT: pending_connect was populated when the exchange started.
-                            conn.pending_connect.take().expect("pending connect");
+                        *sink.pending_connack_auth.lock() = Some((method, data));
                         request.enhanced_auth_verified = true;
                         if request.username.is_none() {
                             request.username = Some(scram_username);
                         }
                         conn.reauth_deadline = None;
                         conn.auth_expiry = auth_expiry_instant(expires_at);
-                        let tenant = request_tenant(shared, &request);
-                        let has_existing = shared
-                            .sessions
-                            .get_in_tenant(&tenant, &request.client_id)
-                            .and_then(|session| *session.conn_id.read())
-                            .is_some_and(|id| id != conn.conn_id);
-                        if has_existing && is_admission_allowed(shared, &tenant, &request) {
-                            handle_takeover_pre_bind(
-                                shared,
-                                tx,
-                                &tenant,
-                                &request.client_id,
-                                conn.conn_id,
-                            )
-                            .await;
-                        }
                         let Some(frame) =
                             conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
                         else {
@@ -2895,7 +2771,7 @@ async fn drain_inbound(
                     ),
                     _ => ("disabled", "disabled"),
                 };
-                let request = bind_request(
+                let mut request = bind_request(
                     connect.clone(),
                     &conn.peer,
                     listener,
@@ -2999,43 +2875,27 @@ async fn drain_inbound(
                                         return Ok(Some(Stop::Clean));
                                     }
                                 }
-                                if reauth::finish_success(
-                                    shared,
-                                    conn.conn_id,
-                                    &conn.client_id,
-                                    tenant,
-                                    verified.acls,
-                                )
-                                .is_err()
-                                {
-                                    wire::encode_connack_v5(
-                                        false,
-                                        reauth::RC_NOT_AUTHORIZED,
-                                        &ConnackProperties::default(),
-                                        &mut sink.out.lock(),
-                                    );
-                                    return Ok(Some(Stop::Clean));
+                                if !verified.subject.is_empty() {
+                                    if let Some(claimed) = connect.username.as_deref() {
+                                        if claimed != verified.subject {
+                                            wire::encode_connack_v5(
+                                                false,
+                                                reauth::RC_NOT_AUTHORIZED,
+                                                &ConnackProperties::default(),
+                                                &mut sink.out.lock(),
+                                            );
+                                            return Ok(Some(Stop::Clean));
+                                        }
+                                    }
+                                    request.username = Some(verified.subject);
+                                } else {
+                                    request.username = None;
                                 }
+                                request.pending_acls = reauth::to_session_acls(verified.acls);
+                                request.enhanced_auth_verified = true;
                                 conn.auth_expiry = auth_expiry_instant(
                                     (verified.expires_at > 0).then_some(verified.expires_at),
                                 );
-                                let has_existing = shared
-                                    .sessions
-                                    .get_in_tenant(&bind_tenant, &request.client_id)
-                                    .and_then(|session| *session.conn_id.read())
-                                    .is_some_and(|id| id != conn.conn_id);
-                                if has_existing
-                                    && is_admission_allowed(shared, &bind_tenant, &request)
-                                {
-                                    handle_takeover_pre_bind(
-                                        shared,
-                                        tx,
-                                        &bind_tenant,
-                                        &request.client_id,
-                                        conn.conn_id,
-                                    )
-                                    .await;
-                                }
                             }
                             Err(_) => {
                                 wire::encode_connack_v5(
@@ -3092,24 +2952,6 @@ async fn drain_inbound(
                             &mut sink.out.lock(),
                         );
                         return Ok(Some(Stop::Clean));
-                    }
-                } else {
-                    let has_existing = shared
-                        .sessions
-                        .get_in_tenant(&bind_tenant, &request.client_id)
-                        .and_then(|session| *session.conn_id.read())
-                        .is_some_and(|id| id != conn.conn_id);
-                    if has_existing
-                        && is_plain_connect_authenticated(shared, &bind_tenant, &request).await
-                    {
-                        handle_takeover_pre_bind(
-                            shared,
-                            tx,
-                            &bind_tenant,
-                            &request.client_id,
-                            conn.conn_id,
-                        )
-                        .await;
                     }
                 }
                 let Some(frame) = conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())

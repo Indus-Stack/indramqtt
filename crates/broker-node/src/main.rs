@@ -1575,6 +1575,8 @@ async fn apply_bind_request_inner(
     // Reuse keeps one bind at one count.
     let mut cached_none_tenant: Option<String> = None;
     let mut cached_verified_tenant: Option<String> = None;
+    let mut acquired_slot_user: Option<(String, String)> = None;
+    let mut pre_validated_will = None;
     if let Ok(req) = parsed.clone() {
         // X1-02: a Receive Maximum of 0 is a protocol error on the wire
         // (see the synchronous path for the code-choice rationale).
@@ -1690,7 +1692,9 @@ async fn apply_bind_request_inner(
                 "ignore_backend_failures is set: CONNECT still fails closed on auth failure"
             );
         }
-        if req.username.is_none() {
+        if req.enhanced_auth_verified {
+            verified_connect_username = req.username.clone();
+        } else if req.username.is_none() {
             // A non-empty user store always wins over `--allow-anonymous`:
             // unauthenticated clients are rejected whenever users exist.
             // A configured directory, database, webhook or JWT endpoint does the same: anonymous
@@ -2245,8 +2249,6 @@ async fn apply_bind_request_inner(
                         server_max_pkt,
                     ));
                 }
-            } else if req.enhanced_auth_verified {
-                verified_connect_username = req.username.clone();
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
                 // CONNECT without a Kerberos token fails closed.
@@ -2299,7 +2301,7 @@ async fn apply_bind_request_inner(
             // TODO(parity): whether a scope/role claim should drive ACLs
             // is open; JWT claims drive no authorisation today.
             let effective_username: Option<String> = if via_jwks {
-                jwks_subject.clone().or_else(|| req.username.clone())
+                jwks_subject.clone()
             } else {
                 kerberos_principal.clone().or_else(|| req.username.clone())
             };
@@ -2317,66 +2319,79 @@ async fn apply_bind_request_inner(
                 cached_verified_tenant = Some(resolved.clone());
                 resolved
             };
-            let already_live = shared
-                .sessions
-                .get_in_tenant(&tenant_for_quota, &req.client_id)
-                .map(|session| *session.connected.read())
-                .unwrap_or(false);
-            if already_live {
-                if let Some(username) = &effective_username {
-                    shared
-                        .sessions
-                        .release_connection_slot_in_tenant(&tenant_for_quota, username);
+            let will = match will_from_bind(&req) {
+                Ok(will) => will,
+                Err(_) => {
+                    if req.protocol_version == 5 {
+                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
+                        return Some(session_binding_reply_with_v5(
+                            frame,
+                            0,
+                            false,
+                            V5_RC_PROTOCOL_ERROR,
+                            shared.sessions.max_topic_alias(),
+                            &v5,
+                        ));
+                    }
+                    return Some(session_binding_reply(
+                        frame,
+                        0,
+                        false,
+                        2u8,
+                        shared.sessions.max_topic_alias(),
+                    ));
                 }
+            };
+            if req.client_id.is_empty() && !req.clean_start {
+                let rc = if req.protocol_version == 5 {
+                    V5_RC_CLIENT_ID_REJECTED
+                } else {
+                    2u8
+                };
+                return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
             }
+            pre_validated_will = Some(will);
+            let incumbent_session = shared
+                .sessions
+                .get_in_tenant(&tenant_for_quota, &req.client_id);
+            let is_takeover = incumbent_session
+                .as_ref()
+                .is_some_and(|session| *session.connected.read());
+            let same_user_takeover = incumbent_session.as_ref().is_some_and(|session| {
+                *session.connected.read()
+                    && session.username.read().as_deref() == effective_username.as_deref()
+            });
             if let Some(username) = &effective_username {
-                // Directory, database, Kerberos, JWKS and webhook users
-                // have no local quotas: unlimited. The invariant below
-                // reads the live role so `VerifiedKerberos::role` is
-                // wired, not test-only: every Kerberos CONNECT sets a role
-                // alongside the principal, and non-Kerberos CONNECTs set
-                // neither.
                 debug_assert!(via_kerberos == kerberos_role.is_some());
                 let max = if via_ldap || via_kerberos || via_jwks || via_db || via_webhook {
                     None
                 } else {
-                    // Tenant scope (MT-06): quotas are per (tenant,
-                    // username); one tenant's limits never gate another.
                     shared
                         .auth
                         .get_quotas_in_tenant(&tenant_for_quota, username)
                         .and_then(|quotas| quotas.max_connections)
                 };
-                if !shared.sessions.acquire_connection_slot_in_tenant(
-                    &tenant_for_quota,
-                    username,
-                    max,
-                ) {
-                    // X1-02: version-4 binds keep the existing `0x8B`
-                    // byte unchanged; version-5 binds carry the
-                    // documented quota code with a reason string plus
-                    // the echoed CONNECT user properties.
-                    let rc = if req.protocol_version == 5 {
-                        V5_RC_CONNECT_QUOTA
-                    } else {
-                        0x8B
-                    };
-                    return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
+                if !same_user_takeover {
+                    if !shared.sessions.acquire_connection_slot_in_tenant(
+                        &tenant_for_quota,
+                        username,
+                        max,
+                    ) {
+                        let rc = if req.protocol_version == 5 {
+                            V5_RC_CONNECT_QUOTA
+                        } else {
+                            0x8B
+                        };
+                        return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
+                    }
+                    acquired_slot_user = Some((tenant_for_quota.clone(), username.clone()));
                 }
-                // TM-06: per-tenant connection bound. Counts live
-                // sessions in the bind's own tenant only, so one full
-                // tenant never gates another. A takeover of the same
-                // client id still succeeds. Refuses with the documented
-                // quota code, counted and logged.
-                let is_takeover = shared
-                    .sessions
-                    .get_in_tenant(&tenant_for_quota, &req.client_id)
-                    .map(|session| *session.connected.read())
-                    .unwrap_or(false);
                 if !is_takeover && !tenant_connection_fits(shared, &tenant_for_quota) {
-                    shared
-                        .sessions
-                        .release_connection_slot_in_tenant(&tenant_for_quota, username);
+                    if let Some((slot_tenant, slot_user)) = acquired_slot_user.take() {
+                        shared
+                            .sessions
+                            .release_connection_slot_in_tenant(&slot_tenant, &slot_user);
+                    }
                     shared.metrics.inc_tenant_conn_refused();
                     shared.tenant_limits.count_conn_refused();
                     tracing::warn!(
@@ -2504,6 +2519,11 @@ async fn apply_bind_request_inner(
             .get_in_tenant(&tenant_for_bind, &req.client_id)
             .is_none();
         if is_new_session && !tenant_session_fits(shared, &tenant_for_bind) {
+            if let Some((slot_tenant, slot_user)) = acquired_slot_user.take() {
+                shared
+                    .sessions
+                    .release_connection_slot_in_tenant(&slot_tenant, &slot_user);
+            }
             shared.metrics.inc_tenant_sess_refused();
             shared.tenant_limits.count_sess_refused();
             tracing::warn!(
@@ -2524,28 +2544,36 @@ async fn apply_bind_request_inner(
             // F1-01: validate the CONNECT last will before touching
             // session state, so an unusable will section rejects the bind
             // with no session created (fail closed, like malformed meta).
-            let will = match will_from_bind(&req) {
-                Ok(will) => will,
-                Err(_) => {
-                    if req.protocol_version == 5 {
-                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
-                        return Some(session_binding_reply_with_v5(
+            let will = match pre_validated_will.take() {
+                Some(will) => will,
+                None => match will_from_bind(&req) {
+                    Ok(will) => will,
+                    Err(_) => {
+                        if let Some((slot_tenant, slot_user)) = acquired_slot_user.take() {
+                            shared
+                                .sessions
+                                .release_connection_slot_in_tenant(&slot_tenant, &slot_user);
+                        }
+                        if req.protocol_version == 5 {
+                            let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
+                            return Some(session_binding_reply_with_v5(
+                                frame,
+                                0,
+                                false,
+                                V5_RC_PROTOCOL_ERROR,
+                                shared.sessions.max_topic_alias(),
+                                &v5,
+                            ));
+                        }
+                        return Some(session_binding_reply(
                             frame,
                             0,
                             false,
-                            V5_RC_PROTOCOL_ERROR,
+                            2u8,
                             shared.sessions.max_topic_alias(),
-                            &v5,
                         ));
                     }
-                    return Some(session_binding_reply(
-                        frame,
-                        0,
-                        false,
-                        2u8,
-                        shared.sessions.max_topic_alias(),
-                    ));
-                }
+                },
             };
             // An empty client id without a clean start is refused
             // with no session created. Reason: the specification
@@ -2590,8 +2618,28 @@ async fn apply_bind_request_inner(
             let is_superuser = verified_connect_username
                 .as_deref()
                 .is_some_and(|name| shared.auth.is_superuser(name));
+            let incumbent_takeover_will = shared
+                .sessions
+                .get_in_tenant(&tenant_for_bind, &req.client_id)
+                .filter(|s| {
+                    *s.connected.read()
+                        && s.conn_id
+                            .read()
+                            .is_some_and(|id| id != frame.header.conn_id)
+                })
+                .and_then(|s| {
+                    s.take_last_will().map(|w| {
+                        (
+                            s.clone(),
+                            s.username.read().clone(),
+                            s.verified_username.read().clone(),
+                            s.peerhost.read().clone(),
+                            w,
+                        )
+                    })
+                });
             let (session, present, expired_swept, stale_conn) =
-                shared.sessions.connect_bind_v5_in_tenant(
+                shared.sessions.connect_bind_v5_in_tenant_with_acls(
                     &tenant_for_bind,
                     &req.client_id,
                     req.clean_start,
@@ -2610,7 +2658,11 @@ async fn apply_bind_request_inner(
                         client_alias_max: req.client_alias_max,
                         will,
                     }),
+                    req.pending_acls.clone(),
                 );
+            if present {
+                prune_revoked_subscriptions(shared, &session, &tenant_for_bind).await;
+            }
             if let Some(old_conn_id) = stale_conn {
                 if old_conn_id != frame.header.conn_id {
                     if let Ok(close) = BrokerFrame::new(
@@ -2621,6 +2673,25 @@ async fn apply_bind_request_inner(
                         Bytes::new(),
                     ) {
                         let _ = shared.conns.order_close(old_conn_id, close);
+                    }
+                }
+            }
+            if let Some((incumbent_sess, inc_user, inc_verified, inc_peer, inc_will)) =
+                incumbent_takeover_will
+            {
+                if stale_conn.is_some_and(|id| id != frame.header.conn_id) {
+                    let deliveries = publish_session_last_will(
+                        shared,
+                        &incumbent_sess,
+                        &tenant_for_bind,
+                        inc_user.as_deref(),
+                        inc_verified.as_deref(),
+                        inc_peer.as_deref(),
+                        inc_will,
+                    )
+                    .await;
+                    for (conn_id, routed) in deliveries {
+                        let _ = shared.conns.route(conn_id, routed);
                     }
                 }
             }
@@ -2916,6 +2987,93 @@ const BIND_FLAG_CERT: u8 = 0x20;
 /// path; mirrors the 16-SAN bound on the certificate section), each
 /// key/value at most [`MAX_V5_BIND_STRING`] bytes (bounds per-bind
 /// memory; mirrors the 1024-byte bound on certificate fields).
+pub(crate) fn session_credential_allows(
+    session: &broker_session::Session,
+    topic: &str,
+    is_publish: bool,
+) -> bool {
+    let guard = session.credential_acls.read();
+    let Some(rules) = guard.as_ref() else {
+        return true;
+    };
+    for rule in rules {
+        let action_matches = match rule.action {
+            0 => is_publish,
+            1 => !is_publish,
+            _ => true,
+        };
+        if !action_matches {
+            continue;
+        }
+        let acl_rule = broker_auth::AclRule {
+            client_pattern: "*".to_string(),
+            topic_pattern: rule.topic_pattern.clone(),
+            action: match rule.action {
+                0 => broker_auth::AclAction::Publish,
+                1 => broker_auth::AclAction::Subscribe,
+                _ => broker_auth::AclAction::All,
+            },
+            allow: rule.allow,
+        };
+        let matched = if is_publish {
+            Topic::new(topic).is_ok_and(|t| acl_rule.topic_matches(&t))
+        } else {
+            TopicFilter::new(topic).is_ok_and(|f| acl_rule.matches_subscribe(&f))
+        };
+        if matched {
+            return rule.allow;
+        }
+    }
+    false
+}
+
+pub(crate) async fn prune_revoked_subscriptions(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    tenant: &str,
+) {
+    let subs: Vec<TopicFilter> = session.subscriptions.read().keys().cloned().collect();
+    if subs.is_empty() {
+        return;
+    }
+    let is_superuser = session.verified_is_superuser.load(Ordering::Relaxed);
+    let verified = session.verified_username.read().clone();
+    let mut revoked = Vec::new();
+    for filter in subs {
+        let auth_ok = if is_superuser {
+            shared
+                .auth
+                .authorize_subscribe_in_tenant_as(
+                    tenant,
+                    &session.client_id,
+                    verified.as_deref(),
+                    &filter,
+                )
+                .await
+                .is_ok()
+        } else {
+            shared
+                .auth
+                .authorize_subscribe_in_tenant(tenant, &session.client_id, &filter)
+                .await
+                .is_ok()
+        };
+        if !auth_ok || !session_credential_allows(session, filter.as_str(), false) {
+            revoked.push(filter);
+        }
+    }
+    if revoked.is_empty() {
+        return;
+    }
+    for filter in &revoked {
+        shared
+            .sessions
+            .remove_subscription_in_tenant(tenant, &session.client_id, filter);
+        unsubscribe_scoped_in_tenant(shared, tenant, &session.client_id, filter);
+    }
+    refresh_subscription_stats(shared);
+}
+
 #[derive(Clone)]
 struct BindRequest {
     client_id: String,
@@ -2967,6 +3125,9 @@ struct BindRequest {
     /// True only when native enhanced authentication (SCRAM-SHA-256)
     /// verified the client proof for this CONNECT.
     enhanced_auth_verified: bool,
+    /// Credential-derived ACL rules verified during enhanced authentication,
+    /// installed on the session only after admission succeeds.
+    pending_acls: Option<Vec<broker_session::CredentialAclRule>>,
 }
 
 /// Longest accepted listener name in a bind.
@@ -3061,6 +3222,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             user_properties: Some(v5.user_properties),
             listener: identity.listener,
             enhanced_auth_verified: false,
+            pending_acls: None,
         });
     }
     // Preferred: exact legacy parse (no alias section).
@@ -3084,6 +3246,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             user_properties: None,
             listener: identity.listener,
             enhanced_auth_verified: false,
+            pending_acls: None,
         });
     }
     // Otherwise the last two bytes may be the alias section: the prefix
@@ -3113,6 +3276,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
                 user_properties: None,
                 listener: identity.listener,
                 enhanced_auth_verified: false,
+                pending_acls: None,
             });
         }
     }
@@ -3188,6 +3352,7 @@ fn decode_flagged_bind(
         user_properties,
         listener: identity.listener,
         enhanced_auth_verified: false,
+        pending_acls: None,
     })
 }
 
@@ -6626,6 +6791,10 @@ async fn apply_subscribe(
                 }
             }
         };
+        let local_denied = local_denied
+            || owner
+                .as_ref()
+                .is_some_and(|session| !session_credential_allows(session, filter.as_str(), false));
         if local_denied {
             // Per-client decision cache (W2-01): record the denial on the
             // owning tenant's session so the management read observes it.
@@ -7965,6 +8134,10 @@ async fn apply_publish(
                 }
             }
         };
+        let allowed = allowed
+            && publisher_session
+                .as_ref()
+                .is_none_or(|session| session_credential_allows(session, topic.as_str(), true));
         // Per-client decision cache (W2-01): record the publish decision
         // so the management read observes edge publishers. One bounded
         // per-session insert on the publish authorization event only;
@@ -10618,35 +10791,42 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     let Some(will) = will else {
         return Vec::new();
     };
+    publish_session_last_will(
+        shared,
+        &session,
+        &tenant,
+        username.as_deref(),
+        verified_username.as_deref(),
+        peerhost.as_deref(),
+        will,
+    )
+    .await
+}
+
+async fn publish_session_last_will(
+    shared: &Shared,
+    session: &Arc<broker_session::Session>,
+    tenant: &str,
+    username: Option<&str>,
+    verified_username: Option<&str>,
+    peerhost: Option<&str>,
+    will: broker_session::StoredWill,
+) -> Vec<(u64, BrokerFrame)> {
+    let client_id = session.client_id.as_str();
     info!(
         "Publishing last will for {} on {}",
         client_id,
         will.topic.as_str()
     );
-    // Bans, the publish ACL and the webhook verdict gate the will like
-    // any other publish from this client (fail closed); the ban check
-    // runs in the session's own tenant, so one tenant's ban never
-    // blocks another tenant's namesake. An empty will payload with
-    // retain set clears retained state through the shared pipeline,
-    // exactly like a normal retained clear. Disconnect events only;
-    // never on the publish or delivery hot path.
-    if shared.bans.is_banned_in_tenant(
-        &tenant,
-        &client_id,
-        username.as_deref(),
-        peerhost.as_deref(),
-    ) {
+    if shared
+        .bans
+        .is_banned_in_tenant(tenant, client_id, username, peerhost)
+    {
         return Vec::new();
     }
-    // Per-client decision cache (W2-01): consult and record the
-    // will-publish decision like any other publish from this client.
-    // Same bounded per-session insert; delivery never touches this lock.
-    // Tenant scope (MT-06): the will authorises in its own tenant (the
-    // session's tenant captured above), like any other publish from this
-    // client. Disconnect events only; never on the hot path.
     let cached_will = cached_authz_lookup(
         shared,
-        &session,
+        session,
         "publish",
         will.topic.as_str(),
         u8::from(will.qos),
@@ -10656,19 +10836,14 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         Some(allow) => allow,
         None => shared
             .auth
-            .authorize_publish_in_tenant_as(
-                &tenant,
-                &client_id,
-                verified_username.as_deref(),
-                &will.topic,
-            )
+            .authorize_publish_in_tenant_as(tenant, client_id, verified_username, &will.topic)
             .await
             .is_ok(),
     };
     if cached_will.is_none() {
         record_authz_under_policy(
             shared,
-            &session,
+            session,
             "publish",
             will.topic.as_str(),
             u8::from(will.qos),
@@ -10676,19 +10851,15 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
             will_allowed,
         );
     }
-    if !will_allowed {
+    if !will_allowed || !session_credential_allows(session, will.topic.as_str(), true) {
         return Vec::new();
     }
-    // B5-03: database ACLs gate the will like any other publish from a
-    // user with no local record (session username, else client id).
     if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-        let is_local = username
-            .as_deref()
-            .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
+        let is_local = username.is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u));
         if !is_local {
-            let key = username.as_deref().unwrap_or(&client_id);
+            let key = username.unwrap_or(client_id);
             if db
-                .authorize_publish_in_tenant(&tenant, key, &will.topic)
+                .authorize_publish_in_tenant(tenant, key, &will.topic)
                 .await
                 .is_err()
             {
@@ -10696,13 +10867,9 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
             }
         }
     }
-    // B5-04: the will carries the publisher's client id, so it consults
-    // the webhook exactly like an edge PublishIn. Deny or an
-    // unreachable, slow or tripped endpoint fails closed (no will
-    // delivery) with a clear log line, never allowed.
     if let Some(webhook) = shared.webhook.as_ref() {
         if webhook
-            .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
+            .authorize_publish_in_tenant(tenant, client_id, &will.topic)
             .await
             .is_err()
         {
@@ -10718,11 +10885,11 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         will.qos,
         will.retain,
         &will.payload,
-        Some(client_id.as_str()),
-        &tenant,
+        Some(client_id),
+        tenant,
     )
     .await;
-    forward_cluster(shared, &will.topic, will.qos, &will.payload, &tenant).await;
+    forward_cluster(shared, &will.topic, will.qos, &will.payload, tenant).await;
     deliveries
 }
 
