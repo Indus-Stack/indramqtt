@@ -723,6 +723,7 @@ impl TcpRocketMqTransport {
                     })?;
                 *guard = Some(stream);
             }
+            // INVARIANT: stream is initialized to Some immediately above when None.
             let stream = guard.as_mut().expect("connected");
             let exchange = async {
                 stream.write_all(&frame).await?;

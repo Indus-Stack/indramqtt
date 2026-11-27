@@ -23,7 +23,7 @@ path = "tests/docs_dx01.rs"
 
 [[test]]
 name = "e2e_integration"
-path = "../../tests/e2e_integration.rs"
+path = "../../tests/e2e_integration/main.rs"
 
 [[test]]
 name = "mc04_messaging_tools"
@@ -40,6 +40,10 @@ path = "../../tests/mt_publish_bench.rs"
 [[test]]
 name = "listener_conformance"
 path = "tests/listener_conformance.rs"
+
+[[test]]
+name = "conformance"
+path = "tests/conformance/main.rs"
 
 [[test]]
 name = "reconnect_storm"
@@ -166,3 +170,7 @@ rdkafka = { version = "0.39", features = ["ssl"] }
 # The MySQL e2e helper reads rows back through this driver. The version
 # and features match crates/broker-connectors so the same protocol runs.
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+# The Microsoft SQL Server e2e helper reads rows back through this driver.
+# The version and features match crates/broker-connectors-enterprise.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "native-tls"] }
+tokio-util = { version = "0.7", features = ["compat"] }

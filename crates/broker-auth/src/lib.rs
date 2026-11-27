@@ -39,7 +39,7 @@ pub use db::{
 pub use jwks::{
     JwksAuthenticator, JwksConfig, VerifiedJwt, JWKS_CACHE_MAX_KEYS, JWKS_DEFAULT_DOCUMENT_CAP,
 };
-pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
+pub use kerberos::{random_session_key, KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
 pub use psk::{PskInsertError, PskStore};
@@ -146,7 +146,7 @@ impl AclAction {
 }
 
 /// One ordered ACL entry: first match wins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclRule {
     pub client_pattern: String,
     pub action: AclAction,
@@ -183,7 +183,7 @@ impl AclRule {
             .unwrap_or(false)
     }
 
-    fn topic_matches(&self, topic: &Topic) -> bool {
+    pub fn topic_matches(&self, topic: &Topic) -> bool {
         TopicFilter::new(self.topic_pattern.as_str())
             .map(|filter| filter.matches(topic))
             .unwrap_or(false)
@@ -211,7 +211,7 @@ impl AclRule {
     /// Whether this rule decides one subscribe request. An allow rule
     /// decides when the rule covers the request. A deny rule decides when
     /// the rule overlaps the request. The first deciding rule wins.
-    fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
+    pub fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
         if self.allow {
             self.filter_covered(filter)
         } else {
@@ -1553,6 +1553,7 @@ impl MemoryAuth {
                     "mqtt_users holds too many users (at most {MAX_AUTHN_USERS} total)"
                 )));
             }
+            // INVARIANT: tenant map contains the target tenant key after insertion check.
             let state = tenants.get_mut(key).expect("tenant just inserted");
             let quotas = state
                 .users
@@ -1981,6 +1982,7 @@ impl MemoryAuth {
                 }
                 tenants.insert(key.to_string(), TenantState::default());
             }
+            // INVARIANT: tenant map contains the target tenant key after insertion check.
             let state = tenants.get_mut(key).expect("tenant just inserted");
             if state.rules.len() >= MAX_ACL_RULES_PER_TENANT {
                 return Err(broker_config::ConfigError::Invalid(format!(
@@ -2396,6 +2398,94 @@ impl MemoryAuth {
             }
             table.retain(|stored| stored.client_pattern != clientid);
             table.extend(rules);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Replace the connection ACL set that a successful re-authentication
+    /// returned in the given tenant. An empty set clears the previous client rules.
+    /// This is the same table that the publish and subscribe checks consult.
+    pub fn apply_reauth_acl(
+        &self,
+        tenant: &str,
+        clientid: &str,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), ClientRuleError> {
+        if clientid.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must not be empty".to_string(),
+            ));
+        }
+        if clientid.len() > MAX_AUTHZ_CLIENTID_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `clientid` {clientid:?} exceeds {MAX_AUTHZ_CLIENTID_LEN} bytes",
+            )));
+        }
+        if clientid == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must name a concrete client, not the catch-all (field `clientid`)".to_string(),
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern != clientid {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].clientid {:?} does not match {clientid:?} (field `clientid`)",
+                    rule.client_pattern
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        {
+            let mut seen: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::with_capacity(rules.len());
+            for rule in &rules {
+                let scope = (
+                    rule.topic_pattern.as_str(),
+                    match rule.action {
+                        AclAction::Publish => "publish",
+                        AclAction::Subscribe => "subscribe",
+                        AclAction::All => "all",
+                    },
+                );
+                if !seen.insert(scope) {
+                    return Err(ClientRuleError::Duplicate);
+                }
+            }
+        }
+        let key = tenant_key(tenant);
+        {
+            let mut tenants = self.tenants_mut();
+            if !tenants.contains_key(key) {
+                if tenants.len() >= MAX_AUTH_TENANTS {
+                    return Err(ClientRuleError::Full);
+                }
+                tenants.insert(key.to_string(), TenantState::default());
+            }
+            // INVARIANT: tenant map contains the target tenant key after insertion check.
+            let state = tenants.get_mut(key).expect("tenant just inserted");
+            let others = state
+                .rules
+                .iter()
+                .filter(|stored| stored.client_pattern != clientid)
+                .count();
+            if others + rules.len() > MAX_ACL_RULES_PER_TENANT {
+                return Err(ClientRuleError::Full);
+            }
+            state
+                .rules
+                .retain(|stored| stored.client_pattern != clientid);
+            state.rules.extend(rules);
         }
         self.persist()
             .map_err(|e| ClientRuleError::Persist(e.to_string()))
@@ -2928,6 +3018,7 @@ impl MemoryAuth {
         );
         leader.notify.notify_waiters();
         {
+            // INVARIANT: leader guard retains the deduplication key until completion cleanup.
             let key = guard.key.take().expect("leader holds dedup key");
             let mut table = self.verify_inflight.lock().await;
             let same = table
@@ -3251,6 +3342,23 @@ impl MemoryAuth {
     /// superuser username bypasses every ACL rule. `None` means the
     /// session has no verified identity and never bypasses.
     pub async fn authorize_subscribe_in_tenant_as(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        authenticated_username: Option<&str>,
+        filter: &TopicFilter,
+    ) -> Result<()> {
+        self.authorize_subscribe_in_tenant_as_sync(
+            tenant,
+            client_id,
+            authenticated_username,
+            filter,
+        )
+    }
+
+    /// Synchronous counterpart of [`Self::authorize_subscribe_in_tenant_as`]
+    /// for callers holding non-async replay locks.
+    pub fn authorize_subscribe_in_tenant_as_sync(
         &self,
         tenant: &str,
         client_id: &str,

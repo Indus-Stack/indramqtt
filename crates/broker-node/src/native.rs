@@ -10,6 +10,9 @@
 //! The connection uses the same session, routing and delivery code as a
 //! connection of the edge. Only the transport is different.
 
+#[path = "reauth.rs"]
+mod reauth;
+
 use super::{
     decode_session_binding_full, detach, handle_inbound_frame_with, merge_egress_batch,
     BindRequest, BindWill, Shared,
@@ -1658,6 +1661,8 @@ where
 /// connection. [`handle_inbound_frame_with`] sends its replies through
 /// the transport trait. This type encodes each reply at once and keeps
 /// the bytes until the connection task writes them.
+type PendingConnackAuth = Option<(Option<String>, Option<Vec<u8>>)>;
+
 struct NativeSink {
     out: parking_lot::Mutex<Vec<u8>>,
     /// Negotiated protocol level (4 until CONNECT is decoded).
@@ -1666,6 +1671,8 @@ struct NativeSink {
     close: AtomicBool,
     /// Set when the kernel accepted the bind.
     accepted: AtomicBool,
+    /// Pending initial enhanced-auth method/data to embed in v5 CONNACK.
+    pending_connack_auth: parking_lot::Mutex<PendingConnackAuth>,
 }
 
 impl NativeSink {
@@ -1675,6 +1682,7 @@ impl NativeSink {
             level: AtomicU8::new(4),
             close: AtomicBool::new(false),
             accepted: AtomicBool::new(false),
+            pending_connack_auth: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1685,7 +1693,53 @@ impl NativeSink {
     fn encode(&self, frame: &BrokerFrame) {
         let level = self.level();
         let mut out = self.out.lock();
-        match encode_frame(frame, level, &mut out) {
+        let effect = match frame.header.opcode {
+            OpCode::SessionBinding => {
+                let Some((_session_id, present, reason, alias_max, v5)) =
+                    decode_session_binding_full(&frame.metadata)
+                else {
+                    *self.pending_connack_auth.lock() = None;
+                    self.close.store(true, Ordering::Relaxed);
+                    return;
+                };
+                let connack_auth = if reason == 0 && level == 5 {
+                    self.pending_connack_auth.lock().take()
+                } else {
+                    *self.pending_connack_auth.lock() = None;
+                    None
+                };
+                if level == 5 {
+                    let empty: Vec<(String, String)> = Vec::new();
+                    let mut props = ConnackProperties {
+                        topic_alias_maximum: (alias_max >= 1).then_some(alias_max),
+                        user_properties: &empty,
+                        auth_method: connack_auth.as_ref().and_then(|(m, _)| m.as_deref()),
+                        auth_data: connack_auth.as_ref().and_then(|(_, d)| d.as_deref()),
+                        ..ConnackProperties::default()
+                    };
+                    if let Some(v5) = v5.as_ref() {
+                        props.session_expiry =
+                            (v5.granted_expiry >= 1).then_some(v5.granted_expiry);
+                        props.receive_maximum =
+                            (v5.server_recv_max >= 1).then_some(v5.server_recv_max);
+                        props.maximum_packet_size =
+                            (v5.server_max_pkt >= 1).then_some(v5.server_max_pkt);
+                        props.reason_string = (!v5.reason.is_empty()).then_some(v5.reason.as_str());
+                        props.user_properties = &v5.user_properties;
+                    }
+                    wire::encode_connack_v5(present, reason, &props, &mut out);
+                } else {
+                    wire::encode_connack(present, connack_return_code(reason), &mut out);
+                }
+                if reason == 0 {
+                    FrameEffect::Accepted
+                } else {
+                    FrameEffect::Close
+                }
+            }
+            _ => encode_frame(frame, level, &mut out),
+        };
+        match effect {
             FrameEffect::None => {}
             FrameEffect::Accepted => self.accepted.store(true, Ordering::Relaxed),
             FrameEffect::Close => self.close.store(true, Ordering::Relaxed),
@@ -1717,6 +1771,17 @@ enum FrameEffect {
     Accepted,
     /// Close the socket after the bytes are written.
     Close,
+}
+
+/// Converts a Unix expiry time in seconds to a local deadline. A zero or
+/// missing value means that the credential carries no expiry.
+fn auth_expiry_instant(expires_at: Option<u64>) -> Option<Instant> {
+    let seconds = expires_at.filter(|value| *value > 0)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    Some(Instant::now() + Duration::from_secs(seconds.saturating_sub(now)))
 }
 
 /// The return code of a CONNACK for protocol level 3 or 4.
@@ -1970,6 +2035,16 @@ struct Conn {
     /// denial with `deny_action = disconnect`). Packets that are already
     /// in the read buffer are not handled after that.
     closing: Option<Arc<AtomicBool>>,
+    /// Authentication Method that CONNECT negotiated, if any.
+    auth_method: Option<String>,
+    /// A SCRAM re-authentication that waits for its client-final message.
+    reauth: Option<reauth::Session>,
+    /// Deadline of an open re-authentication exchange.
+    reauth_deadline: Option<Instant>,
+    /// Deadline of the authentication that the client last presented.
+    auth_expiry: Option<Instant>,
+    /// Pending CONNECT during initial enhanced authentication.
+    pending_connect: Option<(wire::Connect, BindRequest)>,
 }
 
 impl Conn {
@@ -2021,6 +2096,24 @@ fn bind_request(
     peer_as_clientid: &str,
 ) -> BindRequest {
     let props = connect.properties;
+    let is_jwt = props
+        .as_ref()
+        .and_then(|p| p.auth_method.as_deref())
+        .is_some_and(|m| m.eq_ignore_ascii_case("JWT"));
+    let is_scram = props
+        .as_ref()
+        .and_then(|p| p.auth_method.as_deref())
+        .is_some_and(|m| m.eq_ignore_ascii_case("SCRAM-SHA-256"));
+    let auth_data = props.as_ref().and_then(|p| p.auth_data.clone());
+    let scram_user = if is_scram {
+        auth_data
+            .as_deref()
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .and_then(|s| reauth::parameter(s, "n"))
+    } else {
+        None
+    };
+    let password = connect.password.or(if is_jwt { auth_data } else { None });
     // A verified PSK identity replaces the CONNECT username: the
     // bind carries the value authentication checks.
     // A PSK bind keeps accepted behavior.
@@ -2029,13 +2122,21 @@ fn bind_request(
         .psk_identity
         .clone()
         .or_else(|| cert_identity_value(peer_as_username, peer_cert))
-        .or(connect.username);
+        .or(connect.username)
+        .or(scram_user)
+        .or_else(|| {
+            if is_jwt && password.is_some() {
+                Some(connect.client_id.clone())
+            } else {
+                None
+            }
+        });
     BindRequest {
         client_id: cert_identity_value(peer_as_clientid, peer_cert).unwrap_or(connect.client_id),
         clean_start: connect.clean_start,
         keepalive_secs: connect.keepalive,
         username,
-        password: connect.password,
+        password,
         peerhost: Some(peer.to_string()),
         client_alias_max: props
             .as_ref()
@@ -2062,6 +2163,8 @@ fn bind_request(
             .unwrap_or(0),
         user_properties: props.map(|p| p.user_properties.into_iter().collect()),
         listener: listener.to_string(),
+        enhanced_auth_verified: false,
+        pending_acls: None,
     }
 }
 
@@ -2164,6 +2267,21 @@ async fn release_connection(
     shared.conns.unregister(conn_id);
 }
 
+/// Returns the assigned tenant identifier for one connect request.
+fn request_tenant(shared: &Shared, request: &BindRequest) -> String {
+    let ctx = broker_session::tenant::ConnectContext {
+        client_id: request.client_id.clone(),
+        username: request.username.clone(),
+        peer_host: request.peerhost.clone(),
+        listener: request.listener.clone(),
+        cert_cn: request.cert_cn.clone(),
+        cert_subject: request.cert_subject.clone(),
+        cert_sans: request.cert_sans.clone(),
+        user_properties: request.user_properties.clone(),
+    };
+    shared.tenant_registry.assign(&ctx)
+}
+
 /// Owns the kernel state of one connection. When the task ends without
 /// the normal release (a panic in the task, or a cancelled task), the
 /// drop of this guard starts the release. One faulty connection then
@@ -2248,14 +2366,30 @@ where
         keepalive: None,
         peer,
         closing: None,
+        auth_method: None,
+        reauth: None,
+        reauth_deadline: None,
+        auth_expiry: None,
+        pending_connect: None,
     };
     let mut last_packet = Instant::now();
 
     let stop = loop {
         ensure_read_room(&mut inbuf);
-        // One deadline: CONNECT in time, then the keepalive of the client.
+        // One deadline: CONNECT in time, then the keepalive of the client,
+        // an open re-authentication or the current authentication expiry.
         let deadline = if conn.connected {
-            conn.keepalive.map(|keepalive| last_packet + keepalive)
+            let mut earliest = conn.keepalive.map(|keepalive| last_packet + keepalive);
+            for extra in [conn.reauth_deadline, conn.auth_expiry]
+                .into_iter()
+                .flatten()
+            {
+                earliest = Some(match earliest {
+                    Some(current) => current.min(extra),
+                    None => extra,
+                });
+            }
+            earliest
         } else {
             Some(accepted_at + CONNECT_TIMEOUT)
         };
@@ -2323,7 +2457,18 @@ where
             () = waker.notified() => {
                 collect_egress(&mut rx, &shared, conn.conn_id, &sink, &waker);
             }
-            () = timer => break Stop::Abnormal,
+            () = timer => {
+                let now = Instant::now();
+                let expired_auth = conn
+                    .reauth_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                    || conn.auth_expiry.is_some_and(|deadline| now >= deadline);
+                if expired_auth && conn.level == 5 {
+                    wire::encode_disconnect_v5(reauth::RC_NOT_AUTHORIZED, &mut sink.out.lock());
+                    let _ = flush(&sink, &mut io).await;
+                }
+                break Stop::Abnormal;
+            }
         }
         if flush(&sink, &mut io).await.is_err() {
             break Stop::Abnormal;
@@ -2464,6 +2609,137 @@ async fn drain_inbound(
         }
         let packet = inbuf.split_to(header.packet_len()).freeze();
         let body = packet.slice(header.header_len..);
+        if !conn.connected && conn.pending_connect.is_some() {
+            if header.kind != kind::AUTH {
+                return Err(WireError::Malformed(
+                    "expected AUTH during initial authentication",
+                ));
+            }
+            let auth = wire::decode_auth(&body, conn.level)?;
+            if auth.reason == reauth::RC_REAUTHENTICATE {
+                // Behaviour 8: If a client sends AUTH Reason Code 0x19 during initial CONNECT authentication,
+                // the broker sends CONNACK with Reason Code 0x82.
+                let props = ConnackProperties::default();
+                wire::encode_connack_v5(
+                    false,
+                    reauth::RC_BAD_AUTH_METHOD,
+                    &props,
+                    &mut sink.out.lock(),
+                );
+                return Ok(Some(Stop::Clean));
+            }
+            if auth.reason == reauth::RC_CONTINUE_AUTHENTICATION {
+                let Some(pending) = conn.reauth.take() else {
+                    let props = ConnackProperties::default();
+                    wire::encode_connack_v5(
+                        false,
+                        reauth::RC_NOT_AUTHORIZED,
+                        &props,
+                        &mut sink.out.lock(),
+                    );
+                    return Ok(Some(Stop::Clean));
+                };
+                let reauth::State::Scram(state) = pending.state;
+                let scram_username = state.username.clone();
+                let (_connect, mut request) =
+                    // INVARIANT: pending_connect was populated when the exchange started.
+                    conn.pending_connect.take().expect("pending connect");
+                if request
+                    .username
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != scram_username)
+                {
+                    wire::encode_connack_v5(
+                        false,
+                        reauth::RC_NOT_AUTHORIZED,
+                        &ConnackProperties::default(),
+                        &mut sink.out.lock(),
+                    );
+                    return Ok(Some(Stop::Clean));
+                }
+                let outcome = reauth::finish_scram(
+                    shared,
+                    conn.conn_id,
+                    &conn.client_id,
+                    state,
+                    auth.properties.auth_data.as_deref(),
+                    false,
+                )
+                .await;
+                match outcome {
+                    reauth::Outcome::Success {
+                        method,
+                        data,
+                        expires_at,
+                    } => {
+                        *sink.pending_connack_auth.lock() = Some((method, data));
+                        request.enhanced_auth_verified = true;
+                        if request.username.is_none() {
+                            request.username = Some(scram_username);
+                        }
+                        conn.reauth_deadline = None;
+                        conn.auth_expiry = auth_expiry_instant(expires_at);
+                        let Some(frame) =
+                            conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
+                        else {
+                            return Err(WireError::Malformed("frame"));
+                        };
+                        let handled = handle_inbound_frame_with(
+                            frame,
+                            shared,
+                            tx,
+                            sink,
+                            bound,
+                            waker,
+                            Some(&request),
+                        )
+                        .await;
+                        if handled.is_err() {
+                            return Ok(Some(Stop::Abnormal));
+                        }
+                        if sink.accepted.load(Ordering::Relaxed) {
+                            conn.connected = true;
+                            conn.closing = shared.conns.closing_flag(conn.conn_id);
+                        } else {
+                            return Ok(Some(Stop::Clean));
+                        }
+                        continue;
+                    }
+                    _ => {
+                        let props = ConnackProperties::default();
+                        wire::encode_connack_v5(
+                            false,
+                            reauth::RC_NOT_AUTHORIZED,
+                            &props,
+                            &mut sink.out.lock(),
+                        );
+                        return Ok(Some(Stop::Clean));
+                    }
+                }
+            } else {
+                let props = ConnackProperties::default();
+                wire::encode_connack_v5(
+                    false,
+                    reauth::RC_BAD_AUTH_METHOD,
+                    &props,
+                    &mut sink.out.lock(),
+                );
+                return Ok(Some(Stop::Clean));
+            }
+        }
+        if !conn.connected && header.kind == kind::AUTH {
+            // Behaviour 8: AUTH during the initial CONNECT authentication
+            // is a protocol error. The client gets a CONNACK with 0x82.
+            wire::decode_auth(&body, 5)?;
+            let props = ConnackProperties::default();
+            wire::encode_connack_v5(
+                false,
+                reauth::RC_BAD_AUTH_METHOD,
+                &props,
+                &mut sink.out.lock(),
+            );
+            return Ok(Some(Stop::Clean));
+        }
         if !conn.connected && header.kind != kind::CONNECT {
             return Err(WireError::Malformed("first packet is not CONNECT"));
         }
@@ -2475,6 +2751,10 @@ async fn drain_inbound(
                 let connect = wire::decode_connect(&body)?;
                 conn.level = if connect.level == 5 { 5 } else { 4 };
                 sink.level.store(conn.level, Ordering::Relaxed);
+                conn.auth_method = connect
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.auth_method.clone());
                 conn.keepalive = (connect.keepalive > 0)
                     .then(|| Duration::from_millis(u64::from(connect.keepalive) * 1500));
                 // The listener policy selects the certificate identity
@@ -2491,8 +2771,8 @@ async fn drain_inbound(
                     ),
                     _ => ("disabled", "disabled"),
                 };
-                let request = bind_request(
-                    connect,
+                let mut request = bind_request(
+                    connect.clone(),
                     &conn.peer,
                     listener,
                     peer_cert,
@@ -2500,6 +2780,190 @@ async fn drain_inbound(
                     peer_as_clientid,
                 );
                 conn.client_id = request.client_id.clone();
+                let bind_tenant = request_tenant(shared, &request);
+                if let Some(method) = conn.auth_method.as_deref() {
+                    if method.eq_ignore_ascii_case("JWT") {
+                        let auth_data = connect
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.auth_data.as_deref());
+                        let Some(data) = auth_data else {
+                            wire::encode_connack_v5(
+                                false,
+                                reauth::RC_NOT_AUTHORIZED,
+                                &ConnackProperties::default(),
+                                &mut sink.out.lock(),
+                            );
+                            return Ok(Some(Stop::Clean));
+                        };
+                        let Ok(token) = std::str::from_utf8(data) else {
+                            wire::encode_connack_v5(
+                                false,
+                                reauth::RC_NOT_AUTHORIZED,
+                                &ConnackProperties::default(),
+                                &mut sink.out.lock(),
+                            );
+                            return Ok(Some(Stop::Clean));
+                        };
+                        let Some(jwks) = shared.jwks.as_ref() else {
+                            wire::encode_connack_v5(
+                                false,
+                                reauth::RC_NOT_AUTHORIZED,
+                                &ConnackProperties::default(),
+                                &mut sink.out.lock(),
+                            );
+                            return Ok(Some(Stop::Clean));
+                        };
+                        let tenant = &bind_tenant;
+                        match jwks
+                            .verify_token_in_tenant(tenant, &conn.client_id, token)
+                            .await
+                        {
+                            Ok(verified) => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|elapsed| elapsed.as_secs())
+                                    .unwrap_or(0);
+                                if verified.expires_at > 0 && verified.expires_at <= now {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                }
+                                let Some(payload_b64) = token.split('.').nth(1) else {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                };
+                                let Some(payload_bytes) = reauth::decode_base64(payload_b64) else {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                };
+                                let Ok(claims) =
+                                    serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+                                else {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                };
+                                if let Some(claim_cid) =
+                                    claims.get("client_id").and_then(|v| v.as_str())
+                                {
+                                    if claim_cid != conn.client_id {
+                                        wire::encode_connack_v5(
+                                            false,
+                                            reauth::RC_NOT_AUTHORIZED,
+                                            &ConnackProperties::default(),
+                                            &mut sink.out.lock(),
+                                        );
+                                        return Ok(Some(Stop::Clean));
+                                    }
+                                }
+                                if !verified.subject.is_empty() {
+                                    if let Some(claimed) = connect.username.as_deref() {
+                                        if claimed != verified.subject {
+                                            wire::encode_connack_v5(
+                                                false,
+                                                reauth::RC_NOT_AUTHORIZED,
+                                                &ConnackProperties::default(),
+                                                &mut sink.out.lock(),
+                                            );
+                                            return Ok(Some(Stop::Clean));
+                                        }
+                                    }
+                                    request.username = Some(verified.subject);
+                                } else {
+                                    request.username = None;
+                                }
+                                let verified_tenant = request_tenant(shared, &request);
+                                if verified_tenant != bind_tenant {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                }
+                                request.pending_acls = reauth::to_session_acls(verified.acls);
+                                request.enhanced_auth_verified = true;
+                                conn.auth_expiry = auth_expiry_instant(
+                                    (verified.expires_at > 0).then_some(verified.expires_at),
+                                );
+                            }
+                            Err(_) => {
+                                wire::encode_connack_v5(
+                                    false,
+                                    reauth::RC_NOT_AUTHORIZED,
+                                    &ConnackProperties::default(),
+                                    &mut sink.out.lock(),
+                                );
+                                return Ok(Some(Stop::Clean));
+                            }
+                        }
+                    } else if method.eq_ignore_ascii_case("SCRAM-SHA-256") {
+                        let auth_data = connect
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.auth_data.as_deref());
+                        let tenant = &bind_tenant;
+                        let outcome =
+                            reauth::begin_scram(shared, tenant, auth_data, &mut conn.reauth);
+                        match outcome {
+                            reauth::Outcome::Continue {
+                                reason,
+                                method,
+                                data,
+                            } => {
+                                wire::encode_auth(
+                                    reason,
+                                    Some(&method),
+                                    Some(&data),
+                                    &mut sink.out.lock(),
+                                );
+                                conn.reauth_deadline = Some(
+                                    Instant::now()
+                                        + Duration::from_secs(reauth::DEFAULT_REAUTH_TIMEOUT_SECS),
+                                );
+                                conn.pending_connect = Some((connect, request));
+                                continue;
+                            }
+                            _ => {
+                                wire::encode_connack_v5(
+                                    false,
+                                    reauth::RC_NOT_AUTHORIZED,
+                                    &ConnackProperties::default(),
+                                    &mut sink.out.lock(),
+                                );
+                                return Ok(Some(Stop::Clean));
+                            }
+                        }
+                    } else {
+                        wire::encode_connack_v5(
+                            false,
+                            reauth::RC_BAD_AUTH_METHOD,
+                            &ConnackProperties::default(),
+                            &mut sink.out.lock(),
+                        );
+                        return Ok(Some(Stop::Clean));
+                    }
+                }
                 let Some(frame) = conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
                 else {
                     return Err(WireError::Malformed("frame"));
@@ -2576,6 +3040,58 @@ async fn drain_inbound(
                 // send a second one.
                 conn.connected = false;
                 return Ok(Some(Stop::Clean));
+            }
+            kind::AUTH => {
+                let auth = wire::decode_auth(&body, conn.level)?;
+                let tenant = shared
+                    .sessions
+                    .session_for_conn(conn.conn_id)
+                    .map(|session| session.tenant_id.read().clone())
+                    .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
+                let client_id = conn.client_id.clone();
+                let method = conn.auth_method.clone();
+                let outcome = reauth::handle(
+                    shared,
+                    conn.conn_id,
+                    &client_id,
+                    &tenant,
+                    method.as_deref(),
+                    &mut conn.reauth,
+                    &auth,
+                )
+                .await;
+                match outcome {
+                    reauth::Outcome::Continue {
+                        reason,
+                        method,
+                        data,
+                    } => {
+                        wire::encode_auth(reason, Some(&method), Some(&data), &mut sink.out.lock());
+                        conn.reauth_deadline = Some(
+                            Instant::now()
+                                + Duration::from_secs(reauth::DEFAULT_REAUTH_TIMEOUT_SECS),
+                        );
+                    }
+                    reauth::Outcome::Success {
+                        method,
+                        data,
+                        expires_at,
+                    } => {
+                        wire::encode_auth(
+                            reauth::RC_SUCCESS,
+                            method.as_deref(),
+                            data.as_deref(),
+                            &mut sink.out.lock(),
+                        );
+                        conn.reauth_deadline = None;
+                        conn.auth_expiry = auth_expiry_instant(expires_at);
+                    }
+                    reauth::Outcome::Reject { reason } => {
+                        wire::encode_disconnect_v5(reason, &mut sink.out.lock());
+                        return Ok(Some(Stop::Abnormal));
+                    }
+                }
+                continue;
             }
             _ => return Err(WireError::Unsupported("packet type")),
         };

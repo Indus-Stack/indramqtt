@@ -1,0 +1,30 @@
+---
+import Default from '@astrojs/starlight/components/PageSidebar.astro';
+import type { Props } from '@astrojs/starlight/props';
+
+const { headings = [], toc } = Astro.props;
+const d23Headings = headings.filter((h) => h.depth === 2 || h.depth === 3);
+const tocCount = d23Headings.length;
+const hasToc = tocCount >= 3;
+
+let modifiedToc = toc;
+if (toc && tocCount > 40) {
+  modifiedToc = {
+    ...toc,
+    maxHeadingLevel: 2,
+    items: toc.items
+      .filter((item) => item.depth === 2)
+      .map((item) => ({ ...item, children: [] })),
+  };
+}
+---
+
+{
+  hasToc && (
+    <div id="starlight__toc">
+      <Default {...Astro.props} toc={modifiedToc}>
+        <slot />
+      </Default>
+    </div>
+  )
+}

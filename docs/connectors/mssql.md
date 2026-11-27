@@ -129,6 +129,12 @@ disconnected
 - A `driver` other than `ms-sql` is refused with 400.
 - A dead server counts each fire as failed. The broker keeps serving.
 
+## Other names
+
+This connector is also known as `sqlserver`. The alias `sqlserver` redirects to this page.
+
+Both `mssql` and `sqlserver` select the SQL Server connector runtime on v1 and v5 routes.
+
 ## Next steps
 
 - Feed the action from a rule in [Actions](../rules/actions.md).

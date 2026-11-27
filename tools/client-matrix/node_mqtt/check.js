@@ -16,6 +16,7 @@
 
 const net = require("net");
 const crypto = require("crypto");
+const fs = require("fs");
 const { spawn } = require("child_process");
 
 let mqtt;
@@ -28,8 +29,10 @@ try {
 
 const HOST = process.env.MATRIX_HOST || "127.0.0.1";
 const TCP_PORT = parseInt(process.env.MATRIX_TCP_PORT || "1883", 10);
+const TLS_PORT = parseInt(process.env.MATRIX_TLS_PORT || "8883", 10);
 const WS_PORT = parseInt(process.env.MATRIX_WS_PORT || "8083", 10);
 const WS_PATH = process.env.MATRIX_WS_PATH || "/mqtt";
+const CA_FILE = process.env.MATRIX_CA || "";
 const API_BASE = process.env.MATRIX_API_BASE || "";
 const API_KEY = process.env.MATRIX_API_KEY || "";
 const USER = process.env.MATRIX_USER || "";
@@ -57,6 +60,9 @@ function urlFor(transport) {
   if (transport === "ws") {
     return "ws://" + HOST + ":" + WS_PORT + WS_PATH;
   }
+  if (transport === "tls") {
+    return "mqtts://" + HOST + ":" + TLS_PORT;
+  }
   return "mqtt://" + HOST + ":" + TCP_PORT;
 }
 
@@ -81,6 +87,12 @@ class Conn {
       options.cleanStart = clean;
     } else {
       options.clean = clean;
+    }
+    if (TRANSPORT === "tls") {
+      if (CA_FILE) {
+        options.ca = fs.readFileSync(CA_FILE);
+      }
+      options.rejectUnauthorized = true;
     }
     if (username !== "") {
       options.username = username;
@@ -522,6 +534,9 @@ async function checkPayload1mib() {
     }
     if (item.payload.length !== payload.length) {
       throw new Error("1 MiB payload length " + item.payload.length);
+    }
+    if (!item.payload.equals(payload)) {
+      throw new Error("1 MiB payload byte mismatch");
     }
     return "1 MiB payload delivered";
   } finally {

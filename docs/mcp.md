@@ -161,10 +161,9 @@ names the groups with their tool counts.
 One entry per tool, in route-table order within each toolset. The
 `inputSchema` shape is mechanical: path segments become required string
 fields, `query` carries query keys, `body` carries the JSON body and
-`body_base64` carries raw bytes in base64 (use either `body` or
-`body_base64`, never both). Verified examples were captured against a
-running broker with an Administrator API key. The full catalogue with
-one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
+`body_base64` carries raw bytes in base64 (use either `body` or `body_base64`, never both).
+Verified examples were captured against a running broker for 30 tool entries with live examples.
+The full catalogue with one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 
 ### `broker_status`
 
@@ -177,8 +176,14 @@ one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -208,15 +213,21 @@ one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 
 - Toolset: `status`
 - Route: `GET /api/v5/status`
-- Description: `GET /api/v5/status`: node status read. It needs no token, as the (GET /api/v5/status)
+- Description: Node status read. (GET /api/v5/status)
 
 **inputSchema**
 ```json
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -246,15 +257,21 @@ one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 
 - Toolset: `status`
 - Route: `GET /status`
-- Description: `GET /api/v5/status`: node status read. It needs no token, as the (GET /status)
+- Description: Node status read. (GET /status)
 
 **inputSchema**
 ```json
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -289,9 +306,9 @@ one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 ```json
 {
   "type": "object",
-  "properties": {
-
-  }
+  "properties": {},
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -324,8 +341,14 @@ one entry per tool lives in [MCP tools catalogue](./reference/mcp-tools.md).
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -341,12 +364,26 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["as", "who"],
   "properties": {
-    "as": {"type":"string","description":"Value for the :as path segment"},
-    "who": {"type":"string","description":"Value for the :who path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "as": {
+      "type": "string",
+      "description": "Value for the :as path segment."
+    },
+    "who": {
+      "type": "string",
+      "description": "Value for the :who path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "as",
+    "who"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -362,11 +399,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -382,11 +429,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -403,8 +460,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -436,11 +499,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["id"],
   "properties": {
-    "id": {"type":"string","description":"Value for the :id path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "id": {
+      "type": "string",
+      "description": "Value for the :id path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "id"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -457,8 +530,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -491,8 +570,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -524,11 +609,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -544,11 +639,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -564,11 +669,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -584,11 +699,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -604,11 +729,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -625,8 +760,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -643,8 +784,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -677,10 +824,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -696,13 +854,28 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -718,13 +891,28 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -740,13 +928,28 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -762,13 +965,28 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -785,10 +1003,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -804,13 +1033,28 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["clientid"],
   "properties": {
-    "clientid": {"type":"string","description":"Value for the :clientid path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "clientid": {
+      "type": "string",
+      "description": "Value for the :clientid path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [
+    "clientid"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -827,8 +1071,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -861,8 +1111,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -894,11 +1150,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["topic"],
   "properties": {
-    "topic": {"type":"string","description":"Value for the :topic path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "topic": {
+      "type": "string",
+      "description": "Value for the :topic path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "topic"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -915,10 +1181,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -935,10 +1212,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -954,13 +1242,34 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["topic_filter", "qos"],
   "properties": {
-    "topic_filter": {"type":"string","description":"Value for the :topic_filter path segment"},
-    "max_messages": {"type":"string","description":"Value for the :max_messages path segment"},
-    "timeout_seconds": {"type":"string","description":"Value for the :timeout_seconds path segment"},
-    "qos": {"type":"string","description":"Value for the :qos path segment"}
-  }
+    "topic_filter": {
+      "type": "string"
+    },
+    "max_messages": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 10
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30,
+      "default": 5
+    },
+    "qos": {
+      "type": "integer",
+      "enum": [
+        0,
+        1
+      ]
+    }
+  },
+  "required": [
+    "topic_filter",
+    "qos"
+  ]
 }
 ```
 
@@ -977,8 +1286,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -995,8 +1310,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1013,8 +1334,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1031,8 +1358,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1048,11 +1381,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["name"],
   "properties": {
-    "name": {"type":"string","description":"Value for the :name path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "name": {
+      "type": "string",
+      "description": "Value for the :name path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -1069,8 +1412,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1091,7 +1440,7 @@ _No live example captured: this operation requires a path-segment value or a req
 ```
 # HELP indramqtt_messages_received_total Total MQTT ingress messages accepted over BrokerLink.
 # TYPE indramqtt_messages_received_total counter
-indramqtt_messages_received_total 0
+indramqtt_messages_received_total 1
 # HELP indramqtt_messages_forwarded_total Total PublishOut frames admitted into the shard transport mailbox (transport enqueue, not edge arrival; compare with transport_sent).
 # TYPE indramqtt_messages_forwarded_total counter
 indramqtt_messages_forwarded_total 0
@@ -1099,7 +1448,69 @@ indramqtt_messages_forwarded_total 0
 # TYPE indramqtt_messages_dropped_total counter
 indramqtt_messages_dropped_total 0
 # HELP indramqtt_rules_executed_total Total ingress rules whose filter matched.
-... (truncated)
+# TYPE indramqtt_rules_executed_total counter
+indramqtt_rules_executed_total 0
+# HELP indramqtt_connections_active Currently bound edge connections.
+# TYPE indramqtt_connections_active gauge
+indramqtt_connections_active 0
+# HELP indramqtt_unknown_conn_dropped_total Frames routed to a conn_id with no registered mailbox.
+# TYPE indramqtt_unknown_conn_dropped_total counter
+indramqtt_unknown_conn_dropped_total 0
+# HELP indramqtt_dead_mailbox_dropped_total Frames sent into a dead mailbox whose receiver is gone.
+# TYPE indramqtt_dead_mailbox_dropped_total counter
+indramqtt_dead_mailbox_dropped_total 0
+# HELP indramqtt_detached_clean_dropped_total Frames dropped for detached clean sessions.
+# TYPE indramqtt_detached_clean_dropped_total counter
+indramqtt_detached_clean_dropped_total 0
+# HELP indramqtt_offline_queue_evicted_total Offline-queue entries evicted for detached durable sessions.
+# TYPE indramqtt_offline_queue_evicted_total counter
+indramqtt_offline_queue_evicted_total 0
+# HELP indramqtt_inflight_dropped_total QoS 1 downlinks delivered live but untracked for redelivery (per-session inflight window full).
+# TYPE indramqtt_inflight_dropped_total counter
+indramqtt_inflight_dropped_total 0
+# HELP indramqtt_inflight_spilled_total QoS 1 downlinks spilled past the window into the bounded overflow buffer (still tracked for DUP redelivery).
+# TYPE indramqtt_inflight_spilled_total counter
+indramqtt_inflight_spilled_total 0
+# HELP indramqtt_inflight_spill_replayed_total Spilled QoS 1 entries redelivered with DUP set on reconnect replay.
+# TYPE indramqtt_inflight_spill_replayed_total counter
+indramqtt_inflight_spill_replayed_total 0
+# HELP indramqtt_inflight_spill_evicted_total Live QoS 1 deliveries past both window and spill bounds, left untracked.
+# TYPE indramqtt_inflight_spill_evicted_total counter
+indramqtt_inflight_spill_evicted_total 0
+# HELP indramqtt_rule_spill_spilled_total Rule-ingress events appended to the on-disk spill buffer instead of erroring.
+# TYPE indramqtt_rule_spill_spilled_total counter
+indramqtt_rule_spill_spilled_total 0
+# HELP indramqtt_rule_spill_replayed_total Spilled rule-ingress events replayed to the consumer in order.
+# TYPE indramqtt_rule_spill_replayed_total counter
+indramqtt_rule_spill_replayed_total 0
+# HELP indramqtt_rule_spill_dropped_total Rule-ingress overflow events refused (no spill directory, oversize event, disk cap, I/O error).
+# TYPE indramqtt_rule_spill_dropped_total counter
+indramqtt_rule_spill_dropped_total 0
+# HELP indramqtt_rule_spill_torn_total Torn spill tails truncated (plus later segments discarded) on recovery or replay.
+# TYPE indramqtt_rule_spill_torn_total counter
+indramqtt_rule_spill_torn_total 0
+# HELP indramqtt_rule_spill_recovered_total Rule-ingress events found on disk when a spill directory opened.
+# TYPE indramqtt_rule_spill_recovered_total counter
+indramqtt_rule_spill_recovered_total 0
+# HELP indramqtt_tenant_mismatch_dropped_total Fan-out matches excluded by tenant scope.
+# TYPE indramqtt_tenant_mismatch_dropped_total counter
+indramqtt_tenant_mismatch_dropped_total 0
+# HELP indramqtt_transport_sent_total Frames actually written toward the edge by successful transport batch writes.
+# TYPE indramqtt_transport_sent_total counter
+indramqtt_transport_sent_total 0
+# HELP indramqtt_transport_send_failed_total Failed transport batch writes toward the edge.
+# TYPE indramqtt_transport_send_failed_total counter
+indramqtt_transport_send_failed_total 0
+# HELP indramqtt_egress_qos0_shed_total QoS 0 frames shed at route time by the per-connection egress bound.
+# TYPE indramqtt_egress_qos0_shed_total counter
+indramqtt_egress_qos0_shed_total 0
+# HELP indramqtt_puback_deferred_total QoS 1 publishes whose PUBACK is deferred for credit.
+# TYPE indramqtt_puback_deferred_total counter
+indramqtt_puback_deferred_total 0
+# HELP indramqtt_puback_deferred_released_total Deferred PUBACKs released after credit arrived.
+# TYPE indramqtt_puback_deferred_released_total counter
+indramqtt_puback_deferred_released_total 0
+
 ```
 
 ### `get_api_v5_alarms`
@@ -1113,8 +1524,14 @@ indramqtt_messages_dropped_total 0
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1147,8 +1564,14 @@ indramqtt_messages_dropped_total 0
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1167,8 +1590,7 @@ indramqtt_messages_dropped_total 0
 
 **Output**
 ```
-{"bytes.received":0,"bytes.sent":0,"packets.received":0,"packets.sent":0,"packets.connect.received":0,"packets.connack.sent":0,"packets.connack.error":0,"packets.connack.auth_error":0,"packets.publish.received":0,"packets.publish.sent":0,"packets.subscribe.received":0,"packets.suback.sent":0,"packets.pingreq.received":0,"packets.pingresp.sent":0,"messages.received":0,"messages.sent":0,"messages.dropped":0,"messages.delivered":0,"messages.delayed":0,"messages.qos0.received":0,"messages.qos1.received":0,"messages.qos2.received":0,"delivery.dropped":0,"delivery.dropped.no_subscribers":0,"delivery.dropped.qos0_msg":0,"delivery.dropped.queue_full":0,"client.connect":0,"client.connack":0,"client.c
-... (truncated)
+{"bytes.received":0,"bytes.sent":0,"packets.received":1,"packets.sent":0,"packets.connect.received":0,"packets.connack.sent":0,"packets.connack.error":0,"packets.connack.auth_error":0,"packets.publish.received":1,"packets.publish.sent":0,"packets.subscribe.received":0,"packets.suback.sent":0,"packets.pingreq.received":0,"packets.pingresp.sent":0,"messages.received":1,"messages.sent":0,"messages.dropped":0,"messages.delivered":0,"messages.delayed":0,"messages.qos0.received":1,"messages.qos1.received":0,"messages.qos2.received":0,"delivery.dropped":0,"delivery.dropped.no_subscribers":0,"delivery.dropped.qos0_msg":0,"delivery.dropped.queue_full":0,"client.connect":0,"client.connack":0,"client.connected":0,"client.subscribe":0,"rules.matched":0,"actions.executed":0,"messages.transformation_succeeded":0,"messages.transformation_failed":0}
 ```
 
 ### `get_api_v5_monitor`
@@ -1182,8 +1604,14 @@ indramqtt_messages_dropped_total 0
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1202,8 +1630,7 @@ indramqtt_messages_dropped_total 0
 
 **Output**
 ```
-[{"time_stamp":1794824957,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824967,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824977,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824987,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794824997,"connections":0,"live_
-... (truncated)
+[{"time_stamp":1794834153,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794834163,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":0,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794834173,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":1,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794834183,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":1,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"},{"time_stamp":1794834193,"connections":0,"live_connections":0,"topics":0,"subscriptions":0,"received":1,"sent":0,"dropped":0,"rules_matched":0,"tenant":"default"}]
 ```
 
 ### `get_api_v5_monitor_current`
@@ -1217,8 +1644,14 @@ indramqtt_messages_dropped_total 0
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1250,11 +1683,21 @@ indramqtt_messages_dropped_total 0
 ```json
 {
   "type": "object",
-  "required": ["node"],
   "properties": {
-    "node": {"type":"string","description":"Value for the :node path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "node": {
+      "type": "string",
+      "description": "Value for the :node path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "node"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -1270,11 +1713,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["node"],
   "properties": {
-    "node": {"type":"string","description":"Value for the :node path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "node": {
+      "type": "string",
+      "description": "Value for the :node path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "node"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -1291,8 +1744,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1325,8 +1784,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1361,8 +1826,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_prometheus_data_integration`
@@ -1376,8 +1931,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1412,8 +1973,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_prometheus_message_transformation`
@@ -1427,8 +2078,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1463,8 +2120,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_prometheus_namespaced_stats`
@@ -1478,8 +2225,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1514,8 +2267,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_prometheus_schema_validation`
@@ -1529,8 +2372,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1565,8 +2414,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_prometheus_stats`
@@ -1580,8 +2519,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1616,8 +2561,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_prometheus_topic_metrics`
@@ -1631,8 +2666,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1667,8 +2708,98 @@ indramqtt_client_connected_total 0
 # TYPE indramqtt_client_subscribe_total counter
 indramqtt_client_subscribe_total 0
 # TYPE indramqtt_delivery_dropped_total counter
-indramqtt_delivery_dropp
-... (truncated)
+indramqtt_delivery_dropped_total 0
+# TYPE indramqtt_delivery_dropped_no_subscribers_total counter
+indramqtt_delivery_dropped_no_subscribers_total 0
+# TYPE indramqtt_delivery_dropped_qos0_msg_total counter
+indramqtt_delivery_dropped_qos0_msg_total 0
+# TYPE indramqtt_delivery_dropped_queue_full_total counter
+indramqtt_delivery_dropped_queue_full_total 0
+# TYPE indramqtt_messages_delayed_total counter
+indramqtt_messages_delayed_total 0
+# TYPE indramqtt_messages_delivered_total counter
+indramqtt_messages_delivered_total 0
+# TYPE indramqtt_messages_dropped_total counter
+indramqtt_messages_dropped_total 0
+# TYPE indramqtt_messages_qos0_received_total counter
+indramqtt_messages_qos0_received_total 1
+# TYPE indramqtt_messages_qos1_received_total counter
+indramqtt_messages_qos1_received_total 0
+# TYPE indramqtt_messages_qos2_received_total counter
+indramqtt_messages_qos2_received_total 0
+# TYPE indramqtt_messages_received_total counter
+indramqtt_messages_received_total 1
+# TYPE indramqtt_messages_sent_total counter
+indramqtt_messages_sent_total 0
+# TYPE indramqtt_messages_transformation_failed_total counter
+indramqtt_messages_transformation_failed_total 0
+# TYPE indramqtt_messages_transformation_succeeded_total counter
+indramqtt_messages_transformation_succeeded_total 0
+# TYPE indramqtt_packets_connack_auth_error_total counter
+indramqtt_packets_connack_auth_error_total 0
+# TYPE indramqtt_packets_connack_error_total counter
+indramqtt_packets_connack_error_total 0
+# TYPE indramqtt_packets_connack_sent_total counter
+indramqtt_packets_connack_sent_total 0
+# TYPE indramqtt_packets_connect_received_total counter
+indramqtt_packets_connect_received_total 0
+# TYPE indramqtt_packets_pingreq_received_total counter
+indramqtt_packets_pingreq_received_total 0
+# TYPE indramqtt_packets_pingresp_sent_total counter
+indramqtt_packets_pingresp_sent_total 0
+# TYPE indramqtt_packets_publish_received_total counter
+indramqtt_packets_publish_received_total 1
+# TYPE indramqtt_packets_publish_sent_total counter
+indramqtt_packets_publish_sent_total 0
+# TYPE indramqtt_packets_received_total counter
+indramqtt_packets_received_total 1
+# TYPE indramqtt_packets_sent_total counter
+indramqtt_packets_sent_total 0
+# TYPE indramqtt_packets_suback_sent_total counter
+indramqtt_packets_suback_sent_total 0
+# TYPE indramqtt_packets_subscribe_received_total counter
+indramqtt_packets_subscribe_received_total 0
+# TYPE indramqtt_rules_matched_total counter
+indramqtt_rules_matched_total 0
+# TYPE indramqtt_channels_count gauge
+indramqtt_channels_count 0
+# TYPE indramqtt_channels_max gauge
+indramqtt_channels_max 0
+# TYPE indramqtt_cluster_sessions_count gauge
+indramqtt_cluster_sessions_count 0
+# TYPE indramqtt_cluster_sessions_max gauge
+indramqtt_cluster_sessions_max 0
+# TYPE indramqtt_connections_count gauge
+indramqtt_connections_count 0
+# TYPE indramqtt_connections_max gauge
+indramqtt_connections_max 0
+# TYPE indramqtt_delayed_count gauge
+indramqtt_delayed_count 0
+# TYPE indramqtt_live_connections_count gauge
+indramqtt_live_connections_count 0
+# TYPE indramqtt_live_connections_max gauge
+indramqtt_live_connections_max 0
+# TYPE indramqtt_retained_count gauge
+indramqtt_retained_count 1
+# TYPE indramqtt_retained_max gauge
+indramqtt_retained_max 1
+# TYPE indramqtt_sessions_count gauge
+indramqtt_sessions_count 0
+# TYPE indramqtt_sessions_max gauge
+indramqtt_sessions_max 0
+# TYPE indramqtt_suboptions_count gauge
+indramqtt_suboptions_count 0
+# TYPE indramqtt_suboptions_max gauge
+indramqtt_suboptions_max 0
+# TYPE indramqtt_subscriptions_count gauge
+indramqtt_subscriptions_count 0
+# TYPE indramqtt_subscriptions_max gauge
+indramqtt_subscriptions_max 0
+# TYPE indramqtt_topics_count gauge
+indramqtt_topics_count 0
+# TYPE indramqtt_topics_max gauge
+indramqtt_topics_max 0
+
 ```
 
 ### `get_api_v5_slow_subscriptions`
@@ -1682,8 +2813,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1716,8 +2853,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1750,8 +2893,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1784,8 +2933,14 @@ indramqtt_delivery_dropp
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1818,8 +2973,14 @@ NOT_FOUND: telemetry is currently not enabled
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1852,8 +3013,14 @@ NOT_FOUND: telemetry is currently not enabled
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1885,11 +3052,21 @@ NOT_FOUND: telemetry is currently not enabled
 ```json
 {
   "type": "object",
-  "required": ["name"],
   "properties": {
-    "name": {"type":"string","description":"Value for the :name path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "name": {
+      "type": "string",
+      "description": "Value for the :name path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -1905,11 +3082,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["name"],
   "properties": {
-    "name": {"type":"string","description":"Value for the :name path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "name": {
+      "type": "string",
+      "description": "Value for the :name path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -1925,11 +3112,21 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["name"],
   "properties": {
-    "name": {"type":"string","description":"Value for the :name path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "name": {
+      "type": "string",
+      "description": "Value for the :name path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -1946,8 +3143,14 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -1980,10 +3183,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -2000,10 +3214,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -2020,10 +3245,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -2040,10 +3276,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -2060,10 +3307,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 
@@ -2079,13 +3337,28 @@ _No live example captured: this operation requires a path-segment value or a req
 ```json
 {
   "type": "object",
-  "required": ["name"],
   "properties": {
-    "name": {"type":"string","description":"Value for the :name path segment"},
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "name": {
+      "type": "string",
+      "description": "Value for the :name path segment."
+    },
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false
 }
 ```
 
@@ -2102,10 +3375,21 @@ _No live example captured: this operation requires a path-segment value or a req
 {
   "type": "object",
   "properties": {
-    "query": {"type":"object","description":"Query keys of the operation"},
-    "body": {"description":"Body of the operation"},
-    "body_base64": {"description":"Body of the operation"}
-  }
+    "query": {
+      "type": "object",
+      "description": "Query keys of the operation. Omit keys the call does not need.",
+      "additionalProperties": true
+    },
+    "body": {
+      "description": "JSON body of the operation, exactly as the HTTP route takes it."
+    },
+    "body_base64": {
+      "type": "string",
+      "description": "Raw body bytes in base64 for file operations. Use either body or body_base64, never both."
+    }
+  },
+  "required": [],
+  "additionalProperties": false
 }
 ```
 

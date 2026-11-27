@@ -402,6 +402,7 @@ impl AuthnChain {
             }
             let mut next = Vec::with_capacity(current.len());
             for id in &ids {
+                // INVARIANT: every identifier exists in current chain after validation.
                 let entry = current
                     .iter()
                     .find(|e| &e.id == id)

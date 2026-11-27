@@ -133,6 +133,12 @@ ok
 - `message.value` supports only the whole message. A custom value is refused.
 - Producer buffer tuning belongs to `resource_opts`. A present value is refused.
 
+## Other names
+
+This connector is also known as `kafka_producer` and `kafka_consumer`. Old links to `/connectors/kafka_producer/` and `/connectors/kafka_consumer/` redirect here.
+
+The `kafka_producer` name serves egress actions. The `kafka_consumer` name serves ingress sources. Both use the Kafka cluster configuration documented on this page.
+
 ## Next steps
 
 - Feed the action from a rule in [Actions](../rules/actions.md).

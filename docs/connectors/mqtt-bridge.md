@@ -130,6 +130,12 @@ ok
 - A `qos` outside 0-2 is refused with 400.
 - `mqtts://` addresses fail closed until a TLS backend lands. Use plain TCP today.
 
+## Other names
+
+This connector is also known as `mqtt`, `bridge`, and `mqtt_bridge`. Old links to `/connectors/mqtt/` redirect here.
+
+The v5 route accepts connector type `mqtt`. The v1 route accepts `mqtt_bridge`. Both routes map to this bridge runtime.
+
 ## Next steps
 
 - Feed the action from a rule in [Actions](../rules/actions.md).

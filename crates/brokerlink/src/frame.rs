@@ -59,6 +59,7 @@ impl BrokerFrame {
             Bytes::new(),
             Bytes::new(),
         )
+        // INVARIANT: Ping frame has zero-length metadata and payload, always within frame size limits.
         .expect("Ping frame within size bounds")
     }
 
@@ -70,6 +71,7 @@ impl BrokerFrame {
             Bytes::new(),
             Bytes::new(),
         )
+        // INVARIANT: Pong frame has zero-length metadata and payload, always within frame size limits.
         .expect("Pong frame within size bounds")
     }
 

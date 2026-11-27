@@ -17,6 +17,7 @@ flowchart TD
     Auth -- "example" --> Builtin["authentication-builtin.md"]
     Auth -- "example" --> Jwt["authentication-jwt.md"]
     Sec -- "allow" --> Authz["authorization.md"]
+    Sec -- "renew" --> Reauth["re-authentication.md"]
     Sec -- "operate" --> Mgmt["management-access.md"]
     Sec -- "review" --> Audit["audit-log.md"]
 ```
@@ -120,3 +121,4 @@ PY
 - Guard listeners with [TLS](./tls.md).
 - Add users with [Authentication](./authentication.md).
 - Grant topics with [Authorization](./authorization.md).
+- Renew live credentials with [Re-authentication](./re-authentication.md).

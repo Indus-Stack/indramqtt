@@ -177,9 +177,15 @@ ok
 - The connector runs behind the rule engine bounded queue. A slow endpoint sheds load; it never stalls publishers.
 - The tier is enterprise. The kind needs the `azure_eventhubs` feature build.
 
+## Other names
+
+This connector is also known as `azure-event-hubs`, `azure_event_hub_producer`, `azure`, and `eventhubs`. Old links to `/connectors/azure-event-hubs/` and `/connectors/azure_event_hub_producer/` redirect here.
+
+The producer name `azure_event_hub_producer` is accepted on the v5 route. The v5 route maps `azure_event_hub_producer` to this runtime. The v5 route accepts standard producer settings and applies fixed defaults for batch size and backoff.
+
 ## Next steps
 
-- Use the producer name on the v5 route in [Azure Event Hub Producer](./azure_event_hub_producer.md).
+- Use the producer name on the v5 route in [Azure Event Hub Producer](#other-names).
 - Feed the connector from a rule in [Actions](../rules/actions.md).
 - See every kind in [Connectors](./index.md).
 

@@ -125,6 +125,10 @@ hello-listeners
 - An empty client id needs clean start. Without it the broker refuses the CONNECT (3.1.1 code 2, v5 code 0x85).
 - A protocol error after CONNECT ends only that connection. A v5 client gets DISCONNECT 0x82 first.
 - A secure listener without certificate files refuses startup. It logs the missing setting.
+- The `/ws/mqtt` bridge caps buffered incoming WebSocket binary data at 65536 bytes before CONNECT authentication completes. The server closes unauthenticated connections that exceed this limit.
+- After CONNECT succeeds, the buffer limit tracks `session.max_packet_size` up to the broker maximum of 268435460 bytes.
+- The server validates the HTTP Origin header before WebSocket upgrade on `/ws/mqtt`. When present, the Origin host and port must match the Host header. Mismatched requests receive HTTP 403 Forbidden. The bridge permits absent Origin headers.
+- The `/ws/mqtt` bridge supports MQTT 3.1.1 only. Rejected CONNECT packets return CONNACK code 0x04 for bad credentials and 0x05 for unauthorized clients. Subscriptions that exceed quota return SUBACK code 0x80.
 
 ## Next steps
 

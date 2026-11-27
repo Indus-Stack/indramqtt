@@ -172,6 +172,12 @@ ok
 - The buffer holds at most `buffer_capacity` rows. A full buffer returns a connection error. The connector runs behind the rule engine bounded queue, so a slow hub never stalls publishers.
 - The tier is enterprise. The kind needs the `azure_iot` feature build.
 
+## Other names
+
+This connector is also known as `azure-iot`, `azure_iot_hub`, `azure_iothub`, and `iothub`. The alias `azure-iot` redirects to this page.
+
+This kind is pending under ticket SB-11. The broker refuses connector and action create and update with `400 BAD_REQUEST`.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

@@ -1,0 +1,187 @@
+/* Collapsible sidebars and conditional page panel styles (DS-02). */
+
+/* Fixed controls bar over the header */
+.indra-panel-controls {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--sl-nav-height, 3.5rem);
+  pointer-events: none;
+  z-index: calc(var(--sl-z-index-navbar, 10) + 5);
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 0 0.75rem;
+}
+
+/* Sidebar header inside left sidebar (DS-05) */
+.indra-sidebar-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 0.25rem 0.5rem 0.5rem;
+}
+
+/* Button styles and focus ring */
+.indra-toggle-btn {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.375rem;
+  color: var(--sl-color-gray-3);
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.indra-toggle-btn:hover {
+  background-color: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+}
+
+.indra-toggle-btn:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+}
+
+.indra-toggle-sidebar {
+  display: none;
+  margin-right: auto;
+}
+
+.indra-toggle-toc {
+  display: none;
+  margin-left: auto;
+}
+
+#starlight__toc {
+  display: contents;
+}
+
+/* Left sidebar controls (screens 1024 px wide or more) */
+@media (min-width: 1024px) {
+  .indra-toggle-sidebar {
+    display: inline-flex;
+  }
+
+  /* When sidebar is closed: move header content right by width of button */
+  html[data-has-sidebar][data-sidebar='closed'] .header .title-wrapper {
+    margin-inline-start: 2.5rem;
+  }
+
+  html[data-sidebar='closed'] #starlight__sidebar,
+  html[data-sidebar='closed'] .sidebar-pane {
+    visibility: hidden !important;
+    border: none !important;
+    width: 0 !important;
+    background: transparent !important;
+  }
+
+  html[data-sidebar='closed'] .sidebar-content > :not(.indra-sidebar-header) {
+    display: none !important;
+  }
+
+  html[data-sidebar='closed'] .indra-sidebar-header {
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  html[data-sidebar='closed'] .indra-toggle-sidebar {
+    visibility: visible !important;
+    position: fixed;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: calc(var(--sl-z-index-navbar, 10) + 5);
+  }
+
+  html[data-sidebar='closed'] {
+    --sl-sidebar-width: 0rem !important;
+    --sl-content-inline-start: 0rem !important;
+    --sl-content-width: 67.5rem !important;
+  }
+
+  html[data-sidebar='closed'] .main-frame {
+    padding-inline-start: 0 !important;
+  }
+
+  html[data-sidebar='closed'] .main-pane {
+    --sl-content-margin-inline: auto !important;
+  }
+}
+
+/* Page panel under 1280 px: panel is "On this page" drop-down */
+@media (max-width: 1279px) {
+  .right-sidebar-panel {
+    display: none !important;
+  }
+
+  .right-sidebar-container {
+    display: none !important;
+  }
+
+  .lg\:sl-hidden {
+    display: block !important;
+  }
+}
+
+/* Page panel at 1280 px wide or more */
+@media (min-width: 1280px) {
+  .indra-toggle-toc {
+    display: inline-flex;
+  }
+
+  :global([data-has-toc]) .header {
+    padding-inline-end: 2.75rem;
+  }
+
+  .right-sidebar-panel {
+    display: block !important;
+  }
+
+  .lg\:sl-hidden {
+    display: none !important;
+  }
+
+  html[data-toc='closed'] .right-sidebar-container,
+  html[data-toc='closed'] .right-sidebar,
+  html[data-toc='closed'] #starlight__toc,
+  html[data-toc='closed'] .right-sidebar-panel {
+    display: none !important;
+  }
+
+  html[data-toc='closed'] .main-pane {
+    width: 100% !important;
+    max-width: 100% !important;
+    --sl-content-margin-inline: auto !important;
+  }
+}
+
+/* When right-sidebar has no TOC (e.g. fewer than 3 headings) */
+.right-sidebar-container:not(:has(starlight-toc)),
+.right-sidebar:not(:has(starlight-toc)) {
+  display: none !important;
+}
+
+.right-sidebar-container:not(:has(starlight-toc)) ~ .main-pane {
+  width: 100% !important;
+  max-width: 100% !important;
+  --sl-content-margin-inline: auto !important;
+}
+
+/* Adjust padding-top on mobile when there is no mobile TOC */
+body:not(:has(mobile-starlight-toc)) .main-frame,
+html:not(:has(mobile-starlight-toc)) .main-frame {
+  padding-top: var(--sl-nav-height) !important;
+}
+
+/* Ensure closed sidebar details hide their contents */
+details:not([open]) > :not(summary) {
+  display: none !important;
+}
+

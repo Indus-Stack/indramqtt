@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock;
 
+use crate::admin_users::RecoverGuard;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
@@ -104,7 +105,7 @@ impl SlowSubsStore {
         let clientid = truncate(clientid.trim(), MAX_CLIENTID_LEN).to_string();
         let topic = truncate(topic.trim(), MAX_TOPIC_LEN).to_string();
         let key = (clientid.clone(), topic.clone());
-        let mut map = self.inner.write().expect("slow-subs store lock");
+        let mut map = self.inner.write().recover("slow-subs store lock");
         if let Some(existing) = map.get(&key) {
             if timespan <= existing.timespan {
                 return existing.clone();
@@ -145,7 +146,7 @@ impl SlowSubsStore {
     /// Snapshot of stored records sorted by `timespan` descending (slowest
     /// first), ties broken by `clientid` then `topic` for stable pages.
     pub fn list(&self) -> Vec<SlowSubEntry> {
-        let map = self.inner.read().expect("slow-subs store lock");
+        let map = self.inner.read().recover("slow-subs store lock");
         let mut out: Vec<SlowSubEntry> = map.values().cloned().collect();
         out.sort_by(|a, b| {
             b.timespan
@@ -159,7 +160,7 @@ impl SlowSubsStore {
     /// Drop every stored record. Always succeeds, even when nothing is
     /// stored.
     pub fn clear(&self) {
-        self.inner.write().expect("slow-subs store lock").clear();
+        self.inner.write().recover("slow-subs store lock").clear();
     }
 
     /// Number of stored records (never above [`MAX_SLOW_SUBSCRIPTIONS`]).
@@ -175,7 +176,7 @@ impl SlowSubsStore {
         if expire_ms == 0 {
             return;
         }
-        let mut map = self.inner.write().expect("slow-subs store lock");
+        let mut map = self.inner.write().recover("slow-subs store lock");
         map.retain(|_, entry| now_ms.saturating_sub(entry.last_update_time) < expire_ms);
     }
 
@@ -183,7 +184,7 @@ impl SlowSubsStore {
     /// Used by the kernel recorder so the configured `top_k_num` is
     /// honoured outside the API crate.
     pub fn truncate_to(&self, max: usize) {
-        let mut map = self.inner.write().expect("slow-subs store lock");
+        let mut map = self.inner.write().recover("slow-subs store lock");
         if map.len() <= max {
             return;
         }
@@ -204,6 +205,15 @@ impl SlowSubsStore {
         for (key, _) in ordered.into_iter().take(drop_count) {
             map.remove(&key);
         }
+    }
+
+    /// Poison the inner lock on purpose for recovery tests.
+    pub fn poison_for_test(&self) {
+        let _guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        panic!("poison slow subs store lock");
     }
 }
 
@@ -388,7 +398,7 @@ impl SlowSubsSettingsStore {
 
     /// Snapshot the current thresholds.
     pub fn get(&self) -> SlowSubsSettings {
-        self.inner.read().expect("slow-subs settings lock").clone()
+        self.inner.read().recover("slow-subs settings lock").clone()
     }
 
     /// Replace the thresholds after full validation. The caller validates
@@ -401,7 +411,7 @@ impl SlowSubsSettingsStore {
         let expire_interval_ms = parse_duration_to_ms(&next.expire_interval)
             .unwrap_or_else(|| self.expire_interval_ms.load(Ordering::Relaxed));
         let stats_type_code = slow_stats_type_to_code(&next.stats_type);
-        *self.inner.write().expect("slow-subs settings lock") = next;
+        *self.inner.write().recover("slow-subs settings lock") = next;
         self.threshold_ms.store(threshold_ms, Ordering::Relaxed);
         self.enabled.store(enabled, Ordering::Relaxed);
         self.top_k_num.store(top_k_num, Ordering::Relaxed);
@@ -459,7 +469,7 @@ impl SlowSubsSettingsStore {
     /// trip. Keeps the validated struct and the fast-path atomic in sync.
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
-        self.inner.write().expect("slow-subs settings lock").enable = enabled;
+        self.inner.write().recover("slow-subs settings lock").enable = enabled;
     }
 
     /// Test/kernel hook to set `threshold` without a management PUT round
@@ -473,9 +483,18 @@ impl SlowSubsSettingsStore {
         self.threshold_ms.store(millis, Ordering::Relaxed);
         self.inner
             .write()
-            .expect("slow-subs settings lock")
+            .recover("slow-subs settings lock")
             .threshold = threshold.to_string();
         true
+    }
+
+    /// Poison the inner lock on purpose for recovery tests.
+    pub fn poison_for_test(&self) {
+        let _guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        panic!("poison slow subs settings lock");
     }
 }
 

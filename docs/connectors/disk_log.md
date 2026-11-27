@@ -198,6 +198,12 @@ disk_log
 - The connector runs behind the rule engine bounded queue. A slow disk never stalls publishers.
 - The tier is community. The kind ships in the default build.
 
+## Other names
+
+This connector is also known as `disk-log`, `disk`, and `disklog`. The alias `disk-log` redirects to this page.
+
+The connector writes rotating log files inside the data directory. Absolute paths, `..` components, and symlinks are refused.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).

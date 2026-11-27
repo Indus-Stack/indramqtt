@@ -422,6 +422,12 @@ ok
 - A throttled write retries with backoff. Rejected records requeue by index.
 - An empty measure set stops the batch with a failure.
 
+## Other names
+
+This connector is also known as `aws_timestream` and `ts`. Old links to `/connectors/aws_timestream/` redirect here.
+
+The v1 route accepts `timestream`, `ts`, and `aws_timestream`. The v5 route accepts `timestream` and `aws_timestream`.
+
 ## Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).
@@ -704,7 +710,7 @@ delivered
 ### Next steps
 
 - Feed the connector from a rule in [Actions](../rules/actions.md).
-- See the long name in [AWS Timestream](./aws_timestream.md).
+- See the long name in [AWS Timestream](#other-names).
 - See every kind in [Connectors](./index.md).
 
 ## Known limits in this release

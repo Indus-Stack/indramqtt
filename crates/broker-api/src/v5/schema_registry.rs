@@ -30,6 +30,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::admin_users::RecoverGuard;
 use crate::errors::ApiError;
 use crate::ApiState;
 
@@ -115,7 +116,7 @@ impl SchemaRegistryStore {
     pub fn from_registry(registry: &Arc<broker_config::ConfigRegistry>) -> Self {
         let store = Self::new();
         store.seed_from_snapshot(&registry.snapshot().schemas);
-        *store.registry.write().expect("schema store lock") = Some(Arc::clone(registry));
+        *store.registry.write().recover("schema store lock") = Some(Arc::clone(registry));
         store
     }
 
@@ -123,11 +124,11 @@ impl SchemaRegistryStore {
     /// Kernel boot path on the shared instance.
     pub fn seed_from_registry(&self, registry: &Arc<broker_config::ConfigRegistry>) {
         self.seed_from_snapshot(&registry.snapshot().schemas);
-        *self.registry.write().expect("schema store lock") = Some(Arc::clone(registry));
+        *self.registry.write().recover("schema store lock") = Some(Arc::clone(registry));
     }
 
     fn seed_from_snapshot(&self, conf: &broker_config::SchemasConf) {
-        let mut map = self.inner.write().expect("schema store lock");
+        let mut map = self.inner.write().recover("schema store lock");
         map.clear();
         for entry in &conf.schemas {
             // Protobuf stores raw text. It is not JSON. The other
@@ -169,7 +170,7 @@ impl SchemaRegistryStore {
 
     /// Snapshot of live entries sorted by name for stable reads.
     pub fn snapshot(&self) -> Vec<SchemaRecord> {
-        let map = self.inner.read().expect("schema store lock");
+        let map = self.inner.read().recover("schema store lock");
         let mut out: Vec<SchemaRecord> = map.values().cloned().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -179,14 +180,14 @@ impl SchemaRegistryStore {
     pub fn get(&self, name: &str) -> Option<SchemaRecord> {
         self.inner
             .read()
-            .expect("schema store lock")
+            .recover("schema store lock")
             .get(name)
             .cloned()
     }
 
     /// Insert one entry. Fails on duplicate or full store.
     pub fn insert(&self, entry: SchemaRecord) -> Result<SchemaRecord, SchemaInsertError> {
-        let mut map = self.inner.write().expect("schema store lock");
+        let mut map = self.inner.write().recover("schema store lock");
         if map.contains_key(&entry.name) {
             return Err(SchemaInsertError::Duplicate);
         }
@@ -201,7 +202,7 @@ impl SchemaRegistryStore {
     pub fn remove(&self, name: &str) -> bool {
         self.inner
             .write()
-            .expect("schema store lock")
+            .recover("schema store lock")
             .remove(name)
             .is_some()
     }
@@ -211,7 +212,7 @@ impl SchemaRegistryStore {
     /// stores raw text, so it persists verbatim and survives a restart
     /// without added quoting.
     fn export_conf(&self) -> broker_config::SchemasConf {
-        let map = self.inner.read().expect("schema store lock");
+        let map = self.inner.read().recover("schema store lock");
         let mut entries: Vec<broker_config::SchemaEntry> = map
             .values()
             .map(|record| {
@@ -236,15 +237,24 @@ impl SchemaRegistryStore {
     /// Commit the exported root and save it. Failures surface as 500.
     /// Stores without a registry stay memory only.
     fn persist(&self) -> Result<(), broker_config::ConfigError> {
-        let registry = self.registry.read().expect("schema store lock").clone();
+        let registry = self.registry.read().recover("schema store lock").clone();
         let Some(registry) = registry else {
             return Ok(());
         };
-        let _guard = self.save_lock.lock().expect("schema store lock");
+        let _guard = self.save_lock.lock().recover("schema store lock");
         let conf = self.export_conf();
         registry.commit_schemas(conf)?;
         registry.save()?;
         Ok(())
+    }
+
+    /// Poison the inner lock on purpose for recovery tests.
+    pub fn poison_for_test(&self) {
+        let _guard = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        panic!("poison schema registry lock");
     }
 }
 

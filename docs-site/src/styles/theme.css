@@ -1,0 +1,236 @@
+/* Brand theme for the documentation site (DS-01, D1). */
+
+:root {
+  /* Dark mode colours (default) */
+  --sl-color-accent: #00D8F6;
+  --sl-color-accent-high: #67E8F9;
+  --sl-color-accent-hover: #67E8F9;
+  --sl-color-accent-low: #083344;
+
+  --sl-color-black: #18181B;
+  --sl-color-gray-7: #09090B;
+  --sl-color-gray-6: #27272A;
+  --sl-color-gray-5: #3F3F46;
+  --sl-color-gray-4: #71717A;
+  --sl-color-gray-3: #D4D4D8;
+  --sl-color-gray-2: #F4F4F5;
+  --sl-color-gray-1: #FAFAFA;
+  --sl-color-white: #FFFFFF;
+
+  --sl-color-bg: #18181B;
+  --sl-color-bg-nav: #09090B;
+  --sl-color-bg-sidebar: #09090B;
+  --sl-color-bg-inline-code: #27272A;
+  --sl-color-bg-accent: #00D8F6;
+
+  --sl-color-text: #F4F4F5;
+  --sl-color-text-accent: #00D8F6;
+  --sl-color-text-invert: #18181B;
+
+  --sl-color-hairline-shade: #09090B;
+  --sl-color-hairline: #27272A;
+  --sl-color-hairline-light: #3F3F46;
+
+  /* Layout and typography */
+  --sl-content-width: 45rem;
+  --sl-text-base: 1rem;
+  --sl-line-height: 1.6;
+}
+
+:root[data-theme='light'],
+[data-theme='light'] ::backdrop {
+  /* Light mode colours */
+  --sl-color-accent: #0E7490;
+  --sl-color-accent-high: #155E75;
+  --sl-color-accent-hover: #155E75;
+  --sl-color-accent-low: #ECFEFF;
+
+  --sl-color-black: #FFFFFF;
+  --sl-color-gray-7: #F4F4F5;
+  --sl-color-gray-6: #E4E4E7;
+  --sl-color-gray-5: #D4D4D8;
+  --sl-color-gray-4: #71717A;
+  --sl-color-gray-3: #3F3F46;
+  --sl-color-gray-2: #18181B;
+  --sl-color-gray-1: #09090B;
+  --sl-color-white: #09090B;
+
+  --sl-color-bg: #FFFFFF;
+  --sl-color-bg-nav: #FAFAFA;
+  --sl-color-bg-sidebar: #FAFAFA;
+  --sl-color-bg-inline-code: #F4F4F5;
+  --sl-color-bg-accent: #0E7490;
+
+  --sl-color-text: #18181B;
+  --sl-color-text-accent: #0E7490;
+  --sl-color-text-invert: #FFFFFF;
+
+  --sl-color-hairline-shade: #E4E4E7;
+  --sl-color-hairline: #E4E4E7;
+  --sl-color-hairline-light: #F4F4F5;
+}
+
+/* Base typography */
+body {
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.sl-markdown-content {
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.sl-markdown-content p,
+.sl-markdown-content li {
+  max-width: 45rem;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+/* Links */
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--sl-color-text-accent);
+}
+
+.sl-markdown-content a:hover:not(:where(.not-content *)) {
+  color: var(--sl-color-accent-hover);
+}
+
+/* Primary button */
+.sl-link-button.primary {
+  background-color: var(--sl-color-accent);
+  border-color: var(--sl-color-accent);
+  color: var(--sl-color-text-invert);
+}
+
+.sl-link-button.primary:hover {
+  background-color: var(--sl-color-accent-hover);
+  border-color: var(--sl-color-accent-hover);
+  color: var(--sl-color-text-invert);
+}
+
+/* Active sidebar item */
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) a[aria-current='page'],
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) a[aria-current='page']:hover,
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) a[aria-current='page']:focus {
+  background-color: var(--sl-color-accent);
+  color: var(--sl-color-text-invert);
+  font-weight: 600;
+}
+
+/* Box scroll for tables and code blocks */
+.sl-markdown-content table:not(:where(.not-content *)) {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-spacing: 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sl-markdown-content pre,
+.expressive-code {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Prevent viewport horizontal scroll */
+html,
+body {
+  overflow-x: hidden;
+}
+
+/* Mermaid diagrams */
+pre.mermaid,
+.mermaid {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-inline: auto;
+  max-width: 100%;
+  overflow-x: auto;
+  background-color: transparent !important;
+}
+
+pre.mermaid svg,
+.mermaid svg {
+  display: block;
+  margin-inline: auto;
+  max-width: 100%;
+  height: auto;
+}
+
+/* Limit diagram height on desktop screens (1024 px or more) */
+@media (min-width: 1024px) {
+  pre.mermaid svg,
+  .mermaid svg {
+    max-height: 420px;
+  }
+}
+
+/* Header search box centred and at least 320 px wide on screens 1024 px or more */
+@media (min-width: 1024px) {
+  .header > :nth-child(2) {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+  }
+
+  site-search {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin-inline: auto;
+    min-width: 320px;
+    max-width: 28rem;
+    width: 100%;
+  }
+
+  site-search button[data-open-modal] {
+    min-width: 320px;
+    width: 100%;
+    max-width: 100%;
+    justify-content: space-between;
+  }
+}
+
+/* Sub-group labels in left sidebar (DS-05, item 2) */
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) details details summary .large,
+:is(.sidebar-content, #starlight__sidebar, nav[aria-label="Main"]) ul:not(.top-level) summary .large {
+  font-weight: 500 !important;
+  font-size: 0.9375rem !important;
+}
+
+/* Muted connector cards for 'Not in this build' (DS-05, item 4) */
+.connector-card.muted .card-inner {
+  background-color: var(--sl-color-gray-7) !important;
+  border-color: var(--sl-color-hairline-shade) !important;
+}
+
+.connector-card.muted .card-title {
+  color: var(--sl-color-gray-3) !important;
+}
+
+.connector-card.muted .card-description {
+  color: var(--sl-color-gray-3) !important;
+}
+
+.connector-card.muted:hover .card-inner {
+  border-color: var(--sl-color-gray-5) !important;
+}
+
+/* Home hero spacing (DS-05, item 5: at most 48 px space between hero buttons and install box) */
+@media (min-width: 50rem) {
+  .hero {
+    padding-block-end: 0.5rem !important;
+  }
+}
+
+.home-sections {
+  margin-top: 0 !important;
+}
+
+.home-install-box {
+  margin-top: 1rem !important;
+}

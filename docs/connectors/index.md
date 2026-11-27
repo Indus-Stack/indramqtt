@@ -95,7 +95,7 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | Page | System |
 |---|---|
 | [Kafka](./kafka.md) | Event streaming. |
-| [PostgreSQL](./postgres.md) | Relational rows. |
+| [PostgreSQL](./pgsql.md) | Relational rows. |
 | [MySQL](./mysql.md) | Relational rows. |
 | [MongoDB](./mongodb.md) | Documents. |
 | [Couchbase](./couchbase.md) | Document statements. |
@@ -123,17 +123,17 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [AlloyDB](./alloydb.md) | Relational rows. |
 | [CockroachDB](./cockroachdb.md) | Relational rows. |
 | [Redshift](./redshift.md) | Relational rows. |
-| [Azure Blob](./azure-blob.md) | Azure object files. |
+| [Azure Blob](./azure_blob.md) | Azure object files. |
 | [BigQuery](./bigquery.md) | Analytics rows. |
-| [Disk log](./disk-log.md) | Local rotating files. |
+| [Disk log](./disk_log.md) | Local rotating files. |
 | [DynamoDB](./dynamodb.md) | Key-value items. |
 | [Snowflake](./snowflake.md) | Warehouse rows. |
 | [Tablestore](./tablestore.md) | Wide-column rows. |
-| [OPC-UA](./opc-ua.md) | Industrial nodes. |
-| [Sparkplug B](./sparkplug-b.md) | Sparkplug frames. |
+| [OPC-UA](./opc_ua.md) | Industrial nodes. |
+| [Sparkplug B](./sparkplug_b.md) | Sparkplug frames. |
 | [Kinesis](./kinesis.md) | Stream records. |
-| [GCP Pub/Sub](./gcp-pubsub.md) | Topic messages. |
-| [Azure Event Hubs](./azure-event-hubs.md) | Hub events. |
+| [GCP Pub/Sub](./gcp_pubsub.md) | Topic messages. |
+| [Azure Event Hubs](./azure_eventhubs.md) | Hub events. |
 
 ## Lifecycle
 
@@ -151,7 +151,7 @@ curl -X POST http://127.0.0.1:18083/api/v5/connectors/hook-1/stop \
 
 ## Check that it works
 
-Ask the broker for its action type names. The list holds the documented action kinds that are ready in this build.
+Ask the broker for its action type names. The list holds the 38 action type names that the check below asserts. It holds none of `aws_iot`, `azure_iot`, `oci_streaming` and `cassandra`.
 
 ```toml test
 [node]

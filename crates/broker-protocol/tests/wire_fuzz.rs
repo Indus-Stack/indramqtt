@@ -14,8 +14,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Budget when `FUZZ_SECONDS` is unset. The ticket fixes the normal run.
 const DEFAULT_FUZZ_SECONDS: u64 = 20;
-/// Largest random packet in bytes. Small packets reach every decoder
-/// branch without long loops in the test process.
+/// Largest random packet in bytes. Small packets keep one run short.
+/// The packets are random bytes. No check shows that they reach every decoder branch.
 const MAX_PACKET: usize = 512;
 /// Corpus files larger than this are not replayed. Reason: a corpus
 /// file is one failing input; a huge file is a write bug, not a case.
@@ -181,6 +181,11 @@ fn encode_connect(connect: &wire::Connect) -> Vec<u8> {
             section.push(wire::prop::AUTH_METHOD as u8);
             section.extend_from_slice(&(method.len() as u16).to_be_bytes());
             section.extend_from_slice(method.as_bytes());
+        }
+        if let Some(data) = &props.auth_data {
+            section.push(wire::prop::AUTH_DATA as u8);
+            section.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            section.extend_from_slice(data);
         }
         for (key, value) in &props.user_properties {
             section.push(wire::prop::USER_PROPERTY as u8);
@@ -621,6 +626,7 @@ fn connack_encoder_fuzz_stays_correct() {
             },
             reason_string: if rng.below(1) == 1 { Some("ok") } else { None },
             user_properties: &users,
+            ..ConnackProperties::default()
         };
         let mut out = Vec::new();
         wire::encode_connack_v5(rng.below(1) == 1, rng.byte(), &props, &mut out);

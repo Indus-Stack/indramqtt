@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -519,12 +519,61 @@ fn exposition_response(state: &ApiState) -> Response {
         .into_response()
 }
 
+/// Validate that the Accept header does not prefer JSON over text exposition.
+fn validate_prometheus_accept(headers: &HeaderMap) -> Option<Response> {
+    let accept = headers.get(axum::http::header::ACCEPT)?;
+    let Ok(accept_str) = accept.to_str() else {
+        return None;
+    };
+    let mut best_text_q: f32 = -1.0;
+    let mut best_json_q: f32 = -1.0;
+    for part in accept_str.split(',') {
+        let mut segments = part.split(';').map(str::trim);
+        let Some(media_range) = segments.next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let mut q: f32 = 1.0;
+        for param in segments {
+            if let Some((k, v)) = param.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("q") {
+                    if let Ok(parsed) = v.trim().parse::<f32>() {
+                        q = parsed.clamp(0.0, 1.0);
+                    }
+                }
+            }
+        }
+        let lower = media_range.to_ascii_lowercase();
+        if lower == "application/json" {
+            best_json_q = best_json_q.max(q);
+        } else if lower == "text/plain"
+            || lower == "text/*"
+            || lower == "*/*"
+            || lower == "application/openmetrics-text"
+        {
+            best_text_q = best_text_q.max(q);
+        }
+    }
+    if best_json_q > 0.0 && best_json_q > best_text_q {
+        return Some(
+            crate::errors::ApiError::BadRequest(
+                "unsupported accept header: application/json".to_string(),
+            )
+            .into_response(),
+        );
+    }
+    None
+}
+
 /// `GET /prometheus/stats`: text exposition of the node counters and
 /// gauges. Always 200 with `text/plain`. Management-plane only.
 pub async fn get_prometheus_stats(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(_query): Query<PrometheusQuery>,
 ) -> Response {
+    if let Some(rejection) = validate_prometheus_accept(&headers) {
+        return rejection;
+    }
     exposition_response(&state)
 }
 
@@ -533,8 +582,12 @@ pub async fn get_prometheus_stats(
 /// values; the route exists so the documented scrape target answers.
 pub async fn get_prometheus_auth(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(_query): Query<PrometheusQuery>,
 ) -> Response {
+    if let Some(rejection) = validate_prometheus_accept(&headers) {
+        return rejection;
+    }
     exposition_response(&state)
 }
 
@@ -783,7 +836,8 @@ mod tests {
             crate::v5::clients::publish_message(axum::extract::State(state.clone()), body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let (status, content_type, text) =
-            read_text(get_prometheus_stats(State(state.clone()), query()).await).await;
+            read_text(get_prometheus_stats(State(state.clone()), HeaderMap::new(), query()).await)
+                .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             content_type.starts_with("text/plain"),
@@ -801,7 +855,8 @@ mod tests {
         state.stats.set_connections(2);
         state.stats.set_retained(1);
         let (status, content_type, text) =
-            read_text(get_prometheus_stats(State(state.clone()), query()).await).await;
+            read_text(get_prometheus_stats(State(state.clone()), HeaderMap::new(), query()).await)
+                .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             content_type.starts_with("text/plain"),
@@ -813,7 +868,7 @@ mod tests {
         assert!(text.contains("indramqtt_retained_count 1\n"));
         // Every area route serves the same true counters.
         for route in [
-            get_prometheus_auth(State(state.clone()), query()).await,
+            get_prometheus_auth(State(state.clone()), HeaderMap::new(), query()).await,
             get_prometheus_data_integration(State(state.clone()), query()).await,
             get_prometheus_message_transformation(State(state.clone()), query()).await,
             get_prometheus_namespaced_stats(State(state.clone()), query()).await,
@@ -839,5 +894,40 @@ mod tests {
             let _ = h.join();
         });
         assert!(store.get().enable_basic_auth);
+    }
+
+    #[tokio::test]
+    async fn prometheus_accept_negotiation_respects_q_weights() {
+        let state = standalone_state();
+
+        // Explicit q=0 on application/json while preferring text/plain -> 200.
+        let mut h1 = HeaderMap::new();
+        h1.insert(
+            axum::http::header::ACCEPT,
+            "text/plain, application/json;q=0".parse().unwrap(),
+        );
+        let (status1, _, _) =
+            read_text(get_prometheus_stats(State(state.clone()), h1, query()).await).await;
+        assert_eq!(status1, StatusCode::OK);
+
+        // Higher q on text/plain than application/json -> 200.
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            axum::http::header::ACCEPT,
+            "text/plain;q=0.9, application/json;q=0.5".parse().unwrap(),
+        );
+        let (status2, _, _) =
+            read_text(get_prometheus_stats(State(state.clone()), h2, query()).await).await;
+        assert_eq!(status2, StatusCode::OK);
+
+        // Explicit application/json preference -> 400.
+        let mut h3 = HeaderMap::new();
+        h3.insert(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        let (status3, _, _) =
+            read_text(get_prometheus_stats(State(state.clone()), h3, query()).await).await;
+        assert_eq!(status3, StatusCode::BAD_REQUEST);
     }
 }

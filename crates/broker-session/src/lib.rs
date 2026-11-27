@@ -99,6 +99,16 @@ pub struct StoredWill {
     pub payload: Bytes,
 }
 
+/// Credential-derived ACL rule stored on an authenticated session (e.g. JWT
+/// `acl` claims). Evaluated per-session without mutating persisted admin ACLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialAclRule {
+    pub topic_pattern: String,
+    /// `0` = publish, `1` = subscribe, `2` = all.
+    pub action: u8,
+    pub allow: bool,
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub id: SessionId,
@@ -303,6 +313,11 @@ pub struct Session {
     /// fan-out path never touches this lock. Bounded by
     /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] with oldest-first eviction.
     pub authz_cache: RwLock<VecDeque<AuthzDecision>>,
+    /// Per-session credential-derived ACL rules (installed after admission and
+    /// ownership verification; never persisted into the admin rule table).
+    pub credential_acls: RwLock<Option<Vec<CredentialAclRule>>>,
+    /// Monotonic bind generation, incremented atomically on every bind commit.
+    pub bind_generation: AtomicU64,
     /// Node-cache health counters for the status read (W2-15): cumulative
     /// hits (repeat decision refreshed in place), misses (new decision
     /// recorded) and inserts (new entries added) since boot. Three fixed
@@ -850,6 +865,8 @@ impl Session {
             connected_at_ms: RwLock::new(Some(now_ms())),
             ended_at_ms: RwLock::new(None),
             authz_cache: RwLock::new(VecDeque::new()),
+            credential_acls: RwLock::new(None),
+            bind_generation: AtomicU64::new(0),
             authz_cache_hits: AtomicU64::new(0),
             authz_cache_misses: AtomicU64::new(0),
             authz_cache_inserts: AtomicU64::new(0),
@@ -1187,6 +1204,7 @@ impl Session {
     pub fn ack_inflight_timed(&self, packet_id: u16) -> Option<InflightMessage> {
         let mut inflight = self.inflight.write();
         if let Some(pos) = inflight.iter().position(|m| m.packet_id == packet_id) {
+            // INVARIANT: position was found within inflight queue bounds immediately before removal.
             let entry = inflight.remove(pos).expect("position checked");
             // Promote the oldest spill so the window stays the oldest
             // entries. Nested `inflight` -> `inflight_spill` order matches
@@ -1212,6 +1230,7 @@ impl Session {
         drop(inflight);
         let mut spill = self.inflight_spill.write();
         if let Some(pos) = spill.iter().position(|m| m.packet_id == packet_id) {
+            // INVARIANT: position was found within spill queue bounds immediately before removal.
             let entry = spill.remove(pos).expect("position checked");
             self.spill_count.fetch_sub(1, Ordering::Relaxed);
             return Some(entry);
@@ -1584,6 +1603,42 @@ impl Session {
     /// that never runs on the publish or deliver path.
     pub fn clear_authz_cache(&self) {
         self.authz_cache.write().clear();
+    }
+
+    /// Replace the session's credential-derived ACLs and clear cached decisions.
+    pub fn set_credential_acls(&self, acls: Option<Vec<CredentialAclRule>>) {
+        *self.credential_acls.write() = acls;
+        self.clear_authz_cache();
+    }
+
+    /// Current monotonic bind generation for this session.
+    pub fn bind_generation(&self) -> u64 {
+        self.bind_generation.load(Ordering::SeqCst)
+    }
+
+    /// Replace credential-derived ACLs only if `conn_id` and `expected_gen` still
+    /// own this session.
+    pub fn set_credential_acls_for_conn(
+        &self,
+        conn_id: u64,
+        expected_gen: u64,
+        acls: Option<Vec<CredentialAclRule>>,
+    ) -> bool {
+        let mut guard = self.credential_acls.write();
+        if *self.conn_id.read() != Some(conn_id)
+            || self.bind_generation.load(Ordering::SeqCst) != expected_gen
+        {
+            return false;
+        }
+        *guard = acls;
+        drop(guard);
+        self.clear_authz_cache();
+        true
+    }
+
+    /// Snapshot of credential-derived ACLs on this session, if any.
+    pub fn credential_acls_snapshot(&self) -> Option<Vec<CredentialAclRule>> {
+        self.credential_acls.read().clone()
     }
 
     /// Look up a cached authorization verdict on the authorize path.
@@ -3580,6 +3635,36 @@ impl SessionManager {
         max_packet: u32,
         bind_meta: Option<ConnectBindMeta>,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
+        self.connect_bind_v5_in_tenant_with_acls(
+            tenant,
+            client_id,
+            clean_start,
+            expected_owner,
+            version,
+            expiry,
+            receive_max,
+            max_packet,
+            bind_meta,
+            None,
+        )
+    }
+
+    /// Same as [`Self::connect_bind_v5_in_tenant`], atomically committing
+    /// credential-derived ACLs under the same session write lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_bind_v5_in_tenant_with_acls(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+        expected_owner: Option<Option<&str>>,
+        version: u8,
+        expiry: u32,
+        receive_max: u16,
+        max_packet: u32,
+        bind_meta: Option<ConnectBindMeta>,
+        pending_acls: Option<Vec<CredentialAclRule>>,
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>, Option<u64>) {
         let expiry = self.cap_session_expiry(expiry);
         let store = self.offline_store.read().clone();
         let key = SessionKey::new(tenant, client_id);
@@ -3615,6 +3700,8 @@ impl SessionManager {
                     *session.peerhost.write() = Some(p);
                 }
                 session.set_verified_identity(verified_username, is_superuser);
+                session.bind_generation.fetch_add(1, Ordering::SeqCst);
+                session.set_credential_acls(pending_acls);
             }
         };
 

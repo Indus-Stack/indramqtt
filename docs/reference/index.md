@@ -19,6 +19,7 @@ flowchart LR
 - Configuration layers: [Configuration](../operations/configuration.md).
 - Native API (`/api/v1`): users, access rules, tenants, metrics and the console.
 - Reference management API (`/api/v5`): the compatible surface for nodes, clients, rules and metrics. It follows the reference management API.
+- [API deviations](./api-deviations.md): deliberate deviations for connector aliases permitted by CTO ruling.
 - `schemas/config-schema.json`: the machine-readable schema.
 
 ## Check that it works

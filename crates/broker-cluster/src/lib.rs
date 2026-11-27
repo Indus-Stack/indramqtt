@@ -133,6 +133,7 @@ impl ClusterRouteTable {
                 if curr.single_wildcard.is_none() {
                     curr.single_wildcard = Some(Box::new(RouteTrieNode::default()));
                 }
+                // INVARIANT: single_wildcard is initialized immediately above when None.
                 curr = curr.single_wildcard.as_mut().unwrap();
             } else {
                 curr = curr.children.entry(level.to_string()).or_default();

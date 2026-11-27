@@ -1,0 +1,95 @@
+---
+import Default from '@astrojs/starlight/components/PageFrame.astro';
+import type { Props } from '@astrojs/starlight/props';
+
+const { hasSidebar = false, headings = [] } = Astro.props;
+const tocCount = headings.filter((h) => h.depth === 2 || h.depth === 3).length;
+const hasToc = tocCount >= 3;
+---
+
+<script is:inline>
+  (() => {
+    try {
+      const s = localStorage.getItem('indra-docs-sidebar');
+      document.documentElement.setAttribute('data-sidebar', s === 'closed' ? 'closed' : 'open');
+      const t = localStorage.getItem('indra-docs-toc');
+      document.documentElement.setAttribute('data-toc', t === 'closed' ? 'closed' : 'open');
+    } catch (_) {
+      document.documentElement.setAttribute('data-sidebar', 'open');
+      document.documentElement.setAttribute('data-toc', 'open');
+    }
+  })();
+</script>
+
+<div class="indra-panel-controls" aria-label="Sidebar controls">
+  {
+    hasToc && (
+      <button
+        id="indra-toggle-toc"
+        type="button"
+        class="indra-toggle-btn indra-toggle-toc"
+        aria-controls="starlight__toc"
+        aria-expanded="true"
+        aria-label="Toggle table of contents"
+        title="Toggle table of contents"
+      >
+        <svg
+          class="indra-icon"
+          aria-hidden="true"
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <rect width="18" height="18" x="3" y="3" rx="2" />
+          <path d="M15 3v18" />
+        </svg>
+      </button>
+    )
+  }
+</div>
+
+<Default {...Astro.props}>
+  <slot name="header" slot="header" />
+  <Fragment slot="sidebar">
+    {
+      hasSidebar && (
+        <div class="indra-sidebar-header">
+          <button
+            id="indra-toggle-sidebar"
+            type="button"
+            class="indra-toggle-btn indra-toggle-sidebar"
+            aria-controls="starlight__sidebar"
+            aria-expanded="true"
+            aria-label="Toggle sidebar"
+            title="Toggle sidebar ([)"
+          >
+            <svg
+              class="indra-icon"
+              aria-hidden="true"
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect width="18" height="18" x="3" y="3" rx="2" />
+              <path d="M9 3v18" />
+            </svg>
+          </button>
+        </div>
+      )
+    }
+    <slot name="sidebar" />
+  </Fragment>
+  <slot />
+</Default>
+
+<script src="../../scripts/panels.js"></script>

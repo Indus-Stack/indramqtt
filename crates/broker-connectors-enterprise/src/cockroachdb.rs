@@ -198,6 +198,7 @@ fn quote_pg_ident(name: &str) -> Result<String> {
         ));
     }
     let mut bytes = name.bytes();
+    // INVARIANT: name is verified non-empty immediately above.
     let first = bytes.next().expect("non-empty checked above");
     let first_ok = first == b'_' || first.is_ascii_lowercase();
     let rest_ok = bytes.all(|b| b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit());

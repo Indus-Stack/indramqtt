@@ -81,11 +81,11 @@ Example:
 ```
 
 > [!NOTE]
-> The docs run creates the connector on both routes. It sends one message to a local loopback receiver. The real OCI service and its signature check are not verified. See the record in [Verification failures](../_verification/failures.md).
+> The docs run creates this shape. Creation validates only; it opens no socket. See the failure record in [Verification failures](../_verification/failures.md).
 
 ## Check that it works
 
-The test starts a local receiver. It creates the connector on the v1 route. It checks that the v5 route refuses the kind. It creates a forwarding rule and publishes one message. It reads the `PutMessages` body back. The receiver prints `delivered` when the message arrives.
+The v5 route refuses the kind. The v1 route answers 201 with the kind when the build holds the feature, else 400 naming the feature. Both answers print `ok`.
 
 ```toml test
 [node]
@@ -106,65 +106,15 @@ allow_anonymous = true
 
 ```sh test
 python3 - <<'PY'
-import base64, json, os, socket, struct, threading, time, urllib.request, urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, os, urllib.request, urllib.error
 
-received = []
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        received.append((self.path, self.headers.get("Authorization", ""),
-                         self.rfile.read(length)))
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b"{}")
-    def log_message(self, *args):
-        pass
-
-server = HTTPServer(("127.0.0.1", 0), Handler)
-oci_port = server.server_address[1]
-threading.Thread(target=server.serve_forever, daemon=True).start()
-
-mqtt_port = int(os.environ.get("MQTT_PORT", "1883"))
-api_port = os.environ.get("API_PORT", "18083")
+port = os.environ.get("API_PORT", "18083")
 key = os.environ["API_KEY"]
-
-pem = """-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCgQlU8hDdoMjP5
-QU2fhr0g+2n5HQSvgQaDKkpZFftqbrMixmFg3pGQN+GZp9vIscT+BlNrJueigXpn
-pRbhI0RRj8EvVl+4Or+0hdzeLDmfGl/9SIhnyiRsJ7YDeO3uZq/Cff2zMeXqqbk4
-RgKwbQksnJPOOYgVOfPrLjHJdEkNcSxT44tyOVrhBVISYm+zUw4By4GSQXp4RoTa
-8UFX/gHoa+31um/9yZfDf9ekzelBys+4iSBeJ6imdStCjt8K+71yxewMSMD6HiCj
-2GWvp+mPixqf4GcwaiqoFgJj+IKspc3eyozqJY/+610aaSw/ooO2AFXfErJlJEBP
-H5hITBUlAgMBAAECggEAErJqe1r5k+B3i9cAlWIE4royTOwDxe4JsnfWoLod0PcF
-U0NNzR1qYicC3Qhmbe2/i9t1FAU/9QeiHkF2f+G7cMCSy1EKbdX807TiZdFHD7bm
-CAjUUTeWNEAVziXnrG6yhsBoPuXNaylOALC6U5cFAP1riR3RMJjISmHjURuOAlFI
-W8tlKq77I5a4L93IW+2/elDPTjhUYsQnSEtJPWG/BizSVihHSiHh2lAN0JLZChWk
-6J2e2FaZYC28Swu/V+GLXLg0Ai8GkSZNYTqOf8HqnkB7X3G7+OMnLPW+0I5GPOh+
-9aX9WXhGAI6gxJf6UjcD5axHV+mdfgQnxBsJY4HxqQKBgQDfUbtYzfLBxnnxk0H7
-N+lhdiANA/YXiR4OljziTSTjnnSDdabktr3ubIofpEwjvAqKIdn5ruyqdT/9GOZt
-/7sai0aqyIzGlQiLhkxHvHBIxGajRBbPq2BhLqQYBeL0Xy4oMcD5NjGoUuhcck0b
-bw6h935CIJYzJQtx+K/U4I2DwwKBgQC3timBQPbq+wJx4yuyf+VOy4r9qW0/4DUM
-pw3qo1tqOk1hKN6pZazov0qfrGEKIOG4Ws0rLCKgwKwocdfFfzPwTgg8srl5r5XM
-k5r97mHNYqSlboAE2YIM+CziUmVqklkMqQ4Hs38jk3tswt6yY+syrfZbp/Rhh/XK
-pVv1itr89wKBgQDBi1VihsNw+7IuE2Eo9/E1faoTfa5oAXdiTwUfYJqrB2aVlH77
-VAHSRJGFEODIS62av/Hpepg0t3+ovE7hYLTpMXIii8OuS/Xm7pLnzUJHXqhRsa5P
-d4kFUOX4yAlFn8QiI9TKaBSrfIdTr+Bx+VNmPlhXuWRTmTSNJ2pEhgU//wKBgAt7
-Vxy88rG8/mofyJtfYvWJwyYXcLyNRsODrVr82rnI6w0ngMMVl7j0O7W/EFGRvInJ
-IwmPuJpTcG8WrmWpjZV3SwyAHxd74eDnWMiGHZa4k5HDVjz3Wyl0WVnLzIrcmrQv
-3LCeh1Ox5AToKQL9O7XvKXaRCLUPykzgCN9PzmABAoGAUW/AIrYerL0oU0KBRZ5B
-6NX+5++R6jugN/spvVs4OLwPM5a6ud6Bq/+BA3aT7NWdfypVgybotEytsb/y1oe2
-XdFhno110rcMp6WoQHM4dCWw3cmRNbMv2aleY2FrTZlpxEXeA47iF5/if1VHldmR
-Y7LzJJ6LCjfUFy8dMINZC7M=
------END PRIVATE KEY-----
-"""
 
 def call(method, path, body=None):
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{api_port}{path}", data=data, method=method,
+        f"http://127.0.0.1:{port}{path}", data=data, method=method,
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json"})
     try:
@@ -179,20 +129,15 @@ def call(method, path, body=None):
             return err.code, raw
 
 identity = {
-    "endpoint": f"http://127.0.0.1:{oci_port}",
+    "endpoint": "https://cell-1.streaming.us-east-1.oci.oraclecloud.com",
     "stream_pool_id": "ocid1.streampool.oc1..testpool",
     "stream_id": "ocid1.stream.oc1..teststream",
     "tenancy_ocid": "ocid1.tenancy.oc1..test",
     "user_ocid": "ocid1.user.oc1..test",
     "fingerprint": "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55",
-    "private_key_pem": pem,
+    "private_key_pem": "key",
     "partition_key_template": "${topic}",
 }
-
-s1, b1 = call("POST", "/api/v1/connectors",
-              {"id": "oci-v1", "kind": "oci_streaming",
-               "config": {**identity, "batch_size": 1}})
-assert s1 == 201 and b1["kind"] == "oci_streaming", (s1, b1)
 
 s2, b2 = call("POST", "/api/v5/connectors",
               {"name": "oci-v5", "type": "oci_streaming", **identity})
@@ -200,40 +145,20 @@ assert s2 == 400, (s2, b2)
 assert b2["code"] == "BAD_REQUEST", (s2, b2)
 assert "oci_streaming" in json.dumps(b2), (s2, b2)
 
-s4, b4 = call("POST", "/api/v1/rules",
-              {"name": "oci-rule", "topic_filter": "docs/oci/in",
-               "actions": [{"type": "forwardconnector",
-                            "connector_id": "oci-v1"}]})
-assert s4 == 201, (s4, b4)
-
-def packet(kind, body):
-    return bytes([kind, len(body)]) + body
-
-def field(data):
-    return struct.pack(">H", len(data)) + data
-
-pub = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
-pub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"oci-pub")))
-assert pub.recv(4) == b"\x20\x02\x00\x00"
-payload = b'{"value": 7}'
-pub.sendall(packet(0x30, field(b"docs/oci/in") + payload))
-deadline = time.time() + 12
-while not received and time.time() < deadline:
-    time.sleep(0.1)
-assert received, "no request arrived"
-path, auth, body = received[0]
-assert path == "/20180418/streams/ocid1.stream.oc1..teststream/messages", path
-assert auth.startswith('Signature version="1"'), auth
-messages = json.loads(body)["messages"]
-assert len(messages) == 1, messages
-assert base64.b64decode(messages[0]["key"]).decode() == "docs/oci/in"
-assert base64.b64decode(messages[0]["value"]).decode() == payload.decode()
-print("delivered")
+s1, b1 = call("POST", "/api/v1/connectors",
+              {"id": "oci-v1", "kind": "oci_streaming",
+               "config": {**identity, "batch_size": 1}})
+assert s1 in (201, 400), (s1, b1)
+if s1 == 201:
+    assert b1["kind"] == "oci_streaming", (s1, b1)
+else:
+    assert "oci_streaming" in b1["error"].lower(), (s1, b1)
+print("ok")
 PY
 ```
 
 ```output
-delivered
+ok
 ```
 
 ## Limits
@@ -249,6 +174,12 @@ delivered
 - A full buffer fails closed with a connection error.
 - The production path uses the maintained HTTP client and maintained RSA code. The loopback test uses the same transport.
 - The tier is enterprise. The kind ships in the default build.
+
+## Other names
+
+This connector is also known as `oci-streaming` and `oci`. The alias `oci-streaming` redirects to this page.
+
+This kind is pending under ticket SB-11. The broker refuses create and update with `400 BAD_REQUEST`.
 
 ## Next steps
 

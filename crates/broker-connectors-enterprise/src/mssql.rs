@@ -1277,8 +1277,9 @@ impl MssqlSink {
     }
 
     /// Flush buffered rows grouped by table (no-op when empty).
-    /// Deadlocks and disconnects retry in place; terminal errors and
-    /// exhaustion restore the buffer, engage backoff, and propagate.
+    /// Deadlocks and disconnects retry in place; terminal errors restore the
+    /// buffer, engage backoff, and propagate. Exhaustion drops the batch and
+    /// clears backoff so new events dial fresh.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {
@@ -1318,12 +1319,11 @@ impl MssqlSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(
-                            rows,
-                            oldest,
-                            taken_bytes,
-                            ConnectorError::Connection(message),
-                        );
+                        // The batch did not reach the target. Drop it
+                        // and clear the backoff so the next event dials
+                        // again.
+                        self.backoff.lock().success();
+                        return Err(ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;

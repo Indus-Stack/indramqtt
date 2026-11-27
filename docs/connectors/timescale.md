@@ -28,7 +28,7 @@ flowchart LR
 
 ## Settings
 
-Set `kind` to `timescale` on the v1 route. The v1 route also accepts `timescaledb`. It stores the runtime as `timescaledb` and answers with `timescaledb`. The v5 route refuses this kind under the SB-27 ruling. It answers 400 with code `ALREADY_EXISTS` and stores nothing. Use a v1 connector for live delivery.
+The v1 route also refuses `timescaledb`. The v5 route refuses this kind. No live delivery exists until CE2-22.
 
 The v1 route reads the settings below. The v5 route refuses the kind and reads no setting.
 
@@ -119,23 +119,27 @@ full = {
 
 status, created = call("POST", "/api/v1/connectors",
                        {"id": "ts-v1", "kind": "timescale", "config": full})
-assert status == 201 and created["kind"] == "timescaledb", (status, created)
+assert status in (201, 400), (status, created)
+if status == 201:
+    assert created["kind"] == "timescaledb", (status, created)
 
-status, created = call("POST", "/api/v1/connectors",
-                       {"id": "ts-bad-scheme", "kind": "timescale",
-                        "config": {**full, "connection_url": "mysql://u:p@h/db"}})
-assert status == 400 and "connection_url" in json.dumps(created), (status, created)
+    status, created = call("POST", "/api/v1/connectors",
+                           {"id": "ts-bad-scheme", "kind": "timescale",
+                            "config": {**full, "connection_url": "mysql://u:p@h/db"}})
+    assert status == 400 and "connection_url" in json.dumps(created), (status, created)
 
-status, created = call("POST", "/api/v1/connectors",
-                       {"id": "ts-bad-template", "kind": "timescale",
-                        "config": {**full,
-                                   "sql_template": "INSERT INTO t VALUES ($1, $2, $3)"}})
-assert status == 400 and "sql_template" in json.dumps(created), (status, created)
+    status, created = call("POST", "/api/v1/connectors",
+                           {"id": "ts-bad-template", "kind": "timescale",
+                            "config": {**full,
+                                       "sql_template": "INSERT INTO t VALUES ($1, $2, $3)"}})
+    assert status == 400 and "sql_template" in json.dumps(created), (status, created)
 
-status, created = call("POST", "/api/v1/connectors",
-                       {"id": "ts-bad-pool", "kind": "timescale",
-                        "config": {**full, "pool_size": 0}})
-assert status == 400 and "pool_size" in json.dumps(created), (status, created)
+    status, created = call("POST", "/api/v1/connectors",
+                           {"id": "ts-bad-pool", "kind": "timescale",
+                            "config": {**full, "pool_size": 0}})
+    assert status == 400 and "pool_size" in json.dumps(created), (status, created)
+else:
+    assert "timescaledb" in created["error"].lower(), (status, created)
 
 status, created = call("POST", "/api/v5/connectors",
                        {"name": "ts-v5", "type": "timescale", **full})
@@ -156,7 +160,7 @@ created
 - A `hypertable` or `time_column` outside `[A-Za-z0-9_]+` is refused with 400.
 - A template without exactly `$1` to `$4` is refused with 400.
 - A `pool_size` of 0 is refused. A `batch_size` of 0 is refused.
-- The v1 route registers the live sink. The v5 route refuses the kind under the SB-27 ruling and stores nothing.
+- The v1 route also refuses `timescaledb`. The v5 route refuses the kind and stores nothing. No live delivery exists until CE2-22.
 - The production path uses `DriverTimescaleDbTransport` through the maintained driver. The unit tests use `MockTimescaleTransport`.
 - An explicit `sslmode=require`, `verify-ca`, or `verify-full` opts into TLS through the system trust store. Other URLs stay plaintext. An empty trust store denies the connection.
 - Values travel bound: `$1` time, `$2` device id, `$3` topic, `$4` metrics. One extended-protocol round trip runs per row.

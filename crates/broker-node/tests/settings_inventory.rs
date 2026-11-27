@@ -7,8 +7,132 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Extracts each failure and error traceback block from the test suite output.
+/// Each block begins with a FAIL or ERROR line.
+/// Each block ends before the next failure line or before the line of dashes and Ran.
+fn extract_failure_blocks(output: &str) -> Vec<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut blocks = Vec::new();
+    let mut current_block: Option<Vec<&str>> = None;
+
+    for (i, &line) in lines.iter().enumerate() {
+        let is_fail_or_error = line.starts_with("FAIL: ") || line.starts_with("ERROR: ");
+        let is_dashes_before_ran = line.starts_with("---")
+            && lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|next| next.starts_with("Ran "));
+        let is_ran = line.starts_with("Ran ");
+        let is_end_at_ran = is_dashes_before_ran || is_ran;
+
+        if is_fail_or_error {
+            if let Some(mut block_lines) = current_block.take() {
+                while let Some(last) = block_lines.last() {
+                    if last.trim().is_empty() || last.starts_with("===") {
+                        block_lines.pop();
+                    } else {
+                        break;
+                    }
+                }
+                if !block_lines.is_empty() {
+                    blocks.push(block_lines.join("\n"));
+                }
+            }
+            current_block = Some(vec![line]);
+        } else if is_end_at_ran {
+            if let Some(mut block_lines) = current_block.take() {
+                while let Some(last) = block_lines.last() {
+                    if last.trim().is_empty() || last.starts_with("===") {
+                        block_lines.pop();
+                    } else {
+                        break;
+                    }
+                }
+                if !block_lines.is_empty() {
+                    blocks.push(block_lines.join("\n"));
+                }
+            }
+        } else if let Some(ref mut block_lines) = current_block {
+            block_lines.push(line);
+        }
+    }
+
+    if let Some(mut block_lines) = current_block.take() {
+        while let Some(last) = block_lines.last() {
+            if last.trim().is_empty() || last.starts_with("===") {
+                block_lines.pop();
+            } else {
+                break;
+            }
+        }
+        if !block_lines.is_empty() {
+            blocks.push(block_lines.join("\n"));
+        }
+    }
+
+    blocks
+}
+
+/// Formats the failure message of the entry suite.
+/// Places FAIL: and ERROR: traceback blocks before the full stdout and stderr.
+fn format_failure_message(stdout: &str, stderr: &str) -> String {
+    let full = format!("{stdout}\n{stderr}");
+    let blocks = extract_failure_blocks(&full);
+    if blocks.is_empty() {
+        full
+    } else {
+        let mut msg = String::new();
+        for block in &blocks {
+            msg.push_str(block);
+            msg.push('\n');
+            msg.push('\n');
+        }
+        msg.push_str(&full);
+        msg
+    }
+}
+
 #[test]
 fn az01_settings_through_the_real_broker() {
+    let sample_stdout = "entry suite stdout banner\n";
+    let sample_stderr = "\
+======================================================================
+FAIL: test_listener (__main__.InventoryEntry.test_listener)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File \"entry.py\", line 10, in test_listener
+AssertionError: connection not refused
+
+======================================================================
+ERROR: test_edge (__main__.InventoryEntry.test_edge)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File \"entry.py\", line 20, in test_edge
+RuntimeError: timeout
+
+----------------------------------------------------------------------
+Ran 2 tests in 1.000s
+
+FAILED (failures=1, errors=1)
+";
+    let formatted = format_failure_message(sample_stdout, sample_stderr);
+    let fail_pos = match formatted.find("FAIL: test_listener") {
+        Some(pos) => pos,
+        None => panic!("FAIL block missing"),
+    };
+    let error_pos = match formatted.find("ERROR: test_edge") {
+        Some(pos) => pos,
+        None => panic!("ERROR block missing"),
+    };
+    let full_pos = match formatted.find("entry suite stdout banner") {
+        Some(pos) => pos,
+        None => panic!("full output missing"),
+    };
+    assert!(
+        fail_pos < error_pos && error_pos < full_pos,
+        "traceback blocks must appear before full output"
+    );
+
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::process::Command::new("python3")
         .arg(root.join("tests/settings_inventory/entry.py"))
@@ -62,7 +186,11 @@ fn az01_settings_through_the_real_broker() {
         .expect("run the inventory entry checks");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        output.status.success(),
+        "{}",
+        format_failure_message(&stdout, &stderr)
+    );
     assert!(stderr.contains("Ran "), "the entry suite must run cases");
     println!("{stdout}\n{stderr}");
 }
