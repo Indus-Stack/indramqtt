@@ -1,65 +1,132 @@
-name: Release
+name: Beta release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v2026.11.0-beta.*']
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-binaries:
-    name: Build Binary (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: indramqtt-x86_64-unknown-linux-gnu
-            binary_path: target/x86_64-unknown-linux-gnu/release/broker-node
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: indramqtt-aarch64-unknown-linux-gnu
-            binary_path: target/aarch64-unknown-linux-gnu/release/broker-node
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: indramqtt-x86_64-apple-darwin
-            binary_path: target/x86_64-apple-darwin/release/broker-node
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: indramqtt-aarch64-apple-darwin
-            binary_path: target/aarch64-apple-darwin/release/broker-node
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+          fetch-depth: 0
+      - name: Verify tag, merged commit, prior CI, and Docker Hub key
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKERHUBKEY: ${{ secrets.DOCKERHUBKEY }}
+        shell: bash
         run: |
-          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          workspace_version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test "$version" = "$workspace_version"
+          test "$version" = "2026.11.0-beta.1"
+          test -n "$DOCKERHUBKEY"
+          test -f RELEASE_NOTES_2026.11.md
+          git fetch --no-tags origin main
+          commit=$(git rev-parse HEAD)
+          test "$commit" = "$(git rev-parse origin/main)"
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --commit "$commit" --limit 20 --json status,conclusion \
+            | jq -e 'any(.[]; .status == "completed" and .conclusion == "success")'
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p broker-node --features full
+  publish-image:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: indusstack
+          password: ${{ secrets.DOCKERHUBKEY }}
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            indusstack/indramqtt:${{ needs.verify.outputs.version }}
+            indusstack/indramqtt:beta
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Sync Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        continue-on-error: true
+        with:
+          username: indusstack
+          password: ${{ secrets.DOCKERHUBKEY }}
+          repository: indusstack/indramqtt
+          readme-filepath: ./deploy/docker/README.md
+          short-description: "Single-node MQTT broker with streaming SQL and connectors"
 
-      - name: Package release artifact
+  smoke-published-image:
+    needs: [verify, publish-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull published digest and start Compose
+        env:
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        shell: bash
         run: |
-          mkdir dist
-          cp ${{ matrix.binary_path }} dist/indramqtt
-          tar -czf ${{ matrix.artifact_name }}.tar.gz -C dist indramqtt
+          set -euo pipefail
+          docker pull "indusstack/indramqtt@${DIGEST}"
+          docker tag "indusstack/indramqtt@${DIGEST}" "indusstack/indramqtt:${VERSION}"
+          docker compose up -d --no-build
+          for _ in $(seq 1 60); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' indramqtt-broker)
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          docker logs indramqtt-broker
+          exit 1
+      - name: Check MQTT, WebSocket, and config override
+        run: bash tools/image_smoke.sh indramqtt-broker 1883 8083
+      - name: Stop Compose stack
+        if: always()
+        run: docker compose down -v
 
-      - name: Upload release asset
+  github-release:
+    needs: [verify, publish-image, smoke-published-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add tested image digest to release notes
+        env:
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+        shell: bash
+        run: |
+          cp RELEASE_NOTES_2026.11.md "$RUNNER_TEMP/release-body.md"
+          printf '\n## Published image digest\n\n`indusstack/indramqtt@%s`\n' "$DIGEST" >> "$RUNNER_TEMP/release-body.md"
+      - name: Create GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ matrix.artifact_name }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: IndraMQTT Beta 2026.11
+          body_path: ${{ runner.temp }}/release-body.md
+          prerelease: true
+          make_latest: false

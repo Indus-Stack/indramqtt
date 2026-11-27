@@ -105,10 +105,10 @@ export default defineConfig({
         replacesTitle: false,
       },
       social: {
-        github: 'https://github.com/ankur-paan/indramqtt',
+        github: 'https://github.com/Indus-Stack/indramqtt',
       },
       editLink: {
-        baseUrl: 'https://github.com/ankur-paan/indramqtt/edit/main/docs/',
+        baseUrl: 'https://github.com/Indus-Stack/indramqtt/edit/main/docs/',
       },
       customCss: ['./src/styles/theme.css', './src/styles/panels.css'],
       components: {

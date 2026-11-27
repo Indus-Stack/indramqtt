@@ -2,8 +2,8 @@ apiVersion: v2
 name: indramqtt
 description: IndraMQTT single-node broker (one replica, no clustering)
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 2026.11.0-beta.1
+appVersion: "2026.11.0-beta.1"
 keywords:
   - mqtt
   - iot

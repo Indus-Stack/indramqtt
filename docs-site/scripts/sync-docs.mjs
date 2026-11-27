@@ -68,7 +68,7 @@ function stripDuplicateTitle(content) {
 function injectEditUrl(content, relPath) {
   const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!fmMatch || /^editUrl:/m.test(fmMatch[1])) return content;
-  const editUrl = `https://github.com/ankur-paan/indramqtt/edit/main/docs/${relPath.replace(/\\/g, '/')}`;
+  const editUrl = `https://github.com/Indus-Stack/indramqtt/edit/main/docs/${relPath.replace(/\\/g, '/')}`;
   return content.replace(/^---\r?\n/, `---\neditUrl: ${editUrl}\n`);
 }
 
