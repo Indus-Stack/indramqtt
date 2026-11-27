@@ -47,7 +47,7 @@ Build the image from the repository root. The image holds the kernel and the ope
 
 ```sh no-test
 # Slow build. The example test does not run it. See Dockerfile for the stages.
-docker build -t indramqtt/indramqtt:0.1.0 .
+docker build -t indusstack/indramqtt:2026.11.0-beta.1 .
 ```
 
 Start the single-node stack with compose. It mounts the example file at `deploy/compose/indra.toml`.

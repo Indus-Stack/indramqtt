@@ -206,7 +206,7 @@ The full catalogue with one entry per tool lives in [MCP tools catalogue](./refe
 
 **Output**
 ```
-{"version":"0.1.0","uptime_ms":112883,"node":"indra-node-1@bfe554c525c5"}
+{"version":"2026.11.0-beta.1","uptime_ms":112883,"node":"indra-node-1@bfe554c525c5"}
 ```
 
 ### `get_api_v5_status`
@@ -250,7 +250,7 @@ The full catalogue with one entry per tool lives in [MCP tools catalogue](./refe
 
 **Output**
 ```
-{"rel_vsn":"v0.1.0","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
+{"rel_vsn":"v2026.11.0-beta.1","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
 ```
 
 ### `get_status`
@@ -294,7 +294,7 @@ The full catalogue with one entry per tool lives in [MCP tools catalogue](./refe
 
 **Output**
 ```
-{"rel_vsn":"v0.1.0","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
+{"rel_vsn":"v2026.11.0-beta.1","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
 ```
 
 ### `list_toolsets`
@@ -3407,7 +3407,7 @@ Call the status tool through `/mcp` with an API key:
 ```
 
 ```output
-{"result":{"content":[{"type":"text","text":"{\"rel_vsn\":\"v0.1.0\",\"node_name\":\"indra-node-1@bfe554c525c5\",\"broker_status\":\"started\",\"app_status\":\"running\"}"}]},"jsonrpc":"2.0","id":1}
+{"result":{"content":[{"type":"text","text":"{\"rel_vsn\":\"v2026.11.0-beta.1\",\"node_name\":\"indra-node-1@bfe554c525c5\",\"broker_status\":\"started\",\"app_status\":\"running\"}"}]},"jsonrpc":"2.0","id":1}
 ```
 
 The result content holds the same JSON as HTTP

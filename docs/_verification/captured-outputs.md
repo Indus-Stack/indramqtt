@@ -169,8 +169,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `getting-started/first-start.md` | 62 | `OK` |
 | `getting-started/first-user.md` | 39 | `201` |
 | `getting-started/first-user.md` | 82 | `ok<br>denied` |
-| `getting-started/install.md` | 66 | `indramqtt 0.1.0` |
-| `getting-started/install.md` | 74 | `indra 0.1.0` |
+| `getting-started/install.md` | 66 | `indramqtt 2026.11.0-beta.1` |
+| `getting-started/install.md` | 74 | `indra 2026.11.0-beta.1` |
 | `index.md` | 67 | `OK` |
 | `mcp.md` | 3513 | `401` |
 | `migration.md` | 94 | `OK` |
