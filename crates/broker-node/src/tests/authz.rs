@@ -68,6 +68,61 @@ async fn bind_quota_overage_returns_0x8b() {
 }
 
 #[tokio::test]
+async fn different_user_takeover_releases_displaced_quota_slot() {
+    use broker_auth::UserQuotas;
+
+    let shared = test_shared();
+    for user in ["alice-cap", "bob-cap"] {
+        shared
+            .auth
+            .add_user(user, b"pw")
+            .expect("memory-only persist cannot fail");
+        assert!(shared
+            .auth
+            .set_quotas(
+                user,
+                UserQuotas {
+                    max_connections: Some(1),
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                }
+            )
+            .expect("memory-only persist cannot fail"));
+    }
+
+    // Alice connects on shared-client (uses her 1 slot).
+    let f1 = bind_frame(
+        184,
+        1,
+        encode_bind_meta_creds("shared-client", true, 60, "alice-cap", b"pw"),
+    );
+    let r1 = apply_bind(&f1, &shared).await.expect("bind replies");
+    assert_eq!(decode_session_binding_meta(&r1.metadata).2, 0);
+
+    // Bob takes over shared-client; Alice's displaced slot must be released.
+    let f2 = bind_frame(
+        185,
+        1,
+        encode_bind_meta_creds("shared-client", true, 60, "bob-cap", b"pw"),
+    );
+    let r2 = apply_bind(&f2, &shared).await.expect("bind replies");
+    assert_eq!(decode_session_binding_meta(&r2.metadata).2, 0);
+
+    // Alice can now connect on a fresh client id within her max_connections=1 quota.
+    let f3 = bind_frame(
+        186,
+        1,
+        encode_bind_meta_creds("alice-new", true, 60, "alice-cap", b"pw"),
+    );
+    let r3 = apply_bind(&f3, &shared).await.expect("bind replies");
+    assert_eq!(
+        decode_session_binding_meta(&r3.metadata).2,
+        0,
+        "displaced user's quota slot must be released after different-user takeover"
+    );
+}
+
+#[tokio::test]
 async fn publish_rate_overage_returns_0x97_and_drops() {
     use broker_auth::UserQuotas;
 

@@ -480,3 +480,196 @@ async fn jwt_rejects_mismatched_connect_username_and_revokes_subscriptions_on_re
     let _ = std::fs::remove_file(&cert_path);
     kernel.finish().await;
 }
+
+#[tokio::test]
+async fn jwt_rejects_cross_tenant_subject_boundary() {
+    let signing = TestSigningKey::generate("pv14-key");
+    let jwks = TestJwksServer::start(vec![signing.jwk_json()]).await;
+    let cert_path =
+        std::env::temp_dir().join(format!("pv14-jwks-tenant-{}.pem", std::process::id()));
+    std::fs::write(&cert_path, crate::jwks_test_support::TEST_CERT_PEM).expect("cert writes");
+    let extra = format!(
+        "\n[jwks]\n\
+         url = \"{}\"\n\
+         issuer = \"https://issuer.example\"\n\
+         audience = \"indra-mqtt\"\n\
+         ca_cert = \"{}\"\n\
+         \n[[tenants.rules]]\n\
+         listener = \"\"\n\
+         attribute = \"tenant\"\n\
+         expression = \"${{username}}\"\n",
+        jwks.url(),
+        cert_path.display()
+    );
+    let kernel = boot_kernel("jwt-tenant-boundary", &extra).await;
+
+    let token = mint_custom_jwt(
+        &signing,
+        "https://issuer.example",
+        "indra-mqtt",
+        3600,
+        serde_json::json!({ "sub": "tenant-a" }),
+    );
+    let mut sock = dial(kernel.mqtt_port).await;
+    send(
+        &mut sock,
+        &connect5_full(
+            "default",
+            true,
+            Some("JWT"),
+            Some(token.as_bytes()),
+            None,
+            None,
+        ),
+    )
+    .await;
+    let (head, body) = recv(&mut sock).await;
+    assert_eq!(head & 0xF0, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        body.get(1).copied().unwrap_or(0),
+        0x87,
+        "JWT verified in default tenant must not cross into tenant-a"
+    );
+
+    let _ = std::fs::remove_file(&cert_path);
+    kernel.finish().await;
+}
+
+#[tokio::test]
+async fn jwt_reconnect_filters_revoked_offline_qos1_replay() {
+    let signing = TestSigningKey::generate("pv14-key");
+    let jwks = TestJwksServer::start(vec![signing.jwk_json()]).await;
+    let cert_path =
+        std::env::temp_dir().join(format!("pv14-jwks-offline-{}.pem", std::process::id()));
+    std::fs::write(&cert_path, crate::jwks_test_support::TEST_CERT_PEM).expect("cert writes");
+    let extra = format!(
+        "\n[jwks]\n\
+         url = \"{}\"\n\
+         issuer = \"https://issuer.example\"\n\
+         audience = \"indra-mqtt\"\n\
+         ca_cert = \"{}\"\n",
+        jwks.url(),
+        cert_path.display()
+    );
+    let kernel = boot_kernel("jwt-offline-replay", &extra).await;
+
+    // 1. Persistent client connects with review/old/# ACL and subscribes QoS 1.
+    let old_token = mint_custom_jwt(
+        &signing,
+        "https://issuer.example",
+        "indra-mqtt",
+        3600,
+        serde_json::json!({
+            "client_id": "client-offline-revoke",
+            "acl": [
+                { "action": "subscribe", "topic_pattern": "review/old/#", "allow": true }
+            ]
+        }),
+    );
+    let mut sub_sock = dial(kernel.mqtt_port).await;
+    send(
+        &mut sub_sock,
+        &connect5_full(
+            "client-offline-revoke",
+            true,
+            Some("JWT"),
+            Some(old_token.as_bytes()),
+            Some(300),
+            None,
+        ),
+    )
+    .await;
+    let (c_head, c_body) = recv(&mut sub_sock).await;
+    assert_eq!(c_head & 0xF0, 0x20);
+    assert_eq!(c_body.get(1).copied().unwrap_or(0xFF), 0x00);
+
+    // Subscribe QoS 1 to review/old/#
+    let filter = b"review/old/#";
+    let mut sub_pkt = Vec::new();
+    sub_pkt.push(0x82);
+    sub_pkt.push((2 + 1 + 2 + filter.len() + 1) as u8);
+    sub_pkt.extend_from_slice(&1u16.to_be_bytes());
+    sub_pkt.push(0x00);
+    sub_pkt.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+    sub_pkt.extend_from_slice(filter);
+    sub_pkt.push(0x01); // QoS 1
+    send(&mut sub_sock, &sub_pkt).await;
+    let (s_head, _) = recv(&mut sub_sock).await;
+    assert_eq!(s_head & 0xF0, 0x90, "SUBACK");
+
+    // Cleanly disconnect while keeping session_expiry = 300.
+    send(&mut sub_sock, &[0xE0, 0x00]).await;
+    drop(sub_sock);
+
+    // 2. Publisher sends a QoS 1 message to review/old/topic while subscriber is offline.
+    let pub_token = mint_custom_jwt(
+        &signing,
+        "https://issuer.example",
+        "indra-mqtt",
+        3600,
+        serde_json::json!({
+            "client_id": "client-offline-pub",
+            "acl": [
+                { "action": "publish", "topic_pattern": "review/old/#", "allow": true }
+            ]
+        }),
+    );
+    let mut pub_sock =
+        connect_jwt_ok(kernel.mqtt_port, "client-offline-pub", &pub_token, None).await;
+    let topic = b"review/old/topic";
+    let payload = b"queued-revoked-payload";
+    let mut pub_pkt = Vec::new();
+    let rem_len = 2 + topic.len() + 2 + 1 + payload.len();
+    pub_pkt.push(0x32); // QoS 1
+    pub_pkt.push(rem_len as u8);
+    pub_pkt.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    pub_pkt.extend_from_slice(topic);
+    pub_pkt.extend_from_slice(&7u16.to_be_bytes());
+    pub_pkt.push(0x00);
+    pub_pkt.extend_from_slice(payload);
+    send(&mut pub_sock, &pub_pkt).await;
+    let (pa_head, _) = recv(&mut pub_sock).await;
+    assert_eq!(pa_head & 0xF0, 0x40, "PUBACK");
+
+    // 3. Persistent client reconnects with a new token allowing only review/new/#.
+    let new_token = mint_custom_jwt(
+        &signing,
+        "https://issuer.example",
+        "indra-mqtt",
+        3600,
+        serde_json::json!({
+            "client_id": "client-offline-revoke",
+            "acl": [
+                { "action": "subscribe", "topic_pattern": "review/new/#", "allow": true }
+            ]
+        }),
+    );
+    let mut re_sock = dial(kernel.mqtt_port).await;
+    send(
+        &mut re_sock,
+        &connect5_full(
+            "client-offline-revoke",
+            false,
+            Some("JWT"),
+            Some(new_token.as_bytes()),
+            Some(300),
+            None,
+        ),
+    )
+    .await;
+    let (rc_head, rc_body) = recv(&mut re_sock).await;
+    assert_eq!(rc_head & 0xF0, 0x20);
+    assert_eq!(rc_body.get(1).copied().unwrap_or(0xFF), 0x00);
+
+    // PINGREQ must get PINGRESP with no offline PUBLISH delivered for review/old/topic.
+    send(&mut re_sock, &[0xC0, 0x00]).await;
+    let (p_head, _) = recv(&mut re_sock).await;
+    assert_eq!(
+        p_head & 0xF0,
+        0xD0,
+        "PINGRESP must arrive without replaying revoked offline QoS 1 message"
+    );
+
+    let _ = std::fs::remove_file(&cert_path);
+    kernel.finish().await;
+}

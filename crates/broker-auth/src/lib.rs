@@ -3348,6 +3348,23 @@ impl MemoryAuth {
         authenticated_username: Option<&str>,
         filter: &TopicFilter,
     ) -> Result<()> {
+        self.authorize_subscribe_in_tenant_as_sync(
+            tenant,
+            client_id,
+            authenticated_username,
+            filter,
+        )
+    }
+
+    /// Synchronous counterpart of [`Self::authorize_subscribe_in_tenant_as`]
+    /// for callers holding non-async replay locks.
+    pub fn authorize_subscribe_in_tenant_as_sync(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        authenticated_username: Option<&str>,
+        filter: &TopicFilter,
+    ) -> Result<()> {
         // Superusers bypass all ACL checks.
         if authenticated_username.is_some_and(|identity| self.is_superuser(identity)) {
             self.record_authz_verdict(true);

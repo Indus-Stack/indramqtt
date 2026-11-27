@@ -413,6 +413,12 @@ fn validate_ws_origin(headers: &axum::http::HeaderMap, expected_scheme: &str) ->
     origin_matches_host(origin_str, host_hdr, expected_scheme)
 }
 
+fn ws_max_message_bytes(state: &ApiState) -> usize {
+    (state.sessions.max_packet_size() as usize)
+        .saturating_add(5)
+        .clamp(1024, MAX_PACKET_BYTES)
+}
+
 /// Upgrade `GET /ws/mqtt` to an MQTT-over-WebSocket session.
 pub async fn ws_mqtt_handler(
     ws: WebSocketUpgrade,
@@ -443,8 +449,9 @@ pub async fn ws_mqtt_handler(
     if !validate_ws_origin(&headers, expected_scheme) {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.max_message_size(MAX_PACKET_BYTES)
-        .max_frame_size(MAX_PACKET_BYTES)
+    let ws_max_bytes = ws_max_message_bytes(&state);
+    ws.max_message_size(ws_max_bytes)
+        .max_frame_size(ws_max_bytes)
         .on_upgrade(|socket| handle_socket(state, socket))
 }
 
@@ -1403,5 +1410,18 @@ mod tests {
         );
         assert!(!validate_ws_origin(&headers, "https"));
         assert!(validate_ws_origin(&headers, "http"));
+    }
+
+    #[test]
+    fn test_ws_max_message_bytes_tracks_session_limit() {
+        let state = ApiState::standalone(std::sync::Arc::new(broker_rules::RuleEngine::new(
+            64,
+            broker_rules::BackpressurePolicy::DropNewest,
+        )));
+        let expected = (state.sessions.max_packet_size() as usize)
+            .saturating_add(5)
+            .clamp(1024, MAX_PACKET_BYTES);
+        assert_eq!(ws_max_message_bytes(&state), expected);
+        assert!(ws_max_message_bytes(&state) < MAX_PACKET_BYTES);
     }
 }

@@ -1577,6 +1577,8 @@ async fn apply_bind_request_inner(
     let mut cached_verified_tenant: Option<String> = None;
     let mut acquired_slot_user: Option<(String, String)> = None;
     let mut pre_validated_will = None;
+    let mut incumbent_slot_owner: Option<String> = None;
+    let mut same_user_takeover = false;
     if let Ok(req) = parsed.clone() {
         // X1-02: a Receive Maximum of 0 is a protocol error on the wire
         // (see the synchronous path for the code-choice rationale).
@@ -2357,7 +2359,11 @@ async fn apply_bind_request_inner(
             let is_takeover = incumbent_session
                 .as_ref()
                 .is_some_and(|session| *session.connected.read());
-            let same_user_takeover = incumbent_session.as_ref().is_some_and(|session| {
+            incumbent_slot_owner = incumbent_session
+                .as_ref()
+                .filter(|session| *session.connected.read())
+                .and_then(|session| session.username.read().clone());
+            same_user_takeover = incumbent_session.as_ref().is_some_and(|session| {
                 *session.connected.read()
                     && session.username.read().as_deref() == effective_username.as_deref()
             });
@@ -2665,6 +2671,13 @@ async fn apply_bind_request_inner(
             }
             if let Some(old_conn_id) = stale_conn {
                 if old_conn_id != frame.header.conn_id {
+                    if !same_user_takeover {
+                        if let Some(old_user) = incumbent_slot_owner.as_deref() {
+                            shared
+                                .sessions
+                                .release_connection_slot_in_tenant(&tenant_for_bind, old_user);
+                        }
+                    }
                     if let Ok(close) = BrokerFrame::new(
                         OpCode::ConnClose,
                         old_conn_id,
@@ -3032,6 +3045,8 @@ pub(crate) async fn prune_revoked_subscriptions(
     session: &Arc<broker_session::Session>,
     tenant: &str,
 ) {
+    let expected_session_id = session.id;
+    let expected_conn_id = *session.conn_id.read();
     let subs: Vec<TopicFilter> = session.subscriptions.read().keys().cloned().collect();
     if subs.is_empty() {
         return;
@@ -3065,12 +3080,23 @@ pub(crate) async fn prune_revoked_subscriptions(
     if revoked.is_empty() {
         return;
     }
+    let _route_guard = shared.sessions.lock_route_guard();
+    let still_current = shared
+        .sessions
+        .get_in_tenant(tenant, &session.client_id)
+        .is_some_and(|cur| {
+            cur.id == expected_session_id && *cur.conn_id.read() == expected_conn_id
+        });
+    if !still_current {
+        return;
+    }
     for filter in &revoked {
         shared
             .sessions
             .remove_subscription_in_tenant(tenant, &session.client_id, filter);
         unsubscribe_scoped_in_tenant(shared, tenant, &session.client_id, filter);
     }
+    drop(_route_guard);
     refresh_subscription_stats(shared);
 }
 
@@ -7579,6 +7605,30 @@ async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Sh
 /// both paced by the same connection-scoped MQTT 5 Receive Maximum (covering
 /// QoS 1 and QoS 2) and session inflight/spill capacity. Caller must hold
 /// `session.lock_replay()`.
+fn replay_topic_allowed(shared: &Shared, session: &broker_session::Session, topic: &Topic) -> bool {
+    if !session_credential_allows(session, topic.as_str(), false) {
+        return false;
+    }
+    let Ok(filter) = TopicFilter::new(topic.as_str()) else {
+        return false;
+    };
+    let tenant = session.tenant_id.read().clone();
+    let verified = if session.verified_is_superuser.load(Ordering::Relaxed) {
+        session.verified_username.read().clone()
+    } else {
+        None
+    };
+    shared
+        .auth
+        .authorize_subscribe_in_tenant_as_sync(
+            &tenant,
+            &session.client_id,
+            verified.as_deref(),
+            &filter,
+        )
+        .is_ok()
+}
+
 fn resume_replay_locked(
     shared: &Shared,
     session: &Arc<broker_session::Session>,
@@ -7594,6 +7644,21 @@ fn resume_replay_locked(
         let Some(item) = session.pop_next_pending_replay_paced() else {
             break;
         };
+        let item_topic = match &item {
+            broker_session::PendingReplayItem::Qos1 { entry, .. } => &entry.topic,
+            broker_session::PendingReplayItem::Qos2(held) => &held.topic,
+        };
+        if !replay_topic_allowed(shared, session, item_topic) {
+            match &item {
+                broker_session::PendingReplayItem::Qos1 { entry, .. } => {
+                    let _ = session.ack_inflight(entry.packet_id);
+                }
+                broker_session::PendingReplayItem::Qos2(held) => {
+                    let _ = session.ack_qos2_pubcomp(held.packet_id);
+                }
+            }
+            continue;
+        }
         let routed = match &item {
             broker_session::PendingReplayItem::Qos1 { entry, .. } => {
                 let topic_str = entry.topic.as_str();
@@ -7682,6 +7747,9 @@ fn resume_pending_retained_locked(
         if expected_conn_id.is_some_and(|cid| *session.conn_id.read() != Some(cid)) {
             session.push_front_pending_retained(item);
             break;
+        }
+        if !replay_topic_allowed(shared, session, &item.topic) {
+            continue;
         }
 
         let effective = u8::from(item.qos);
@@ -7777,6 +7845,9 @@ fn replay_queued_offline_locked(
             unrouted.push(queued);
             unrouted.extend(retained);
             break;
+        }
+        if !replay_topic_allowed(shared, session, &queued.topic) {
+            continue;
         }
 
         // Atomically check MQTT 5 Receive Maximum and reserve QoS 1/2
@@ -11886,6 +11957,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Share the kernel's gauge-plus-high-water-mark store (W1-25) so the
     // node/global stats reads observe the lifecycle points above instead
     // of an empty per-request copy. One `Arc` clone, no new buffering.
+    state.api_https = std::env::var("INDRA_API_HTTPS")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    state.trust_proxy_proto = std::env::var("INDRA_API_TRUST_PROXY_PROTO")
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true);
     state.stats = shared.stats.clone();
     // Share the kernel's readiness flag (W1-27) so `GET /status` reports
     // the same atomic the kernel marks ready. One `Arc` clone, one load

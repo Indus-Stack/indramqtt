@@ -2891,6 +2891,16 @@ async fn drain_inbound(
                                 } else {
                                     request.username = None;
                                 }
+                                let verified_tenant = request_tenant(shared, &request);
+                                if verified_tenant != bind_tenant {
+                                    wire::encode_connack_v5(
+                                        false,
+                                        reauth::RC_NOT_AUTHORIZED,
+                                        &ConnackProperties::default(),
+                                        &mut sink.out.lock(),
+                                    );
+                                    return Ok(Some(Stop::Clean));
+                                }
                                 request.pending_acls = reauth::to_session_acls(verified.acls);
                                 request.enhanced_auth_verified = true;
                                 conn.auth_expiry = auth_expiry_instant(
