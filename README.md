@@ -1,11 +1,16 @@
 # IndraMQTT
 
-[![CI](https://github.com/ankur-paan/indramqtt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ankur-paan/indramqtt/actions/workflows/ci.yml?query=branch%3Amain)
+[![CI](https://github.com/Indus-Stack/indramqtt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Indus-Stack/indramqtt/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
 
 IndraMQTT is a Rust broker for MQTT 5.0 and 3.1.1. It runs SQL rules as messages arrive, so you can filter a sensor reading, reshape its payload, and publish the result to another topic or send it to a connector. The broker, rule engine, and tenant isolation run in one process.
 
 **Pre-1.0 · single-node evaluation.** The first stable release is targeted for April 2027. [Current limits](#limits-at-this-time) · [Roadmap](ROADMAP.md) · [Documentation](docs/index.md) · [Website](https://indramqtt.com)
+
+**Beta 2026.11:** The pinned image is
+`indusstack/indramqtt:2026.11.0-beta.1`. See the
+[release notes](RELEASE_NOTES_2026.11.md) for the published-image quickstart
+and the beta's limits.
 
 ## Get started
 
@@ -14,7 +19,7 @@ IndraMQTT is a Rust broker for MQTT 5.0 and 3.1.1. It runs SQL rules as messages
 On a local development machine with Docker Compose v2 (with `--wait` support), start the broker and wait for its health check. The example accepts anonymous MQTT clients. The management API requires a separate login.
 
 ```sh
-git clone https://github.com/ankur-paan/indramqtt.git
+git clone https://github.com/Indus-Stack/indramqtt.git
 cd indramqtt
 docker compose up -d --build --wait
 curl -fsS http://localhost:18083/healthz
@@ -88,4 +93,4 @@ Run `cargo test --workspace` to test the default build. [Contributor guide](CONT
 
 Choose either the [MIT licence](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) for all code in this repository, including production use. Pre-1.0 builds still contain legacy licence checks. Some operations can ask for a key, and the dashboard can show a trial state or the labels “community” and “enterprise”. The roadmap tracks their removal.
 
-Report defects or request features through [GitHub issues](https://github.com/ankur-paan/indramqtt/issues). For support, email [sales@i-dacs.com](mailto:sales@i-dacs.com).
+Report defects or request features through [GitHub issues](https://github.com/Indus-Stack/indramqtt/issues). For support, email [sales@i-dacs.com](mailto:sales@i-dacs.com).

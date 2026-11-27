@@ -4,7 +4,7 @@
 # kernel serves the MQTT, TLS and WebSocket sockets.
 #
 # Build from the repository root:
-#   docker build -t indramqtt/indramqtt:0.1.0 .
+#   docker build -t indusstack/indramqtt:2026.11.0-beta.1 .
 #
 # Size target: less than 250 MB uncompressed. The runtime stage contains
 # the two binaries and the default config file. It does not contain a

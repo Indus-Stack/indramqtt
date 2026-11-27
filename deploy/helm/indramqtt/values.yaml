@@ -12,8 +12,8 @@ image:
   # operator always knows which tree produced the running container. The
   # default tag follows the workspace version (Cargo.toml
   # `[workspace.package]`); change it to track releases.
-  repository: indramqtt/indramqtt
-  tag: "0.1.0"
+  repository: indusstack/indramqtt
+  tag: "2026.11.0-beta.1"
   pullPolicy: IfNotPresent
 
 service:

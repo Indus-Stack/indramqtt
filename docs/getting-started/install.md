@@ -68,7 +68,7 @@ Show the version of each binary:
 ```
 
 ```output
-indramqtt 0.1.0
+indramqtt 2026.11.0-beta.1
 ```
 
 ```sh test
@@ -76,7 +76,7 @@ indramqtt 0.1.0
 ```
 
 ```output
-indra 0.1.0
+indra 2026.11.0-beta.1
 ```
 
 ## Next steps

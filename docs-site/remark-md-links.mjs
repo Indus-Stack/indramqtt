@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // Where a link to a file outside docs/ goes.
-export const REPOSITORY_BLOB_URL = 'https://github.com/ankur-paan/indramqtt/blob/main';
+export const REPOSITORY_BLOB_URL = 'https://github.com/Indus-Stack/indramqtt/blob/main';
 
 // The page of the failed docs examples lives in an internal folder. The
 // site publishes it under a clean route (see scripts/sync-docs.mjs).

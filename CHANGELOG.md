@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
-## [Unreleased] - Sprint 20
+## [Unreleased]
+
+## [2026.11.0-beta.1] - 2026-11-27
+
+First public beta. This release is for single-node evaluation; see
+[`RELEASE_NOTES_2026.11.md`](RELEASE_NOTES_2026.11.md) for installation,
+verified behavior, and current limits.
 
 ### Security
 - **url 2.5.8 → 2.5.9**: fixes advisory RUSTSEC-2026-0592, stack overflow in `Url::origin()` on nested `blob:` URLs.

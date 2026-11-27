@@ -18,7 +18,7 @@ services:
     # Pinned image reference: the workspace version (Cargo.toml
     # `[workspace.package]`), never `:latest`, so an operator always knows
     # which tree produced the running container.
-    image: indramqtt/indramqtt:0.1.0
+    image: indusstack/indramqtt:2026.11.0-beta.1
     container_name: indramqtt-broker
     restart: unless-stopped
     ports:

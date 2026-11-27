@@ -97,7 +97,7 @@ The catalogue holds 370 tools: 368 routed tools plus `list_toolsets` and `subscr
 
 **Output**
 ```
-{"rel_vsn":"v0.1.0","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
+{"rel_vsn":"v2026.11.0-beta.1","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
 ```
 
 ### `broker_status`
@@ -141,7 +141,7 @@ The catalogue holds 370 tools: 368 routed tools plus `list_toolsets` and `subscr
 
 **Output**
 ```
-{"version":"0.1.0","uptime_ms":112883,"node":"indra-node-1@bfe554c525c5"}
+{"version":"2026.11.0-beta.1","uptime_ms":112883,"node":"indra-node-1@bfe554c525c5"}
 ```
 
 ### `get_status`
@@ -185,7 +185,7 @@ The catalogue holds 370 tools: 368 routed tools plus `list_toolsets` and `subscr
 
 **Output**
 ```
-{"rel_vsn":"v0.1.0","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
+{"rel_vsn":"v2026.11.0-beta.1","node_name":"indra-node-1@bfe554c525c5","broker_status":"started","app_status":"running"}
 ```
 
 ### `get_api_v1_clients`
@@ -12680,7 +12680,7 @@ _No live example captured: this operation requires a path-segment value or a req
 
 **Output**
 ```
-{"node_id":"bfe554c525c5","status":"running","version":"0.1.0","connections":0,"rules":0,"window_channel_depth":65536,"backpressure_policy":"DropOldest"}
+{"node_id":"bfe554c525c5","status":"running","version":"2026.11.0-beta.1","connections":0,"rules":0,"window_channel_depth":65536,"backpressure_policy":"DropOldest"}
 ```
 
 ### `get_api_v5_cluster`
@@ -13210,7 +13210,7 @@ _No live example captured: this operation requires a path-segment value or a req
 
 **Output**
 ```
-[{"node":"mn03-check@bfe554c525c5","node_status":"running","role":"core","version":"0.1.0","otp_release":"1.99.1/x86_64-unknown-linux-gnu","uptime":125061,"connections":0,"live_connections":0,"cluster_sessions":0,"memory_total":"5.00G","memory_used":"71.95M","load1":4.95,"load5":4.49,"load15":4.95,"max_fds":524288,"process_used":9,"sys_path":"/work/target/tmp-mn03/data","log_path":"The log path is not yet set"}]
+[{"node":"mn03-check@bfe554c525c5","node_status":"running","role":"core","version":"2026.11.0-beta.1","otp_release":"1.99.1/x86_64-unknown-linux-gnu","uptime":125061,"connections":0,"live_connections":0,"cluster_sessions":0,"memory_total":"5.00G","memory_used":"71.95M","load1":4.95,"load5":4.49,"load15":4.95,"max_fds":524288,"process_used":9,"sys_path":"/work/target/tmp-mn03/data","log_path":"The log path is not yet set"}]
 ```
 
 ### `get_api_v5_nodes_by_node`

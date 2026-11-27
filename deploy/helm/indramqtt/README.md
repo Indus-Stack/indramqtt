@@ -17,7 +17,7 @@ install, connect.
 
 | Value | Default | When to change it |
 |---|---|---|
-| `image.repository` / `image.tag` | `indramqtt/indramqtt:0.1.0` (workspace version, pinned, never `:latest`) | Track releases. |
+| `image.repository` / `image.tag` | `indusstack/indramqtt:2026.11.0-beta.1` (workspace version, pinned, never `:latest`) | Track releases. |
 | `service.type` | `ClusterIP` | `NodePort` or `LoadBalancer` to reach the broker from outside the cluster. |
 | `service.mqttPort` / `wsPort` / `apiPort` | `1883` / `8083` / `18083`, the same ports as the compose example | Change the port here only. The Service, the container ports, the probes and the binds in `indra.toml` use the same value. |
 | `storage.size` | `10Gi` | Grow for retained history or an enabled stream journal. |
@@ -38,7 +38,7 @@ helm template indra ./deploy/helm/indramqtt
 # example), or override named values only:
 helm install indra ./deploy/helm/indramqtt
 helm install indra ./deploy/helm/indramqtt \
-  --set image.tag=0.1.0 \
+  --set image.tag=2026.11.0-beta.1 \
   --set storage.size=20Gi \
   --set config.allowAnonymous=false
 ```
